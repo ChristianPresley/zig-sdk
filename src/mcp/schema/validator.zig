@@ -105,6 +105,8 @@ const Compiler = struct {
     refs: std.ArrayList([]const u8) = .empty,
     patterns: std.StringHashMapUnmanaged(regex.Regex) = .empty,
     pattern_buffer_len: usize = 0,
+    /// The schema objects that the walk compiled, by the address of their key storage.
+    visited: std.AutoHashMapUnmanaged(usize, void) = .empty,
 
     fn pattern(self: *Compiler, source: []const u8) CompileError!void {
         if (self.patterns.contains(source)) return;
@@ -127,6 +129,7 @@ const Compiler = struct {
             .bool => return,
             .object => |obj| {
                 if (depth > self.options.limits.max_depth) return error.SchemaTooDeep;
+                if (obj.count() > 0) try self.visited.put(self.arena, @intFromPtr(obj.keys().ptr), {});
                 self.count += 1;
                 if (self.count > self.options.limits.max_subschemas) return error.TooManySubschemas;
                 var it = obj.iterator();
@@ -287,6 +290,8 @@ pub fn compile(arena: Allocator, root: Value, options: Options) CompileError!Sch
         const ref = c.refs.items[i];
         const target = resolveRef(&schema, ref) orelse return error.InvalidSchema;
         if ((try seen.getOrPut(arena, ref)).found_existing) continue;
+        // The walk above already compiled the root and every schema under a known keyword.
+        if (target == .object and target.object.count() > 0 and c.visited.contains(@intFromPtr(target.object.keys().ptr))) continue;
         try c.node(target, 0, false);
     }
     schema.patterns = c.patterns;
@@ -922,6 +927,9 @@ test "compile rejects unsupported and remote schemas" {
     // A reference into an unknown member is compiled too.
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$ref\":\"#/x\",\"x\":{\"minimum\":\"a\"}}", .{}));
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$ref\":\"#/x\",\"x\":5}", .{}));
+    // A reference to the root or to a known subschema does not compile it again.
+    _ = try compileText(arena, "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"$id\":\"urn:x\",\"properties\":{\"n\":{\"$ref\":\"#\"}}}", .{});
+    _ = try compileText(arena, "{\"properties\":{\"a\":{\"type\":\"integer\"},\"b\":{\"type\":\"string\"}},\"$ref\":\"#/properties/a\"}", .{ .limits = .{ .max_subschemas = 3 } });
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"items\":[{}]}", .{}));
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"type\":\"int\"}", .{}));
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"multipleOf\":0}", .{}));
