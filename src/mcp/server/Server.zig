@@ -21,6 +21,7 @@ const envelope = @import("../transport/envelope.zig");
 const UriTemplate = @import("../uri_template/UriTemplate.zig");
 const request_state = @import("request_state.zig");
 const mrtr = @import("mrtr.zig");
+const tasks = @import("tasks.zig");
 pub const RequestContext = @import("RequestContext.zig");
 pub const Outcome = mrtr.Outcome;
 pub const InputRequired = mrtr.InputRequired;
@@ -56,6 +57,8 @@ pub const Options = struct {
     /// Ignore JSON Schema keywords the validator does not support instead of rejecting the
     /// tool at registration.
     allow_unsupported_schema_keywords: bool = false,
+    /// Enable the Tasks extension. The server then advertises it under `extensions`.
+    tasks: ?tasks.Options = null,
     cache: struct {
         discover: CacheHint = .{},
         lists: CacheHint = .{},
@@ -82,6 +85,8 @@ pub const ToolDef = struct {
     output_schema: ?[]const u8 = null,
     /// Client capabilities the tool needs. Checked before the handler runs (`-32021`).
     requires_client: ?types.ClientCapabilities = null,
+    /// How the tool relates to the Tasks extension.
+    task_support: tasks.TaskSupport = .none,
     userdata: ?*anyopaque = null,
 };
 
@@ -121,6 +126,7 @@ const ToolEntry = struct {
     output: ?validator.Schema,
     handler: ToolHandler,
     requires_client: ?types.ClientCapabilities,
+    task_support: tasks.TaskSupport,
     userdata: ?*anyopaque,
     enabled: bool = true,
 };
@@ -172,6 +178,7 @@ completion_handler: ?CompletionHandler = null,
 subscriptions: std.ArrayList(*Subscription) = .empty,
 subscriptions_lock: Io.Mutex = .init,
 state_codec: ?request_state.Codec = null,
+task_store: ?tasks.Store = null,
 /// Counts of protocol violations by peers, for diagnostics.
 violations: std.atomic.Value(u64) = .init(0),
 /// Set once `shutdownSubscriptions` ran. Later listen requests end immediately.
@@ -188,10 +195,23 @@ pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
     if (options.request_state == .sealed_ephemeral) {
         server.state_codec = try request_state.Codec.initRandom(io, options.limits.request_state_ttl);
     }
+    if (options.tasks) |task_options| {
+        server.task_store = tasks.Store.init(gpa, io, task_options);
+        // Advertise the extension. Other extensions the caller declared are kept.
+        const arena = server.registry_arena.allocator();
+        var ext: std.json.ObjectMap = .empty;
+        if (options.capabilities.extensions) |existing| if (existing == .object) {
+            var it = existing.object.iterator();
+            while (it.next()) |kv| try ext.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+        };
+        try ext.put(arena, tasks.extension_id, .{ .object = .empty });
+        server.options.capabilities.extensions = .{ .object = ext };
+    }
     return server;
 }
 
 pub fn deinit(self: *Server) void {
+    if (self.task_store) |*store| store.deinit();
     if (self.state_codec) |*c| c.deinit();
     self.tools.deinit(self.gpa);
     self.resources.deinit(self.gpa);
@@ -307,6 +327,7 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
         .output = output,
         .handler = handler,
         .requires_client = def.requires_client,
+        .task_support = def.task_support,
         .userdata = def.userdata,
     };
     self.registry_lock.lockSharedUncancelable(std.Io.Threaded.global_single_threaded.io());
@@ -490,7 +511,7 @@ fn finishResult(self: *Server, ctx: *RequestContext, result: anytype) RequestCon
             }
         }
     }
-    if (@hasField(T, "ttlMs")) {
+    if (@hasField(T, "ttlMs") and @hasField(T, "cacheScope")) {
         const hint = if (T == types.DiscoverResult) self.options.cache.discover else if (T == types.ReadResourceResult) self.options.cache.reads else self.options.cache.lists;
         if (stamped.ttlMs == null) stamped.ttlMs = @max(hint.ttl_ms, 0);
         if (stamped.cacheScope == null) stamped.cacheScope = hint.scope;
@@ -532,6 +553,9 @@ fn dispatch(self: *Server, ctx: *RequestContext) RequestContext.Error!void {
         const err = try errors.unsupportedProtocolVersion(ctx.arena, &version.supported_versions, ctx.meta.protocol_version);
         return ctx.setError(err);
     }
+
+    // The Tasks extension has its own methods.
+    if (std.mem.startsWith(u8, ctx.method, "tasks/")) return self.dispatchTask(ctx);
 
     // Method table and capability gate.
     const method = methods.Method.fromName(ctx.method) orelse {
@@ -768,11 +792,13 @@ fn callTool(self: *Server, ctx: *RequestContext, params: types.CallToolRequestPa
     };
     if (params.arguments) |a| if (a != .object) return ctx.setError(errors.invalidParams("arguments must be an object"));
     if (entry.requires_client) |required| try self.requireCapabilities(ctx, required);
+    const client_has_tasks = self.task_store != null and ctx.meta.client_capabilities.hasExtension(tasks.extension_id);
+    if (entry.task_support == .required and !client_has_tasks) return ctx.setError(try tasks.missingExtensionError(ctx.arena));
     const args: Value = params.arguments orelse .{ .object = .empty };
     if (try checkArguments(ctx, entry, args)) |detail| return self.rejectArguments(ctx, params.name, detail);
     try self.prepareInputRound(ctx, "tools/call", params.name, params.inputResponses, params.requestState);
     ctx.userdata = entry.userdata;
-    const outcome = entry.handler(ctx, args) catch |e| switch (e) {
+    var outcome = entry.handler(ctx, args) catch |e| switch (e) {
         error.InvalidArguments => return self.rejectArguments(ctx, params.name, "the arguments do not parse"),
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
@@ -782,7 +808,36 @@ fn callTool(self: *Server, ctx: *RequestContext, params: types.CallToolRequestPa
             return self.finishResult(ctx, result);
         },
     };
+    if (outcome == .start_task) {
+        if (client_has_tasks and entry.task_support != .none) return self.startTask(ctx, entry, params);
+        // Without the extension the task body runs at once, inside a synthetic task.
+        var synthetic: tasks.Task = .{
+            .arena_state = .init(self.gpa),
+            .id = "sync",
+            .tool = params.name,
+            .params = ctx.params orelse .null,
+            .kind = ctx.kind,
+            .created_ms = 0,
+            .updated_ms = 0,
+            .ttl_ms = 0,
+        };
+        defer synthetic.arena_state.deinit();
+        ctx.task = &synthetic;
+        defer ctx.task = null;
+        outcome = entry.handler(ctx, args) catch |e| switch (e) {
+            error.InvalidArguments => return self.rejectArguments(ctx, params.name, "the arguments do not parse"),
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Rpc => return error.Rpc,
+            else => {
+                const result = try types.CallToolResult.err(ctx.arena, "Tool failed: {t}", .{e});
+                return self.finishResult(ctx, result);
+            },
+        };
+        if (outcome == .start_task) return ctx.setError(errors.internalError("The tool returned start_task inside a task"));
+    }
     switch (outcome) {
+        .start_task => unreachable,
         .complete => |r| {
             var result = r;
             if (entry.output) |*out| if (result.isError != true) {
@@ -887,6 +942,7 @@ fn finishRead(self: *Server, ctx: *RequestContext, outcome: Outcome(types.ReadRe
             try self.finishResult(ctx, r);
         },
         .input_required => |ir| try self.finishInputRequired(ctx, .@"resources/read", ir),
+        .start_task => return ctx.setError(errors.internalError("Only tools can start a task")),
     }
 }
 
@@ -910,6 +966,7 @@ fn getPrompt(self: *Server, ctx: *RequestContext, params: types.GetPromptRequest
         switch (outcome) {
             .complete => |r| try self.finishResult(ctx, r),
             .input_required => |ir| try self.finishInputRequired(ctx, .@"prompts/get", ir),
+            .start_task => return ctx.setError(errors.internalError("Only tools can start a task")),
         }
         return;
     }
@@ -1083,4 +1140,240 @@ fn deliver(self: *Server, io: Io, sub: *Subscription, event: Event, uri: ?[]cons
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tasks extension
+// ---------------------------------------------------------------------------------------------
+
+/// Create the task, start its runner, and answer with `CreateTaskResult`.
+fn startTask(self: *Server, ctx: *RequestContext, entry: *ToolEntry, params: types.CallToolRequestParams) RequestContext.Error!void {
+    const store = &self.task_store.?;
+    const task = store.create(params.name, ctx.params orelse .null, ctx.kind) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TooManyTasks => return ctx.setError(errors.internalError("Too many tasks")),
+        error.EntropyUnavailable => return ctx.setError(errors.internalError("No entropy for the task id")),
+    };
+    _ = entry;
+    // The task is in the store: a `tasks/get` resolves from now on.
+    task.future = ctx.io.concurrent(runTask, .{ self, ctx.io, task }) catch null;
+    if (task.future == null) runTask(self, ctx.io, task);
+    task.lock.lockUncancelable(ctx.io);
+    defer task.lock.unlock(ctx.io);
+    const result: tasks.CreateTaskResult = .{
+        .taskId = task.id,
+        .status = @tagName(task.status),
+        .createdAt = try tasks.formatTimestamp(ctx.arena, task.created_ms),
+        .lastUpdatedAt = try tasks.formatTimestamp(ctx.arena, task.updated_ms),
+        .ttlMs = task.ttl_ms,
+        .pollIntervalMs = store.options.poll_interval_ms,
+    };
+    try self.finishResult(ctx, result);
+}
+
+const noop_responder_vtable: Transport.Responder.VTable = .{
+    .notify = noopNotify,
+    .finish = noopFinish,
+    .abort = noopAbort,
+};
+
+fn noopNotify(_: *anyopaque, _: Io, _: []const u8) Transport.SendError!void {}
+fn noopFinish(_: *anyopaque, _: Io, _: []const u8) Transport.SendError!void {}
+fn noopAbort(_: *anyopaque, _: Io) void {}
+
+/// The body of a task: run the tool handler once with the answers collected so far.
+fn runTask(self: *Server, io: Io, task: *tasks.Task) void {
+    const arena = task.arena();
+    var dummy: u8 = 0;
+    var ctx: RequestContext = .{
+        .io = io,
+        .gpa = self.gpa,
+        .arena = arena,
+        .server = self,
+        .id = .{ .integer = 0 },
+        .method = "tools/call",
+        .meta = undefined,
+        .params = task.params,
+        .cancel = &task.cancel,
+        .responder = .{ .ptr = &dummy, .vtable = &noop_responder_vtable },
+        .kind = task.kind,
+        .task = task,
+    };
+    const outcome = self.runTaskBody(&ctx, task) catch |e| switch (e) {
+        error.Canceled => {
+            self.settleTask(io, task, .cancelled, null, null);
+            return;
+        },
+        error.OutOfMemory => {
+            self.settleTask(io, task, .failed, null, errors.internalError("Out of memory").toWire());
+            return;
+        },
+        error.Rpc => {
+            const err = ctx.rpc_error orelse errors.internalError("Internal error");
+            self.settleTask(io, task, .failed, null, err.toWire());
+            return;
+        },
+    };
+    switch (outcome) {
+        .complete => |result| {
+            const text = json.writeAlloc(arena, result) catch {
+                self.settleTask(io, task, .failed, null, errors.internalError("Out of memory").toWire());
+                return;
+            };
+            const tree = json.parseTree(arena, text) catch {
+                self.settleTask(io, task, .failed, null, errors.internalError("Out of memory").toWire());
+                return;
+            };
+            self.settleTask(io, task, .completed, tree, null);
+        },
+        .input_required => |ir| {
+            const text = json.writeAlloc(arena, ir.requests) catch {
+                self.settleTask(io, task, .failed, null, errors.internalError("Out of memory").toWire());
+                return;
+            };
+            const tree = json.parseTree(arena, text) catch {
+                self.settleTask(io, task, .failed, null, errors.internalError("Out of memory").toWire());
+                return;
+            };
+            task.lock.lockUncancelable(io);
+            defer task.lock.unlock(io);
+            if (task.status == .cancelled) return;
+            task.status = .input_required;
+            task.input_requests = tree;
+            task.updated_ms = tasks.nowMs(io);
+        },
+        .start_task => self.settleTask(io, task, .failed, null, errors.internalError("The tool returned start_task inside a task").toWire()),
+    }
+}
+
+fn runTaskBody(self: *Server, ctx: *RequestContext, task: *tasks.Task) RequestContext.Error!Outcome(types.CallToolResult) {
+    ctx.meta = meta_mod.lift(ctx.arena, ctx.params) catch return ctx.setError(errors.internalError("The task params lost their _meta"));
+    const entry = self.findTool(task.tool) orelse return ctx.setError(errors.internalError("The tool of the task is gone"));
+    ctx.userdata = entry.userdata;
+    const params = json.parseValue(types.CallToolRequestParams, ctx.arena, task.params) catch return ctx.setError(errors.internalError("The task params do not parse"));
+    // Answers: the ones the creating request carried, then the ones from `tasks/update`.
+    var responses: std.json.ObjectMap = .empty;
+    if (params.inputResponses) |given| {
+        var it = given.map.iterator();
+        while (it.next()) |kv| try responses.put(ctx.arena, kv.key_ptr.*, kv.value_ptr.*);
+    }
+    {
+        task.lock.lockUncancelable(ctx.io);
+        defer task.lock.unlock(ctx.io);
+        var it = task.input_responses.iterator();
+        while (it.next()) |kv| try responses.put(ctx.arena, kv.key_ptr.*, kv.value_ptr.*);
+    }
+    try self.prepareInputRound(ctx, "tools/call", task.tool, .{ .map = responses }, params.requestState);
+    const args: Value = params.arguments orelse .{ .object = .empty };
+    return entry.handler(ctx, args) catch |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Rpc => return error.Rpc,
+        error.InvalidArguments => return .{ .complete = try types.CallToolResult.err(ctx.arena, "Invalid arguments for tool {s}", .{task.tool}) },
+        else => return .{ .complete = try types.CallToolResult.err(ctx.arena, "Tool failed: {t}", .{e}) },
+    };
+}
+
+fn settleTask(self: *Server, io: Io, task: *tasks.Task, status: tasks.Status, result: ?Value, err: ?types.Error) void {
+    _ = self;
+    task.lock.lockUncancelable(io);
+    defer task.lock.unlock(io);
+    if (task.isTerminal()) return;
+    task.status = status;
+    task.result = result;
+    task.err = err;
+    task.input_requests = null;
+    task.updated_ms = tasks.nowMs(io);
+}
+
+fn dispatchTask(self: *Server, ctx: *RequestContext) RequestContext.Error!void {
+    const store: *tasks.Store = if (self.task_store) |*s| s else {
+        const msg = try std.fmt.allocPrint(ctx.arena, "Method not found: {s}", .{ctx.method});
+        return ctx.setError(errors.methodNotFound(msg));
+    };
+    const is_get = std.mem.eql(u8, ctx.method, "tasks/get");
+    const is_update = std.mem.eql(u8, ctx.method, "tasks/update");
+    const is_cancel = std.mem.eql(u8, ctx.method, "tasks/cancel");
+    if (!is_get and !is_update and !is_cancel) {
+        const msg = try std.fmt.allocPrint(ctx.arena, "Method not found: {s}", .{ctx.method});
+        return ctx.setError(errors.methodNotFound(msg));
+    }
+    if (!ctx.meta.client_capabilities.hasExtension(tasks.extension_id)) return ctx.setError(try tasks.missingExtensionError(ctx.arena));
+    if (is_get) {
+        const params = try parseParams(ctx, tasks.GetParams);
+        const task = store.get(params.taskId) orelse return ctx.setError(errors.invalidParams("Unknown taskId"));
+        task.lock.lockUncancelable(ctx.io);
+        defer task.lock.unlock(ctx.io);
+        const detailed: tasks.DetailedTask = .{
+            .taskId = task.id,
+            .status = @tagName(task.status),
+            .createdAt = try tasks.formatTimestamp(ctx.arena, task.created_ms),
+            .lastUpdatedAt = try tasks.formatTimestamp(ctx.arena, task.updated_ms),
+            .ttlMs = task.ttl_ms,
+            .pollIntervalMs = store.options.poll_interval_ms,
+            .inputRequests = if (task.status == .input_required) task.input_requests else null,
+            .result = if (task.status == .completed) task.result else null,
+            .@"error" = if (task.status == .failed) task.err else null,
+        };
+        return self.finishResult(ctx, detailed);
+    }
+    if (is_update) {
+        const params = try parseParams(ctx, tasks.UpdateParams);
+        const task = store.get(params.taskId) orelse return ctx.setError(errors.invalidParams("Unknown taskId"));
+        var resume_now = false;
+        {
+            task.lock.lockUncancelable(ctx.io);
+            defer task.lock.unlock(ctx.io);
+            if (task.status == .input_required) {
+                if (params.inputResponses) |given| {
+                    var it = given.map.iterator();
+                    while (it.next()) |kv| {
+                        // Copy the answer into the task arena; the request arena dies soon.
+                        const text = try json.writeAlloc(task.arena(), kv.value_ptr.*);
+                        const copy = json.parseTree(task.arena(), text) catch return error.OutOfMemory;
+                        try task.input_responses.put(task.arena(), try task.arena().dupe(u8, kv.key_ptr.*), copy);
+                        if (task.input_requests) |*pending| if (pending.* == .object) {
+                            _ = pending.object.orderedRemove(kv.key_ptr.*);
+                        };
+                    }
+                }
+                const pending_count: usize = if (task.input_requests) |p| (if (p == .object) p.object.count() else 0) else 0;
+                if (pending_count == 0) {
+                    task.status = .working;
+                    task.input_requests = null;
+                    resume_now = true;
+                }
+                task.updated_ms = tasks.nowMs(ctx.io);
+            }
+        }
+        if (resume_now) {
+            if (task.future) |*f| {
+                f.await(ctx.io);
+                task.future = null;
+            }
+            task.future = ctx.io.concurrent(runTask, .{ self, ctx.io, task }) catch null;
+            if (task.future == null) runTask(self, ctx.io, task);
+        }
+        return self.finishResult(ctx, types.EmptyResult{});
+    }
+    // tasks/cancel
+    const params = try parseParams(ctx, tasks.CancelParams);
+    const task = store.get(params.taskId) orelse return ctx.setError(errors.invalidParams("Unknown taskId"));
+    var running = false;
+    {
+        task.lock.lockUncancelable(ctx.io);
+        defer task.lock.unlock(ctx.io);
+        if (!task.isTerminal()) {
+            running = true;
+            task.cancel.cancel(ctx.io, "cancelled by the client");
+        }
+    }
+    if (running) {
+        if (task.future) |*f| {
+            _ = f.cancel(ctx.io);
+            task.future = null;
+        }
+        self.settleTask(ctx.io, task, .cancelled, null, null);
+    }
+    return self.finishResult(ctx, types.EmptyResult{});
 }

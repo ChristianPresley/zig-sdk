@@ -8,6 +8,9 @@ pub fn Outcome(comptime T: type) type {
     return union(enum) {
         complete: T,
         input_required: InputRequired,
+        /// Only for tools: turn this call into a task and run the handler again inside it.
+        /// Without the tasks extension the handler runs again at once.
+        start_task,
     };
 }
 

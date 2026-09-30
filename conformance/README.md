@@ -22,4 +22,4 @@ Add `--stdio` to the start command to serve on standard input and output instead
 
 ## Scope
 
-The suite scores 37 server scenarios for revision 2026-07-28. The fixture server passes all of them. The suite also runs scenarios that it does not score. The scenarios for the Tasks extension fail until the extension module is available. That is a planned milestone.
+The suite scores 37 server scenarios for revision 2026-07-28. The fixture server passes all of them. The suite also runs scenarios that it does not score. The ten scenarios for the Tasks extension pass their functional checks. Their check `wire-schema-valid` fails, because the suite validates the task result against the core `CallToolResult` schema, which requires `content`.

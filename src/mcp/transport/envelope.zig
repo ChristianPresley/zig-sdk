@@ -107,7 +107,7 @@ pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?V
     const hm = headers.method orelse return .{ .message = "Header mismatch: Mcp-Method header is required" };
     if (!std.mem.eql(u8, hm, method)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Method header value '{s}' does not match body method '{s}'", .{ hm, method }) };
 
-    const source: methods.HeaderNameSource = if (methods.Method.fromName(method)) |m| m.headerNameSource() else .none;
+    const source: methods.HeaderNameSource = if (methods.Method.fromName(method)) |m| m.headerNameSource() else if (isTaskMethod(method)) .task_id else .none;
     if (source != .none) {
         const key: []const u8 = switch (source) {
             .name => "name",
@@ -272,4 +272,9 @@ test "verify headers against body" {
     try std.testing.expect(!schemaHeadersValid(dup));
     const num = try json.parseTree(arena, "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\",\"x-mcp-header\":\"X\"}}}");
     try std.testing.expect(!schemaHeadersValid(num));
+}
+
+/// The Tasks extension methods that mirror `params.taskId` into `Mcp-Name`.
+fn isTaskMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "tasks/get") or std.mem.eql(u8, method, "tasks/update") or std.mem.eql(u8, method, "tasks/cancel");
 }

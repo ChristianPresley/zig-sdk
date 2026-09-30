@@ -13,6 +13,7 @@ const RequestId = @import("../jsonrpc/id.zig").RequestId;
 const Server = @import("Server.zig");
 
 const Principal = @import("../auth/resource_server.zig").Principal;
+const tasks = @import("tasks.zig");
 
 const RequestContext = @This();
 
@@ -37,6 +38,8 @@ kind: Transport.Kind,
 userdata: ?*anyopaque = null,
 /// Transport data for the request. The HTTP server stores the authorization principal.
 transport_context: ?*anyopaque = null,
+/// Set while a handler runs inside a task of the Tasks extension.
+task: ?*tasks.Task = null,
 /// Set by `setError`. Returned as the JSON-RPC error of the request.
 rpc_error: ?errors.RpcError = null,
 /// `params.name` or `params.uri`, used to bind sealed state to its target.
@@ -45,6 +48,12 @@ progress_sent: u32 = 0,
 long_lived: bool = false,
 
 pub const Error = error{ Canceled, Rpc, OutOfMemory };
+
+/// True when the handler runs inside a task. A tool that returns `.start_task` runs again
+/// with this set.
+pub fn inTask(self: *const RequestContext) bool {
+    return self.task != null;
+}
 
 /// The authorization principal of the request, when the transport checked a bearer token.
 pub fn principal(self: *const RequestContext) ?*const Principal {

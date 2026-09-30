@@ -143,6 +143,80 @@ fn hiddenTool(ctx: *Ctx, _: NoArgs) anyerror!Result {
     return textResult(ctx, "hidden", .{});
 }
 
+// -- Tasks extension tools -------------------------------------------------------------------
+
+const GreetArgs = struct { name: []const u8 = "world" };
+
+fn greet(ctx: *Ctx, args: GreetArgs) anyerror!Result {
+    return textResult(ctx, "Hello, {s}!", .{args.name});
+}
+
+/// Sleep in short steps so a cancellation stops the task quickly.
+fn sleepSeconds(ctx: *Ctx, seconds: i64) anyerror!void {
+    var remaining_ms: i64 = seconds * 1000;
+    while (remaining_ms > 0) : (remaining_ms -= 100) {
+        try ctx.checkCancel();
+        try ctx.io.sleep(.fromMilliseconds(@min(remaining_ms, 100)), .awake);
+    }
+}
+
+const SlowArgs = struct { seconds: i64 = 0, label: ?[]const u8 = null };
+
+fn slowCompute(ctx: *Ctx, args: SlowArgs) anyerror!Result {
+    if (!ctx.inTask()) return .start_task;
+    try sleepSeconds(ctx, @max(args.seconds, 0));
+    return textResult(ctx, "computed {s} after {d} s", .{ args.label orelse "job", args.seconds });
+}
+
+fn failingJob(ctx: *Ctx, _: NoArgs) anyerror!Result {
+    if (!ctx.inTask()) return .start_task;
+    try sleepSeconds(ctx, 1);
+    return .{ .complete = try types.CallToolResult.err(ctx.arena, "The job failed as designed", .{}) };
+}
+
+fn protocolErrorJob(ctx: *Ctx, _: NoArgs) anyerror!Result {
+    if (!ctx.inTask()) return .start_task;
+    return ctx.setError(mcp.protocol.errors.internalError("The job hit an internal error as designed"));
+}
+
+const ConfirmDeleteArgs = struct { filename: []const u8 = "file.txt" };
+
+fn confirmDelete(ctx: *Ctx, args: ConfirmDeleteArgs) anyerror!Result {
+    if (!ctx.inTask()) return .start_task;
+    if (try ctx.elicitResponse("confirm")) |r| {
+        if (r.action != .accept) return textResult(ctx, "Kept {s}", .{args.filename});
+        return textResult(ctx, "Deleted {s}", .{args.filename});
+    }
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    const message = try std.fmt.allocPrint(ctx.arena, "Delete {s}?", .{args.filename});
+    try ir.elicitForm("confirm", message, try mcp.InputRequired.stringSchema(ctx.arena, "confirm", "Type yes", false));
+    return .{ .input_required = ir };
+}
+
+fn multiInput(ctx: *Ctx, _: NoArgs) anyerror!Result {
+    if (!ctx.inTask()) return .start_task;
+    if (ctx.hasAllResponses(&.{ "first", "second" })) {
+        const first = nameFrom((try ctx.elicitResponse("first")).?);
+        const second = nameFrom((try ctx.elicitResponse("second")).?);
+        return textResult(ctx, "{s} and {s}", .{ first, second });
+    }
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    if ((try ctx.elicitResponse("first")) == null) try ir.elicitForm("first", "First name?", try mcp.InputRequired.stringSchema(ctx.arena, "name", null, true));
+    if ((try ctx.elicitResponse("second")) == null) try ir.elicitForm("second", "Second name?", try mcp.InputRequired.stringSchema(ctx.arena, "name", null, true));
+    return .{ .input_required = ir };
+}
+
+fn toolWithTask(ctx: *Ctx, _: NoArgs) anyerror!Result {
+    const answer = try ctx.elicitResponse("user_name");
+    if (answer == null) {
+        var ir: mcp.InputRequired = .init(ctx.arena);
+        try ir.elicitForm("user_name", "What is your name?", try mcp.InputRequired.stringSchema(ctx.arena, "name", "Your name", true));
+        return .{ .input_required = ir };
+    }
+    if (!ctx.inTask()) return .start_task;
+    return textResult(ctx, "Hello, {s}! The task is done.", .{nameFrom(answer.?)});
+}
+
 // -- Multi round-trip request tools ----------------------------------------------------------
 
 fn nameFrom(r: types.ElicitResult) []const u8 {
@@ -408,6 +482,7 @@ pub fn main(init: std.process.Init) !void {
             .logging = .{ .object = .empty },
         },
         .mrtr = .{ .elicitation = true, .sampling = true, .sampling_tools = true, .roots = true },
+        .tasks = .{},
     });
     defer server.deinit();
 
@@ -439,6 +514,13 @@ pub fn main(init: std.process.Init) !void {
     try server.addTool(.{ .name = "test_input_required_result_capabilities", .description = "MRTR per declared capability" }, irCapabilities);
     try server.addToolJson(.{ .name = "json_schema_2020_12_tool", .description = "Tool with a 2020-12 schema", .input_schema = json_schema_2020_12 }, jsonSchema2020);
     try server.addTool(.{ .name = "test_x_mcp_header", .description = "Tool with header annotations" }, xMcpHeader);
+    try server.addTool(.{ .name = "greet", .description = "Greets by name" }, greet);
+    try server.addTool(.{ .name = "slow_compute", .description = "Sleeps for some seconds inside a task", .task_support = .optional }, slowCompute);
+    try server.addTool(.{ .name = "failing_job", .description = "A task that ends in a tool error", .task_support = .required }, failingJob);
+    try server.addTool(.{ .name = "protocol_error_job", .description = "A task that ends in a protocol error", .task_support = .optional }, protocolErrorJob);
+    try server.addTool(.{ .name = "confirm_delete", .description = "A task that asks for confirmation", .task_support = .optional }, confirmDelete);
+    try server.addTool(.{ .name = "multi_input", .description = "A task that asks two questions at once", .task_support = .optional }, multiInput);
+    try server.addTool(.{ .name = "test_tool_with_task", .description = "MRTR round then a task", .task_support = .required }, toolWithTask);
     _ = server.setToolEnabled(io, "test_hidden_tool", false);
 
     try server.addResource(.{ .uri = "test://static-text", .name = "Static Text Resource", .mime_type = "text/plain", .description = "A static text resource" }, readStaticText);

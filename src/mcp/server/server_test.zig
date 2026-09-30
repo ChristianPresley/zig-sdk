@@ -395,3 +395,153 @@ test "client-cancelled listen stream gets no response" {
     try std.testing.expectEqual(1, f.harness.out.items.len);
     try std.testing.expect(f.harness.finished);
 }
+
+// -- Tasks extension --------------------------------------------------------------------------
+
+const meta_tasks =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"elicitation":{},"extensions":{"io.modelcontextprotocol/tasks":{}}}}
+;
+
+const SlowArgs = struct { ms: i64 = 0 };
+
+fn slowTool(ctx: *RequestContext, args: SlowArgs) anyerror!mcp.Outcome(types.CallToolResult) {
+    if (!ctx.inTask()) return .start_task;
+    var left = args.ms;
+    while (left > 0) : (left -= 10) {
+        try ctx.checkCancel();
+        try ctx.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "slept {d} ms", .{args.ms}) };
+}
+
+fn askTask(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    if (!ctx.inTask()) return .start_task;
+    if (try ctx.elicitResponse("user_name")) |r| {
+        const name = json.getString(r.content orelse .null, "name") orelse "nobody";
+        return .{ .complete = try types.CallToolResult.text(ctx.arena, "task greets {s}", .{name}) };
+    }
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.elicitForm("user_name", "Name?", try mcp.InputRequired.stringSchema(ctx.arena, "name", null, true));
+    return .{ .input_required = ir };
+}
+
+fn failTask(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    if (!ctx.inTask()) return .start_task;
+    return ctx.setError(mcp.protocol.errors.internalError("boom"));
+}
+
+const TaskFixture = struct {
+    base: Fixture,
+    next_id: i64 = 100,
+
+    fn init(self: *TaskFixture) !void {
+        self.* = .{ .base = undefined };
+        try self.base.init(.{ .info = .{ .name = "test", .version = "0.1.0" }, .tasks = .{ .poll_interval_ms = 10 } });
+        try self.base.server.addTool(.{ .name = "slow", .task_support = .optional }, slowTool);
+        try self.base.server.addToolJson(.{ .name = "ask_task", .task_support = .required }, askTask);
+        try self.base.server.addToolJson(.{ .name = "fail_task", .task_support = .optional }, failTask);
+    }
+
+    fn deinit(self: *TaskFixture) void {
+        self.base.deinit();
+    }
+
+    fn call(self: *TaskFixture, method: []const u8, meta: []const u8, extra: []const u8) !Value {
+        self.next_id += 1;
+        return self.base.call(self.next_id, method, meta, extra);
+    }
+
+    fn get(self: *TaskFixture, task_id: []const u8) !Value {
+        const extra = try std.fmt.allocPrint(self.base.arena(), "\"taskId\":\"{s}\"", .{task_id});
+        return result(try self.call("tasks/get", meta_tasks, extra));
+    }
+
+    /// Poll `tasks/get` until the task has the wanted status.
+    fn waitFor(self: *TaskFixture, task_id: []const u8, status: []const u8) !Value {
+        var tries: usize = 0;
+        while (tries < 500) : (tries += 1) {
+            const r = try self.get(task_id);
+            if (std.mem.eql(u8, r.object.get("status").?.string, status)) return r;
+            try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.TaskTimeout;
+    }
+};
+
+fn taskId(v: Value) []const u8 {
+    return result(v).object.get("taskId").?.string;
+}
+
+test "tasks extension: gate, sync fallback and lifecycle" {
+    var f: TaskFixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    // The extension is advertised.
+    const disc = result(try f.call("server/discover", meta_none, ""));
+    const ext = disc.object.get("capabilities").?.object.get("extensions").?;
+    try std.testing.expect(ext.object.get(mcp.tasks.extension_id) != null);
+
+    // Without the extension: task methods are gated, optional tools run at once, required tools fail.
+    const gated = try f.call("tasks/get", meta_none, "\"taskId\":\"x\"");
+    try std.testing.expectEqual(@as(i64, -32021), errorCode(gated).?);
+    const sync = result(try f.call("tools/call", meta_all, "\"name\":\"slow\",\"arguments\":{\"ms\":0}"));
+    try std.testing.expectEqualStrings("complete", sync.object.get("resultType").?.string);
+    try std.testing.expectEqualStrings("slept 0 ms", sync.object.get("content").?.array.items[0].object.get("text").?.string);
+    const required = try f.call("tools/call", meta_all, "\"name\":\"ask_task\",\"arguments\":{}");
+    try std.testing.expectEqual(@as(i64, -32021), errorCode(required).?);
+    const removed = try f.call("tasks/list", meta_tasks, "");
+    try std.testing.expectEqual(@as(i64, -32601), errorCode(removed).?);
+    const unknown = try f.call("tasks/get", meta_tasks, "\"taskId\":\"nope\"");
+    try std.testing.expectEqual(@as(i64, -32602), errorCode(unknown).?);
+
+    // With the extension: a task is created, then completes.
+    const created = try f.call("tools/call", meta_tasks, "\"name\":\"slow\",\"arguments\":{\"ms\":30}");
+    const cr = result(created);
+    try std.testing.expectEqualStrings("task", cr.object.get("resultType").?.string);
+    try std.testing.expect(cr.object.get("requestState") == null);
+    try std.testing.expect(cr.object.get("content") == null);
+    try std.testing.expectEqual(@as(i64, 10), cr.object.get("pollIntervalMs").?.integer);
+    const done = try f.waitFor(taskId(created), "completed");
+    try std.testing.expectEqualStrings("complete", done.object.get("resultType").?.string);
+    try std.testing.expectEqualStrings("slept 30 ms", done.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string);
+    try std.testing.expect(done.object.get("error") == null);
+
+    // A protocol error makes the task fail with the error object.
+    const failing = try f.call("tools/call", meta_tasks, "\"name\":\"fail_task\",\"arguments\":{}");
+    const failed = try f.waitFor(taskId(failing), "failed");
+    try std.testing.expectEqual(@as(i64, -32603), failed.object.get("error").?.object.get("code").?.integer);
+    try std.testing.expect(failed.object.get("result") == null);
+
+    // Cancel a running task; a second cancel is an idempotent ack.
+    const long = try f.call("tools/call", meta_tasks, "\"name\":\"slow\",\"arguments\":{\"ms\":60000}");
+    const cancel_extra = try std.fmt.allocPrint(f.base.arena(), "\"taskId\":\"{s}\"", .{taskId(long)});
+    const ack = result(try f.call("tasks/cancel", meta_tasks, cancel_extra));
+    try std.testing.expectEqualStrings("complete", ack.object.get("resultType").?.string);
+    try std.testing.expect(ack.object.get("taskId") == null);
+    _ = try f.waitFor(taskId(long), "cancelled");
+    const ack2 = result(try f.call("tasks/cancel", meta_tasks, cancel_extra));
+    try std.testing.expectEqualStrings("complete", ack2.object.get("resultType").?.string);
+}
+
+test "tasks extension: input required inside a task" {
+    var f: TaskFixture = undefined;
+    try f.init();
+    defer f.deinit();
+
+    const created = try f.call("tools/call", meta_tasks, "\"name\":\"ask_task\",\"arguments\":{}");
+    try std.testing.expectEqualStrings("task", result(created).object.get("resultType").?.string);
+    const id = taskId(created);
+    const parked = try f.waitFor(id, "input_required");
+    const req = parked.object.get("inputRequests").?.object.get("user_name").?;
+    try std.testing.expectEqualStrings("elicitation/create", req.object.get("method").?.string);
+
+    const update = try std.fmt.allocPrint(f.base.arena(), "\"taskId\":\"{s}\",\"inputResponses\":{{\"user_name\":{{\"action\":\"accept\",\"content\":{{\"name\":\"Alice\"}}}}}}", .{id});
+    const ack = result(try f.call("tasks/update", meta_tasks, update));
+    try std.testing.expectEqualStrings("complete", ack.object.get("resultType").?.string);
+    const done = try f.waitFor(id, "completed");
+    try std.testing.expect(done.object.get("inputRequests") == null);
+    try std.testing.expectEqualStrings("task greets Alice", done.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string);
+}

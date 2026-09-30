@@ -150,10 +150,8 @@ pub const removed_methods = [_][]const u8{
     "sampling/createMessage",
     "elicitation/create",
     "roots/list",
-    "tasks/get",
     "tasks/list",
     "tasks/result",
-    "tasks/cancel",
 };
 
 pub fn isRemovedMethod(text: []const u8) bool {

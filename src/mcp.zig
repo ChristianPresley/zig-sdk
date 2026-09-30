@@ -11,6 +11,8 @@ pub const Limits = @import("mcp/Limits.zig");
 pub const Server = @import("mcp/server/Server.zig");
 pub const Client = @import("mcp/client/Client.zig");
 pub const auth = @import("mcp/auth.zig");
+/// The Tasks extension: task support levels, results and the store.
+pub const tasks = @import("mcp/server/tasks.zig");
 pub const RequestContext = Server.RequestContext;
 pub const Outcome = Server.Outcome;
 pub const InputRequired = Server.InputRequired;
