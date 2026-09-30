@@ -1,11 +1,14 @@
-//! A small MCP client for the command line. It connects over stdio to a server process
-//! or over Streamable HTTP to a URL, then lists the tools or calls one.
+//! A small MCP client for the command line. It connects over stdio to a server process,
+//! over Streamable HTTP to a URL or over a Unix domain socket to a path. Then it lists the
+//! tools or calls one.
 //!
 //! Usage:
 //!   client_cli stdio <command> [args...] -- list
 //!   client_cli stdio <command> [args...] -- call <tool> [json-arguments]
 //!   client_cli http <url> -- list
 //!   client_cli http <url> -- call <tool> [json-arguments]
+//!   client_cli unix <path> -- list
+//!   client_cli unix <path> -- call <tool> [json-arguments]
 const std = @import("std");
 const mcp = @import("mcp");
 
@@ -24,6 +27,8 @@ pub fn main(init: std.process.Init) !void {
     defer if (stdio_client) |c| c.deinit();
     var http_client: ?*mcp.transport.HttpClient = null;
     defer if (http_client) |c| c.deinit();
+    var unix_client: ?*mcp.transport.unix.Client = null;
+    defer if (unix_client) |c| c.deinit();
     var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "client_cli", .version = "0.1.0" } });
     defer client.deinit();
     if (std.mem.eql(u8, mode, "stdio")) {
@@ -32,6 +37,9 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "http")) {
         http_client = try mcp.transport.HttpClient.init(io, gpa, .{ .url = args[2] });
         client.connect(http_client.?.transport());
+    } else if (std.mem.eql(u8, mode, "unix")) {
+        unix_client = try mcp.transport.unix.Client.connect(io, gpa, .{ .path = args[2] });
+        client.connect(unix_client.?.transport());
     } else return usage();
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -68,6 +76,6 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() error{InvalidArguments} {
-    std.log.err("usage: client_cli (stdio <command> [args...] | http <url>) -- (list | call <tool> [json-arguments])", .{});
+    std.log.err("usage: client_cli (stdio <command> [args...] | http <url> | unix <path>) -- (list | call <tool> [json-arguments])", .{});
     return error.InvalidArguments;
 }

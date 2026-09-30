@@ -16,6 +16,12 @@ stdio: struct {
     read_buffer: usize = 64 << 10,
 } = .{},
 
+unix_socket: struct {
+    /// Maximum open connections of the Unix socket server. Overflow: the server closes the
+    /// new connection at once.
+    max_connections: u32 = 64,
+} = .{},
+
 http: struct {
     /// Maximum request body bytes. Overflow: HTTP 413.
     max_body_bytes: usize = 4 << 20,

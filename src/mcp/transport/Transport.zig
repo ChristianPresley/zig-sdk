@@ -70,8 +70,8 @@ pub const Responder = struct {
 };
 
 /// Which binding delivered the request. Some rules are transport specific (for example
-/// `notifications/cancelled` exists only on stdio).
-pub const Kind = enum { stdio, memory, streamable_http, grpc };
+/// `notifications/cancelled` exists only on stdio and on the Unix socket).
+pub const Kind = enum { stdio, memory, streamable_http, grpc, unix_socket };
 
 /// One inbound message with everything a handler needs. The transport owns `arena` and frees
 /// it after the engine returns.

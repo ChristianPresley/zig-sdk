@@ -5,6 +5,8 @@ pub const Responder = Transport.Responder;
 pub const Inbound = Transport.Inbound;
 pub const memory = @import("transport/memory.zig");
 pub const stdio = @import("transport/stdio.zig");
+/// The stdio framing over a Unix domain socket, with many connections.
+pub const unix = @import("transport/unix.zig");
 pub const http = @import("transport/http.zig");
 pub const HttpClient = @import("transport/http_client.zig").Client;
 pub const sse = @import("transport/sse.zig");
