@@ -54,6 +54,7 @@ All notable changes to this project are recorded in this file. The format follow
 - The HTTP client gives each SSE event to the caller when it arrives, not after 4 KiB.
 - The client router takes only frames with a top-level `result` or `error` as responses.
 - The server shuts down every listen stream at shutdown, not the first 64.
+- The HTTP, Unix socket and gRPC servers connect to their own listener at shutdown. On Windows a cancel did not always wake a blocked accept, and `serve` could wait without end.
 - The Unix socket transport refuses a path that is longer than the `sockaddr_un` of the target, 104 bytes on macOS.
 - The server rejects control characters and bytes that are not ASCII in `Mcp-Param`, `Mcp-Name` and `Mcp-Method` values.
 
