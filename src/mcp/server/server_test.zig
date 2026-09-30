@@ -259,20 +259,24 @@ test "tool schemas validate arguments and structured output" {
     try g.server.addToolJson(.{ .name = "code", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"pattern\":\"^[A-Z]{3}$\"}}}" }, boom);
     try std.testing.expectEqual(@as(i64, -32602), errorCode(try g.call(6, "tools/call", meta_none, "\"name\":\"code\",\"arguments\":{\"a\":\"abc\"}")).?);
     try std.testing.expect(errorCode(try g.call(7, "tools/call", meta_none, "\"name\":\"code\",\"arguments\":{\"a\":\"ABC\"}")) == null);
-    // Registration rejects unsupported keywords, regular expression features that the engine
-    // does not support, invalid regular expressions, remote references and bad header annotations.
-    try std.testing.expectError(error.UnsupportedKeyword, g.server.addToolJson(.{ .name = "u", .input_schema = "{\"type\":\"object\",\"unevaluatedProperties\":false}" }, boom));
+    // `unevaluatedProperties` rejects the names that no other keyword evaluated.
+    try g.server.addToolJson(.{ .name = "strict", .input_schema = "{\"type\":\"object\",\"allOf\":[{\"properties\":{\"a\":{\"type\":\"string\"}}}],\"unevaluatedProperties\":false}" }, boom);
+    try std.testing.expectEqual(@as(i64, -32602), errorCode(try g.call(8, "tools/call", meta_none, "\"name\":\"strict\",\"arguments\":{\"a\":\"x\",\"b\":1}")).?);
+    try std.testing.expect(errorCode(try g.call(9, "tools/call", meta_none, "\"name\":\"strict\",\"arguments\":{\"a\":\"x\"}")) == null);
+    // Registration rejects `$schema` outside the root of a resource, regular expression
+    // features that the engine does not support, invalid regular expressions, remote
+    // references and bad header annotations.
+    try std.testing.expectError(error.UnsupportedKeyword, g.server.addToolJson(.{ .name = "u", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\"}}}" }, boom));
     try std.testing.expectError(error.UnsupportedKeyword, g.server.addToolJson(.{ .name = "p", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"pattern\":\"^(?=a)\"}}}" }, boom));
     try std.testing.expectError(error.InvalidSchema, g.server.addToolJson(.{ .name = "q", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"pattern\":\"^(a\"}}}" }, boom));
     try std.testing.expectError(error.RemoteRef, g.server.addToolJson(.{ .name = "r", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"$ref\":\"https://example.com/x\"}}}" }, boom));
     try std.testing.expectError(error.InvalidHeaderAnnotation, g.server.addToolJson(.{ .name = "h", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"object\",\"x-mcp-header\":\"A\"}}}" }, boom));
     try std.testing.expectError(error.InvalidHeaderAnnotation, g.server.addToolJson(.{ .name = "h2", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"x-mcp-header\":\"A\"},\"b\":{\"type\":\"string\",\"x-mcp-header\":\"a\"}}}" }, boom));
-    // Opting in keeps unsupported keywords as annotations.
+    // Opting in ignores the regular expressions that the engine does not support.
     var h: Fixture = undefined;
     try h.init(.{ .info = .{ .name = "test", .version = "0.1.0" }, .allow_unsupported_schema_keywords = true });
     defer h.deinit();
     try h.server.addToolJson(.{ .name = "p", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"pattern\":\"^(?=a)\"}}}" }, boom);
-    try h.server.addToolJson(.{ .name = "u", .input_schema = "{\"type\":\"object\",\"unevaluatedProperties\":false}" }, boom);
 }
 
 test "multi round-trip request with sealed state" {

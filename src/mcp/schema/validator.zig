@@ -1,13 +1,29 @@
-//! JSON Schema 2020-12 subset validator over `std.json.Value`.
+//! JSON Schema 2020-12 validator over `std.json.Value`.
 //!
-//! The validator has no dynamic scope and no annotation collection. The compiler rejects the
-//! keywords that need them. With `Options.allow_unsupported_keywords`, the compiler ignores
-//! them. The compiler always rejects remote references. The validator keeps annotation
-//! keywords such as `title`, `description`, `default`, `format` and `x-*` keys, but does not
-//! evaluate them.
+//! The validator evaluates each keyword of the 2020-12 vocabularies for the core, the
+//! applicators, the unevaluated locations and the validation. The keywords of the vocabularies
+//! for the format, the content and the meta-data are annotations. The validator keeps them and
+//! does not evaluate them. This is the default behavior of 2020-12. Thus `format`,
+//! `contentEncoding`, `contentMediaType` and `contentSchema` never make an instance invalid.
+//!
+//! A document can hold more than one schema resource. The root and each subschema with `$id`
+//! start a resource. The compiler resolves `$id`, `$ref` and `$dynamicRef` against the base
+//! URI of their resource with the rules of RFC 3986. The base URI of a root without `$id` is
+//! `default_base_uri`. The compiler resolves each reference one time. A reference to a URI
+//! outside the document fails with `error.RemoteRef`, because the validator never gets a
+//! schema from the network.
+//!
+//! The keywords `unevaluatedProperties` and `unevaluatedItems` use the annotations of the
+//! subschemas that the instance passes. The keyword `not` gives no annotations. The keyword
+//! `$dynamicRef` uses the dynamic scope. The dynamic scope is the list of the resources that
+//! the evaluation entered.
+//!
+//! The validator ignores unknown keywords. The keywords `$recursiveRef` and `$recursiveAnchor`
+//! of 2019-09 are unknown keywords in 2020-12.
 //!
 //! The keywords `pattern` and `patternProperties` use the engine in `regex.zig`. The compiler
-//! compiles each regular expression one time and keeps the program in the `Schema`.
+//! compiles each regular expression one time and keeps the program in the `Schema`. The engine
+//! does not support all features of ECMA-262. Refer to `regex.zig` for the list.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
@@ -16,8 +32,12 @@ const regex = @import("regex.zig");
 
 pub const dialect_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 
+/// The base URI of a root schema without `$id`. The domain `.invalid` never resolves.
+pub const default_base_uri = "https://schema.invalid/root.json";
+
 pub const Options = struct {
-    /// Ignore unsupported keywords. Without this option, the compiler rejects the schema.
+    /// Ignore a regular expression that uses a feature that `regex.zig` does not support.
+    /// Without this option, the compiler rejects the schema.
     allow_unsupported_keywords: bool = false,
     limits: Limits.Schema = .{},
 };
@@ -26,11 +46,12 @@ pub const CompileError = error{
     OutOfMemory,
     /// `$schema` names a dialect other than 2020-12.
     UnsupportedDialect,
-    /// A keyword from the unsupported list is present.
+    /// `$schema` is in a subschema that is not the root of a schema resource.
     UnsupportedKeyword,
-    /// A `$ref` points outside the document.
+    /// A `$ref` or a `$dynamicRef` points to a URI outside the document.
     RemoteRef,
-    /// A keyword has an operand of the wrong shape, or a `$ref` has no target.
+    /// A keyword has an operand of the wrong shape, a reference has no target, or two
+    /// resources have the same `$id`.
     InvalidSchema,
     SchemaTooDeep,
     TooManySubschemas,
@@ -54,12 +75,40 @@ pub const ValidateError = error{
 /// A compiled schema. The root value must outlive the schema.
 pub const Schema = struct {
     root: Value,
-    anchors: std.StringHashMapUnmanaged(Value),
     options: Options,
+    /// The schema resources of the document. Item 0 is the resource of the root.
+    resources: []const Resource = &.{},
+    /// The resource and the resolved references of each schema object, by the address of
+    /// the key storage of the object.
+    nodes: std.AutoHashMapUnmanaged(usize, Node) = .empty,
     /// The compiled `pattern` values and `patternProperties` keys, by source text.
     patterns: std.StringHashMapUnmanaged(regex.Regex) = .empty,
     /// The largest match buffer that one of `patterns` needs, in `u32` items.
     pattern_buffer_len: usize = 0,
+};
+
+/// A schema resource: the root schema or a subschema with `$id`.
+pub const Resource = struct {
+    /// The absolute URI of the resource, without a fragment.
+    uri: []const u8,
+    root: Value,
+    /// The names of `$anchor` and `$dynamicAnchor` in the resource.
+    anchors: std.StringHashMapUnmanaged(Value) = .empty,
+    /// The names of `$dynamicAnchor` in the resource.
+    dynamic_anchors: std.StringHashMapUnmanaged(Value) = .empty,
+};
+
+/// The compiled facts about one schema object.
+pub const Node = struct {
+    /// The index of the resource of the object in `Schema.resources`.
+    resource: u32,
+    /// The target of `$ref`.
+    ref: ?Value = null,
+    /// The target of `$dynamicRef` before the dynamic scope applies.
+    dynamic_ref: ?Value = null,
+    /// The anchor name of `$dynamicRef` when its target has this name in `$dynamicAnchor`.
+    /// Without this name, `$dynamicRef` is equal to `$ref`.
+    dynamic_name: ?[]const u8 = null,
 };
 
 pub const Failure = struct {
@@ -80,33 +129,50 @@ pub const Result = struct {
     }
 };
 
-const unsupported_keywords = std.StaticStringMap(void).initComptime(.{
-    .{"unevaluatedProperties"},
-    .{"unevaluatedItems"},
-    .{"$dynamicRef"},
-    .{"$dynamicAnchor"},
-    .{"$recursiveRef"},
-    .{"$recursiveAnchor"},
-    .{"contentEncoding"},
-    .{"contentMediaType"},
-    .{"contentSchema"},
-});
-
 const schema_map_keywords = [_][]const u8{ "properties", "$defs", "definitions", "dependentSchemas" };
 const schema_list_keywords = [_][]const u8{ "prefixItems", "allOf", "anyOf", "oneOf" };
-const schema_single_keywords = [_][]const u8{ "items", "additionalProperties", "propertyNames", "contains", "not", "if", "then", "else" };
+const schema_single_keywords = [_][]const u8{
+    "items",                 "additionalProperties", "propertyNames", "contains", "not", "if", "then", "else",
+    "unevaluatedProperties", "unevaluatedItems",     "contentSchema",
+};
+const annotation_string_keywords = [_][]const u8{ "contentEncoding", "contentMediaType" };
 const type_names = [_][]const u8{ "null", "boolean", "object", "array", "number", "integer", "string" };
+
+/// The identity of a schema object: the address of its key storage. An empty object has no
+/// keywords and thus no identity.
+fn nodeKey(value: Value) ?usize {
+    if (value != .object or value.object.count() == 0) return null;
+    return @intFromPtr(value.object.keys().ptr);
+}
+
+const PendingRef = struct {
+    /// The identity of the schema object that holds the reference.
+    owner: usize,
+    ref: []const u8,
+    resource: u32,
+    dynamic: bool,
+};
+
+const Target = struct {
+    value: Value,
+    resource: u32,
+    dynamic_name: ?[]const u8 = null,
+};
 
 const Compiler = struct {
     arena: Allocator,
     options: Options,
     count: u32 = 0,
-    anchors: std.StringHashMapUnmanaged(Value) = .empty,
-    refs: std.ArrayList([]const u8) = .empty,
+    resources: std.ArrayList(Resource) = .empty,
+    /// The index of each resource in `resources`, by URI.
+    resource_ids: std.StringHashMapUnmanaged(u32) = .empty,
+    nodes: std.AutoHashMapUnmanaged(usize, Node) = .empty,
+    refs: std.ArrayList(PendingRef) = .empty,
     patterns: std.StringHashMapUnmanaged(regex.Regex) = .empty,
     pattern_buffer_len: usize = 0,
-    /// The schema objects that the walk compiled, by the address of their key storage.
-    visited: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    /// True while the compiler reads a reference target that no known keyword holds. The
+    /// identifiers in such a target do not replace the identifiers of the document.
+    detached: bool = false,
 
     fn pattern(self: *Compiler, source: []const u8) CompileError!void {
         if (self.patterns.contains(source)) return;
@@ -124,63 +190,96 @@ const Compiler = struct {
         self.pattern_buffer_len = @max(self.pattern_buffer_len, re.bufferLen());
     }
 
-    fn node(self: *Compiler, value: Value, depth: u16, is_root: bool) CompileError!void {
+    /// Add the resource of `root`, with `id` resolved against `base`.
+    fn addResource(self: *Compiler, base: []const u8, id: []const u8, root: Value) CompileError!u32 {
+        const uri = try resolveUri(self.arena, base, id);
+        const hash = std.mem.indexOfScalar(u8, uri, '#') orelse uri.len;
+        // An identifier can have an empty fragment, but no other fragment.
+        if (hash + 1 < uri.len) return error.InvalidSchema;
+        const plain = uri[0..hash];
+        const index: u32 = @intCast(self.resources.items.len);
+        try self.resources.append(self.arena, .{ .uri = plain, .root = root });
+        const gop = try self.resource_ids.getOrPut(self.arena, plain);
+        if (gop.found_existing) {
+            if (!self.detached) return error.InvalidSchema;
+        } else gop.value_ptr.* = index;
+        return index;
+    }
+
+    fn anchor(self: *Compiler, resource: u32, name: []const u8, owner: Value, dynamic: bool) CompileError!void {
+        const r = &self.resources.items[resource];
+        const gop = try r.anchors.getOrPut(self.arena, name);
+        if (gop.found_existing) {
+            // `$anchor` and `$dynamicAnchor` can give one object the same name.
+            if (nodeKey(gop.value_ptr.*) != nodeKey(owner)) {
+                if (self.detached) return;
+                return error.DuplicateAnchor;
+            }
+        } else gop.value_ptr.* = owner;
+        if (dynamic) try r.dynamic_anchors.put(self.arena, name, owner);
+    }
+
+    fn node(self: *Compiler, value: Value, depth: u16, resource: u32, is_root: bool) CompileError!void {
         switch (value) {
             .bool => return,
             .object => |obj| {
                 if (depth > self.options.limits.max_depth) return error.SchemaTooDeep;
-                if (obj.count() > 0) try self.visited.put(self.arena, @intFromPtr(obj.keys().ptr), {});
                 self.count += 1;
                 if (self.count > self.options.limits.max_subschemas) return error.TooManySubschemas;
+                var res = resource;
+                var resource_root = is_root;
+                if (!is_root) if (obj.get("$id")) |id| {
+                    if (id != .string) return error.InvalidSchema;
+                    res = try self.addResource(self.resources.items[resource].uri, id.string, value);
+                    resource_root = true;
+                };
+                const key = nodeKey(value) orelse return;
+                try self.nodes.put(self.arena, key, .{ .resource = res });
                 var it = obj.iterator();
-                while (it.next()) |kv| try self.keyword(kv.key_ptr.*, kv.value_ptr.*, depth, is_root);
+                while (it.next()) |kv| try self.keyword(kv.key_ptr.*, kv.value_ptr.*, depth, res, resource_root, value);
             },
             else => return error.InvalidSchema,
         }
     }
 
-    fn keyword(self: *Compiler, key: []const u8, value: Value, depth: u16, is_root: bool) CompileError!void {
-        if (unsupported_keywords.has(key)) {
-            if (self.options.allow_unsupported_keywords) return;
-            return error.UnsupportedKeyword;
-        }
+    fn keyword(self: *Compiler, key: []const u8, value: Value, depth: u16, resource: u32, resource_root: bool, owner: Value) CompileError!void {
         if (std.mem.eql(u8, key, "$schema")) {
-            if (!is_root) return error.UnsupportedKeyword;
+            if (!resource_root) return error.UnsupportedKeyword;
             if (value != .string or !std.mem.eql(u8, value.string, dialect_2020_12)) return error.UnsupportedDialect;
             return;
         }
         if (std.mem.eql(u8, key, "$id")) {
             if (value != .string) return error.InvalidSchema;
-            if (!is_root) {
-                if (self.options.allow_unsupported_keywords) return;
-                return error.UnsupportedKeyword;
-            }
             return;
         }
-        if (std.mem.eql(u8, key, "$anchor")) {
+        if (std.mem.eql(u8, key, "$anchor") or std.mem.eql(u8, key, "$dynamicAnchor")) {
             if (value != .string or !isPlainName(value.string)) return error.InvalidSchema;
+            try self.anchor(resource, value.string, owner, key[1] == 'd');
             return;
         }
-        if (std.mem.eql(u8, key, "$ref")) {
+        if (std.mem.eql(u8, key, "$ref") or std.mem.eql(u8, key, "$dynamicRef")) {
             if (value != .string) return error.InvalidSchema;
-            if (!std.mem.startsWith(u8, value.string, "#")) return error.RemoteRef;
-            try self.refs.append(self.arena, value.string);
+            try self.refs.append(self.arena, .{ .owner = nodeKey(owner).?, .ref = value.string, .resource = resource, .dynamic = key[1] == 'd' });
             return;
         }
         for (schema_map_keywords) |k| if (std.mem.eql(u8, key, k)) {
             if (value != .object) return error.InvalidSchema;
             var it = value.object.iterator();
-            while (it.next()) |kv| try self.node(kv.value_ptr.*, depth + 1, false);
+            while (it.next()) |kv| try self.node(kv.value_ptr.*, depth + 1, resource, false);
             return;
         };
         for (schema_list_keywords) |k| if (std.mem.eql(u8, key, k)) {
             if (value != .array or value.array.items.len == 0) return error.InvalidSchema;
-            for (value.array.items) |item| try self.node(item, depth + 1, false);
+            for (value.array.items) |item| try self.node(item, depth + 1, resource, false);
             return;
         };
         for (schema_single_keywords) |k| if (std.mem.eql(u8, key, k)) {
             if (value == .array) return error.InvalidSchema;
-            try self.node(value, depth + 1, false);
+            try self.node(value, depth + 1, resource, false);
+            return;
+        };
+        for (annotation_string_keywords) |k| if (std.mem.eql(u8, key, k)) {
+            if (value != .string) return error.InvalidSchema;
             return;
         };
         if (std.mem.eql(u8, key, "type")) {
@@ -219,7 +318,7 @@ const Compiler = struct {
             return;
         }
         if (isCountKeyword(key)) {
-            if (value != .integer or value.integer < 0) return error.InvalidSchema;
+            if (countValue(value) == null) return error.InvalidSchema;
             return;
         }
         if (std.mem.eql(u8, key, "uniqueItems")) {
@@ -236,11 +335,50 @@ const Compiler = struct {
             var it = value.object.iterator();
             while (it.next()) |kv| {
                 try self.pattern(kv.key_ptr.*);
-                try self.node(kv.value_ptr.*, depth + 1, false);
+                try self.node(kv.value_ptr.*, depth + 1, resource, false);
             }
             return;
         }
         // Everything else is an annotation or an unknown keyword and is ignored.
+    }
+
+    /// Resolve `ref` against the URI of `resource` and find its target in the document.
+    fn resolve(self: *Compiler, resource: u32, ref: []const u8) CompileError!Target {
+        const uri = try resolveUri(self.arena, self.resources.items[resource].uri, ref);
+        const hash = std.mem.indexOfScalar(u8, uri, '#') orelse uri.len;
+        const id = self.resource_ids.get(uri[0..hash]) orelse return error.RemoteRef;
+        const r = self.resources.items[id];
+        const fragment = if (hash < uri.len) uri[hash + 1 ..] else "";
+        if (fragment.len == 0) return .{ .value = r.root, .resource = id };
+        if (fragment[0] != '/') {
+            const target = r.anchors.get(fragment) orelse return error.InvalidSchema;
+            return .{ .value = target, .resource = id, .dynamic_name = if (r.dynamic_anchors.contains(fragment)) fragment else null };
+        }
+        // A JSON pointer. It can cross into an embedded resource, and then the target is in
+        // that resource.
+        var current = r.root;
+        var res = id;
+        var it = std.mem.splitScalar(u8, fragment[1..], '/');
+        var buf: [256]u8 = undefined;
+        while (it.next()) |raw| {
+            const token = unescapeToken(&buf, raw) orelse return error.InvalidSchema;
+            switch (current) {
+                .object => |obj| current = obj.get(token) orelse return error.InvalidSchema,
+                .array => |arr| {
+                    const index = std.fmt.parseInt(usize, token, 10) catch return error.InvalidSchema;
+                    if (index >= arr.items.len) return error.InvalidSchema;
+                    current = arr.items[index];
+                },
+                else => return error.InvalidSchema,
+            }
+            if (nodeKey(current)) |k| if (self.nodes.get(k)) |n| {
+                res = n.resource;
+            };
+        }
+        return switch (current) {
+            .object, .bool => .{ .value = current, .resource = res },
+            else => error.InvalidSchema,
+        };
     }
 };
 
@@ -248,6 +386,28 @@ fn isCountKeyword(key: []const u8) bool {
     const names = [_][]const u8{ "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "minContains", "maxContains" };
     for (names) |n| if (std.mem.eql(u8, key, n)) return true;
     return false;
+}
+
+/// The value of a count keyword such as `maxLength`: a non-negative integer. A number with a
+/// zero fraction, such as `2.0`, is an integer too. A count larger than `usize` gets the
+/// maximum `usize`.
+fn countValue(value: Value) ?usize {
+    switch (value) {
+        .integer => |i| return if (i < 0) null else std.math.cast(usize, i) orelse std.math.maxInt(usize),
+        .float, .number_string => {
+            if (!isInteger(value)) return null;
+            const f = toF64(value).?;
+            if (f < 0) return null;
+            if (f >= @as(f64, @floatFromInt(std.math.maxInt(usize)))) return std.math.maxInt(usize);
+            return @intFromFloat(f);
+        },
+        else => return null,
+    }
+}
+
+/// The value of a count keyword that the compiler checked.
+fn countOf(value: Value) usize {
+    return countValue(value).?;
 }
 
 fn isTypeName(s: []const u8) bool {
@@ -268,79 +428,154 @@ fn isPlainName(s: []const u8) bool {
     return true;
 }
 
-/// Compile a schema: check the dialect, reject unsupported keywords and remote references,
-/// compile the regular expressions, collect anchors and resolve every local reference once.
+/// Compile a schema. The compiler checks the dialect and the keywords and compiles the
+/// regular expressions. It finds the schema resources and their anchors, and resolves every
+/// reference one time.
 pub fn compile(arena: Allocator, root: Value, options: Options) CompileError!Schema {
     var c: Compiler = .{ .arena = arena, .options = options };
-    try c.node(root, 0, true);
-    try collectAnchors(arena, root, &c.anchors);
-    var schema: Schema = .{
+    var id: []const u8 = "";
+    if (root == .object) if (root.object.get("$id")) |v| {
+        if (v != .string) return error.InvalidSchema;
+        id = v.string;
+    };
+    _ = try c.addResource(default_base_uri, id, root);
+    try c.node(root, 0, 0, true);
+    // A reference can point into a member that the walk above does not visit, such as an
+    // unknown keyword. Compile each such target too, so that validation never meets an
+    // unchecked operand. The list grows while the loop runs, because a target can hold
+    // references.
+    var i: usize = 0;
+    while (i < c.refs.items.len) : (i += 1) {
+        const pending = c.refs.items[i];
+        const target = try c.resolve(pending.resource, pending.ref);
+        if (nodeKey(target.value)) |k| if (!c.nodes.contains(k)) {
+            c.detached = true;
+            try c.node(target.value, 0, target.resource, false);
+        };
+        const owner = c.nodes.getPtr(pending.owner).?;
+        if (pending.dynamic) {
+            owner.dynamic_ref = target.value;
+            owner.dynamic_name = target.dynamic_name;
+        } else owner.ref = target.value;
+    }
+    return .{
         .root = root,
-        .anchors = c.anchors,
         .options = options,
+        .resources = c.resources.items,
+        .nodes = c.nodes,
         .patterns = c.patterns,
         .pattern_buffer_len = c.pattern_buffer_len,
     };
-    // A reference can point into a member that the walk above does not visit, such as an
-    // unknown keyword. Compile each target too, so that validation never meets an unchecked
-    // operand. The list grows while the loop runs, because a target can hold references.
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    var i: usize = 0;
-    while (i < c.refs.items.len) : (i += 1) {
-        const ref = c.refs.items[i];
-        const target = resolveRef(&schema, ref) orelse return error.InvalidSchema;
-        if ((try seen.getOrPut(arena, ref)).found_existing) continue;
-        // The walk above already compiled the root and every schema under a known keyword.
-        if (target == .object and target.object.count() > 0 and c.visited.contains(@intFromPtr(target.object.keys().ptr))) continue;
-        try c.node(target, 0, false);
-    }
-    schema.patterns = c.patterns;
-    schema.pattern_buffer_len = c.pattern_buffer_len;
-    return schema;
 }
 
-fn collectAnchors(arena: Allocator, node: Value, anchors: *std.StringHashMapUnmanaged(Value)) CompileError!void {
-    switch (node) {
-        .object => |obj| {
-            if (obj.get("$anchor")) |a| {
-                if (a == .string) {
-                    const gop = try anchors.getOrPut(arena, a.string);
-                    if (gop.found_existing) return error.DuplicateAnchor;
-                    gop.value_ptr.* = node;
-                }
+/// The five parts of a URI reference (RFC 3986, section 3). A null part is absent.
+const UriParts = struct {
+    scheme: ?[]const u8 = null,
+    authority: ?[]const u8 = null,
+    path: []const u8 = "",
+    query: ?[]const u8 = null,
+    fragment: ?[]const u8 = null,
+};
+
+fn splitUri(text: []const u8) UriParts {
+    var parts: UriParts = .{};
+    var rest = text;
+    if (std.mem.indexOfScalar(u8, rest, '#')) |i| {
+        parts.fragment = rest[i + 1 ..];
+        rest = rest[0..i];
+    }
+    if (std.mem.indexOfScalar(u8, rest, '?')) |i| {
+        parts.query = rest[i + 1 ..];
+        rest = rest[0..i];
+    }
+    for (rest, 0..) |c, i| {
+        if (c == ':') {
+            if (i > 0 and std.ascii.isAlphabetic(rest[0])) {
+                parts.scheme = rest[0..i];
+                rest = rest[i + 1 ..];
             }
-            var it = obj.iterator();
-            while (it.next()) |kv| try collectAnchors(arena, kv.value_ptr.*, anchors);
-        },
-        .array => |a| for (a.items) |item| try collectAnchors(arena, item, anchors),
-        else => {},
+            break;
+        }
+        if (!(std.ascii.isAlphanumeric(c) or c == '+' or c == '-' or c == '.')) break;
     }
+    if (std.mem.startsWith(u8, rest, "//")) {
+        const end = std.mem.indexOfScalarPos(u8, rest, 2, '/') orelse rest.len;
+        parts.authority = rest[2..end];
+        rest = rest[end..];
+    }
+    parts.path = rest;
+    return parts;
 }
 
-fn resolveRef(schema: *const Schema, ref: []const u8) ?Value {
-    if (ref.len == 0 or std.mem.eql(u8, ref, "#")) return schema.root;
-    if (!std.mem.startsWith(u8, ref, "#")) return null;
-    const fragment = ref[1..];
-    if (fragment[0] != '/') return schema.anchors.get(fragment);
-    var current = schema.root;
-    var it = std.mem.splitScalar(u8, fragment[1..], '/');
-    var buf: [256]u8 = undefined;
-    while (it.next()) |raw| {
-        const token = unescapeToken(&buf, raw) orelse return null;
-        switch (current) {
-            .object => |obj| current = obj.get(token) orelse return null,
-            .array => |arr| {
-                const index = std.fmt.parseInt(usize, token, 10) catch return null;
-                if (index >= arr.items.len) return null;
-                current = arr.items[index];
-            },
-            else => return null,
+/// Resolve a URI reference against a base URI (RFC 3986, section 5.2.2).
+fn resolveUri(arena: Allocator, base_text: []const u8, ref_text: []const u8) Allocator.Error![]const u8 {
+    const base = splitUri(base_text);
+    const r = splitUri(ref_text);
+    var t: UriParts = .{ .fragment = r.fragment };
+    if (r.scheme != null) {
+        t.scheme = r.scheme;
+        t.authority = r.authority;
+        t.path = try removeDotSegments(arena, r.path);
+        t.query = r.query;
+    } else {
+        if (r.authority != null) {
+            t.authority = r.authority;
+            t.path = try removeDotSegments(arena, r.path);
+            t.query = r.query;
+        } else {
+            if (r.path.len == 0) {
+                t.path = base.path;
+                t.query = r.query orelse base.query;
+            } else {
+                const merged = if (r.path[0] == '/') r.path else try mergePaths(arena, base, r.path);
+                t.path = try removeDotSegments(arena, merged);
+                t.query = r.query;
+            }
+            t.authority = base.authority;
+        }
+        t.scheme = base.scheme;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    if (t.scheme) |s| try out.print(arena, "{s}:", .{s});
+    if (t.authority) |a| try out.print(arena, "//{s}", .{a});
+    try out.appendSlice(arena, t.path);
+    if (t.query) |q| try out.print(arena, "?{s}", .{q});
+    if (t.fragment) |f| try out.print(arena, "#{s}", .{f});
+    return out.items;
+}
+
+/// Merge a relative path with the path of the base URI (RFC 3986, section 5.2.3).
+fn mergePaths(arena: Allocator, base: UriParts, path: []const u8) Allocator.Error![]const u8 {
+    if (base.authority != null and base.path.len == 0) return std.mem.concat(arena, u8, &.{ "/", path });
+    const cut = if (std.mem.lastIndexOfScalar(u8, base.path, '/')) |i| i + 1 else 0;
+    return std.mem.concat(arena, u8, &.{ base.path[0..cut], path });
+}
+
+/// Remove the segments `.` and `..` from a path (RFC 3986, section 5.2.4).
+fn removeDotSegments(arena: Allocator, path: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var in = path;
+    while (in.len > 0) {
+        if (std.mem.startsWith(u8, in, "../")) {
+            in = in[3..];
+        } else if (std.mem.startsWith(u8, in, "./") or std.mem.startsWith(u8, in, "/./")) {
+            in = in[2..];
+        } else if (std.mem.eql(u8, in, "/.")) {
+            in = "/";
+        } else if (std.mem.startsWith(u8, in, "/../") or std.mem.eql(u8, in, "/..")) {
+            in = if (in.len == 3) "/" else in[3..];
+            const cut = std.mem.lastIndexOfScalar(u8, out.items, '/') orelse 0;
+            out.shrinkRetainingCapacity(cut);
+        } else if (std.mem.eql(u8, in, ".") or std.mem.eql(u8, in, "..")) {
+            in = "";
+        } else {
+            const start: usize = if (in[0] == '/') 1 else 0;
+            const end = std.mem.indexOfScalarPos(u8, in, start, '/') orelse in.len;
+            try out.appendSlice(arena, in[0..end]);
+            in = in[end..];
         }
     }
-    return switch (current) {
-        .object, .bool => current,
-        else => null,
-    };
+    return out.items;
 }
 
 /// Decode a JSON pointer token: percent escapes first, then `~1` and `~0`.
@@ -374,6 +609,19 @@ fn unescapeToken(buf: []u8, raw: []const u8) ?[]const u8 {
 
 const Segment = union(enum) { key: []const u8, index: usize };
 
+/// A set of evaluated locations of one instance: the member indexes of an object or the item
+/// indexes of an array, one bit each.
+const Marks = []u64;
+
+fn isMarked(marks: Marks, i: usize) bool {
+    return marks[i / 64] & (@as(u64, 1) << @intCast(i % 64)) != 0;
+}
+
+fn mark(marks: ?Marks, i: usize) void {
+    const m = marks orelse return;
+    m[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+}
+
 const Evaluator = struct {
     arena: Allocator,
     schema: *const Schema,
@@ -384,6 +632,9 @@ const Evaluator = struct {
     failures: std.ArrayList(Failure) = .empty,
     truncated: bool = false,
     regex_buffer: []u32 = &.{},
+    /// The dynamic scope: the indexes of the resources that the evaluation entered, the
+    /// outermost first.
+    scope: std.ArrayList(u32) = .empty,
 
     /// Match `s` against the compiled expression for `source`. Return null when the compiler
     /// ignored the expression.
@@ -422,14 +673,47 @@ const Evaluator = struct {
         return out.toOwnedSlice() catch return error.OutOfMemory;
     }
 
+    /// Make an empty set of marks for `len` locations. Each word of the set costs one unit of
+    /// the evaluation budget, so that the memory of the marks has a limit too.
+    fn newMarks(self: *Evaluator, len: usize) ValidateError!Marks {
+        const words = (len + 63) / 64;
+        if (words > self.budget) return error.EvalBudgetExceeded;
+        self.budget -= @intCast(words);
+        const m = try self.arena.alloc(u64, words);
+        @memset(m, 0);
+        return m;
+    }
+
+    /// Evaluate `node` against a child location of the instance. The annotations of a child
+    /// location do not go to the parent location.
     fn child(self: *Evaluator, node: Value, inst: Value, seg: Segment, depth: u16, collect: bool) ValidateError!bool {
         if (depth + 1 > self.limits.max_depth) return error.InstanceTooDeep;
         try self.path.append(self.arena, seg);
         defer _ = self.path.pop();
-        return self.eval(node, inst, depth + 1, collect);
+        return self.eval(node, inst, depth + 1, collect, null);
     }
 
-    fn eval(self: *Evaluator, node: Value, inst: Value, depth: u16, collect: bool) ValidateError!bool {
+    /// Follow a reference to `target` at the same instance location.
+    fn follow(self: *Evaluator, target: Value, inst: Value, depth: u16, collect: bool, marks: ?Marks) ValidateError!bool {
+        if (self.ref_hops >= self.limits.max_ref_hops) return error.TooManyRefHops;
+        self.ref_hops += 1;
+        defer self.ref_hops -= 1;
+        return self.eval(target, inst, depth, collect, marks);
+    }
+
+    /// The target of a `$dynamicRef`: the outermost resource in the dynamic scope that has
+    /// the anchor name in `$dynamicAnchor`, or else the static target.
+    fn dynamicTarget(self: *Evaluator, n: Node, target: Value) Value {
+        const name = n.dynamic_name orelse return target;
+        for (self.scope.items) |id| {
+            if (self.schema.resources[id].dynamic_anchors.get(name)) |v| return v;
+        }
+        return target;
+    }
+
+    /// Evaluate `node` against `inst`. When `marks` is not null and the instance is valid,
+    /// add the locations that this schema evaluated to `marks`.
+    fn eval(self: *Evaluator, node: Value, inst: Value, depth: u16, collect: bool, marks: ?Marks) ValidateError!bool {
         switch (node) {
             .bool => |b| {
                 if (b) return true;
@@ -438,13 +722,29 @@ const Evaluator = struct {
             .object => |obj| {
                 if (self.budget == 0) return error.EvalBudgetExceeded;
                 self.budget -= 1;
+                const info: ?Node = if (nodeKey(node)) |k| self.schema.nodes.get(k) else null;
+                // The evaluation enters a resource when the resource changes.
+                const entered = if (info) |n| self.scope.items.len == 0 or self.scope.getLast() != n.resource else false;
+                if (entered) try self.scope.append(self.arena, info.?.resource);
+                defer if (entered) {
+                    _ = self.scope.pop();
+                };
+                // The locations that this schema evaluated. The set exists only when this
+                // schema or a parent at the same location has an unevaluated keyword.
+                const local: ?Marks = switch (inst) {
+                    .object => |o| if (marks != null or obj.contains("unevaluatedProperties")) try self.newMarks(o.count()) else null,
+                    .array => |a| if (marks != null or obj.contains("unevaluatedItems")) try self.newMarks(a.items.len) else null,
+                    else => null,
+                };
+                defer if (local) |m| self.arena.free(m);
                 var ok = true;
-                if (obj.get("$ref")) |r| {
-                    if (self.ref_hops >= self.limits.max_ref_hops) return error.TooManyRefHops;
-                    self.ref_hops += 1;
-                    defer self.ref_hops -= 1;
-                    const target = resolveRef(self.schema, r.string) orelse return self.fail(collect, "$ref", "unresolved reference", .{});
-                    if (!try self.eval(target, inst, depth, collect)) ok = false;
+                if (info) |n| {
+                    if (n.ref) |target| if (!try self.follow(target, inst, depth, collect, local)) {
+                        ok = false;
+                    };
+                    if (n.dynamic_ref) |target| if (!try self.follow(self.dynamicTarget(n, target), inst, depth, collect, local)) {
+                        ok = false;
+                    };
                 }
                 if (obj.get("type")) |t| if (!try self.checkType(t, inst, collect)) {
                     ok = false;
@@ -467,15 +767,22 @@ const Evaluator = struct {
                     .string => |s| if (!try self.checkString(obj, s, collect)) {
                         ok = false;
                     },
-                    .object => if (!try self.checkObject(obj, inst, depth, collect)) {
+                    .object => if (!try self.checkObject(obj, inst, depth, collect, local)) {
                         ok = false;
                     },
-                    .array => if (!try self.checkArray(obj, inst, depth, collect)) {
+                    .array => if (!try self.checkArray(obj, inst, depth, collect, local)) {
                         ok = false;
                     },
                     else => {},
                 }
-                if (!try self.checkLogic(obj, inst, depth, collect)) ok = false;
+                if (!try self.checkLogic(obj, inst, depth, collect, local)) ok = false;
+                if (local) |m| {
+                    // The unevaluated keywords come after all other keywords of the object.
+                    if (!try self.checkUnevaluated(obj, inst, depth, collect, m)) ok = false;
+                    if (ok) if (marks) |parent| for (parent, m) |*p, x| {
+                        p.* |= x;
+                    };
+                }
                 return ok;
             },
             else => return true,
@@ -526,16 +833,16 @@ const Evaluator = struct {
         const max = obj.get("maxLength");
         if (min == null and max == null) return ok;
         const len = std.unicode.utf8CountCodepoints(s) catch s.len;
-        if (min) |m| if (len < @as(usize, @intCast(m.integer))) {
-            ok = try self.fail(collect, "minLength", "string is shorter than {d} characters", .{m.integer}) and ok;
+        if (min) |m| if (len < countOf(m)) {
+            ok = try self.fail(collect, "minLength", "string is shorter than {d} characters", .{countOf(m)}) and ok;
         };
-        if (max) |m| if (len > @as(usize, @intCast(m.integer))) {
-            ok = try self.fail(collect, "maxLength", "string is longer than {d} characters", .{m.integer}) and ok;
+        if (max) |m| if (len > countOf(m)) {
+            ok = try self.fail(collect, "maxLength", "string is longer than {d} characters", .{countOf(m)}) and ok;
         };
         return ok;
     }
 
-    fn checkObject(self: *Evaluator, obj: std.json.ObjectMap, inst: Value, depth: u16, collect: bool) ValidateError!bool {
+    fn checkObject(self: *Evaluator, obj: std.json.ObjectMap, inst: Value, depth: u16, collect: bool, marks: ?Marks) ValidateError!bool {
         var ok = true;
         const members = inst.object;
         if (obj.get("required")) |req| for (req.array.items) |name| {
@@ -543,11 +850,11 @@ const Evaluator = struct {
                 ok = try self.fail(collect, "required", "missing required property \"{s}\"", .{name.string}) and ok;
             }
         };
-        if (obj.get("minProperties")) |m| if (members.count() < @as(usize, @intCast(m.integer))) {
-            ok = try self.fail(collect, "minProperties", "object has fewer than {d} properties", .{m.integer}) and ok;
+        if (obj.get("minProperties")) |m| if (members.count() < countOf(m)) {
+            ok = try self.fail(collect, "minProperties", "object has fewer than {d} properties", .{countOf(m)}) and ok;
         };
-        if (obj.get("maxProperties")) |m| if (members.count() > @as(usize, @intCast(m.integer))) {
-            ok = try self.fail(collect, "maxProperties", "object has more than {d} properties", .{m.integer}) and ok;
+        if (obj.get("maxProperties")) |m| if (members.count() > countOf(m)) {
+            ok = try self.fail(collect, "maxProperties", "object has more than {d} properties", .{countOf(m)}) and ok;
         };
         if (obj.get("dependentRequired")) |deps| {
             var it = deps.object.iterator();
@@ -562,20 +869,18 @@ const Evaluator = struct {
             var it = deps.object.iterator();
             while (it.next()) |kv| {
                 if (!members.contains(kv.key_ptr.*)) continue;
-                if (!try self.eval(kv.value_ptr.*, inst, depth, collect)) ok = false;
+                if (!try self.eval(kv.value_ptr.*, inst, depth, collect, marks)) ok = false;
             }
         }
         const props = obj.get("properties");
         const pattern_props = obj.get("patternProperties");
         const additional = obj.get("additionalProperties");
         const names_schema = obj.get("propertyNames");
-        var it = members.iterator();
-        while (it.next()) |kv| {
-            const name = kv.key_ptr.*;
+        for (members.keys(), members.values(), 0..) |name, value, i| {
             var covered = false;
             if (props) |p| if (p.object.get(name)) |sub| {
                 covered = true;
-                if (!try self.child(sub, kv.value_ptr.*, .{ .key = name }, depth, collect)) ok = false;
+                if (!try self.child(sub, value, .{ .key = name }, depth, collect)) ok = false;
             };
             // A name that a `patternProperties` expression matches is not additional.
             if (pattern_props) |pp| if (pp == .object) {
@@ -584,12 +889,14 @@ const Evaluator = struct {
                     const matched = self.matchPattern(entry.key_ptr.*, name) orelse continue;
                     if (!matched) continue;
                     covered = true;
-                    if (!try self.child(entry.value_ptr.*, kv.value_ptr.*, .{ .key = name }, depth, collect)) ok = false;
+                    if (!try self.child(entry.value_ptr.*, value, .{ .key = name }, depth, collect)) ok = false;
                 }
             };
             if (!covered) if (additional) |a| {
-                if (!try self.child(a, kv.value_ptr.*, .{ .key = name }, depth, collect)) ok = false;
+                covered = true;
+                if (!try self.child(a, value, .{ .key = name }, depth, collect)) ok = false;
             };
+            if (covered) mark(marks, i);
             if (names_schema) |ns| {
                 if (!try self.child(ns, .{ .string = name }, .{ .key = name }, depth, collect)) ok = false;
             }
@@ -597,14 +904,14 @@ const Evaluator = struct {
         return ok;
     }
 
-    fn checkArray(self: *Evaluator, obj: std.json.ObjectMap, inst: Value, depth: u16, collect: bool) ValidateError!bool {
+    fn checkArray(self: *Evaluator, obj: std.json.ObjectMap, inst: Value, depth: u16, collect: bool, marks: ?Marks) ValidateError!bool {
         var ok = true;
         const items = inst.array.items;
-        if (obj.get("minItems")) |m| if (items.len < @as(usize, @intCast(m.integer))) {
-            ok = try self.fail(collect, "minItems", "array has fewer than {d} items", .{m.integer}) and ok;
+        if (obj.get("minItems")) |m| if (items.len < countOf(m)) {
+            ok = try self.fail(collect, "minItems", "array has fewer than {d} items", .{countOf(m)}) and ok;
         };
-        if (obj.get("maxItems")) |m| if (items.len > @as(usize, @intCast(m.integer))) {
-            ok = try self.fail(collect, "maxItems", "array has more than {d} items", .{m.integer}) and ok;
+        if (obj.get("maxItems")) |m| if (items.len > countOf(m)) {
+            ok = try self.fail(collect, "maxItems", "array has more than {d} items", .{countOf(m)}) and ok;
         };
         if (obj.get("uniqueItems")) |u| if (u.bool) {
             outer: for (items, 0..) |a, i| {
@@ -620,63 +927,94 @@ const Evaluator = struct {
             for (prefix.array.items, 0..) |sub, i| {
                 if (i >= items.len) break;
                 if (!try self.child(sub, items[i], .{ .index = i }, depth, collect)) ok = false;
+                mark(marks, i);
             }
         }
         if (obj.get("items")) |sub| {
             var i = prefix_len;
             while (i < items.len) : (i += 1) {
                 if (!try self.child(sub, items[i], .{ .index = i }, depth, collect)) ok = false;
+                mark(marks, i);
             }
         }
         if (obj.get("contains")) |sub| {
             var matched: usize = 0;
             for (items, 0..) |item, i| {
-                if (try self.child(sub, item, .{ .index = i }, depth, false)) matched += 1;
+                if (try self.child(sub, item, .{ .index = i }, depth, false)) {
+                    matched += 1;
+                    mark(marks, i);
+                }
             }
-            const min: usize = if (obj.get("minContains")) |m| @intCast(m.integer) else 1;
+            const min: usize = if (obj.get("minContains")) |m| countOf(m) else 1;
             if (matched < min) {
                 ok = try self.fail(collect, "contains", "array needs at least {d} matching items", .{min}) and ok;
             }
-            if (obj.get("maxContains")) |m| if (matched > @as(usize, @intCast(m.integer))) {
-                ok = try self.fail(collect, "maxContains", "array has more than {d} matching items", .{m.integer}) and ok;
+            if (obj.get("maxContains")) |m| if (matched > countOf(m)) {
+                ok = try self.fail(collect, "maxContains", "array has more than {d} matching items", .{countOf(m)}) and ok;
             };
         }
         return ok;
     }
 
-    fn checkLogic(self: *Evaluator, obj: std.json.ObjectMap, inst: Value, depth: u16, collect: bool) ValidateError!bool {
+    fn checkLogic(self: *Evaluator, obj: std.json.ObjectMap, inst: Value, depth: u16, collect: bool, marks: ?Marks) ValidateError!bool {
         var ok = true;
         if (obj.get("allOf")) |list| for (list.array.items) |sub| {
-            if (!try self.eval(sub, inst, depth, collect)) ok = false;
+            if (!try self.eval(sub, inst, depth, collect, marks)) ok = false;
         };
         if (obj.get("anyOf")) |list| {
+            // With marks, every alternative that passes gives annotations. Thus the loop
+            // stops at the first match only without marks.
             var any = false;
-            for (list.array.items) |sub| if (try self.eval(sub, inst, depth, false)) {
+            for (list.array.items) |sub| if (try self.eval(sub, inst, depth, false, marks)) {
                 any = true;
-                break;
+                if (marks == null) break;
             };
             if (!any) ok = try self.fail(collect, "anyOf", "value matches none of the alternatives", .{}) and ok;
         }
         if (obj.get("oneOf")) |list| {
             var matches: usize = 0;
-            for (list.array.items) |sub| if (try self.eval(sub, inst, depth, false)) {
+            for (list.array.items) |sub| if (try self.eval(sub, inst, depth, false, marks)) {
                 matches += 1;
             };
             if (matches != 1) ok = try self.fail(collect, "oneOf", "value matches {d} alternatives, expected exactly one", .{matches}) and ok;
         }
-        if (obj.get("not")) |sub| if (try self.eval(sub, inst, depth, false)) {
+        if (obj.get("not")) |sub| if (try self.eval(sub, inst, depth, false, null)) {
             ok = try self.fail(collect, "not", "value matches the forbidden schema", .{}) and ok;
         };
         if (obj.get("if")) |cond| {
-            if (try self.eval(cond, inst, depth, false)) {
-                if (obj.get("then")) |sub| if (!try self.eval(sub, inst, depth, collect)) {
+            if (try self.eval(cond, inst, depth, false, marks)) {
+                if (obj.get("then")) |sub| if (!try self.eval(sub, inst, depth, collect, marks)) {
                     ok = false;
                 };
             } else {
-                if (obj.get("else")) |sub| if (!try self.eval(sub, inst, depth, collect)) {
+                if (obj.get("else")) |sub| if (!try self.eval(sub, inst, depth, collect, marks)) {
                     ok = false;
                 };
             }
+        }
+        return ok;
+    }
+
+    /// Apply `unevaluatedProperties` or `unevaluatedItems` to each location that is not in
+    /// `marks`, and then add that location to `marks`.
+    fn checkUnevaluated(self: *Evaluator, obj: std.json.ObjectMap, inst: Value, depth: u16, collect: bool, marks: Marks) ValidateError!bool {
+        var ok = true;
+        switch (inst) {
+            .object => |members| if (obj.get("unevaluatedProperties")) |sub| {
+                for (members.keys(), members.values(), 0..) |name, value, i| {
+                    if (isMarked(marks, i)) continue;
+                    if (!try self.child(sub, value, .{ .key = name }, depth, collect)) ok = false;
+                    mark(marks, i);
+                }
+            },
+            .array => |arr| if (obj.get("unevaluatedItems")) |sub| {
+                for (arr.items, 0..) |item, i| {
+                    if (isMarked(marks, i)) continue;
+                    if (!try self.child(sub, item, .{ .index = i }, depth, collect)) ok = false;
+                    mark(marks, i);
+                }
+            },
+            else => {},
         }
         return ok;
     }
@@ -691,7 +1029,7 @@ pub fn validate(arena: Allocator, schema: *const Schema, instance: Value) Valida
         .budget = schema.options.limits.eval_budget,
         .regex_buffer = try arena.alloc(u32, schema.pattern_buffer_len),
     };
-    const valid = try ev.eval(schema.root, instance, 0, true);
+    const valid = try ev.eval(schema.root, instance, 0, true, null);
     return .{ .valid = valid, .failures = ev.failures.items, .truncated = ev.truncated };
 }
 
@@ -915,13 +1253,169 @@ test "logic, conditionals and references" {
     });
 }
 
+test "unevaluatedProperties and unevaluatedItems" {
+    try runCases(&.{
+        // Adjacent keywords give annotations.
+        .{ .schema = "{\"properties\":{\"a\":true},\"patternProperties\":{\"^x-\":true},\"unevaluatedProperties\":false}", .instance = "{\"a\":1,\"x-b\":2}", .valid = true },
+        .{ .schema = "{\"properties\":{\"a\":true},\"unevaluatedProperties\":false}", .instance = "{\"a\":1,\"b\":2}", .valid = false },
+        .{ .schema = "{\"properties\":{\"a\":true},\"unevaluatedProperties\":{\"type\":\"integer\"}}", .instance = "{\"a\":\"s\",\"b\":2}", .valid = true },
+        .{ .schema = "{\"additionalProperties\":true,\"unevaluatedProperties\":false}", .instance = "{\"b\":2}", .valid = true },
+        // Annotations come from in-place subschemas that pass.
+        .{ .schema = "{\"allOf\":[{\"properties\":{\"a\":true}}],\"unevaluatedProperties\":false}", .instance = "{\"a\":1}", .valid = true },
+        .{ .schema = "{\"anyOf\":[{\"properties\":{\"a\":{\"type\":\"integer\"}}},{\"properties\":{\"b\":true}}],\"unevaluatedProperties\":false}", .instance = "{\"a\":1,\"b\":2}", .valid = true },
+        .{ .schema = "{\"anyOf\":[{\"properties\":{\"a\":{\"type\":\"integer\"}}},{\"properties\":{\"b\":true}}],\"unevaluatedProperties\":false}", .instance = "{\"a\":\"s\",\"b\":2}", .valid = false },
+        .{ .schema = "{\"oneOf\":[{\"properties\":{\"a\":true},\"required\":[\"a\"]},{\"properties\":{\"b\":true},\"required\":[\"b\"]}],\"unevaluatedProperties\":false}", .instance = "{\"a\":1}", .valid = true },
+        .{ .schema = "{\"if\":{\"properties\":{\"a\":{\"const\":1}}},\"then\":{\"properties\":{\"b\":true}},\"else\":{\"properties\":{\"c\":true}},\"unevaluatedProperties\":false}", .instance = "{\"a\":1,\"b\":2}", .valid = true },
+        .{ .schema = "{\"if\":{\"properties\":{\"a\":{\"const\":1}}},\"then\":{\"properties\":{\"b\":true}},\"else\":{\"properties\":{\"c\":true}},\"unevaluatedProperties\":false}", .instance = "{\"a\":2,\"c\":2}", .valid = false },
+        .{ .schema = "{\"dependentSchemas\":{\"a\":{\"properties\":{\"b\":true}}},\"properties\":{\"a\":true},\"unevaluatedProperties\":false}", .instance = "{\"a\":1,\"b\":2}", .valid = true },
+        .{ .schema = "{\"$defs\":{\"d\":{\"properties\":{\"a\":true}}},\"$ref\":\"#/$defs/d\",\"unevaluatedProperties\":false}", .instance = "{\"a\":1}", .valid = true },
+        // The keyword `not` gives no annotations.
+        .{ .schema = "{\"not\":{\"not\":{\"properties\":{\"a\":true}}},\"unevaluatedProperties\":false}", .instance = "{\"a\":1}", .valid = false },
+        // A sibling subschema cannot see the annotations of another sibling.
+        .{ .schema = "{\"allOf\":[{\"properties\":{\"a\":true}},{\"unevaluatedProperties\":false}]}", .instance = "{\"a\":1}", .valid = false },
+        // A nested unevaluated keyword evaluates all remaining names.
+        .{ .schema = "{\"allOf\":[{\"unevaluatedProperties\":true}],\"unevaluatedProperties\":false}", .instance = "{\"a\":1}", .valid = true },
+        // Annotations of a child location do not go to the parent location.
+        .{ .schema = "{\"properties\":{\"o\":{\"properties\":{\"a\":true}}},\"unevaluatedProperties\":false}", .instance = "{\"o\":{\"a\":1}}", .valid = true },
+        .{ .schema = "{\"properties\":{\"o\":{\"unevaluatedProperties\":false}}}", .instance = "{\"o\":{\"a\":1}}", .valid = false },
+        // Items.
+        .{ .schema = "{\"prefixItems\":[true],\"unevaluatedItems\":false}", .instance = "[1]", .valid = true },
+        .{ .schema = "{\"prefixItems\":[true],\"unevaluatedItems\":false}", .instance = "[1,2]", .valid = false },
+        .{ .schema = "{\"prefixItems\":[true],\"items\":true,\"unevaluatedItems\":false}", .instance = "[1,2]", .valid = true },
+        .{ .schema = "{\"contains\":{\"type\":\"string\"},\"unevaluatedItems\":false}", .instance = "[\"a\",\"b\"]", .valid = true },
+        .{ .schema = "{\"contains\":{\"type\":\"string\"},\"unevaluatedItems\":false}", .instance = "[\"a\",1]", .valid = false },
+        .{ .schema = "{\"anyOf\":[{\"prefixItems\":[true,true]},{\"prefixItems\":[true]}],\"unevaluatedItems\":false}", .instance = "[1,2]", .valid = true },
+        .{ .schema = "{\"allOf\":[{\"prefixItems\":[true]}],\"unevaluatedItems\":{\"type\":\"integer\"}}", .instance = "[\"a\",2]", .valid = true },
+        .{ .schema = "{\"allOf\":[{\"prefixItems\":[true]}],\"unevaluatedItems\":{\"type\":\"integer\"}}", .instance = "[\"a\",\"b\"]", .valid = false },
+        .{ .schema = "{\"unevaluatedItems\":false}", .instance = "{\"a\":1}", .valid = true },
+        .{ .schema = "{\"unevaluatedProperties\":false}", .instance = "[1]", .valid = true },
+    });
+}
+
+test "embedded resources and base URIs" {
+    try runCases(&.{
+        // A reference resolves against the base URI of its resource.
+        .{ .schema = "{\"$id\":\"https://example.com/root.json\",\"$defs\":{\"a\":{\"$id\":\"a/schema.json\",\"$defs\":{\"n\":{\"type\":\"integer\"}},\"$ref\":\"#/$defs/n\"}},\"$ref\":\"a/schema.json\"}", .instance = "1", .valid = true },
+        .{ .schema = "{\"$id\":\"https://example.com/root.json\",\"$defs\":{\"a\":{\"$id\":\"a/schema.json\",\"$defs\":{\"n\":{\"type\":\"integer\"}},\"$ref\":\"#/$defs/n\"}},\"$ref\":\"a/schema.json\"}", .instance = "\"x\"", .valid = false },
+        .{ .schema = "{\"$id\":\"https://example.com/root.json\",\"$defs\":{\"a\":{\"$id\":\"a/schema.json\",\"$defs\":{\"n\":{\"type\":\"integer\"}}}},\"$ref\":\"https://example.com/a/schema.json#/$defs/n\"}", .instance = "\"x\"", .valid = false },
+        // An `$id` resolves against the nearest parent resource.
+        .{ .schema = "{\"$id\":\"https://example.com/x/root.json\",\"$defs\":{\"b\":{\"$id\":\"b/\",\"$defs\":{\"c\":{\"$id\":\"c.json\",\"type\":\"string\"}}}},\"$ref\":\"https://example.com/x/b/c.json\"}", .instance = "1", .valid = false },
+        .{ .schema = "{\"$id\":\"https://example.com/x/root.json\",\"$defs\":{\"b\":{\"$id\":\"b/\",\"$defs\":{\"c\":{\"$id\":\"../c.json\",\"type\":\"string\"}}}},\"$ref\":\"c.json\"}", .instance = "\"s\"", .valid = true },
+        // A reference to an anchor uses the anchors of the target resource.
+        .{ .schema = "{\"$id\":\"https://example.com/root.json\",\"$defs\":{\"a\":{\"$anchor\":\"n\",\"type\":\"string\"},\"b\":{\"$id\":\"b.json\",\"$defs\":{\"n\":{\"$anchor\":\"n\",\"type\":\"integer\"}}}},\"$ref\":\"b.json#n\"}", .instance = "1", .valid = true },
+        .{ .schema = "{\"$id\":\"https://example.com/root.json\",\"$defs\":{\"a\":{\"$anchor\":\"n\",\"type\":\"string\"},\"b\":{\"$id\":\"b.json\",\"$defs\":{\"n\":{\"$anchor\":\"n\",\"type\":\"integer\"}}}},\"$ref\":\"#n\"}", .instance = "1", .valid = false },
+        // The fragment `#` in a subschema resource is the root of that resource.
+        .{ .schema = "{\"$defs\":{\"list\":{\"$id\":\"urn:example:list\",\"type\":\"array\",\"items\":{\"$ref\":\"#\"}}},\"$ref\":\"urn:example:list\"}", .instance = "[[[]]]", .valid = true },
+        .{ .schema = "{\"$defs\":{\"list\":{\"$id\":\"urn:example:list\",\"type\":\"array\",\"items\":{\"$ref\":\"#\"}}},\"$ref\":\"urn:example:list\"}", .instance = "[[1]]", .valid = false },
+        // An `$id` in a value that is not a schema is not an identifier.
+        .{ .schema = "{\"$defs\":{\"a\":{\"const\":{\"$id\":\"https://example.com/c.json\"}},\"b\":{\"$id\":\"https://example.com/c.json\",\"type\":\"string\"}},\"$ref\":\"https://example.com/c.json\"}", .instance = "\"s\"", .valid = true },
+        // A reference into an unknown keyword uses the resource of that location.
+        .{ .schema = "{\"$defs\":{\"r\":{\"$id\":\"https://example.com/r.json\",\"x-unknown\":{\"$ref\":\"#/$defs/n\"},\"$defs\":{\"n\":{\"type\":\"null\"}}}},\"$ref\":\"https://example.com/r.json#/x-unknown\"}", .instance = "null", .valid = true },
+        .{ .schema = "{\"$defs\":{\"r\":{\"$id\":\"https://example.com/r.json\",\"x-unknown\":{\"$ref\":\"#/$defs/n\"},\"$defs\":{\"n\":{\"type\":\"null\"}}}},\"$ref\":\"https://example.com/r.json#/x-unknown\"}", .instance = "1", .valid = false },
+    });
+}
+
+test "dynamic references and the dynamic scope" {
+    try runCases(&.{
+        // The outermost resource in the dynamic scope with the anchor name wins.
+        .{ .schema = "{\"$id\":\"https://example.com/strict\",\"$dynamicAnchor\":\"node\",\"$ref\":\"tree\",\"unevaluatedProperties\":false,\"$defs\":{\"tree\":{\"$id\":\"tree\",\"$dynamicAnchor\":\"node\",\"type\":\"object\",\"properties\":{\"data\":true,\"children\":{\"type\":\"array\",\"items\":{\"$dynamicRef\":\"#node\"}}}}}}", .instance = "{\"children\":[{\"data\":1}]}", .valid = true },
+        .{ .schema = "{\"$id\":\"https://example.com/strict\",\"$dynamicAnchor\":\"node\",\"$ref\":\"tree\",\"unevaluatedProperties\":false,\"$defs\":{\"tree\":{\"$id\":\"tree\",\"$dynamicAnchor\":\"node\",\"type\":\"object\",\"properties\":{\"data\":true,\"children\":{\"type\":\"array\",\"items\":{\"$dynamicRef\":\"#node\"}}}}}}", .instance = "{\"children\":[{\"daat\":1}]}", .valid = false },
+        // Without the strict root, the tree schema allows other names.
+        .{ .schema = "{\"$id\":\"https://example.com/root\",\"$ref\":\"tree\",\"$defs\":{\"tree\":{\"$id\":\"tree\",\"$dynamicAnchor\":\"node\",\"type\":\"object\",\"properties\":{\"data\":true,\"children\":{\"type\":\"array\",\"items\":{\"$dynamicRef\":\"#node\"}}}}}}", .instance = "{\"children\":[{\"daat\":1}]}", .valid = true },
+        // A target without `$dynamicAnchor` makes `$dynamicRef` equal to `$ref`.
+        .{ .schema = "{\"$id\":\"https://example.com/root\",\"$ref\":\"list\",\"$defs\":{\"foo\":{\"$dynamicAnchor\":\"items\",\"type\":\"string\"},\"list\":{\"$id\":\"list\",\"type\":\"array\",\"items\":{\"$dynamicRef\":\"#items\"},\"$defs\":{\"items\":{\"$anchor\":\"items\"}}}}}", .instance = "[1]", .valid = true },
+        // A resource that the evaluation left is not in the dynamic scope.
+        .{ .schema = "{\"$id\":\"https://example.com/main\",\"if\":{\"$id\":\"first\",\"$defs\":{\"t\":{\"$dynamicAnchor\":\"t\",\"type\":\"number\"}}},\"then\":{\"$id\":\"second\",\"$ref\":\"start\",\"$defs\":{\"t\":{\"$dynamicAnchor\":\"t\",\"type\":\"null\"}}},\"$defs\":{\"start\":{\"$id\":\"start\",\"$dynamicRef\":\"inner#t\"},\"inner\":{\"$id\":\"inner\",\"$dynamicAnchor\":\"t\",\"type\":\"string\"}}}", .instance = "null", .valid = true },
+        .{ .schema = "{\"$id\":\"https://example.com/main\",\"if\":{\"$id\":\"first\",\"$defs\":{\"t\":{\"$dynamicAnchor\":\"t\",\"type\":\"number\"}}},\"then\":{\"$id\":\"second\",\"$ref\":\"start\",\"$defs\":{\"t\":{\"$dynamicAnchor\":\"t\",\"type\":\"null\"}}},\"$defs\":{\"start\":{\"$id\":\"start\",\"$dynamicRef\":\"inner#t\"},\"inner\":{\"$id\":\"inner\",\"$dynamicAnchor\":\"t\",\"type\":\"string\"}}}", .instance = "1", .valid = false },
+        .{ .schema = "{\"$id\":\"https://example.com/main\",\"if\":{\"$id\":\"first\",\"$defs\":{\"t\":{\"$dynamicAnchor\":\"t\",\"type\":\"number\"}}},\"then\":{\"$id\":\"second\",\"$ref\":\"start\",\"$defs\":{\"t\":{\"$dynamicAnchor\":\"t\",\"type\":\"null\"}}},\"$defs\":{\"start\":{\"$id\":\"start\",\"$dynamicRef\":\"inner#t\"},\"inner\":{\"$id\":\"inner\",\"$dynamicAnchor\":\"t\",\"type\":\"string\"}}}", .instance = "\"s\"", .valid = false },
+        // A `$dynamicRef` with a JSON pointer is equal to `$ref`.
+        .{ .schema = "{\"$defs\":{\"a\":{\"$dynamicAnchor\":\"a\",\"type\":\"integer\"}},\"$dynamicRef\":\"#/$defs/a\"}", .instance = "\"x\"", .valid = false },
+    });
+}
+
+test "content, format and unknown keywords are annotations" {
+    try runCases(&.{
+        // The content keywords are annotations. The validator does not decode or parse the string.
+        .{ .schema = "{\"contentEncoding\":\"base64\"}", .instance = "\"not base64!\"", .valid = true },
+        .{ .schema = "{\"contentMediaType\":\"application/json\"}", .instance = "\"{not json\"", .valid = true },
+        .{ .schema = "{\"contentMediaType\":\"application/json\",\"contentSchema\":{\"type\":\"object\",\"required\":[\"a\"]}}", .instance = "\"[]\"", .valid = true },
+        .{ .schema = "{\"contentEncoding\":\"base64\",\"contentMediaType\":\"application/json\",\"contentSchema\":false}", .instance = "\"e30=\"", .valid = true },
+        .{ .schema = "{\"contentEncoding\":\"base64\",\"type\":\"string\"}", .instance = "1", .valid = false },
+        // The keyword `format` is an annotation.
+        .{ .schema = "{\"format\":\"date-time\"}", .instance = "\"yesterday\"", .valid = true },
+        .{ .schema = "{\"format\":\"ipv4\"}", .instance = "\"999.1.1.1\"", .valid = true },
+        // The keywords of 2019-09 are unknown keywords.
+        .{ .schema = "{\"$recursiveAnchor\":true,\"$recursiveRef\":\"#\",\"type\":\"integer\"}", .instance = "1", .valid = true },
+        .{ .schema = "{\"$recursiveAnchor\":true,\"$recursiveRef\":\"#\",\"type\":\"integer\"}", .instance = "\"x\"", .valid = false },
+    });
+}
+
+test "URI reference resolution" {
+    // RFC 3986, section 5.4.
+    const base = "http://a/b/c/d;p?q";
+    const cases = [_][2][]const u8{
+        .{ "g:h", "g:h" },
+        .{ "g", "http://a/b/c/g" },
+        .{ "./g", "http://a/b/c/g" },
+        .{ "g/", "http://a/b/c/g/" },
+        .{ "/g", "http://a/g" },
+        .{ "//g", "http://g" },
+        .{ "?y", "http://a/b/c/d;p?y" },
+        .{ "g?y", "http://a/b/c/g?y" },
+        .{ "#s", "http://a/b/c/d;p?q#s" },
+        .{ "g#s", "http://a/b/c/g#s" },
+        .{ "g?y#s", "http://a/b/c/g?y#s" },
+        .{ ";x", "http://a/b/c/;x" },
+        .{ "g;x", "http://a/b/c/g;x" },
+        .{ "g;x?y#s", "http://a/b/c/g;x?y#s" },
+        .{ "", "http://a/b/c/d;p?q" },
+        .{ ".", "http://a/b/c/" },
+        .{ "./", "http://a/b/c/" },
+        .{ "..", "http://a/b/" },
+        .{ "../", "http://a/b/" },
+        .{ "../g", "http://a/b/g" },
+        .{ "../..", "http://a/" },
+        .{ "../../", "http://a/" },
+        .{ "../../g", "http://a/g" },
+        .{ "../../../g", "http://a/g" },
+        .{ "../../../../g", "http://a/g" },
+        .{ "/./g", "http://a/g" },
+        .{ "/../g", "http://a/g" },
+        .{ "g.", "http://a/b/c/g." },
+        .{ ".g", "http://a/b/c/.g" },
+        .{ "g..", "http://a/b/c/g.." },
+        .{ "..g", "http://a/b/c/..g" },
+        .{ "./../g", "http://a/b/g" },
+        .{ "./g/.", "http://a/b/c/g/" },
+        .{ "g/./h", "http://a/b/c/g/h" },
+        .{ "g/../h", "http://a/b/c/h" },
+        .{ "g;x=1/./y", "http://a/b/c/g;x=1/y" },
+        .{ "g;x=1/../y", "http://a/b/c/y" },
+        .{ "g?y/./x", "http://a/b/c/g?y/./x" },
+        .{ "g?y/../x", "http://a/b/c/g?y/../x" },
+        .{ "g#s/./x", "http://a/b/c/g#s/./x" },
+        .{ "g#s/../x", "http://a/b/c/g#s/../x" },
+        .{ "http:g", "http:g" },
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case[1], try resolveUri(arena_state.allocator(), base, case[0]));
+    }
+}
+
 test "compile rejects unsupported and remote schemas" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expectError(error.UnsupportedKeyword, compileText(arena, "{\"unevaluatedProperties\":false}", .{}));
-    try std.testing.expectError(error.UnsupportedKeyword, compileText(arena, "{\"properties\":{\"a\":{\"$id\":\"x\"}}}", .{}));
+    // `$schema` is valid only at the root of a resource.
+    try std.testing.expectError(error.UnsupportedKeyword, compileText(arena, "{\"properties\":{\"a\":{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\"}}}", .{}));
+    _ = try compileText(arena, "{\"properties\":{\"a\":{\"$id\":\"x\",\"$schema\":\"https://json-schema.org/draft/2020-12/schema\"}}}", .{});
+    try std.testing.expectError(error.UnsupportedDialect, compileText(arena, "{\"properties\":{\"a\":{\"$id\":\"x\",\"$schema\":\"http://json-schema.org/draft-07/schema#\"}}}", .{}));
     try std.testing.expectError(error.RemoteRef, compileText(arena, "{\"$ref\":\"https://example.com/s.json\"}", .{}));
+    try std.testing.expectError(error.RemoteRef, compileText(arena, "{\"$dynamicRef\":\"other.json#x\"}", .{}));
+    // A reference to an `$id` in a subschema is local.
+    _ = try compileText(arena, "{\"$ref\":\"https://example.com/s.json\",\"$defs\":{\"s\":{\"$id\":\"https://example.com/s.json\"}}}", .{});
     try std.testing.expectError(error.UnsupportedDialect, compileText(arena, "{\"$schema\":\"http://json-schema.org/draft-07/schema#\"}", .{}));
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$ref\":\"#/$defs/missing\"}", .{}));
     // A reference into an unknown member is compiled too.
@@ -937,8 +1431,25 @@ test "compile rejects unsupported and remote schemas" {
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"allOf\":[]}", .{}));
     try std.testing.expectError(error.DuplicateAnchor, compileText(arena, "{\"$defs\":{\"a\":{\"$anchor\":\"x\"},\"b\":{\"$anchor\":\"x\"}}}", .{}));
     try std.testing.expectError(error.Syntax, compileText(arena, "{", .{}));
-    // Allowed when opted in.
-    _ = try compileText(arena, "{\"unevaluatedProperties\":false}", .{ .allow_unsupported_keywords = true });
+    // Identifiers: a fragment other than an empty one, two resources with one URI.
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$defs\":{\"a\":{\"$id\":\"a.json#x\"}}}", .{}));
+    _ = try compileText(arena, "{\"$defs\":{\"a\":{\"$id\":\"a.json#\"}}}", .{});
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$defs\":{\"a\":{\"$id\":\"a.json\"},\"b\":{\"$id\":\"./a.json\"}}}", .{}));
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$id\":1}", .{}));
+    // Anchors are local to their resource.
+    _ = try compileText(arena, "{\"$defs\":{\"a\":{\"$anchor\":\"x\"},\"b\":{\"$id\":\"b.json\",\"$anchor\":\"x\"}}}", .{});
+    try std.testing.expectError(error.DuplicateAnchor, compileText(arena, "{\"$defs\":{\"a\":{\"$anchor\":\"x\"},\"b\":{\"$dynamicAnchor\":\"x\"}}}", .{}));
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$dynamicAnchor\":\"1x\"}", .{}));
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$ref\":\"#nothing\"}", .{}));
+    // The new keywords check their operands.
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"unevaluatedProperties\":[]}", .{}));
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"unevaluatedItems\":1}", .{}));
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"contentEncoding\":1}", .{}));
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"contentSchema\":{\"type\":\"int\"}}", .{}));
+    // A count can be a number with a zero fraction.
+    _ = try compileText(arena, "{\"maxLength\":2.0}", .{});
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"maxLength\":2.5}", .{}));
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"minItems\":-1}", .{}));
     // Limits.
     try std.testing.expectError(error.TooManySubschemas, compileText(arena, "{\"properties\":{\"a\":{},\"b\":{}}}", .{ .limits = .{ .max_subschemas = 2 } }));
     try std.testing.expectError(error.SchemaTooDeep, compileText(arena, "{\"properties\":{\"a\":{\"properties\":{\"b\":{}}}}}", .{ .limits = .{ .max_depth = 1 } }));
@@ -1036,6 +1547,13 @@ test "failure report and evaluation limits" {
     const budget = try compileText(arena, "{\"items\":{\"type\":\"integer\"}}", .{ .limits = .{ .eval_budget = 3 } });
     const many = try std.json.parseFromSliceLeaky(Value, arena, "[1,2,3,4]", .{});
     try std.testing.expectError(error.EvalBudgetExceeded, validate(arena, &budget, many));
+
+    // The set of evaluated items costs one unit of the budget per 64 items.
+    const three = try std.json.parseFromSliceLeaky(Value, arena, "[1,2,3]", .{});
+    const tight = try compileText(arena, "{\"unevaluatedItems\":{\"type\":\"integer\"}}", .{ .limits = .{ .eval_budget = 4 } });
+    try std.testing.expectError(error.EvalBudgetExceeded, validate(arena, &tight, three));
+    const enough = try compileText(arena, "{\"unevaluatedItems\":{\"type\":\"integer\"}}", .{ .limits = .{ .eval_budget = 5 } });
+    try std.testing.expect((try validate(arena, &enough, three)).valid);
 
     const deep = try compileText(arena, "{\"properties\":{\"n\":{\"$ref\":\"#\"}}}", .{ .limits = .{ .max_depth = 2 } });
     const nested = try std.json.parseFromSliceLeaky(Value, arena, "{\"n\":{\"n\":{\"n\":{}}}}", .{});

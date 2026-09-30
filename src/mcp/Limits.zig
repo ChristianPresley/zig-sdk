@@ -106,7 +106,9 @@ pub const Schema = struct {
     max_ref_hops: u16 = 64,
     /// Maximum failures that one validation records. Overflow: the report stops at the limit.
     max_errors: u16 = 32,
-    /// Maximum subschema evaluations per validation. Overflow: the instance is invalid.
+    /// Maximum subschema evaluations per validation. The set of evaluated locations for
+    /// `unevaluatedProperties` and `unevaluatedItems` also costs one unit per 64 locations.
+    /// Overflow: the instance is invalid.
     eval_budget: u32 = 100_000,
     /// Maximum bytes of one regular expression in `pattern` or in a `patternProperties` key.
     /// Overflow: registration rejects the schema.

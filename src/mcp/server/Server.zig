@@ -60,8 +60,9 @@ pub const Options = struct {
     invalid_args_policy: enum { tool_error, rpc_error } = .tool_error,
     /// Mirror `structuredContent` into a text block when the handler gave none.
     structured_text_mirror: bool = true,
-    /// Ignore JSON Schema keywords that the validator does not support. Without this option,
-    /// the registration of the tool fails.
+    /// Ignore a `pattern` or a `patternProperties` expression that uses a regular expression
+    /// feature that the validator does not support. Without this option, the registration of
+    /// the tool fails. The validator supports all keywords of JSON Schema 2020-12.
     allow_unsupported_schema_keywords: bool = false,
     /// Enable the Tasks extension. The server then advertises it under `extensions`.
     tasks: ?tasks.Options = null,
@@ -286,10 +287,12 @@ pub const RegisterError = error{
     SchemaNotObject,
     /// An `x-mcp-header` annotation is malformed, duplicated or on a non-scalar property.
     InvalidHeaderAnnotation,
-    /// The schema uses a keyword or a regular expression feature that the validator does
-    /// not support (see `Options`).
+    /// The schema has `$schema` in a subschema that is not the root of a schema resource.
+    /// Or a regular expression of the schema uses a feature that the validator does not
+    /// support (see `Options`).
     UnsupportedKeyword,
-    /// The schema references a document other than itself.
+    /// The schema references a document other than itself. A reference to a subschema of the
+    /// document with that `$id` is not remote.
     RemoteRef,
     /// The schema names a dialect other than JSON Schema 2020-12.
     UnsupportedDialect,
