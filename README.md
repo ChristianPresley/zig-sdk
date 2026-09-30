@@ -76,11 +76,11 @@ zig build test
 zig build examples
 ```
 
-Other build steps: `fmt`, `docs`, `lint-docs`, `census`, `commit-policy`, `bench` (`-- --smoke` for a quick run), and `test --fuzz` for the fuzz targets.
+Other build steps: `fmt`, `docs`, `site`, `lint-docs`, `census`, `extract-requirements`, `spec-matrix`, `gen-bibliography`, `gen-dictionary`, `commit-policy`, `bench` (`-- --smoke` for a quick run), and `test --fuzz` for the fuzz targets.
 
 ## Documentation
 
-The wiki holds the guides, the style guide and the bibliography.[^wiki] The API reference comes from `zig build docs`. Start with these pages:
+The wiki holds the guides, the style guide and the bibliography.[^wiki] The [API reference](https://christianpresley.github.io/zig-sdk/) comes from `zig build site`. The [conformance matrix](docs/generated/conformance-matrix.md) maps each requirement of the specification to its tests. Start with these pages:
 
 - [Getting Started](https://github.com/ChristianPresley/zig-sdk/wiki/Getting-Started)
 - [Server Guide](https://github.com/ChristianPresley/zig-sdk/wiki/Server-Guide) and [Client Guide](https://github.com/ChristianPresley/zig-sdk/wiki/Client-Guide)

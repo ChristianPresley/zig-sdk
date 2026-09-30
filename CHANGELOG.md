@@ -17,6 +17,8 @@ All notable changes to this project are recorded in this file. The format follow
 - JWT signing keys (`mcp.auth.jwt.SigningKey`) for ES256, ES384, EdDSA, RS256 and PS256, JWK set parsing, and ES384 and EdDSA verification.
 - Skills extension (`io.modelcontextprotocol/skills`): the server option `skills`, `addSkill`, `addDynamicSkill`, `skills/list`, `skills/get` and `resources/directory/read`, and the client methods `listSkills`, `getSkill`, `readDirectory` and `readSkillFile` with manifest checks.
 - MCP Apps extension (`io.modelcontextprotocol/ui`): the server option `apps`, UI resources with `addUiResource`, tool UI metadata with `ToolDef.ui`, and the client accessors `toolUi` and `readUiResource`.
+- Requirement matrix: `zig build extract-requirements` finds the 733 normative sentences of the vendored specification pages, `docs/spec/requirement_tests.zon` maps each one to tests or to a reason, and `zig build spec-matrix` checks the mapping and renders `docs/generated/conformance-matrix.md`. The CI checks both files. 127 new tests cover requirements that had no test.
+- Documentation site: `zig build site` builds a landing page and the API reference of the modules `mcp` and `mcp_grpc`. The workflow `docs.yml` deploys it to GitHub Pages from `main`.
 - `zig build lint-docs` has the options `--strict`, `--format`, `--rule`, `--string-literals` and `--wiki-dir`, and the warning rules of the project profile. The project dictionary has all its lists.
 
 ### Changed
