@@ -6,16 +6,19 @@
 //! concurrently, `notifications/cancelled` cancels a request, and listen streams work. When a
 //! peer closes its connection, the server cancels the requests of that peer.
 //!
-//! On POSIX systems the server sets the mode `0600` on the socket file after it creates the
-//! file. Before that, the umask of the process applies. On Windows the server gives the socket
-//! file a protected access control list that allows access only to the user of the process.
-//! Before that, the file inherits the access control list of the directory. Windows checks
-//! this list when a client connects.
+//! The file mode and the directory of the socket control access, because the server does not
+//! check the peer. On POSIX systems the server sets the mode `0600` on the socket file. On
+//! Windows it gives the socket file a protected access control list that allows access only
+//! to the user of the process. Windows checks this list when a client connects.
 //!
-//! We recommend a socket directory that only the owner can open. The server refuses a path
-//! that is not a socket. It removes a stale socket file at start and its own socket file at
-//! shutdown. The file mode and the directory of the socket control access, because the server
-//! does not check the peer.
+//! `bind` creates the socket in a new private directory next to the path and sets the mode or
+//! the list. Then it moves the socket to the path. Thus no client can connect before the
+//! socket has its protection. `bind` refuses a directory where other accounts can add, delete
+//! or rename entries, because such an account can put its own socket at the path. Use
+//! `createPrivateDirectory` to make a safe directory.
+//!
+//! The server refuses a path that is not a socket. It removes a stale socket file at start
+//! and its own socket file at shutdown.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -35,6 +38,7 @@ const Router = router_mod.Router;
 
 const log = std.log.scoped(.mcp_unix);
 const windows_acl = if (builtin.os.tag == .windows) @import("windows_acl.zig") else struct {};
+const socket_dir = @import("socket_dir.zig");
 
 /// True when the target has Unix domain sockets. Windows has them from Windows 10 version
 /// 1803. When this is false, `Server.bind` and `Client.connect` return `error.Unsupported`.
@@ -43,7 +47,8 @@ pub const supported = Io.net.has_unix_sockets;
 pub const Options = struct {
     /// The file system path of the socket. On Windows the server resolves a relative path
     /// against the current directory. The path has 108 bytes or less on Linux and 104 bytes
-    /// or less on macOS.
+    /// or less on macOS. During `bind` the socket is in a directory with an 11-byte name next
+    /// to the path. Thus the path of the directory of the socket plus 14 bytes must also fit.
     path: []const u8,
     /// The permission bits of the socket file on POSIX systems. On Windows a value without
     /// group and other bits (`mode & 0o077 == 0`) allows access only to the user of the
@@ -64,7 +69,17 @@ pub const BindError = error{
     /// Windows did not set the access control list of the socket file. The log has the
     /// Windows error code.
     AccessControlFailed,
-} || Io.net.UnixAddress.ListenError || Io.Dir.StatFileError || Io.File.OpenError || Io.Dir.DeleteFileError || Io.Dir.SetFilePermissionsError || std.process.CurrentPathAllocError;
+    /// Other accounts can add, delete or rename entries in the directory of the socket.
+    DirectoryNotPrivate,
+} || Io.net.UnixAddress.ListenError || Io.Dir.StatFileError || Io.File.OpenError || Io.Dir.DeleteFileError || Io.Dir.SetFilePermissionsError || std.process.CurrentPathAllocError || socket_dir.TempError || Io.Dir.RenameError;
+
+/// Create a private directory for sockets at `path`. On POSIX systems it has the mode `0700`.
+/// On Windows it has an access control list that allows access only to the user of the
+/// process. A directory that is already at `path` must be private, or the call gives
+/// `error.DirectoryNotPrivate`. The parent directories must exist.
+pub fn createPrivateDirectory(io: Io, path: []const u8) socket_dir.CreateError!void {
+    return socket_dir.createPrivate(io, path);
+}
 
 /// Serves one MCP server on a Unix domain socket.
 pub const Server = struct {
@@ -101,12 +116,15 @@ pub const Server = struct {
     }
 
     /// Create the socket. This call removes a stale socket file at the path. A file that is
-    /// not a socket, or a socket with a live server, makes the call fail.
+    /// not a socket, a socket with a live server, or a directory that is not private makes the
+    /// call fail.
     pub fn bind(self: *Server) BindError!void {
         if (!supported) return error.Unsupported;
         const io = self.io;
         if (self.path == null) self.path = try resolvePath(io, self.gpa, self.options.path);
         const path = self.path.?;
+        const dir = std.fs.path.dirname(path) orelse ".";
+        if (!try socket_dir.isPrivate(io, dir, self.options.mode)) return error.DirectoryNotPrivate;
         switch (try pathState(io, path)) {
             .absent => {},
             .other => return error.PathNotSocket,
@@ -116,16 +134,38 @@ pub const Server = struct {
             },
         }
         const address = try unixAddress(path);
-        self.listener = address.listen(io, .{}) catch |e| switch (e) {
-            error.AddressFamilyUnsupported => return error.Unsupported,
-            else => |err| return err,
-        };
-        errdefer self.closeListener();
-        if (builtin.os.tag == .windows) {
-            if (self.options.mode & 0o077 == 0) try windows_acl.restrictToCurrentUser(path);
-        } else {
-            try Io.Dir.cwd().setFilePermissions(io, path, .fromMode(@intCast(self.options.mode)), .{});
+        if (builtin.os.tag == .windows and self.options.mode & 0o077 != 0) {
+            // A shared socket keeps the list that it inherits from the directory, so it has
+            // no protection to apply.
+            self.listener = try listen(io, address);
+            return;
         }
+        // Create the socket in a new private directory, protect it, and then move it to
+        // `path`. Before the move, only the user of the process can reach it.
+        const temp = try socket_dir.createTemp(io, self.gpa, dir);
+        defer self.gpa.free(temp);
+        defer Io.Dir.cwd().deleteDir(io, temp) catch |e| log.warn("could not remove the directory {s}: {t}", .{ temp, e });
+        const inner = try std.fs.path.join(self.gpa, &.{ temp, "s" });
+        defer self.gpa.free(inner);
+        var listener = try listen(io, try unixAddress(inner));
+        errdefer {
+            listener.deinit(io);
+            Io.Dir.cwd().deleteFile(io, inner) catch {};
+        }
+        if (builtin.os.tag == .windows) {
+            try windows_acl.restrictToCurrentUser(inner);
+        } else {
+            try Io.Dir.cwd().setFilePermissions(io, inner, .fromMode(@intCast(self.options.mode)), .{});
+        }
+        try Io.Dir.rename(Io.Dir.cwd(), inner, Io.Dir.cwd(), path, io);
+        self.listener = listener;
+    }
+
+    fn listen(io: Io, address: Io.net.UnixAddress) BindError!Io.net.Server {
+        return address.listen(io, .{}) catch |e| switch (e) {
+            error.AddressFamilyUnsupported => error.Unsupported,
+            else => |err| err,
+        };
     }
 
     /// Accept connections until a call to `shutdown`. Then remove the socket file.

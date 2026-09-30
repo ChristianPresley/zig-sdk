@@ -120,10 +120,14 @@ const Fixture = struct {
     }
 };
 
-/// A path in the temporary directory. It stays relative, because POSIX limits the socket
-/// path to 108 bytes.
+/// A path in the private directory `run` of the temporary directory. The server refuses a
+/// directory that other accounts can write to. The path stays relative, because POSIX limits
+/// the socket path to 108 bytes.
 fn socketPath(tmp: *std.testing.TmpDir, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/run", .{tmp.sub_path});
+    defer gpa.free(dir);
+    try unix.createPrivateDirectory(std.testing.io, dir);
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name });
 }
 
 /// Windows connects to absolute socket paths only.
@@ -396,16 +400,16 @@ test "unix socket server refuses a path that is not a socket" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "mcp.sock", .data = "keep me" });
     const path = try socketPath(&tmp, "mcp.sock");
     defer gpa.free(path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "run/mcp.sock", .data = "keep me" });
     var server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "unix-test", .version = "1" } });
     defer server.deinit();
     var transport: unix.Server = .init(io, gpa, &server, .{ .path = path });
     defer transport.deinit();
     try std.testing.expectError(error.PathNotSocket, transport.bind());
     var buf: [16]u8 = undefined;
-    try std.testing.expectEqualStrings("keep me", try tmp.dir.readFile(io, "mcp.sock", &buf));
+    try std.testing.expectEqualStrings("keep me", try tmp.dir.readFile(io, "run/mcp.sock", &buf));
 }
 
 test "unix socket server refuses a live socket, replaces a stale one and removes its own" {
@@ -440,11 +444,11 @@ test "unix socket server refuses a live socket, replaces a stale one and removes
         try replaced.bind();
     }
     // `deinit` removed the socket file.
-    try std.testing.expectError(error.FileNotFound, f.tmp.dir.statFile(io, "stale.sock", .{ .follow_symlinks = false }));
+    try std.testing.expectError(error.FileNotFound, f.tmp.dir.statFile(io, "run/stale.sock", .{ .follow_symlinks = false }));
 
     // `serve` removes the socket file at shutdown.
     f.halt();
-    try std.testing.expectError(error.FileNotFound, f.tmp.dir.statFile(io, "mcp.sock", .{ .follow_symlinks = false }));
+    try std.testing.expectError(error.FileNotFound, f.tmp.dir.statFile(io, "run/mcp.sock", .{ .follow_symlinks = false }));
 }
 
 const WaitJob = struct {
@@ -507,7 +511,61 @@ test "unix socket shutdown ends listen streams and cancels requests in flight" {
     const note = try mcp.jsonrpc.Message.parse(arena, try arena.dupe(u8, try reader.interface.takeDelimiterExclusive('\n')));
     try std.testing.expect(note == .notification);
     try std.testing.expectEqualStrings("notifications/cancelled", note.notification.method);
-    try std.testing.expectError(error.FileNotFound, f.tmp.dir.statFile(io, "mcp.sock", .{ .follow_symlinks = false }));
+    try std.testing.expectError(error.FileNotFound, f.tmp.dir.statFile(io, "run/mcp.sock", .{ .follow_symlinks = false }));
+}
+
+/// A path in the temporary directory, relative like `socketPath`.
+fn tmpPath(tmp: *std.testing.TmpDir, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+/// Bind a server on `name` in the directory `dir` of `tmp` and return the result.
+fn tryBind(tmp: *std.testing.TmpDir, dir: []const u8, mode: u32) !void {
+    const io = std.testing.io;
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}/mcp.sock", .{ tmp.sub_path, dir });
+    defer gpa.free(path);
+    var server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "unix-test", .version = "1" } });
+    defer server.deinit();
+    var transport: unix.Server = .init(io, gpa, &server, .{ .path = path, .mode = mode });
+    defer transport.deinit();
+    try transport.bind();
+}
+
+test "createPrivateDirectory accepts a private directory that exists" {
+    if (!unix.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmpPath(&tmp, "private");
+    defer gpa.free(dir);
+    try unix.createPrivateDirectory(io, dir);
+    try unix.createPrivateDirectory(io, dir);
+    try tryBind(&tmp, "private", 0o600);
+}
+
+test "unix socket server leaves only the socket in its directory" {
+    if (!unix.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(.{});
+    defer f.stop();
+    // `bind` created the socket in a temporary directory and moved it. That directory is gone.
+    var dir = try f.tmp.dir.openDir(io, "run", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (try it.next(io)) |entry| : (count += 1) try std.testing.expectEqualStrings("mcp.sock", entry.name);
+    try std.testing.expectEqual(1, count);
+    try smoke(f.path);
+}
+
+/// Connect to the server at `path`, to show that the moved socket accepts connections.
+fn smoke(path: []const u8) !void {
+    const io = std.testing.io;
+    const abs = try absolutePath(path);
+    defer gpa.free(abs);
+    const stream = try (try Io.net.UnixAddress.init(abs)).connect(io);
+    stream.close(io);
 }
 
 // The access tests of the socket file are different on POSIX and on Windows. Each target
@@ -522,9 +580,60 @@ const posix_access_tests = struct {
         var f: Fixture = undefined;
         try f.start(.{});
         defer f.stop();
-        const st = try f.tmp.dir.statFile(io, "mcp.sock", .{ .follow_symlinks = false });
+        const st = try f.tmp.dir.statFile(io, "run/mcp.sock", .{ .follow_symlinks = false });
         try std.testing.expectEqual(Io.File.Kind.unix_domain_socket, st.kind);
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    }
+
+    fn makeDir(tmp: *std.testing.TmpDir, name: []const u8, mode: std.posix.mode_t) !void {
+        const io = std.testing.io;
+        try tmp.dir.createDir(io, name, .fromMode(0o700));
+        // The umask removes bits at creation, so set the mode after it.
+        try tmp.dir.setFilePermissions(io, name, .fromMode(mode), .{});
+    }
+
+    test "createPrivateDirectory gives mode 0700 on POSIX" {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmpPath(&tmp, "private");
+        defer gpa.free(dir);
+        try unix.createPrivateDirectory(io, dir);
+        const st = try tmp.dir.statFile(io, "private", .{});
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), st.permissions.toMode() & 0o7777);
+    }
+
+    test "unix socket server refuses a directory that others can write to on POSIX" {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try makeDir(&tmp, "open", 0o777);
+        try std.testing.expectError(error.DirectoryNotPrivate, tryBind(&tmp, "open", 0o600));
+        try std.testing.expectError(error.DirectoryNotPrivate, tryBind(&tmp, "open", 0o666));
+        // The sticky bit does not help: another account can put a socket at the path before
+        // the server starts.
+        try makeDir(&tmp, "sticky", 0o1777);
+        try std.testing.expectError(error.DirectoryNotPrivate, tryBind(&tmp, "sticky", 0o600));
+        // The group can write only when the mode gives the group access to the socket.
+        try makeDir(&tmp, "group", 0o770);
+        try std.testing.expectError(error.DirectoryNotPrivate, tryBind(&tmp, "group", 0o600));
+        try tryBind(&tmp, "group", 0o660);
+        // An existing directory that is not private is not accepted as private.
+        const open = try tmpPath(&tmp, "open");
+        defer gpa.free(open);
+        try std.testing.expectError(error.DirectoryNotPrivate, unix.createPrivateDirectory(io, open));
+    }
+
+    test "unix socket server refuses a directory with a parent that others can rename it in" {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try makeDir(&tmp, "parent", 0o777);
+        try tmp.dir.createDir(io, "parent/run", .fromMode(0o700));
+        try std.testing.expectError(error.DirectoryNotPrivate, tryBind(&tmp, "parent/run", 0o600));
+        // With the sticky bit, other accounts cannot rename a directory that they do not own.
+        try tmp.dir.setFilePermissions(io, "parent", .fromMode(0o1777), .{});
+        try tryBind(&tmp, "parent/run", 0o600);
     }
 };
 
@@ -564,8 +673,34 @@ const windows_access_tests = struct {
         var transport: unix.Server = .init(io, gpa, &server, .{ .path = path, .mode = 0o666 });
         defer transport.deinit();
         try transport.bind();
+        // The list is not protected: it comes from the directory.
         const report = try windows_acl.inspect(transport.path.?);
         try std.testing.expect(!report.protected);
-        try std.testing.expect(!report.only_current_user);
+    }
+
+    test "createPrivateDirectory gives an owner-only list on Windows" {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmpPath(&tmp, "private");
+        defer gpa.free(dir);
+        try unix.createPrivateDirectory(io, dir);
+        const report = try windows_acl.inspect(dir);
+        try std.testing.expect(report.protected);
+        try std.testing.expectEqual(1, report.ace_count);
+        try std.testing.expect(report.only_current_user);
+    }
+
+    test "unix socket server refuses a directory that others can write to on Windows" {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const dir = try tmpPath(&tmp, "open");
+        defer gpa.free(dir);
+        try unix.createPrivateDirectory(io, dir);
+        try windows_acl.openToEveryone(dir);
+        try std.testing.expectError(error.DirectoryNotPrivate, tryBind(&tmp, "open", 0o600));
+        try std.testing.expectError(error.DirectoryNotPrivate, tryBind(&tmp, "open", 0o666));
+        try std.testing.expectError(error.DirectoryNotPrivate, unix.createPrivateDirectory(io, dir));
     }
 };
