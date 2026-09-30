@@ -1,7 +1,21 @@
 #!/bin/sh
-# Reject attribution trailers. This repository has one author and one committer.
-if grep -Eiq '^(Co-Authored-By|Signed-off-by|Reviewed-by|Acked-by):' "$1"; then
+# The commit policy of this repository. It has one author and one committer, every commit
+# follows Conventional Commits, and the body describes every changed file.
+msg="$1"
+if grep -Eiq '^(Co-Authored-By|Signed-off-by|Reviewed-by|Acked-by):' "$msg"; then
   echo "commit-msg: attribution trailers are not permitted in this repository" >&2
   exit 1
 fi
-exit 0
+subject=$(grep -v '^#' "$msg" | head -n 1)
+if ! printf '%s\n' "$subject" | grep -Eq '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([A-Za-z0-9._/, -]+\))?!?: .+'; then
+  echo "commit-msg: the subject must follow Conventional Commits: type(scope): description" >&2
+  exit 1
+fi
+status=0
+for file in $(git diff --cached --name-only); do
+  if ! grep -Eq "^[[:space:]]*$(printf '%s' "$file" | sed 's/[][\\.*^$/]/\\&/g'):" "$msg"; then
+    echo "commit-msg: the body has no line for $file" >&2
+    status=1
+  fi
+done
+exit $status

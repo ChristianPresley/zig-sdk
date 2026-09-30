@@ -7,6 +7,9 @@ Thank you for your interest in zig-sdk. This page tells you how the project acce
 - Every commit is GPG-signed by the maintainer, Christian Presley.
 - The maintainer is the only author and the only committer.
 - Commit messages have no attribution trailer. The `commit-msg` hook rejects them.
+- The subject follows Conventional Commits: `type(scope): description`. The types are feat, fix, docs, style, refactor, perf, test, build, ci, chore and revert.
+- The body has one line for each changed file: `path: what changed`. The `commit-msg` hook and the `commit-policy` CI job check this.
+- Pull request descriptions do not carry a generator or attribution line.
 - Merges happen on the maintainer's computer with `git merge --ff-only`. The GitHub web interface is not used for merges.
 
 If you send a pull request, the maintainer applies your change as a signed commit and credits you in `CHANGELOG.md`.
