@@ -560,7 +560,7 @@ const Recording = struct {
     }
 };
 
-/// A client transport that answers each request with the next canned reply. A reply is the
+/// A client transport that answers each request with the next canned response. A response text is the
 /// `"result":...` or `"error":...` member of the response. The transport adds the request id.
 const Canned = struct {
     arena: Allocator,

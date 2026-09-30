@@ -530,6 +530,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-29
 - Note: Release dates verified on GitHub releases page.
 
+### MCP-SPEC-SOURCE-2026-07-28
+
+- Title: MCP specification 2026-07-28 source pages (docs/specification/2026-07-28)
+- Author: Model Context Protocol project
+- Publisher: GitHub
+- Date: commit 046fa30efd374370afb87ef830bd788eac5f217e
+- URL: <https://github.com/modelcontextprotocol/modelcontextprotocol/tree/046fa30efd374370afb87ef830bd788eac5f217e/docs/specification/2026-07-28>
+- Accessed: 2026-09-30
+- Note: Vendored in test/fixtures/mcp_spec_2026_07_28 for the requirement matrix.
+
 ### MCP-STDIO-2026-07-28
 
 - Title: stdio transport 2026-07-28
@@ -1463,6 +1473,33 @@ This page lists every source that the wiki, the README and the design documents 
 - Date: 2019-04-06
 - URL: <https://github.github.com/gfm/>
 - Accessed: 2026-09-29
+
+### GH-ACTION-CONFIGURE-PAGES
+
+- Title: actions/configure-pages
+- Author: GitHub, Inc.
+- Publisher: GitHub
+- Date: v6
+- URL: <https://github.com/actions/configure-pages>
+- Accessed: 2026-09-30
+
+### GH-ACTION-DEPLOY-PAGES
+
+- Title: actions/deploy-pages
+- Author: GitHub, Inc.
+- Publisher: GitHub
+- Date: v5
+- URL: <https://github.com/actions/deploy-pages>
+- Accessed: 2026-09-30
+
+### GH-ACTION-UPLOAD-PAGES-ARTIFACT
+
+- Title: actions/upload-pages-artifact
+- Author: GitHub, Inc.
+- Publisher: GitHub
+- Date: v5
+- URL: <https://github.com/actions/upload-pages-artifact>
+- Accessed: 2026-09-30
 
 ### GH-ACTIONS
 

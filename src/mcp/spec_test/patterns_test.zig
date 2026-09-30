@@ -597,7 +597,7 @@ test "stdio server ends a listen stream with a result and then notifications/can
 /// A client transport that records each request and answers from a list of results.
 const FakeServer = struct {
     arena: Allocator,
-    /// The `result` of each round, as JSON text. A text that starts with `!` is sent as is.
+    /// The `result` of each round, as JSON text. The fake server sends a text that starts with `!` without a change.
     replies: []const []const u8,
     requests: std.ArrayList(Value) = .empty,
     hook_calls: *const u32,
@@ -812,9 +812,9 @@ const Listener = struct {
     token: Transport.CancelToken = .{},
     timeout: ?Io.Duration = null,
     acked: std.atomic.Value(bool) = .init(false),
-    /// The subscription id of the acknowledgement.
+    /// The subscription id of the acknowledgment.
     subscription_id: i64 = -1,
-    /// Acknowledgements that carried another subscription id.
+    /// Acknowledgments that carried another subscription id.
     foreign: u32 = 0,
     outcome: ?Client.RequestError = null,
 

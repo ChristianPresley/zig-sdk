@@ -1,19 +1,23 @@
-//! spec-matrix: checks the requirement mapping and renders the conformance matrix.
+//! The `spec-matrix` tool checks the requirement mapping and renders the conformance matrix.
 //!
 //! The tool reads the requirements of `docs/spec/requirements.zon` and the mapping of
-//! `docs/spec/requirement_tests.zon`. It fails when a requirement has no mapping, when a
-//! mapping names an id that is not a requirement, when an id has two mappings, and when a
-//! mapping cites a test that does not exist. A Zig test is `path:name` and must match a
-//! `test "name"` declaration in that file. A conformance scenario is
-//! `conformance:server/NAME` or `conformance:client/NAME` and must be in the scenario list of
-//! the mapping. The harness version of the mapping must be the version that CI runs.
+//! `docs/spec/requirement_tests.zon`. It fails in these conditions:
+//! - A requirement has no mapping.
+//! - A mapping names an id that is not a requirement.
+//! - An id has two mappings.
+//! - A mapping cites a test that does not exist.
 //!
-//! Usage: spec-matrix [--check] [--fail-on-must-gap] [--out PATH]
+//! A Zig test is `path:name` and must match a `test "name"` declaration in that file. A
+//! conformance scenario is `conformance:server/NAME` or `conformance:client/NAME` and must be
+//! in the scenario list of the mapping. The harness version of the mapping must be the
+//! version that CI runs.
+//!
+//! Usage: `spec-matrix [--check] [--fail-on-must-gap] [--out PATH]`
 //!
 //! Without `--check` the tool writes the matrix to `docs/generated/conformance-matrix.md`.
 //! With `--check` it does not write. It fails when the file on disk is not equal to a new
-//! rendering. `--fail-on-must-gap` also fails when a MUST or MUST NOT requirement has the
-//! status `gap`.
+//! matrix. `--fail-on-must-gap` also fails when a requirement of the level `must` or
+//! `must_not` has the status `gap`.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;

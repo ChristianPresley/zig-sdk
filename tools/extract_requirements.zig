@@ -1,16 +1,16 @@
-//! extract-requirements: finds the normative sentences of the MCP specification.
+//! The `extract-requirements` tool finds the normative sentences of the MCP specification.
 //!
-//! The tool reads each `.mdx` page of the vendored specification, splits the page into
-//! sentences and keeps each sentence that has an RFC 2119 keyword in uppercase. It gives
+//! The tool reads each `.mdx` page of the vendored specification and splits the page into
+//! sentences. It keeps each sentence that has an RFC 2119 keyword in uppercase. It gives
 //! each sentence a stable id and writes the list to `docs/spec/requirements.zon`.
 //!
-//! Usage: extract-requirements [--check] [--spec DIR] [--out PATH]
+//! Usage: `extract-requirements [--check] [--spec DIR] [--out PATH]`
 //!
 //! `--check` does not write. It fails when the file on disk is not equal to a new extraction.
 //!
 //! Rules of the extraction:
-//! - Front matter, fenced code, MDX comments, `import` and `export` lines and tag-only lines
-//!   are not prose. Tags inside prose are removed and their text stays.
+//! - Front matter, fenced code, `.mdx` comments, `import` and `export` lines and tag-only
+//!   lines are not prose. The tool removes tags inside prose and keeps their text.
 //! - Each paragraph, list item and table cell is split into sentences.
 //! - A sentence with a keyword that ends with a colon and has a nested list after it is a
 //!   stem. Each item of the list without its own keyword becomes one requirement, with the
