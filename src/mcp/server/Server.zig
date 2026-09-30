@@ -1357,18 +1357,11 @@ pub const shutdown_reason = "server shutdown";
 /// End every subscription gracefully. Call before the transport closes.
 pub fn shutdownSubscriptions(self: *Server, io: Io) void {
     self.shutting_down.store(true, .release);
+    // `CancelToken.shutdown` takes no lock, so the loop runs under the lock. A listen task
+    // then cannot remove its entry and free its token while the loop reads the token.
     self.subscriptions_lock.lockUncancelable(io);
-    const subs = self.subscriptions.items;
-    // Copy the tokens: `listen` removes entries as the tasks wake.
-    var tokens: [64]*Transport.CancelToken = undefined;
-    var count: usize = 0;
-    for (subs) |s| {
-        if (count == tokens.len) break;
-        tokens[count] = s.cancel;
-        count += 1;
-    }
-    self.subscriptions_lock.unlock(io);
-    for (tokens[0..count]) |t| t.shutdown(io, shutdown_reason);
+    defer self.subscriptions_lock.unlock(io);
+    for (self.subscriptions.items) |s| s.cancel.shutdown(io, shutdown_reason);
 }
 
 fn publish(self: *Server, io: Io, event: Event, uri: ?[]const u8) void {

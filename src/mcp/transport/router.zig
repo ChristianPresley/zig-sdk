@@ -152,9 +152,42 @@ fn logCancelled(arena: Allocator, params: ?Value) void {
 }
 
 /// True when `frame` is a response. A response has "result" or "error" and no "method" at
-/// the top level. The frames come from the SDK parser, so a cheap check is enough.
+/// the top level. Keys inside nested values do not count, so a notification with an
+/// "error" member in its data is not a response.
 pub fn frameIsResponse(frame: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    var scanner: std.json.Scanner = .initCompleteInput(fba.allocator(), frame);
+    return topLevelResponse(fba.allocator(), &scanner) catch fallbackIsResponse(frame);
+}
+
+fn topLevelResponse(fba: std.mem.Allocator, scanner: *std.json.Scanner) !bool {
+    if (try scanner.next() != .object_begin) return error.NotAnObject;
+    var found = false;
+    while (true) {
+        switch (try scanner.nextAllocMax(fba, .alloc_if_needed, 64)) {
+            .object_end => return found,
+            .string, .allocated_string => |key| {
+                if (std.mem.eql(u8, key, "method")) return false;
+                if (std.mem.eql(u8, key, "result") or std.mem.eql(u8, key, "error")) found = true;
+            },
+            else => return error.UnexpectedToken,
+        }
+        try scanner.skipValue();
+    }
+}
+
+/// The check for a frame that the scanner cannot read in the fixed buffer.
+fn fallbackIsResponse(frame: []const u8) bool {
+    if (std.mem.indexOf(u8, frame, "\"method\"") != null) return false;
     return std.mem.indexOf(u8, frame, "\"result\"") != null or std.mem.indexOf(u8, frame, "\"error\"") != null;
+}
+
+test "only top-level keys make a frame a response" {
+    try std.testing.expect(frameIsResponse("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"));
+    try std.testing.expect(frameIsResponse("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"x\"}}"));
+    try std.testing.expect(!frameIsResponse("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"error\",\"data\":{\"error\":\"disk full\",\"result\":1}}}"));
+    try std.testing.expect(!frameIsResponse("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"progress\":1,\"message\":\"\\\"error\\\"\"}}"));
 }
 
 test "router routes responses by id and progress by token" {
