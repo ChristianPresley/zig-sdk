@@ -15,3 +15,5 @@ test {
 }
 /// The HTTP/1.1 client connection the Streamable HTTP client uses.
 pub const http1 = @import("transport/http1.zig");
+/// The `x-mcp-header` bindings shared by the HTTP and gRPC clients.
+pub const tool_headers = @import("transport/tool_headers.zig");

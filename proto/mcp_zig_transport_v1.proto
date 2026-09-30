@@ -1,0 +1,19 @@
+// The gRPC binding of the Model Context Protocol used by the Zig SDK: a JSON-RPC tunnel.
+// One `Call` carries one JSON-RPC request and streams back its notifications and its one
+// response. See the wiki page "Transport-gRPC" for the normative description.
+syntax = "proto3";
+
+package mcp.zig.transport.v1;
+
+// One JSON-RPC 2.0 message, encoded as UTF-8 JSON text.
+message JsonRpcMessage {
+  bytes jsonrpc = 1;
+  reserved 2 to 15;
+}
+
+service Mcp {
+  // Send one request. The response stream carries zero or more notifications related to
+  // the request, then exactly one response. A `subscriptions/listen` request keeps the
+  // stream open until the server or the client ends it.
+  rpc Call(JsonRpcMessage) returns (stream JsonRpcMessage);
+}

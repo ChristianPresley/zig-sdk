@@ -31,7 +31,7 @@ The project is in development. The table shows the parts that exist today.
 | Client: in-memory, stdio and Streamable HTTP transports, multi round-trip driver | Done |
 | Authorization: OAuth 2.1 client | Done, passes every scored `auth/*` scenario of the official suite |
 | Authorization: resource server helpers (bearer checks, metadata, JWT) | Done |
-| gRPC transport (JSON-RPC tunnel over HTTP/2) | Planned |
+| gRPC transport (JSON-RPC tunnel over HTTP/2, module `mcp_grpc`) | Done, with its own protobuf, HPACK, HTTP/2 and gRPC layers |
 | Tasks extension (server and client) | Done, passes the functional checks of the ten unscored scenarios |
 
 ## Requirements

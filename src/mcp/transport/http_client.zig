@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const http = std.http;
 const http1 = @import("http1.zig");
+const tool_headers = @import("tool_headers.zig");
 const Transport = @import("Transport.zig");
 const envelope = @import("envelope.zig");
 const sse = @import("sse.zig");
@@ -30,8 +31,7 @@ pub const Client = struct {
     options: Options,
     /// The system trust store, loaded for `https` URLs without an explicit `tls` option.
     system_bundle: ?std.crypto.Certificate.Bundle = null,
-    tool_headers: std.StringHashMapUnmanaged(ToolHeaders) = .empty,
-    tool_headers_lock: Io.Mutex = .init,
+    tool_headers: tool_headers.Map,
 
     pub const Options = struct {
         url: []const u8,
@@ -48,9 +48,6 @@ pub const Client = struct {
 
     pub const TlsSetup = http1.TlsSetup;
 
-    const Binding = struct { param: []u8, header: []u8 };
-    const ToolHeaders = struct { name: []u8, bindings: []Binding };
-
     pub const InitError = error{ OutOfMemory, InvalidUrl, TrustStoreUnavailable };
 
     pub fn init(io: Io, gpa: Allocator, options: Options) InitError!*Client {
@@ -63,6 +60,7 @@ pub const Client = struct {
             .url = undefined,
             .target = undefined,
             .options = options,
+            .tool_headers = .init(gpa, io),
         };
         errdefer self.arena_state.deinit();
         const arena = self.arena_state.allocator();
@@ -79,9 +77,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         if (self.system_bundle) |*b| b.deinit(self.gpa);
-        var it = self.tool_headers.valueIterator();
-        while (it.next()) |th| self.freeToolHeaders(th.*);
-        self.tool_headers.deinit(self.gpa);
+        self.tool_headers.deinit();
         self.arena_state.deinit();
         self.gpa.destroy(self);
     }
@@ -90,15 +86,6 @@ pub const Client = struct {
     fn open(self: *Client) http1.OpenError!*http1.Connection {
         const secure: ?http1.TlsSetup = if (!self.target.secure) null else self.options.tls orelse .{ .trust = .{ .bundle = &self.system_bundle.? } };
         return http1.Connection.open(self.io, self.gpa, self.target.host, self.target.port, secure);
-    }
-
-    fn freeToolHeaders(self: *Client, th: ToolHeaders) void {
-        for (th.bindings) |b| {
-            self.gpa.free(b.param);
-            self.gpa.free(b.header);
-        }
-        self.gpa.free(th.bindings);
-        self.gpa.free(th.name);
     }
 
     pub fn transport(self: *Client) Transport.ClientTransport {
@@ -293,16 +280,7 @@ pub const Client = struct {
         if (method != .@"tools/call") return;
         const tool_name = json.getString(params, "name") orelse return;
         const arguments = params.object.get("arguments") orelse return;
-        if (arguments != .object) return;
-        self.tool_headers_lock.lockUncancelable(self.io);
-        defer self.tool_headers_lock.unlock(self.io);
-        const th = self.tool_headers.get(tool_name) orelse return;
-        for (th.bindings) |b| {
-            const value = arguments.object.get(b.param) orelse continue;
-            const encoded = (try envelope.encodeParam(arena, value)) orelse continue;
-            const header_name = try std.mem.concat(arena, u8, &.{ envelope.header_param_prefix, b.header });
-            try headers.append(arena, .{ .name = header_name, .value = encoded });
-        }
+        try self.tool_headers.appendParamHeaders(arena, headers, tool_name, arguments, false);
     }
 
     /// Hand a frame to the sink. A `tools/list` result is scanned for header annotations
@@ -310,67 +288,8 @@ pub const Client = struct {
     fn deliver(self: *Client, io: Io, arena: Allocator, ex: *Transport.Exchange, frame: []const u8) Transport.ExchangeError!void {
         var out = frame;
         if (std.mem.eql(u8, ex.method, "tools/list")) {
-            if (self.learnToolHeaders(arena, frame) catch null) |rewritten| out = rewritten;
+            if (self.tool_headers.learn(arena, frame) catch null) |rewritten| out = rewritten;
         }
         ex.sink.deliver(io, out) catch return error.InvalidFrame;
-    }
-
-    /// Returns a rewritten frame when tools were removed, else null.
-    fn learnToolHeaders(self: *Client, arena: Allocator, frame: []const u8) !?[]const u8 {
-        var tree = try json.parseTree(arena, frame);
-        if (tree != .object) return null;
-        const result = tree.object.get("result") orelse return null;
-        if (result != .object) return null;
-        const tools = result.object.get("tools") orelse return null;
-        if (tools != .array) return null;
-        var kept: std.json.Array = .init(arena);
-        var removed = false;
-        for (tools.array.items) |tool| {
-            if (tool != .object) continue;
-            const name = json.getString(tool, "name") orelse continue;
-            const schema = tool.object.get("inputSchema") orelse .null;
-            if (!envelope.schemaHeadersValid(schema)) {
-                removed = true;
-                continue;
-            }
-            try self.storeBindings(name, schema);
-            try kept.append(tool);
-        }
-        if (!removed) return null;
-        var new_result = result;
-        try new_result.object.put(arena, "tools", .{ .array = kept });
-        try tree.object.put(arena, "result", new_result);
-        return try json.writeAlloc(arena, tree);
-    }
-
-    fn storeBindings(self: *Client, name: []const u8, schema: Value) !void {
-        var bindings: std.ArrayList(Binding) = .empty;
-        errdefer {
-            for (bindings.items) |b| {
-                self.gpa.free(b.param);
-                self.gpa.free(b.header);
-            }
-            bindings.deinit(self.gpa);
-        }
-        if (schema == .object) if (schema.object.get("properties")) |props| if (props == .object) {
-            var it = props.object.iterator();
-            while (it.next()) |kv| {
-                const prop = kv.value_ptr.*;
-                if (prop != .object) continue;
-                const header = json.getString(prop, "x-mcp-header") orelse continue;
-                try bindings.append(self.gpa, .{
-                    .param = try self.gpa.dupe(u8, kv.key_ptr.*),
-                    .header = try self.gpa.dupe(u8, header),
-                });
-            }
-        };
-        const th: ToolHeaders = .{ .name = try self.gpa.dupe(u8, name), .bindings = try bindings.toOwnedSlice(self.gpa) };
-        self.tool_headers_lock.lockUncancelable(self.io);
-        defer self.tool_headers_lock.unlock(self.io);
-        if (self.tool_headers.fetchRemove(name)) |old| self.freeToolHeaders(old.value);
-        self.tool_headers.put(self.gpa, th.name, th) catch |e| {
-            self.freeToolHeaders(th);
-            return e;
-        };
     }
 };

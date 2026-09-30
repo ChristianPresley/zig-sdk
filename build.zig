@@ -16,6 +16,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    // The gRPC transport is its own module; nothing in `mcp` imports it.
+    const mcp_grpc = b.addModule("mcp_grpc", .{
+        .root_source_file = b.path("src/mcp_grpc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "mcp", .module = mcp }},
+    });
+    const grpc_tests = b.addTest(.{ .root_module = mcp_grpc });
+    test_step.dependOn(&b.addRunArtifact(grpc_tests).step);
+
     // Formatting check.
     const fmt_step = b.step("fmt", "Check formatting");
     const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "build.zig.zon", "src", "examples", "tools", "conformance" }, .check = true });
