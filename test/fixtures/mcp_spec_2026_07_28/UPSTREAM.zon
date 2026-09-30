@@ -1,0 +1,13 @@
+.{
+    .repo = "https://github.com/modelcontextprotocol/modelcontextprotocol",
+    .commit = "046fa30efd374370afb87ef830bd788eac5f217e",
+    .path = "docs/specification/2026-07-28",
+    .fetched = "2026-09-30",
+    .license = "LICENSE (MIT, in transition to Apache-2.0; specification contributions are Apache-2.0)",
+    .modified = false,
+    // Pages of the upstream directory that are not copied here:
+    // schema.mdx is generated from schema.ts, which test/fixtures/mcp_schema_2026_07_28 has.
+    // changelog.mdx lists the changes since 2025-11-25 and is not normative.
+    // The two PNG images of server/ are not text.
+    .omitted = .{ "schema.mdx", "changelog.mdx", "server/resource-picker.png", "server/slash-command.png" },
+}

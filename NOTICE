@@ -10,5 +10,11 @@ test/fixtures/mcp_schema_2026_07_28/ at the commit recorded in UPSTREAM.zon. The
 project distributes them under a licence that is in transition from the MIT License to the
 Apache License, Version 2.0; the upstream LICENSE file is included next to the fixtures.
 
+This product includes the pages of the Model Context Protocol specification, revision
+2026-07-28, from the same repository, vendored under test/fixtures/mcp_spec_2026_07_28/ at
+the commit recorded in UPSTREAM.zon, with the upstream LICENSE file next to them. The files
+docs/spec/requirements.zon and docs/generated/conformance-matrix.md quote sentences of these
+pages.
+
 No text of the ASD-STE100 Simplified Technical English standard is included in this
 product. The project cites its rules by number only.

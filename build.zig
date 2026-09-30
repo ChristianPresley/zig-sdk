@@ -153,6 +153,13 @@ pub fn build(b: *std.Build) void {
     addTool(b, "gen-dictionary", "Render the project dictionary", "tools/gen_dictionary.zig", &.{ "--out", "docs/generated/dictionary.md" });
     addTool(b, "check-version", "Check that a release tag matches the package version", "tools/check_version.zig", &.{});
     addTool(b, "changelog-section", "Print the changelog section of a version", "tools/changelog_section.zig", &.{});
+    addTool(b, "extract-requirements", "Extract the normative sentences of the specification", "tools/extract_requirements.zig", &.{});
+
+    // Unit tests of the requirement tools run with the other tests.
+    for ([_][]const u8{"tools/extract_requirements.zig"}) |path| {
+        const tool_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(path), .target = b.graph.host }) });
+        test_step.dependOn(&b.addRunArtifact(tool_tests).step);
+    }
 }
 
 fn addTool(b: *std.Build, step_name: []const u8, description: []const u8, source: []const u8, default_args: []const []const u8) void {

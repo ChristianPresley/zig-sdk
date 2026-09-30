@@ -26,6 +26,7 @@ jobs:
       - run: zig build census
       - run: zig build gen-bibliography
       - run: zig build gen-dictionary -- --check --out docs/generated/dictionary.md
+      - run: zig build extract-requirements -- --check
 
   commit-policy:
     name: commit-policy
