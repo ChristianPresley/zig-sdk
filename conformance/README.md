@@ -18,7 +18,7 @@ Do these steps to run the suite on your computer:
 3. Run the suite: `npx --yes @modelcontextprotocol/conformance@0.2.0-alpha.11 server --url http://127.0.0.1:3000/mcp --requirements 2026-07-28 --expected-failures conformance/expected-failures-server.yml`.
 4. Read the summary. The suite exits with code 0 when each scored scenario passes.
 
-Add `--stdio` to the start command to serve on standard input and output instead. Add `--grpc-port N` to serve the gRPC binding as well; the CI job `grpc-interop` calls it from a Node `http2` peer (`.github/interop/h2_peer.mjs`) and from `curl` with HTTP/2 prior knowledge.
+Add `--stdio` to the start command to serve on standard input and output instead. Add `--grpc-port N` to serve the gRPC binding as well. The CI job `grpc-interop` calls it from a Node `http2` peer and from `curl` with HTTP/2 prior knowledge.
 
 ## Scope
 

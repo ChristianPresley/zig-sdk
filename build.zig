@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
 
     // Examples.
     const examples_step = b.step("examples", "Build all examples");
-    const example_names = [_][]const u8{ "stdio_server", "https_server" };
+    const example_names = [_][]const u8{ "stdio_server", "https_server", "grpc_server", "grpc_client", "client_cli" };
     for (example_names) |name| {
         const exe = b.addExecutable(.{
             .name = name,
@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "mcp", .module = mcp }},
+                .imports = &.{ .{ .name = "mcp", .module = mcp }, .{ .name = "mcp_grpc", .module = mcp_grpc } },
             }),
         });
         const install = b.addInstallArtifact(exe, .{});
