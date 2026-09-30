@@ -212,6 +212,40 @@ test "stdio client drives the example server process" {
     try std.testing.expectEqual(@as(i64, -32602), diag.rpc_error.?.code);
 }
 
+/// End the server process behind the client's back, as a crash would.
+fn crashChild(proc: *mcp.transport.stdio.Client) void {
+    if (@import("builtin").os.tag == .windows) {
+        _ = std.os.windows.ntdll.NtTerminateProcess(proc.child.id.?, @enumFromInt(9));
+    } else {
+        std.posix.kill(proc.child.id.?, .KILL) catch {};
+    }
+}
+
+test "stdio client restarts a crashed server and the client re-issues the request" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    Io.Dir.cwd().access(io, exampleServerPath(), .{}) catch return error.SkipZigTest;
+    const proc = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = &.{exampleServerPath()}, .max_restarts = 1 });
+    defer proc.deinit();
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(proc.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    _ = try client.discover(arena, .{ .timeout = .fromSeconds(20) });
+    crashChild(proc);
+    // The reader sees the end of the stream and spawns the server again. `server/discover`
+    // is idempotent, so a lost request is re-issued to the new process.
+    const disc = try client.discover(arena, .{ .timeout = .fromSeconds(20) });
+    try std.testing.expect(disc.capabilities.tools != null);
+    try std.testing.expectEqual(1, proc.restartCount());
+    // A second crash exceeds the limit: the stream stays closed.
+    crashChild(proc);
+    try std.testing.expectError(error.Closed, client.discover(arena, .{ .timeout = .fromSeconds(20), .retry = .never }));
+}
+
 test "stdio client spawns and closes without requests" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

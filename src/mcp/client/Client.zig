@@ -84,8 +84,20 @@ pub const RequestOptions = struct {
     /// Return the `CreateTaskResult` of a `tools/call` in `Response.task` instead of waiting
     /// for the task. Only meaningful when `capabilities.extensions` declares the extension.
     allow_task: bool = false,
+    /// What to do when the stream is lost before any response byte arrived.
+    retry: Retry = .auto,
     diagnostics: ?*Diagnostics = null,
     userdata: ?*anyopaque = null,
+};
+
+pub const Retry = enum {
+    /// Re-issue idempotent methods with a new id, up to `limits.max_lost_stream_retries`.
+    auto,
+    /// Never re-issue.
+    never,
+    /// Re-issue every method, also `tools/call` and a `subscriptions/listen` stream that
+    /// already delivered events. Use it to keep a listen stream open across a server restart.
+    force,
 };
 
 pub const RequestError = error{
@@ -341,10 +353,13 @@ const Collector = struct {
     response: ?Value = null,
     rpc_error: ?types.Error = null,
     invalid: bool = false,
+    /// Frames delivered so far. A lost stream is only retried when nothing arrived.
+    frames: u32 = 0,
 
     fn onFrame(ptr: *anyopaque, io: Io, frame: []const u8) anyerror!void {
         _ = io;
         const self: *Collector = @ptrCast(@alignCast(ptr));
+        self.frames += 1;
         const msg = message.Message.parse(self.arena, frame) catch {
             self.invalid = true;
             return error.InvalidFrame;
@@ -402,6 +417,7 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
 
     var round: u32 = 0;
     var version_retried = false;
+    var lost_retries: u32 = 0;
     var input_responses: ?std.json.ObjectMap = null;
     var request_state: ?[]const u8 = null;
     while (round < self.options.limits.mrtr_max_rounds_client) : (round += 1) {
@@ -430,9 +446,15 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             error.OutOfMemory => return error.OutOfMemory,
             error.Timeout => return error.Timeout,
             error.Canceled => return error.Canceled,
-            error.Closed => return error.Closed,
             error.InvalidFrame, error.HttpStatus => return error.InvalidResponse,
-            error.WriteFailed, error.ReadFailed => return error.TransportFailed,
+            error.Closed, error.WriteFailed, error.ReadFailed => {
+                if (self.canRetryLost(options, known, collector.frames, lost_retries)) {
+                    lost_retries += 1;
+                    round -|= 1;
+                    continue;
+                }
+                return if (e == error.Closed) error.Closed else error.TransportFailed;
+            },
         };
         if (collector.rpc_error) |rpc| {
             // One retry when the server rejects the version but supports ours (-32022).
@@ -484,6 +506,17 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
         request_state = ir.requestState;
     }
     return error.TooManyRounds;
+}
+
+/// True when a request whose stream was lost can be sent again with a new id.
+fn canRetryLost(self: *Client, options: RequestOptions, known: ?methods.Method, frames: u32, done: u32) bool {
+    if (done >= self.options.limits.max_lost_stream_retries) return false;
+    if (options.cancel) |c| if (c.isCancelled()) return false;
+    return switch (options.retry) {
+        .never => false,
+        .force => true,
+        .auto => frames == 0 and known != null and known.?.isIdempotent(),
+    };
 }
 
 /// True when `data.supported` of a -32022 error lists the revision this SDK speaks.

@@ -44,6 +44,9 @@ max_progress_rate_per_s: u32 = 50,
 request_timeout: Io.Duration = .fromSeconds(60),
 max_total_timeout: Io.Duration = .fromSeconds(600),
 shutdown_grace: Io.Duration = .fromSeconds(2),
+/// How often the client re-issues a request after it lost the stream before any response
+/// byte. Only idempotent methods are retried unless the caller forces it.
+max_lost_stream_retries: u32 = 3,
 cancel_notify_timeout: Io.Duration = .fromSeconds(5),
 request_state_ttl: Io.Duration = .fromSeconds(600),
 page_size: u32 = 100,
