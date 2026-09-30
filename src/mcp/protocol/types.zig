@@ -125,8 +125,8 @@ pub const InputRequest = union(enum) {
     pub const jsonStringify = json.Discriminated(@This(), "method").jsonStringify;
 };
 
-/// Responses are keyed by the server-chosen request key; their shape is known only from the
-/// request they answer, so they are kept as raw JSON and decoded on demand.
+/// The server-chosen request key identifies each response. Only the request that it answers
+/// tells its shape, so the SDK keeps it as raw JSON and decodes it on demand.
 pub const InputRequests = std.json.ArrayHashMap(InputRequest);
 pub const InputResponses = std.json.ArrayHashMap(Value);
 

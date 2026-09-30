@@ -16,7 +16,7 @@ const RequestContext = @This();
 
 io: Io,
 gpa: Allocator,
-/// Freed when the request completes. Results may point into it.
+/// Freed when the request completes. Results can point into it.
 arena: Allocator,
 server: *Server,
 id: RequestId,
@@ -33,7 +33,7 @@ responder: Transport.Responder,
 kind: Transport.Kind,
 /// The `userdata` given at registration of the tool, resource or prompt.
 userdata: ?*anyopaque = null,
-/// Set by `setError`; returned as the JSON-RPC error of the request.
+/// Set by `setError`. Returned as the JSON-RPC error of the request.
 rpc_error: ?errors.RpcError = null,
 /// `params.name` or `params.uri`, used to bind sealed state to its target.
 target: []const u8 = "",

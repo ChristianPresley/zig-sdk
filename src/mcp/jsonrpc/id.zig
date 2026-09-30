@@ -1,5 +1,5 @@
-//! JSON-RPC request identifiers. Strings and integers are supported; integers that do not fit
-//! in an `i64` keep their digits verbatim. Fractional or exponent numbers are rejected.
+//! JSON-RPC request identifiers. The SDK accepts strings and integers. Integers that do not fit
+//! in an `i64` keep their digits verbatim. The parser rejects fractional or exponent numbers.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;

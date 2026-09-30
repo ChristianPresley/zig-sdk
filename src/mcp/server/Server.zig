@@ -36,7 +36,7 @@ pub const Options = struct {
     /// Exact mirror of the advertised `ServerCapabilities`. Registering a tool, resource or
     /// prompt declares the matching capability when it is absent.
     capabilities: types.ServerCapabilities = .{},
-    /// Which kinds of input requests handlers may issue.
+    /// Which kinds of input requests handlers can issue.
     mrtr: struct {
         elicitation: bool = true,
         sampling: bool = false,
@@ -167,7 +167,7 @@ subscriptions_lock: Io.Mutex = .init,
 state_codec: ?request_state.Codec = null,
 /// Counts of protocol violations by peers, for diagnostics.
 violations: std.atomic.Value(u64) = .init(0),
-/// Set once `shutdownSubscriptions` ran; later listen requests end immediately.
+/// Set once `shutdownSubscriptions` ran. Later listen requests end immediately.
 shutting_down: std.atomic.Value(bool) = .init(false),
 
 pub const InitError = error{ OutOfMemory, EntropyUnavailable };
@@ -395,7 +395,7 @@ pub fn notifyResourcesListChanged(self: *Server, io: Io) void {
 // ---------------------------------------------------------------------------------------------
 
 /// Handle one inbound message. Requests always end in exactly one `finish` or `abort` on the
-/// responder. Notifications and responses are ignored here; transports handle
+/// responder. This function ignores notifications and responses. Transports process
 /// `notifications/cancelled` themselves.
 pub fn handle(self: *Server, io: Io, inbound: Transport.Inbound) void {
     switch (inbound.message) {

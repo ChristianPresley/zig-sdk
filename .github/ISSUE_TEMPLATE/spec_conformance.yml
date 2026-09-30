@@ -1,0 +1,16 @@
+name: Specification conformance
+description: Report a difference between the SDK and the MCP specification.
+labels: [conformance]
+body:
+  - type: input
+    id: clause
+    attributes:
+      label: Specification clause
+    validations:
+      required: true
+  - type: textarea
+    id: difference
+    attributes:
+      label: Difference
+    validations:
+      required: true

@@ -75,7 +75,7 @@ pub const Framer = struct {
 };
 
 /// Write one framed message: `text` followed by a newline. `text` must not contain a raw
-/// newline; minified JSON never does.
+/// newline. Minified JSON never does.
 pub fn writeFrame(writer: *Io.Writer, text: []const u8) Io.Writer.Error!void {
     std.debug.assert(std.mem.findScalar(u8, text, '\n') == null);
     try writer.writeAll(text);

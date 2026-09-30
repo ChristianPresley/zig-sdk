@@ -1,0 +1,16 @@
+# Words that this project does not use in prose, with the project replacement.
+# Format: word -> replacement. Lines that start with # are comments.
+# The alternatives are the project's own wording and are tied to the glossary.
+should -> must (when it is a requirement) or "We recommend that" (when it is advice)
+shall -> must
+may -> can
+ensure -> make sure
+ensures -> makes sure
+however -> but
+utilize -> use
+utilizes -> uses
+via -> through, or with
+session -> (forbidden: the protocol is stateless; describe the request or the stream)
+following -> these, or that follows
+implement -> write, or provide
+implements -> provides

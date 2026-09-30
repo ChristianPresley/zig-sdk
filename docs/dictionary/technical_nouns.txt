@@ -1,0 +1,96 @@
+# Project technical nouns (ASD-STE100 rule 1.5, categories 15 and 19), one per line.
+# PN-1 protocol nouns
+server
+client
+host
+tool
+resource
+resource template
+prompt
+sampling
+elicitation
+root
+capability
+request
+response
+notification
+result
+error
+message
+JSON-RPC
+method
+params
+progress token
+cursor
+page
+subscription
+completion
+logging level
+annotation
+content block
+protocol version
+authorization server
+access token
+bearer token
+scope
+# PN-2 transport nouns
+transport
+stdio transport
+Streamable HTTP transport
+gRPC transport
+stream
+endpoint
+connection
+header
+event stream
+TLS
+port
+socket
+frame
+payload
+# PN-3 Zig and build nouns
+allocator
+arena
+module
+package
+build graph
+build step
+comptime
+slice
+struct
+union
+enum
+error set
+error union
+optional
+reader
+writer
+buffer
+byte
+thread
+cache
+artifact
+target
+# PN-4 repository and process nouns
+repository
+wiki
+wiki page
+commit
+signed commit
+GPG key
+branch
+pull request
+issue
+tag
+release
+changelog
+workflow
+job
+runner
+contributor
+maintainer
+reviewer
+bibliography
+reference
+style guide
+dictionary

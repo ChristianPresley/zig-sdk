@@ -1,0 +1,16 @@
+name: Documentation
+description: Report a documentation problem or a Simplified Technical English deviation.
+labels: [documentation]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Page or file
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+    validations:
+      required: true

@@ -1,0 +1,14 @@
+zig-sdk
+Copyright 2026 Christian Presley
+
+This product includes software developed by Christian Presley and licensed under the
+Apache License, Version 2.0.
+
+This product includes test fixtures from the Model Context Protocol specification
+repository (https://github.com/modelcontextprotocol/modelcontextprotocol), vendored under
+test/fixtures/mcp_schema_2026_07_28/ at the commit recorded in UPSTREAM.zon. The upstream
+project distributes them under a licence that is in transition from the MIT License to the
+Apache License, Version 2.0; the upstream LICENSE file is included next to the fixtures.
+
+No text of the ASD-STE100 Simplified Technical English standard is included in this
+product. The project cites its rules by number only.

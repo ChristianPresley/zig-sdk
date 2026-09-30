@@ -1,0 +1,15 @@
+name: Feature request
+description: Ask for a feature that the MCP specification 2026-07-28 defines.
+labels: [enhancement]
+body:
+  - type: input
+    id: spec
+    attributes:
+      label: Specification section
+      description: Link to the section of the 2026-07-28 specification.
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you need?
+    validations:
+      required: true

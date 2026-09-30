@@ -1,16 +1,16 @@
 //! Maps every schema definition that has an example fixture to its Zig type and wire role.
-//! `golden_test.zig` uses this table; the census tool checks it against `schema.json`.
+//! `golden_test.zig` uses this table. The census tool checks it against `schema.json`.
 const std = @import("std");
 const types = @import("types.zig");
 
 pub const Role = enum {
     /// A plain data type: the example is the value itself.
     data,
-    /// A JSON-RPC request envelope; `T` is the params type.
+    /// A JSON-RPC request envelope. `T` is the params type.
     request,
-    /// A JSON-RPC notification envelope; `T` is the params type.
+    /// A JSON-RPC notification envelope. `T` is the params type.
     notification,
-    /// A JSON-RPC result response envelope; `T` is the result type.
+    /// A JSON-RPC result response envelope. `T` is the result type.
     response,
     /// A JSON-RPC error response envelope.
     error_response,

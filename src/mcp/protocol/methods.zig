@@ -33,7 +33,7 @@ pub const Method = enum {
         };
     }
 
-    /// This method may return `InputRequiredResult`.
+    /// This method can return `InputRequiredResult`.
     pub fn allowsInputRequired(self: Method) bool {
         return switch (self) {
             .@"tools/call", .@"resources/read", .@"prompts/get" => true,
@@ -46,7 +46,7 @@ pub const Method = enum {
         return self == .@"subscriptions/listen";
     }
 
-    /// A lost request may be re-issued automatically.
+    /// The client can re-issue a lost request automatically.
     pub fn isIdempotent(self: Method) bool {
         return switch (self) {
             .@"tools/call", .@"subscriptions/listen" => false,
@@ -111,7 +111,7 @@ pub const Method = enum {
     });
 };
 
-/// Notifications a client may send. Only cancellation exists in this revision.
+/// Notifications a client can send. Only cancellation exists in this revision.
 pub const ClientNotification = enum {
     @"notifications/cancelled",
 
@@ -121,7 +121,7 @@ pub const ClientNotification = enum {
     }
 };
 
-/// Notifications a server may send.
+/// Notifications a server can send.
 pub const ServerNotification = enum {
     @"notifications/cancelled",
     @"notifications/progress",

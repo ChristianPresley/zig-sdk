@@ -1,0 +1,5 @@
+# Approved words with a restricted meaning in this project.
+support: technical verb, "provide an implementation of a protocol feature"
+handle: prefer "process" or "receive"; "handle" is also a technical noun for an opaque identifier
+return: technical verb for the value a function gives back
+free: technical verb for releasing memory

@@ -1,7 +1,7 @@
 //! Protocol constants.
 const std = @import("std");
 
-/// The only MCP specification revision that this SDK implements.
+/// The only MCP specification revision that this SDK provides.
 pub const version = "2026-07-28";
 /// All revisions that this SDK supports. Exactly one entry by design.
 pub const supported_versions = [_][]const u8{version};
