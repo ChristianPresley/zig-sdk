@@ -85,6 +85,8 @@ pub fn build(b: *std.Build) void {
     addTool(b, "lint-docs", "Check prose against the project STE profile", "tools/lint_docs.zig", &.{ "README.md", "docs", "src", "conformance" });
     addTool(b, "census", "Check the schema fixtures against the Zig types", "tools/schema_census.zig", &.{});
     addTool(b, "commit-policy", "Check commits for a sole signed author", "tools/commit_policy.zig", &.{});
+    addTool(b, "gen-bibliography", "Check the bibliography and render it", "tools/gen_bibliography.zig", &.{ "--check", "--out", "docs/generated/bibliography.md" });
+    addTool(b, "gen-dictionary", "Render the project dictionary", "tools/gen_dictionary.zig", &.{ "--out", "docs/generated/dictionary.md" });
 }
 
 fn addTool(b: *std.Build, step_name: []const u8, description: []const u8, source: []const u8, default_args: []const []const u8) void {
