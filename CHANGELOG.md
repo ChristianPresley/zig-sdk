@@ -20,6 +20,14 @@ All notable changes to this project are recorded in this file. The format follow
 - Requirement matrix: `zig build extract-requirements` finds the 733 normative sentences of the vendored specification pages, `docs/spec/requirement_tests.zon` maps each one to tests or to a reason, and `zig build spec-matrix` checks the mapping and renders `docs/generated/conformance-matrix.md`. The CI checks both files. 127 new tests cover requirements that had no test.
 - Documentation site: `zig build site` builds a landing page and the API reference of the modules `mcp` and `mcp_grpc`. The workflow `docs.yml` deploys it to GitHub Pages from `main`.
 - `zig build lint-docs` has the options `--strict`, `--format`, `--rule`, `--string-literals` and `--wiki-dir`, and the warning rules of the project profile. The project dictionary has all its lists.
+- Full JSON Schema 2020-12 support: `unevaluatedProperties`, `unevaluatedItems`, `$id` in subschemas with base URI resolution, `$dynamicRef` and `$dynamicAnchor`. The content keywords are annotations. The draft 2020-12 files of the JSON Schema Test Suite run with the tests.
+- `x-mcp-header` annotations on nested properties. The client and the server refuse a tool with an annotation that a chain of `properties` keywords does not reach, and the client logs the refusal.
+- The client refreshes `tools/list` and retries a tool call one time after error `-32020`.
+- The client validates `structuredContent` against the output schema and reports `Diagnostics.structured_content_invalid`.
+- The client and the server validate elicitation URLs, form answers against `requestedSchema`, sampling messages with tool results, and `includeContext` against the client capability.
+- The HTTP server cancels a request when the client disconnects. Progress notifications have a rate limit of `limits.max_progress_rate_per_s` on both sides.
+- `RequestOptions.max_total_timeout`. A request without a timeout gets `limits.request_timeout` (60 s).
+- `OAuthClient.Options.application_type`, `OAuthClient.lastFailure`, `ResourceServer.scope_hierarchy` and `Principal.issuer`.
 
 ### Changed
 
@@ -28,12 +36,26 @@ All notable changes to this project are recorded in this file. The format follow
 - `mcp.tls.PrivateKey.publicKeyBytes` takes a larger buffer, and `max_signature_len` is 512 for RSA keys.
 - The TLS client refuses a HelloRetryRequest cookie of more than 8 KiB.
 - `Transport.Kind` has the value `unix_socket`.
+- `OAuthClient` `Registration.pre_registered` is a list of credentials bound to an issuer. A challenge from an authorization server without credentials gives `error.IssuerNotRegistered`.
+- Sealed `requestState` is bound to the principal (issuer, subject and client). Another principal gets error `-32602`.
+- The authorization clients refuse `http` for metadata, registration, authorization and token endpoints unless `allow_http` is set. `redirect_uri` must be `https` or a loopback `http` address.
+- Resource URIs and token audiences compare the scheme and the host without case.
+- `RequestError` and `ExchangeError` have `InvalidRequest`: the client refuses to mirror an integer outside the safe range of JavaScript.
+- The client cache keys private results by credential, drops them when the credential changes, does not cache requests with `requestState`, and drops the cached pages of a list after an invalid cursor.
+- `completion/complete` for an unknown prompt or resource gives error `-32602` before the handler runs.
+- A client cancellation with any reason text never looks like a server shutdown. The stdio and Unix socket servers do not write a response for a canceled request.
 
 ### Fixed
 
 - The stdio line framer drops all of a line that is longer than the limit. Before, the rest of the line arrived as a separate frame.
 - The JSON Schema compiler compiles the target of each local `$ref`. Before, a reference into an unknown member could reach the validator unchecked and stop the process.
 - An HTTP/1.1 GET request of the SDK client has no `content-length` header.
+- A stdio or Unix socket server read freed memory when a valid JSON value was not a JSON-RPC message.
+- The HTTP client gives each SSE event to the caller when it arrives, not after 4 KiB.
+- The client router takes only frames with a top-level `result` or `error` as responses.
+- The server shuts down every listen stream at shutdown, not the first 64.
+- The Unix socket transport refuses a path that is longer than the `sockaddr_un` of the target, 104 bytes on macOS.
+- The server rejects control characters and bytes that are not ASCII in `Mcp-Param`, `Mcp-Name` and `Mcp-Method` values.
 
 ## [0.1.0] - 2026-09-30
 
