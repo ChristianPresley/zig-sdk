@@ -13,5 +13,6 @@ All notable changes to this project are recorded in this file. The format follow
 - Streamable HTTP transport for servers with SSE responses and header mirroring.
 - Conformance fixture server and a CI job that runs the official conformance suite.
 - Comptime JSON Schema derivation from Zig types.
+- JSON Schema 2020-12 subset validator. Tool arguments are checked against the input schema and structured output against the output schema.
 - Build steps `test`, `fmt`, `examples`, `docs`, `lint-docs`, `census`, `commit-policy`, `conformance-server`.
 - CI workflow with a GitHub-native Zig installation step.

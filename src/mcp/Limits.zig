@@ -52,19 +52,29 @@ completion_max_values: u32 = 100,
 mrtr_max_rounds_client: u8 = 10,
 max_step_up_attempts: u8 = 3,
 
-schema: struct {
-    max_depth: u16 = 32,
-    max_subschemas: u32 = 4096,
-    max_ref_hops: u16 = 64,
-    max_errors: u16 = 32,
-    eval_budget: u32 = 100_000,
-} = .{},
+schema: Schema = .{},
 
 uri_template: struct {
     max_template_bytes: usize = 64 << 10,
     max_expressions: u16 = 256,
     max_uri_bytes: usize = 64 << 10,
 } = .{},
+
+/// Limits of the JSON Schema validator.
+pub const Schema = struct {
+    /// Maximum nesting depth of a schema and of a validated instance. Overflow: the schema
+    /// is rejected at registration, or the instance is invalid.
+    max_depth: u16 = 32,
+    /// Maximum subschema objects in one schema. Overflow: rejected at registration.
+    max_subschemas: u32 = 4096,
+    /// Maximum `$ref` follows without consuming instance depth. Overflow: the instance is
+    /// invalid.
+    max_ref_hops: u16 = 64,
+    /// Maximum failures recorded per validation. Overflow: the report is truncated.
+    max_errors: u16 = 32,
+    /// Maximum subschema evaluations per validation. Overflow: the instance is invalid.
+    eval_budget: u32 = 100_000,
+};
 
 pub const default: Limits = .{};
 

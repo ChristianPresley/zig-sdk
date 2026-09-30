@@ -58,6 +58,14 @@ fn needsSampling(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.C
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "ok", .{}) };
 }
 
+/// Echoes `structuredContent` from the `shape` argument to exercise output validation.
+fn shape(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    const sc = args.object.get("shape") orelse return error.NoShape;
+    const blocks = try ctx.arena.alloc(types.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = "shape" } };
+    return .{ .complete = .{ .content = blocks, .structuredContent = sc } };
+}
+
 fn readStatic(ctx: *RequestContext, uri: []const u8) anyerror!mcp.Outcome(types.ReadResourceResult) {
     const contents = try ctx.arena.alloc(types.ResourceContents, 1);
     contents[0] = .{ .text = .{ .uri = uri, .mimeType = "text/plain", .text = "static text" } };
@@ -98,6 +106,11 @@ const Fixture = struct {
         try self.server.addToolJson(.{ .name = "boom" }, boom);
         try self.server.addToolJson(.{ .name = "ask_name" }, askName);
         try self.server.addToolJson(.{ .name = "needs_sampling", .requires_client = .{ .sampling = .{} } }, needsSampling);
+        try self.server.addToolJson(.{
+            .name = "shape",
+            .input_schema = "{\"type\":\"object\",\"properties\":{\"shape\":{\"type\":\"object\"},\"count\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"shape\"]}",
+            .output_schema = "{\"type\":\"object\",\"properties\":{\"sides\":{\"type\":\"integer\"}},\"required\":[\"sides\"]}",
+        }, shape);
         try self.server.addResource(.{ .uri = "test://static-text", .name = "static", .mime_type = "text/plain" }, readStatic);
         try self.server.addResourceTemplate(.{ .uri_template = "test://template/{id}/data", .name = "tpl" }, readTemplate);
         try self.server.addPrompt(.{ .name = "test_prompt", .arguments = &.{.{ .name = "arg1", .required = true }} }, getPrompt);
@@ -181,7 +194,7 @@ test "tools list and call" {
 
     const list = result(try f.call(1, "tools/list", meta_none, ""));
     const tools = list.object.get("tools").?.array.items;
-    try std.testing.expectEqual(4, tools.len);
+    try std.testing.expectEqual(5, tools.len);
     try std.testing.expectEqualStrings("add", tools[0].object.get("name").?.string);
     const schema = tools[0].object.get("inputSchema").?;
     try std.testing.expectEqualStrings("object", schema.object.get("type").?.string);
@@ -213,6 +226,45 @@ test "tools list and call" {
     try std.testing.expectEqual(@as(i64, -32021), errorCode(missing).?);
     try std.testing.expect(missing.object.get("error").?.object.get("data").?.object.get("requiredCapabilities").?.object.get("sampling") != null);
     try std.testing.expect(errorCode(try f.call(7, "tools/call", meta_all, "\"name\":\"needs_sampling\",\"arguments\":{}")) == null);
+}
+
+test "tool schemas validate arguments and structured output" {
+    var f: Fixture = undefined;
+    try f.init(.{ .info = .{ .name = "test", .version = "0.1.0" } });
+    defer f.deinit();
+
+    // Valid arguments and valid structured output.
+    const ok = result(try f.call(1, "tools/call", meta_none, "\"name\":\"shape\",\"arguments\":{\"shape\":{\"sides\":3},\"count\":2}"));
+    try std.testing.expect(ok.object.get("isError") == null);
+    try std.testing.expectEqual(3, ok.object.get("structuredContent").?.object.get("sides").?.integer);
+    // A schema violation in the arguments is a tool error with the location.
+    const bad = result(try f.call(2, "tools/call", meta_none, "\"name\":\"shape\",\"arguments\":{\"shape\":{\"sides\":3},\"count\":0}"));
+    try std.testing.expect(bad.object.get("isError").?.bool);
+    const text = bad.object.get("content").?.array.items[0].object.get("text").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, text, "/count") != null);
+    // A missing required argument.
+    const missing = result(try f.call(3, "tools/call", meta_none, "\"name\":\"shape\",\"arguments\":{}"));
+    try std.testing.expect(missing.object.get("isError").?.bool);
+    // Structured output that does not match the output schema is a server error.
+    const wrong = try f.call(4, "tools/call", meta_none, "\"name\":\"shape\",\"arguments\":{\"shape\":{\"sides\":\"three\"}}");
+    try std.testing.expectEqual(@as(i64, -32603), errorCode(wrong).?);
+
+    // The rpc_error policy turns argument violations into -32602.
+    var g: Fixture = undefined;
+    try g.init(.{ .info = .{ .name = "test", .version = "0.1.0" }, .invalid_args_policy = .rpc_error });
+    defer g.deinit();
+    try std.testing.expectEqual(@as(i64, -32602), errorCode(try g.call(5, "tools/call", meta_none, "\"name\":\"shape\",\"arguments\":{}")).?);
+
+    // Registration rejects unsupported keywords, remote references and bad header annotations.
+    try std.testing.expectError(error.UnsupportedKeyword, g.server.addToolJson(.{ .name = "p", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"pattern\":\"^a\"}}}" }, boom));
+    try std.testing.expectError(error.RemoteRef, g.server.addToolJson(.{ .name = "r", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"$ref\":\"https://example.com/x\"}}}" }, boom));
+    try std.testing.expectError(error.InvalidHeaderAnnotation, g.server.addToolJson(.{ .name = "h", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"object\",\"x-mcp-header\":\"A\"}}}" }, boom));
+    try std.testing.expectError(error.InvalidHeaderAnnotation, g.server.addToolJson(.{ .name = "h2", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"x-mcp-header\":\"A\"},\"b\":{\"type\":\"string\",\"x-mcp-header\":\"a\"}}}" }, boom));
+    // Opting in keeps unsupported keywords as annotations.
+    var h: Fixture = undefined;
+    try h.init(.{ .info = .{ .name = "test", .version = "0.1.0" }, .allow_unsupported_schema_keywords = true });
+    defer h.deinit();
+    try h.server.addToolJson(.{ .name = "p", .input_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"pattern\":\"^a\"}}}" }, boom);
 }
 
 test "multi round-trip request with sealed state" {
@@ -284,7 +336,7 @@ test "pagination" {
     try std.testing.expectEqual(3, page1.object.get("tools").?.array.items.len);
     const cursor = page1.object.get("nextCursor").?.string;
     const page2 = result(try f.call(2, "tools/list", meta_none, try std.fmt.allocPrint(f.arena(), "\"cursor\":\"{s}\"", .{cursor})));
-    try std.testing.expectEqual(1, page2.object.get("tools").?.array.items.len);
+    try std.testing.expectEqual(2, page2.object.get("tools").?.array.items.len);
     try std.testing.expect(page2.object.get("nextCursor") == null);
     try std.testing.expectEqual(@as(i64, -32602), errorCode(try f.call(3, "tools/list", meta_none, "\"cursor\":\"garbage!\"")).?);
 }
