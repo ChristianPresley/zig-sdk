@@ -26,6 +26,17 @@ pub fn build(b: *std.Build) void {
     const grpc_tests = b.addTest(.{ .root_module = mcp_grpc });
     test_step.dependOn(&b.addRunArtifact(grpc_tests).step);
 
+    // The tests of the documentation tools.
+    for ([_][]const u8{ "tools/lint_docs/main.zig", "tools/gen_dictionary.zig" }) |tool_source| {
+        const tool_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(tool_source),
+            .target = b.graph.host,
+        }) });
+        const run_tool_tests = b.addRunArtifact(tool_tests);
+        run_tool_tests.setCwd(b.path("."));
+        test_step.dependOn(&run_tool_tests.step);
+    }
+
     // Formatting check.
     const fmt_step = b.step("fmt", "Check formatting");
     const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "build.zig.zon", "src", "examples", "tools", "conformance", "bench" }, .check = true });
@@ -107,7 +118,7 @@ pub fn build(b: *std.Build) void {
     b.step("bench", "Run the benchmarks").dependOn(&run_bench.step);
 
     // Tools written in Zig and run through `zig build <step>`.
-    addTool(b, "lint-docs", "Check prose against the project STE profile", "tools/lint_docs.zig", &.{ "README.md", "docs", "src", "conformance" });
+    addTool(b, "lint-docs", "Check prose against the project STE profile", "tools/lint_docs/main.zig", &.{ "--strict", "--string-literals" });
     addTool(b, "census", "Check the schema fixtures against the Zig types", "tools/schema_census.zig", &.{});
     addTool(b, "commit-policy", "Check commits for a sole signed author", "tools/commit_policy.zig", &.{});
     addTool(b, "gen-bibliography", "Check the bibliography and render it", "tools/gen_bibliography.zig", &.{ "--check", "--out", "docs/generated/bibliography.md" });
