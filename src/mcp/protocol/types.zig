@@ -1,6 +1,6 @@
 //! Typed mirrors of `schema/2026-07-28/schema.ts`. Field names are the wire names.
-//! Unknown fields are ignored on input and optional fields that are null are omitted on
-//! output (see `json.wire_options`).
+//! The parser ignores unknown fields on input. The writer omits optional fields that are
+//! null on output (see `json.wire_options`).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = @import("../json.zig");

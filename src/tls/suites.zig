@@ -149,7 +149,7 @@ pub const DirectionKeys = union(enum) {
     }
 };
 
-/// A running transcript hash whose algorithm is chosen at run time.
+/// A transcript hash that adds each message. The code selects its algorithm at run time.
 pub const Transcript = union(enum) {
     sha256: crypto.hash.sha2.Sha256,
     sha384: crypto.hash.sha2.Sha384,

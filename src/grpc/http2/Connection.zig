@@ -1,6 +1,6 @@
 //! One HTTP/2 connection (RFC 9113) with its streams, for the gRPC binding. A read task
 //! runs `run` and dispatches frames. Application tasks send on streams. Server push and
-//! priorities are not used. Flow control is honoured in both directions.
+//! priorities are not in use. Flow control applies in both directions.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -25,7 +25,7 @@ pub const Options = struct {
     max_frame_size: u32 = frame.default_max_frame_size,
     /// The largest decoded header list the peer can send. Overflow: `ENHANCE_YOUR_CALM`.
     max_header_list_size: u32 = 8 << 10,
-    /// The largest header block under assembly across CONTINUATION frames.
+    /// The largest header block under assembly across `CONTINUATION` frames.
     max_header_block_size: u32 = 32 << 10,
     /// Called from the read task when a stream the peer opened has all its request headers.
     on_stream: ?*const fn (userdata: ?*anyopaque, stream: *Stream) void = null,
@@ -36,11 +36,11 @@ pub const Error = error{
     ReadFailed,
     WriteFailed,
     OutOfMemory,
-    /// The connection is closed or was closed by a GOAWAY.
+    /// The connection is closed, or a `GOAWAY` closed it.
     Closed,
     /// The peer reset the stream. The code is in `Stream.reset`.
     StreamReset,
-    /// The peer violated the protocol. The connection was ended with a GOAWAY.
+    /// The peer violated the protocol. The connection sent a `GOAWAY` and ended.
     ProtocolError,
 } || Io.Cancelable;
 
@@ -51,7 +51,7 @@ writer: *Io.Writer,
 options: Options,
 /// Guards every field below that changes after `init`, and the streams.
 lock: Io.Mutex = .init,
-/// Signalled on every state change: windows, stream data, headers, resets, closing.
+/// Signaled on every state change: windows, stream data, headers, resets and the close.
 cond: Io.Condition = .init,
 /// Serializes writes to the socket.
 write_lock: Io.Mutex = .init,
@@ -66,7 +66,7 @@ peer_streams_open: u32 = 0,
 send_window: i64 = frame.default_initial_window,
 /// Bytes the peer can still send on the connection.
 recv_window: i64,
-/// Consumed bytes the peer has not been credited for.
+/// Consumed bytes that the connection did not credit to the peer yet.
 recv_credit: u32 = 0,
 closed: bool = false,
 goaway_received: bool = false,
@@ -151,8 +151,8 @@ pub fn run(self: *Connection) void {
     self.terminate();
 }
 
-/// Send GOAWAY and stop accepting streams. Existing streams finish. The read task keeps
-/// running until the peer closes.
+/// Send `GOAWAY` and accept no new streams. Existing streams finish. The read task
+/// continues until the peer closes.
 pub fn shutdown(self: *Connection) void {
     self.sendGoaway(.no_error);
 }
@@ -214,7 +214,7 @@ fn sendWindowUpdate(self: *Connection, stream_id: u31, increment: u32) void {
     self.writeFrame(.window_update, 0, stream_id, &payload) catch {};
 }
 
-/// Send a PING. The answer is handled in `run`.
+/// Send a `PING`. The function `run` receives the answer.
 pub fn ping(self: *Connection, data: [8]u8) Error!void {
     try self.writeFrame(.ping, 0, 0, &data);
 }
@@ -552,8 +552,8 @@ fn onWindowUpdate(self: *Connection, header: frame.Header, payload: []const u8) 
 
 // -- Streams ---------------------------------------------------------------------------------
 
-/// Open a stream to the peer. The id is assigned when the first header block goes out, so
-/// that ids increase in wire order (section 5.1.1).
+/// Open a stream to the peer. The connection gives the id when the first header block goes
+/// out, so that ids increase in wire order (section 5.1.1).
 pub fn openStream(self: *Connection) Error!*Stream {
     self.lock.lockUncancelable(self.io);
     defer self.lock.unlock(self.io);
@@ -681,7 +681,7 @@ pub const Stream = struct {
         conn.writer.flush() catch return error.WriteFailed;
     }
 
-    /// Send data, waiting for flow control credit. With `end_stream` the send side closes.
+    /// Send data. The call waits for flow control credit. With `end_stream` the send side closes.
     pub fn sendData(self: *Stream, bytes: []const u8, end_stream: bool) Error!void {
         const conn = self.conn;
         var offset: usize = 0;

@@ -1,5 +1,5 @@
 //! Size, count and time limits with their defaults. Every field has one documented overflow
-//! behaviour and one test.
+//! behavior and one test.
 const std = @import("std");
 const Io = std.Io;
 
@@ -9,10 +9,10 @@ const Limits = @This();
 json_max_depth: u16 = 64,
 
 stdio: struct {
-    /// Maximum bytes of one newline-delimited message. Overflow: the frame is dropped and,
-    /// when the request id can be recovered, `-32600` is returned.
+    /// Maximum bytes of one newline-delimited message. Overflow: the transport drops the frame
+    /// and, when it can recover the request id, it returns `-32600`.
     max_line_bytes: usize = 16 << 20,
-    /// Buffer used by the line reader. Longer lines fall back to a growing buffer.
+    /// Buffer of the line reader. For a longer line, the reader uses a buffer that grows.
     read_buffer: usize = 64 << 10,
 } = .{},
 
@@ -51,7 +51,7 @@ request_timeout: Io.Duration = .fromSeconds(60),
 max_total_timeout: Io.Duration = .fromSeconds(600),
 shutdown_grace: Io.Duration = .fromSeconds(2),
 /// How often the client re-issues a request after it lost the stream before any response
-/// byte. Only idempotent methods are retried unless the caller forces it.
+/// byte. The client retries only idempotent methods, unless the caller forces it.
 max_lost_stream_retries: u32 = 3,
 cancel_notify_timeout: Io.Duration = .fromSeconds(5),
 request_state_ttl: Io.Duration = .fromSeconds(600),
@@ -84,15 +84,15 @@ uri_template: struct {
 
 /// Limits of the JSON Schema validator.
 pub const Schema = struct {
-    /// Maximum nesting depth of a schema and of a validated instance. Overflow: the schema
-    /// is rejected at registration, or the instance is invalid.
+    /// Maximum nesting depth of a schema and of a validated instance. Overflow: the server
+    /// rejects the schema at registration, or the instance is invalid.
     max_depth: u16 = 32,
     /// Maximum subschema objects in one schema. Overflow: rejected at registration.
     max_subschemas: u32 = 4096,
-    /// Maximum `$ref` follows without consuming instance depth. Overflow: the instance is
+    /// Maximum `$ref` follows that do not use instance depth. Overflow: the instance is
     /// invalid.
     max_ref_hops: u16 = 64,
-    /// Maximum failures recorded per validation. Overflow: the report is truncated.
+    /// Maximum failures that one validation records. Overflow: the report stops at the limit.
     max_errors: u16 = 32,
     /// Maximum subschema evaluations per validation. Overflow: the instance is invalid.
     eval_budget: u32 = 100_000,

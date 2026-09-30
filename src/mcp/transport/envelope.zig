@@ -17,7 +17,7 @@ pub const sentinel_start = "=?base64?";
 pub const sentinel_end = "?=";
 
 /// True when `value` can travel as a header value verbatim. Such a value has only visible
-/// ASCII, spaces and tabs, no whitespace at its ends, and is not shaped like the sentinel.
+/// ASCII, spaces and tabs, no whitespace at its ends, and does not have the sentinel form.
 pub fn isPlainHeaderValue(value: []const u8) bool {
     if (value.len == 0) return true;
     if (value[0] == ' ' or value[0] == '\t' or value[value.len - 1] == ' ' or value[value.len - 1] == '\t') return false;
@@ -42,7 +42,8 @@ pub fn encodeValue(arena: Allocator, value: []const u8) Allocator.Error![]const 
 
 pub const DecodeError = error{ InvalidEncoding, OutOfMemory };
 
-/// Decode a header value: plain values are returned as is, sentinel values are base64-decoded.
+/// Decode a header value. The function returns a plain value as it is and decodes the base64
+/// of a sentinel value.
 pub fn decodeValue(arena: Allocator, value: []const u8) DecodeError![]const u8 {
     if (!(std.mem.startsWith(u8, value, sentinel_start) and std.mem.endsWith(u8, value, sentinel_end))) return value;
     const body = value[sentinel_start.len .. value.len - sentinel_end.len];
@@ -54,8 +55,8 @@ pub fn decodeValue(arena: Allocator, value: []const u8) DecodeError![]const u8 {
     return out;
 }
 
-/// Encode a JSON parameter value for an `Mcp-Param-*` header. Only strings, integers and
-/// booleans are allowed. Null means "omit the header".
+/// Encode a JSON parameter value for an `Mcp-Param-*` header. The function accepts only
+/// strings, integers and booleans. Null means "omit the header".
 pub fn encodeParam(arena: Allocator, value: Value) Allocator.Error!?[]const u8 {
     return switch (value) {
         .null => null,
@@ -99,12 +100,12 @@ pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?V
         const m = p.object.get("_meta") orelse break :blk null;
         break :blk json.getString(m, meta_mod.key_protocol_version);
     };
-    const hv = headers.protocol_version orelse return .{ .message = "Header mismatch: MCP-Protocol-Version header is required" };
+    const hv = headers.protocol_version orelse return .{ .message = "Header mismatch: the MCP-Protocol-Version header is missing" };
     if (!isPlainHeaderValue(hv)) return .{ .message = "Header mismatch: MCP-Protocol-Version has an invalid value" };
     if (meta_version) |mv| {
         if (!std.mem.eql(u8, hv, mv)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: MCP-Protocol-Version header value '{s}' does not match body value '{s}'", .{ hv, mv }) };
     }
-    const hm = headers.method orelse return .{ .message = "Header mismatch: Mcp-Method header is required" };
+    const hm = headers.method orelse return .{ .message = "Header mismatch: the Mcp-Method header is missing" };
     if (!std.mem.eql(u8, hm, method)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Method header value '{s}' does not match body method '{s}'", .{ hm, method }) };
 
     const source: methods.HeaderNameSource = if (methods.Method.fromName(method)) |m| m.headerNameSource() else if (isTaskMethod(method)) .task_id else .none;
@@ -119,7 +120,7 @@ pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?V
             const p = params orelse break :blk null;
             break :blk json.getString(p, key);
         };
-        const raw = headers.name orelse return .{ .message = "Header mismatch: Mcp-Name header is required" };
+        const raw = headers.name orelse return .{ .message = "Header mismatch: the Mcp-Name header is missing" };
         const decoded = decodeValue(arena, raw) catch return .{ .message = "Header mismatch: Mcp-Name header has an invalid encoding" };
         if (body_value) |bv| {
             if (!std.mem.eql(u8, decoded, bv)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Name header value '{s}' does not match body value '{s}'", .{ decoded, bv }) };
@@ -153,7 +154,7 @@ pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?V
                     if (header_value != null) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} is present but the body has no value", .{annotation_name}) };
                     continue;
                 }
-                const raw = header_value orelse return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} header is required", .{annotation_name}) };
+                const raw = header_value orelse return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: the Mcp-Param-{s} header is missing", .{annotation_name}) };
                 const decoded = decodeValue(arena, raw) catch return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} has an invalid encoding", .{annotation_name}) };
                 if (!paramMatches(decoded, body_value.?)) {
                     return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} header value '{s}' does not match the body", .{ annotation_name, decoded }) };
@@ -200,8 +201,8 @@ fn isTchar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", c) != null;
 }
 
-/// Check every `x-mcp-header` annotation of a tool input schema. Returns false when the tool
-/// must be excluded from `tools/list` on header-carrying transports.
+/// Check every `x-mcp-header` annotation of a tool input schema. Returns false when
+/// transports that carry headers must not show the tool in `tools/list`.
 pub fn schemaHeadersValid(schema: Value) bool {
     if (schema != .object) return true;
     const props = schema.object.get("properties") orelse return true;

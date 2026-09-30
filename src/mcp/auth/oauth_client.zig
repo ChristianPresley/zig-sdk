@@ -2,7 +2,7 @@
 //! authorization server metadata, registers the client, runs the authorization code flow with
 //! PKCE and requests tokens. The HTTP client transport calls it for 401 and 403 challenges.
 //!
-//! Credentials are kept per issuer and never reused for another authorization server.
+//! The client keeps credentials per issuer and never uses them for another authorization server.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -37,7 +37,7 @@ pub const Client = struct {
         dynamic,
     };
 
-    /// How the authorization code is obtained.
+    /// How the client gets the authorization code.
     pub const Authorize = union(enum) {
         /// Request the authorization URL, do not follow the redirect, and read the code from
         /// the `Location` header. For automated tests only.
@@ -74,13 +74,13 @@ pub const Client = struct {
         OutOfMemory,
         /// More challenges than `max_step_up_attempts` for one request.
         TooManyAttempts,
-        /// No protected resource metadata was found.
+        /// The client found no protected resource metadata.
         NoResourceMetadata,
         /// The metadata `resource` is not the server URL.
         ResourceMismatch,
         NoAuthorizationServer,
         NoAuthorizationServerMetadata,
-        /// The metadata `issuer` is not the URL that was queried.
+        /// The metadata `issuer` is not the URL of the query.
         IssuerMismatch,
         InsecureEndpoint,
         /// The authorization server does not offer PKCE with S256.

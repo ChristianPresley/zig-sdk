@@ -17,7 +17,7 @@ const regex = @import("regex.zig");
 pub const dialect_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 
 pub const Options = struct {
-    /// Ignore unsupported keywords instead of rejecting the schema.
+    /// Ignore unsupported keywords. Without this option, the compiler rejects the schema.
     allow_unsupported_keywords: bool = false,
     limits: Limits.Schema = .{},
 };
@@ -72,7 +72,7 @@ pub const Failure = struct {
 pub const Result = struct {
     valid: bool,
     failures: []const Failure,
-    /// True when more failures were found than `limits.max_errors`.
+    /// True when the validator found more failures than `limits.max_errors`.
     truncated: bool = false,
 
     pub fn first(self: Result) ?Failure {

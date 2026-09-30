@@ -84,7 +84,7 @@ const ServerSetup = struct {
 };
 
 /// One handshake and echo between the SDK client and the SDK server. Returns the client
-/// error, if any. The server result is in `echo`. `expect_alpn` is checked on the client.
+/// error, if any. The server result is in `echo`. The client checks `expect_alpn`.
 fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, client_setup: ClientSetup, echo_out: *Echo, expect_alpn: ?[]const u8) !void {
     const chains = [_]*const tls.CertChain{chain};
     echo_out.* = .{
@@ -327,7 +327,7 @@ test "every cipher suite negotiates with the SDK client" {
     }
 }
 
-/// True when OpenSSL runs on this machine. LibreSSL is skipped: its `s_server` has no `-rev`.
+/// True when OpenSSL runs on this machine. The tests skip LibreSSL: its `s_server` has no `-rev`.
 fn haveOpenssl(io: Io, gpa: std.mem.Allocator) bool {
     return opensslVersion(io, gpa) != null;
 }

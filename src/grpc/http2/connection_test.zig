@@ -35,7 +35,7 @@ const Side = struct {
         self.run_future = try self.io.concurrent(Connection.run, .{self.conn});
     }
 
-    /// Stop sending. The peer reads the end of the stream and closes its side.
+    /// Send no more data. The peer reads the end of the stream and closes its side.
     fn halfClose(self: *Side) void {
         self.conn.shutdown();
         self.stream.shutdown(self.io, .send) catch {};

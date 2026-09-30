@@ -1,4 +1,4 @@
-//! A bounded DER reader. Every length is checked against the input before a slice is made.
+//! A bounded DER reader. The reader checks every length against the input before it makes a slice.
 const std = @import("std");
 
 pub const Error = error{ Truncated, InvalidLength, UnexpectedTag, Overflow };
@@ -30,7 +30,7 @@ pub const Element = struct {
         return self;
     }
 
-    /// Decode a small non-negative INTEGER.
+    /// Decode a small non-negative `INTEGER`.
     pub fn smallInt(self: Element) Error!u64 {
         if (self.tag != tag_integer) return error.UnexpectedTag;
         var bytes = self.content;
@@ -43,7 +43,7 @@ pub const Element = struct {
         return v;
     }
 
-    /// The content of a BIT STRING without the unused-bits octet, which must be zero.
+    /// The content of a `BIT STRING` without the unused-bits octet, which must be zero.
     pub fn bitString(self: Element) Error![]const u8 {
         if (self.tag != tag_bit_string) return error.UnexpectedTag;
         if (self.content.len == 0 or self.content[0] != 0) return error.InvalidLength;
@@ -71,7 +71,7 @@ pub const Iterator = struct {
     }
 };
 
-/// Parse the element at the start of `bytes`. Trailing bytes are permitted.
+/// Parse the element at the start of `bytes`. Trailing bytes can follow.
 pub fn parse(bytes: []const u8) Error!Element {
     if (bytes.len < 2) return error.Truncated;
     const tag = bytes[0];

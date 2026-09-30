@@ -35,7 +35,7 @@ pub const TaskSupport = enum {
 
 pub const Status = enum { working, input_required, completed, failed, cancelled };
 
-/// The result of `tools/call` when a task was created (`Result & Task`).
+/// The result of `tools/call` when the server created a task (`Result & Task`).
 pub const CreateTaskResult = struct {
     _meta: ?types.ResultMetaObject = null,
     resultType: []const u8 = "task",
@@ -79,7 +79,7 @@ pub const CancelParams = struct {
     taskId: []const u8,
 };
 
-/// One task. Every field except `cancel` is guarded by `lock`.
+/// One task. The `lock` guards every field except `cancel`.
 pub const Task = struct {
     arena_state: std.heap.ArenaAllocator,
     id: []const u8,
@@ -126,7 +126,7 @@ pub const Store = struct {
         return .{ .gpa = gpa, .io = io, .options = options };
     }
 
-    /// Cancel every running task, wait for it, and free everything.
+    /// Cancel every task that runs, wait for it, and free everything.
     pub fn deinit(self: *Store) void {
         var it = self.tasks.valueIterator();
         while (it.next()) |task_ptr| {
@@ -142,7 +142,7 @@ pub const Store = struct {
         self.tasks.deinit(self.gpa);
     }
 
-    /// Create a task for a `tools/call`. The params are copied into the task arena.
+    /// Create a task for a `tools/call`. The store copies the params into the task arena.
     pub fn create(self: *Store, tool: []const u8, params: Value, kind: Transport.Kind) error{ OutOfMemory, TooManyTasks, EntropyUnavailable }!*Task {
         const task = try self.gpa.create(Task);
         errdefer self.gpa.destroy(task);
@@ -173,7 +173,7 @@ pub const Store = struct {
         return task;
     }
 
-    /// Find a task that has not expired.
+    /// Find a task that is not expired.
     pub fn get(self: *Store, id: []const u8) ?*Task {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);

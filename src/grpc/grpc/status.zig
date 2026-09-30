@@ -56,7 +56,7 @@ pub fn encodeMessage(arena: std.mem.Allocator, text: []const u8) std.mem.Allocat
     return out.items;
 }
 
-/// Decode a `grpc-message` header. Malformed escapes are kept as they are.
+/// Decode a `grpc-message` header. The decoder keeps malformed escapes as they are.
 pub fn decodeMessage(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;

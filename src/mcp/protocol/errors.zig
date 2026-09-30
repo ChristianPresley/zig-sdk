@@ -32,7 +32,7 @@ pub const Code = enum(i64) {
     }
 };
 
-/// A wire error object. All slices are owned by the arena of the message being built.
+/// A wire error object. The arena of the message under construction owns all slices.
 pub const RpcError = struct {
     code: i64,
     message: []const u8,

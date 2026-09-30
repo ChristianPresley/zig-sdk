@@ -1,5 +1,5 @@
-//! The Streamable HTTP transport (server side): one POST endpoint, JSON or SSE responses,
-//! long-lived listen streams, header mirroring, Origin and Host validation.
+//! The Streamable HTTP transport (server side): one `POST` endpoint, JSON or SSE responses,
+//! long-lived listen streams, header mirroring, `Origin` and `Host` validation.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -34,7 +34,7 @@ pub const Options = struct {
     /// The MCP endpoint path.
     path: []const u8 = "/mcp",
     response_mode: ResponseMode = .auto,
-    /// Origins that are accepted when an `Origin` header is present. Empty means loopback only.
+    /// Origins that the server accepts in an `Origin` header. Empty means loopback only.
     allowed_origins: []const []const u8 = &.{},
     /// Hosts accepted in the `Host` header. Empty means loopback names plus the bound address.
     allowed_hosts: []const []const u8 = &.{},
@@ -95,14 +95,14 @@ pub const Server = struct {
         }
     }
 
-    /// Bind the listening socket. After this call `bound_port` is set (useful with port 0).
+    /// Bind the listen socket. After this call `bound_port` has the port (useful with port 0).
     pub fn bind(self: *Server) !void {
         var address = try Io.net.IpAddress.parse(self.options.address, self.options.port);
         self.listener = try address.listen(self.io, .{ .reuse_address = self.limits.http.reuse_address });
         self.bound_port = self.listener.?.socket.address.getPort();
     }
 
-    /// Accept connections until `shutdown` is called.
+    /// Accept connections until a call to `shutdown`.
     pub fn serve(self: *Server) !void {
         if (self.listener == null) try self.bind();
         var accept_future = try self.io.concurrent(acceptLoop, .{self});
@@ -140,7 +140,7 @@ pub const Server = struct {
         }
     }
 
-    /// Stop accepting and end active streams. Safe to call from another task.
+    /// Accept no more connections and end active streams. Safe to call from another task.
     pub fn shutdown(self: *Server) void {
         self.closing.store(true, .release);
         self.stop_event.set(self.io);
@@ -316,7 +316,7 @@ fn statusForCode(code: i64) http.Status {
     };
 }
 
-/// Handle one request on a connection. Returns whether the connection can be reused.
+/// Handle one request on a connection. Returns whether the connection can carry one more request.
 fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
     var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena_state.deinit();

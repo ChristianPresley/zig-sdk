@@ -8,7 +8,7 @@ const Stream = Connection.Stream;
 pub const prefix_len = 5;
 
 pub const Error = Connection.Error || error{
-    /// The message is compressed. The SDK negotiates identity only.
+    /// The sender compressed the message. The SDK negotiates identity only.
     Compressed,
     /// The message is larger than the limit.
     MessageTooLarge,

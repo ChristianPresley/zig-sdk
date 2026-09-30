@@ -62,7 +62,7 @@ pub const Method = enum {
         };
     }
 
-    /// The server capability that must be declared for the method to exist.
+    /// The server capability that the server must declare for the method to exist.
     pub const Gate = enum { none, tools, resources, prompts, completions, subscriptions };
 
     pub fn gate(self: Method) Gate {
@@ -137,8 +137,8 @@ pub const ServerNotification = enum {
     }
 };
 
-/// Methods that existed in earlier revisions and were removed. A server answers them with
-/// `-32601` like any unknown method, but names them for diagnostics.
+/// Methods that existed in earlier revisions only. A server answers them with `-32601`
+/// like any unknown method, but names them for diagnostics.
 pub const removed_methods = [_][]const u8{
     "initialize",
     "notifications/initialized",

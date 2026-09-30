@@ -1,5 +1,5 @@
-//! Benchmarks of the hot paths: request dispatch through the in-memory transport, HPACK
-//! decoding, the TLS 1.3 handshake on a loopback socket and the HTTP/2 echo path.
+//! Benchmarks of the hot paths: request dispatch on the in-memory transport, HPACK decoding,
+//! the TLS 1.3 handshake on loopback and the HTTP/2 echo path.
 //!
 //! Usage: zig build bench [-- --smoke]
 //! `--smoke` runs a few iterations only, to check that every benchmark still works.

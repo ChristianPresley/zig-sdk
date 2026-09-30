@@ -1,4 +1,4 @@
-//! Parsing and building JSON-RPC 2.0 messages.
+//! Parse and build JSON-RPC 2.0 messages.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;

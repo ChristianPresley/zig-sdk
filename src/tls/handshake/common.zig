@@ -147,7 +147,7 @@ pub const MessageReader = struct {
         return .{ .buf = buf };
     }
 
-    /// Bytes of the next message that are already buffered. Must be zero when keys change.
+    /// Bytes of the next message that are already in the buffer. Must be zero when keys change.
     pub fn pendingBytes(self: *const MessageReader) usize {
         return self.len - self.pending_consumed;
     }

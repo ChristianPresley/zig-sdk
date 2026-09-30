@@ -2,7 +2,7 @@
 
 ## Report a vulnerability
 
-Use GitHub private vulnerability reporting on this repository. Do not open a public issue for a vulnerability.
+Use the private vulnerability report form of GitHub on this repository. Do not open a public issue for a vulnerability.
 
 Give these details:
 

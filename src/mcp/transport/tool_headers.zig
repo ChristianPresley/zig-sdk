@@ -1,6 +1,6 @@
 //! The `x-mcp-header` bindings a client learns from `tools/list` results, shared by the
-//! Streamable HTTP and the gRPC clients. Tools with invalid annotations are removed from
-//! the list the application sees.
+//! Streamable HTTP and the gRPC clients. The client removes tools with invalid annotations
+//! from the list that the application sees.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -38,8 +38,8 @@ pub const Map = struct {
         self.gpa.free(e.name);
     }
 
-    /// Scan a `tools/list` result frame. Returns a rewritten frame when tools with invalid
-    /// annotations were removed, else null.
+    /// Scan a `tools/list` result frame. Returns a rewritten frame without the tools that have
+    /// invalid annotations, or null when all annotations are valid.
     pub fn learn(self: *Map, arena: Allocator, frame: []const u8) !?[]const u8 {
         var tree = try json.parseTree(arena, frame);
         if (tree != .object) return null;

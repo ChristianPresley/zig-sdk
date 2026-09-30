@@ -27,7 +27,7 @@ pub const TokenVerifier = struct {
     }
 };
 
-/// What a rejected request must be answered with.
+/// The answer to a rejected request.
 pub const Challenge = struct {
     status: u16,
     www_authenticate: []const u8,

@@ -13,7 +13,7 @@ const oid_ec_public_key = "\x2a\x86\x48\xce\x3d\x02\x01";
 pub const PrecheckError = error{InvalidCertificate};
 
 /// Walk the parts of a certificate that `std.crypto.Certificate.parse` and its verifiers
-/// read, with bounded parsing. A malformed certificate then ends in an error and never in
+/// read, with bounded reads. A malformed certificate then ends in an error and never in
 /// an out-of-bounds read. Call it before every use of the std parser on peer data.
 pub fn precheck(bytes: []const u8) PrecheckError!void {
     precheckInner(bytes) catch return error.InvalidCertificate;

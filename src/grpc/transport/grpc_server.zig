@@ -89,14 +89,14 @@ pub const Server = struct {
         };
     }
 
-    /// Bind the listening socket. After this call `bound_port` is set.
+    /// Bind the listen socket. After this call `bound_port` has the port.
     pub fn bind(self: *Server) !void {
         var address = try Io.net.IpAddress.parse(self.options.address, self.options.port);
         self.listener = try address.listen(self.io, .{});
         self.bound_port = self.listener.?.socket.address.getPort();
     }
 
-    /// Accept connections until `shutdown` is called.
+    /// Accept connections until a call to `shutdown`.
     pub fn serve(self: *Server) !void {
         if (self.listener == null) try self.bind();
         var accept_future = try self.io.concurrent(acceptLoop, .{self});
@@ -132,7 +132,7 @@ pub const Server = struct {
         }
     }
 
-    /// Stop accepting and end the open connections. Safe to call from another task.
+    /// Accept no more connections and end the open connections. Safe to call from another task.
     pub fn shutdown(self: *Server) void {
         self.closing.store(true, .release);
         self.stop_event.set(self.io);

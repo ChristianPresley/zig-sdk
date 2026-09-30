@@ -32,7 +32,7 @@ pub const Error = error{
     KeyMismatch,
     UnsupportedKey,
     InvalidKey,
-    /// The leaf certificate could not be parsed.
+    /// The parser cannot read the leaf certificate.
     InvalidCertificate,
 };
 

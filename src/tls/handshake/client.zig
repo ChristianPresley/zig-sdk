@@ -24,8 +24,8 @@ pub const max_handshake_bytes = CertChain.max_chain_bytes + 4096;
 
 pub const Options = struct {
     io: std.Io,
-    /// The host name for server name indication and for the certificate check. An IP
-    /// address literal is checked against the certificate but not sent as server name.
+    /// The host name for server name indication and for the certificate check. The client
+    /// checks an IP address literal against the certificate but does not send it as SNI.
     host: []const u8,
     trust: Trust,
     /// Application protocols in preference order. Empty sends no ALPN extension.

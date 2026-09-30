@@ -1,4 +1,4 @@
-//! The Streamable HTTP client transport. Every request is one POST on its own connection.
+//! The Streamable HTTP client transport. Every request is one `POST` on its own connection.
 //! The response is either one JSON message or an SSE stream of messages. The transport
 //! mirrors the request into the `Mcp-*` headers, learns `x-mcp-header` annotations from
 //! `tools/list` results, and drops tools whose annotations are invalid. HTTPS uses the
@@ -115,7 +115,7 @@ pub const Client = struct {
         }
     };
 
-    /// Run the POST in a task so that cancellation and the deadline can interrupt it.
+    /// Run the `POST` in a task so that cancellation and the deadline can interrupt it.
     fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
@@ -191,7 +191,7 @@ pub const Client = struct {
 
     const Challenge = struct { status: u16, www_authenticate: ?[]const u8 };
 
-    /// Send the request, answering authorization challenges until the attempt limit.
+    /// Send the request. Answer authorization challenges until the attempt limit.
     fn perform(self: *Client, arena: Allocator, ex: *Transport.Exchange) Transport.ExchangeError!void {
         var attempt: u8 = 0;
         while (true) {
@@ -208,7 +208,7 @@ pub const Client = struct {
         }
     }
 
-    /// One POST. Returns a challenge when the server answered 401 or 403.
+    /// One `POST`. Returns a challenge when the server answered 401 or 403.
     fn performOnce(self: *Client, arena: Allocator, ex: *Transport.Exchange) Transport.ExchangeError!?Challenge {
         const io = self.io;
         var headers: std.ArrayList(http.Header) = .empty;
@@ -293,8 +293,8 @@ pub const Client = struct {
         try self.tool_headers.appendParamHeaders(arena, headers, tool_name, arguments, false);
     }
 
-    /// Hand a frame to the sink. A `tools/list` result is scanned for header annotations
-    /// first, and tools with invalid annotations are removed from it.
+    /// Hand a frame to the sink. First, the transport scans a `tools/list` result for header
+    /// annotations and removes the tools with invalid annotations.
     fn deliver(self: *Client, io: Io, arena: Allocator, ex: *Transport.Exchange, frame: []const u8) Transport.ExchangeError!void {
         var out = frame;
         if (std.mem.eql(u8, ex.method, "tools/list")) {

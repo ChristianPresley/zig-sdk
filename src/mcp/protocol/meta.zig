@@ -1,4 +1,4 @@
-//! Per-request `_meta` handling: reserved keys, key grammar, and lifting the envelope.
+//! Per-request `_meta` rules: reserved keys, key grammar, and the envelope lift.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;

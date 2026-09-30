@@ -8,7 +8,7 @@ const Certificate = crypto.Certificate;
 const CaSet = @import("CaSet.zig");
 const x509 = @import("x509.zig");
 
-/// How the peer certificate is verified.
+/// How the SDK verifies the peer certificate.
 pub const Trust = union(enum) {
     /// No verification. Only for tests: anyone can present any certificate.
     no_verification,
@@ -50,8 +50,8 @@ pub const Leaf = struct {
     }
 };
 
-/// Verify a chain, leaf first, against the trust policy. `host` is checked against the leaf
-/// when given. The validity times use `now_sec`.
+/// Verify a chain, leaf first, against the trust policy. When `host` is not null, the function
+/// checks it against the leaf. The validity times use `now_sec`.
 pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, now_sec: i64) Error!Leaf {
     if (certs.len == 0 or certs.len > max_certs) return error.TlsCertificateInvalid;
     const leaf_parsed = parse(certs[0]) catch return error.TlsCertificateInvalid;

@@ -64,9 +64,9 @@ pub const Hooks = struct {
     elicit_form: ?*const fn (ctx: *HookContext, params: types.ElicitRequestFormParams) anyerror!types.ElicitResult = null,
     /// Answer a URL elicitation. The hook shows the URL to the user and never opens it alone.
     elicit_url: ?*const fn (ctx: *HookContext, params: types.ElicitRequestURLParams) anyerror!types.ElicitResult = null,
-    /// Answer a sampling request. Required when `capabilities.sampling` is declared.
+    /// Answer a sampling request. Required when `capabilities.sampling` declares sampling.
     sample: ?*const fn (ctx: *HookContext, params: types.CreateMessageRequestParams) anyerror!types.CreateMessageResult = null,
-    /// List the roots. Required when `capabilities.roots` is declared.
+    /// List the roots. Required when `capabilities.roots` declares roots.
     list_roots: ?*const fn (ctx: *HookContext) anyerror![]const types.Root = null,
     /// A server notification that belongs to no request (stdio only).
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
@@ -86,19 +86,19 @@ pub const Diagnostics = struct {
 };
 
 pub const RequestOptions = struct {
-    /// Relative timeout for the whole request, including multi round-trip rounds.
+    /// Relative timeout for the whole request, with all multi round-trip rounds.
     timeout: ?Io.Duration = null,
     cancel: ?*Transport.CancelToken = null,
     on_progress: ?*const fn (userdata: ?*anyopaque, params: types.ProgressNotificationParams) void = null,
     on_log: ?*const fn (userdata: ?*anyopaque, params: types.LoggingMessageNotificationParams) void = null,
     /// Any notification on the request stream that is not progress or log.
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
-    /// Return an `InputRequiredResult` to the caller instead of driving the hooks.
+    /// Return an `InputRequiredResult` to the caller. The client does not call the hooks.
     allow_input_required: bool = false,
-    /// Return the `CreateTaskResult` of a `tools/call` in `Response.task` instead of waiting
-    /// for the task. Only meaningful when `capabilities.extensions` declares the extension.
+    /// Return the `CreateTaskResult` of a `tools/call` in `Response.task`. The client does not
+    /// wait for the task. Only meaningful when `capabilities.extensions` declares the extension.
     allow_task: bool = false,
-    /// What to do when the stream is lost before any response byte arrived.
+    /// What to do when the client loses the stream before any response byte arrived.
     retry: Retry = .auto,
     /// How this request uses the result cache.
     cache_mode: cache_mod.Mode = .default,
@@ -273,14 +273,14 @@ pub fn updateTask(self: *Client, arena: Allocator, task_id: []const u8, input_re
     _ = try self.requestAs(arena, types.EmptyResult, "tasks/update", params, options);
 }
 
-/// Ask the server to cancel a task. The call on a finished task is also accepted.
+/// Ask the server to cancel a task. The server also accepts the call on a finished task.
 pub fn cancelTask(self: *Client, arena: Allocator, task_id: []const u8, options: RequestOptions) RequestError!void {
     _ = try self.requestAs(arena, types.EmptyResult, "tasks/cancel", try taskParams(arena, task_id), options);
 }
 
-/// Poll a task until it ends. Input requests are answered with the hooks. The returned task
-/// has the status `completed`. A failed task sets `Diagnostics.rpc_error` from the task and
-/// returns `error.Rpc`. A cancelled task returns `error.TaskCancelled`.
+/// Poll a task until it ends. The hooks answer input requests. The task that the function
+/// returns has the status `completed`. A failed task sets `Diagnostics.rpc_error` from the
+/// task and returns `error.Rpc`. A canceled task returns `error.TaskCancelled`.
 pub fn awaitTask(self: *Client, arena: Allocator, task_id: []const u8, options: AwaitOptions) RequestError!tasks.DetailedTask {
     const deadline: ?Io.Clock.Timestamp = if (options.timeout) |d| Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake }) else null;
     var default_interval: Io.Duration = .fromMilliseconds(1000);
@@ -474,7 +474,7 @@ const Collector = struct {
     response: ?Value = null,
     rpc_error: ?types.Error = null,
     invalid: bool = false,
-    /// Frames delivered so far. A lost stream is only retried when nothing arrived.
+    /// Frames delivered so far. The client retries a lost stream only when nothing arrived.
     frames: u32 = 0,
 
     fn onFrame(ptr: *anyopaque, io: Io, frame: []const u8) anyerror!void {
@@ -645,7 +645,7 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
     return error.TooManyRounds;
 }
 
-/// True when a request whose stream was lost can be sent again with a new id.
+/// True when the client can send a request again with a new id after it lost the stream.
 fn canRetryLost(self: *Client, options: RequestOptions, known: ?methods.Method, frames: u32, done: u32) bool {
     if (done >= self.options.limits.max_lost_stream_retries) return false;
     if (options.cancel) |c| if (c.isCancelled()) return false;

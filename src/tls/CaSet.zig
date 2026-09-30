@@ -29,7 +29,7 @@ pub fn count(self: *const CaSet) usize {
     return self.certs.items.len;
 }
 
-/// Add one DER certificate. The bytes are copied.
+/// Add one DER certificate. The set copies the bytes.
 pub fn addDer(self: *CaSet, bytes: []const u8) AddError!void {
     if (self.certs.items.len >= max_anchors) return error.TooManyAnchors;
     x509.precheck(bytes) catch return error.InvalidCertificate;

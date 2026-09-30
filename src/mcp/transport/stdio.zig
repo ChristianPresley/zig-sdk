@@ -311,7 +311,7 @@ pub const Client = struct {
     closed: std.atomic.Value(bool) = .init(false),
     /// True once the reader task saw the end of the stream for the last time.
     reader_done: std.atomic.Value(bool) = .init(false),
-    /// Counts the restarts. A request that waits across a restart is lost.
+    /// Counts the restarts. A request that waits across a restart fails.
     generation: std.atomic.Value(u32) = .init(0),
     restarts: u32 = 0,
     /// Receives notifications that belong to no request in flight.
@@ -325,7 +325,7 @@ pub const Client = struct {
         environ_map: ?*const std.process.Environ.Map = null,
         cwd: std.process.Child.Cwd = .inherit,
         limits: Limits = .{},
-        /// How often a waiting request checks for cancellation.
+        /// How often a request that waits checks for cancellation.
         poll_interval: Io.Duration = .fromMilliseconds(50),
         /// Put the child in its own process group (POSIX) or job object (Windows), so that
         /// `close` and `kill` also end the processes it spawned.
@@ -399,7 +399,7 @@ pub const Client = struct {
     }
 
     /// Close stdin and wait for the process to exit. After `limits.shutdown_grace` the
-    /// process tree gets a termination signal, and after one more grace period it is killed.
+    /// process tree gets a termination signal, and after one more grace period a kill signal.
     pub fn close(self: *Client) void {
         const io = self.io;
         if (!self.closed.swap(true, .acq_rel)) {

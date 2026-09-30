@@ -31,7 +31,7 @@ pub const schema = struct {
     pub const regex = @import("mcp/schema/regex.zig");
 };
 pub const UriTemplate = @import("mcp/uri_template/UriTemplate.zig");
-/// TLS 1.3 server and certificate handling for HTTPS.
+/// TLS 1.3 server, certificates and keys for HTTPS.
 pub const tls = @import("tls/tls.zig");
 pub const util = struct {
     pub const line_framer = @import("mcp/util/line_framer.zig");

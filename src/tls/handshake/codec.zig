@@ -1,4 +1,4 @@
-//! Handshake message parsing and building (RFC 8446 section 4).
+//! Parse and build handshake messages (RFC 8446 section 4).
 const std = @import("std");
 const tls = std.crypto.tls;
 const Decoder = tls.Decoder;
@@ -10,7 +10,7 @@ pub const ParseError = error{
     DecodeError,
     /// A field has a forbidden value: alert `illegal_parameter`.
     IllegalParameter,
-    /// TLS 1.3 was not offered: alert `protocol_version`.
+    /// The peer did not offer TLS 1.3: alert `protocol_version`.
     ProtocolVersion,
     /// A mandatory extension is absent: alert `missing_extension`.
     MissingExtension,

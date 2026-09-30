@@ -19,8 +19,8 @@ pub fn encodedLen(jsonrpc: []const u8) usize {
     return 1 + wire.varintLen(jsonrpc.len) + jsonrpc.len;
 }
 
-/// Decode a `JsonRpcMessage`. Unknown fields are skipped. The returned slice points into
-/// `bytes`.
+/// Decode a `JsonRpcMessage`. The decoder skips unknown fields. The slice that the function
+/// returns points into `bytes`.
 pub fn decodeJsonRpcMessage(bytes: []const u8) DecodeError![]const u8 {
     var r: wire.Reader = .init(bytes);
     var jsonrpc: ?[]const u8 = null;

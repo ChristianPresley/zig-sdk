@@ -2,8 +2,8 @@
 //! decryption of records, alerts, key updates and the plaintext `reader` and `writer`.
 //!
 //! The handshake code owns a `Connection` while the keys are not yet set and hands it to the
-//! application when the handshake is complete. The struct must not be moved after `reader`
-//! or `writer` were used, because both point back at it.
+//! application when the handshake is complete. Do not move the struct after the first use of
+//! `reader` or `writer`, because both point back at it.
 const std = @import("std");
 const crypto = std.crypto;
 const tls = crypto.tls;
@@ -55,7 +55,7 @@ pub const min_read_buffer_len = tls.max_ciphertext_len;
 pub const key_update_threshold: u64 = 1 << 24;
 
 pub const ReadError = error{
-    /// The peer sent a fatal alert. It is stored in `alert`.
+    /// The peer sent a fatal alert. The field `alert` holds it.
     TlsAlert,
     TlsBadRecordMac,
     TlsRecordOverflow,
@@ -125,8 +125,8 @@ pub fn eof(self: *const Connection) bool {
 
 // -- Reading records -------------------------------------------------------------------------
 
-/// Read one record. Encrypted records are decrypted into the `reader` buffer after its
-/// end. The returned data is valid until the next read.
+/// Read one record. The function decrypts an encrypted record into the `reader` buffer after
+/// its end. The data that it returns is valid until the next read.
 pub fn readRecord(self: *Connection) RecordError!Record {
     const input = self.input;
     const header = input.peek(tls.record_header_len) catch |e| switch (e) {
@@ -218,7 +218,7 @@ fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
 }
 
 /// Decrypt one record into the reader buffer. Application data advances the buffer end.
-/// Other content is handled here and yields no bytes.
+/// This function processes other content and gives no bytes for it.
 fn readIndirect(c: *Connection) Reader.Error!usize {
     if (c.received_close_notify) return error.EndOfStream;
     const rec = c.readRecord() catch |e| switch (e) {
@@ -311,8 +311,8 @@ fn rotateWriteKeys(c: *Connection) void {
 
 // -- Writing records -------------------------------------------------------------------------
 
-/// Encrypt `bytes` as records of `content_type` into `out`. Returns how much was written and
-/// how much of `bytes` was consumed. The rest did not fit.
+/// Encrypt `bytes` as records of `content_type` into `out`. Returns the number of bytes that
+/// it wrote and the number of bytes of `bytes` that it used. The rest did not fit.
 fn encryptInto(c: *Connection, out: []u8, bytes: []const u8, content_type: tls.ContentType) struct { written: usize, consumed: usize } {
     var written: usize = 0;
     var consumed: usize = 0;
@@ -373,14 +373,14 @@ pub fn writeChangeCipherSpec(c: *Connection) Writer.Error!void {
     try c.output.writeAll(&.{ @intFromEnum(tls.ContentType.change_cipher_spec), 0x03, 0x03, 0x00, 0x01, 0x01 });
 }
 
-/// Send an alert and flush. A fatal alert is also recorded in `alert`.
+/// Send an alert and flush. The field `alert` also records a fatal alert.
 pub fn sendAlert(c: *Connection, level: tls.Alert.Level, description: tls.Alert.Description) Writer.Error!void {
     if (level == .fatal) c.alert = .{ .level = level, .description = description };
     try c.writeRecord(.alert, &.{ @intFromEnum(level), @intFromEnum(description) });
     try c.output.flush();
 }
 
-/// Send `close_notify` after flushing pending plaintext.
+/// Flush pending plaintext, then send `close_notify`.
 pub fn end(c: *Connection) Writer.Error!void {
     try flush(&c.writer);
     if (c.sent_close_notify) return;
@@ -389,7 +389,7 @@ pub fn end(c: *Connection) Writer.Error!void {
     try c.output.flush();
 }
 
-/// Rotate our keys before the AEAD record limit (section 5.5) is reached.
+/// Rotate our keys before the connection gets to the AEAD record limit (section 5.5).
 fn maybeUpdateKeys(c: *Connection) Writer.Error!void {
     if (!c.handshake_complete) return;
     const seq = switch (c.write_keys) {
@@ -400,7 +400,7 @@ fn maybeUpdateKeys(c: *Connection) Writer.Error!void {
     try c.updateKeys();
 }
 
-/// Send a KeyUpdate and rotate our write keys. Pending plaintext must be flushed first.
+/// Send a KeyUpdate and rotate our write keys. Flush pending plaintext first.
 pub fn updateKeys(c: *Connection) Writer.Error!void {
     var buf: [8]u8 = undefined;
     try c.writeRecord(.handshake, codec.keyUpdate(&buf, false));

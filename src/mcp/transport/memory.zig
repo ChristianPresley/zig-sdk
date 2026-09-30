@@ -29,8 +29,8 @@ pub const Harness = struct {
         self.finished = false;
     }
 
-    /// Deliver one request frame and run the server inline. Long-lived requests must be sent
-    /// with `sendConcurrent`.
+    /// Deliver one request frame and run the server inline. Send long-lived requests with
+    /// `sendConcurrent`.
     pub fn send(self: *Harness, text: []const u8) !void {
         var token: Transport.CancelToken = .{};
         try self.sendWithToken(text, &token);

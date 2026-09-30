@@ -34,4 +34,4 @@ All prose uses the project profile of ASD-STE100 Simplified Technical English. T
 
 ## Scope
 
-The SDK obeys MCP specification revision 2026-07-28 only. Changes that add behavior from older revisions are not accepted.
+The SDK obeys MCP specification revision 2026-07-28 only. The project does not accept changes that add behavior from older revisions.

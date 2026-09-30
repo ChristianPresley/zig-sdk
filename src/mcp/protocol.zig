@@ -1,4 +1,4 @@
-//! Protocol layer: version table, schema types, method table, errors and `_meta` handling.
+//! Protocol layer: version table, schema types, method table, errors and the `_meta` rules.
 pub const version = @import("protocol/version.zig");
 pub const types = @import("protocol/types.zig");
 pub const errors = @import("protocol/errors.zig");

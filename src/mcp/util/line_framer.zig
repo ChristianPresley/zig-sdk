@@ -20,7 +20,7 @@ pub const Framer = struct {
     reader: *Io.Reader,
     max_line_bytes: usize,
 
-    /// Read the next non-blank line into `arena`. Trailing `\r` is removed. Returns
+    /// Read the next non-blank line into `arena`. The reader removes a trailing `\r`. Returns
     /// `error.EndOfStream` when the stream ended without a complete line.
     pub fn next(self: *Framer, arena: Allocator) Error![]u8 {
         while (true) {

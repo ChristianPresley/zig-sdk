@@ -43,7 +43,7 @@ pub const Config = struct {
     /// What to do when the client asks for a server name no chain covers.
     server_name_mismatch: enum { ignore, alert } = .ignore,
     client_auth: ClientAuth = .none,
-    /// How a client certificate is verified. Required when `client_auth` is not `none`.
+    /// How the server verifies a client certificate. Required when `client_auth` is not `none`.
     client_trust: ?verify.Trust = null,
 };
 
@@ -92,7 +92,7 @@ fn selectSuite(config: Config, hello: *const codec.ClientHello) ?Suite {
 
 const GroupChoice = struct {
     group: key_share.Group,
-    /// The client's key share, or null when a HelloRetryRequest is needed.
+    /// The key share of the client, or null when the server must send a HelloRetryRequest.
     share: ?[]const u8,
 };
 

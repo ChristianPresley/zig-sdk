@@ -118,7 +118,7 @@ pub const Decoder = struct {
         return self.size;
     }
 
-    /// Decode one header block. The headers are copied into `arena`.
+    /// Decode one header block. The decoder copies the headers into `arena`.
     pub fn decode(self: *Decoder, arena: Allocator, block: []const u8, out: *std.ArrayList(Header)) Error!void {
         var r: BlockReader = .{ .buf = block };
         var list_size: usize = 0;

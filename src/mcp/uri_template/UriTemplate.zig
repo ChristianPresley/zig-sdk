@@ -1,7 +1,7 @@
 //! RFC 6570 URI templates, the subset used by MCP resource templates: simple `{var}` and
 //! reserved `{+var}` expressions with sequential, non-backtracking matching.
-//! Path-based operators (`{/var}`, `{.var}`, `{#var}`, `{?var}`, `{&var}`) are parsed and
-//! matched with their prefix literal. Explode and prefix modifiers are rejected.
+//! The parser accepts path-based operators (`{/var}`, `{.var}`, `{#var}`, `{?var}`, `{&var}`)
+//! and matches them with their prefix literal. The parser rejects explode and prefix modifiers.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -104,8 +104,8 @@ pub const Variable = struct {
     value: []const u8,
 };
 
-/// Match `uri` against the template. On success the variables are filled from `uri` (slices
-/// into `uri`, percent-encoded as they appear) and appended to `out`.
+/// Match `uri` against the template. On success the function appends the variables to `out`.
+/// Their values are slices into `uri`, percent-encoded as they appear.
 pub fn match(self: UriTemplate, uri: []const u8, out: *std.ArrayList(Variable), gpa: Allocator) Allocator.Error!bool {
     const start_len = out.items.len;
     errdefer out.shrinkRetainingCapacity(start_len);

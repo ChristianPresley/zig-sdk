@@ -1,5 +1,5 @@
 //! TLS 1.3 (RFC 8446) for the SDK: a server and a client on top of the primitives in
-//! `std.crypto`. Only TLS 1.3 is offered. There is no resumption, no early data and no
+//! `std.crypto`. The SDK offers only TLS 1.3. There is no resumption, no early data and no
 //! renegotiation.
 const std = @import("std");
 

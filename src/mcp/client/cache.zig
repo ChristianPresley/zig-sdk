@@ -9,7 +9,7 @@ const json = @import("../json.zig");
 
 pub const Options = struct {
     enabled: bool = false,
-    /// Entries kept at the same time. Overflow: the oldest entry is dropped.
+    /// Entries kept at the same time. Overflow: the cache drops the oldest entry.
     max_entries: u32 = 256,
     /// The longest lifetime accepted from a server hint.
     max_ttl_ms: i64 = 3_600_000,

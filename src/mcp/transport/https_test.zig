@@ -66,7 +66,7 @@ const Fixture = struct {
     }
 };
 
-/// One HTTPS POST through the std TLS client. Returns the response head and body text.
+/// One HTTPS `POST` through the std TLS client. Returns the response head and body text.
 fn postWithStdClient(gpa: std.mem.Allocator, io: Io, port: u16, body: []const u8) ![]u8 {
     const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
     var stream = try address.connect(io, .{ .mode = .stream });

@@ -1,4 +1,4 @@
-//! Client behaviour over the in-memory link to a server.
+//! Client behavior over the in-memory link to a server.
 const std = @import("std");
 const Io = std.Io;
 const Value = std.json.Value;

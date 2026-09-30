@@ -1,7 +1,7 @@
 //! Interfaces between the protocol engine and the transports.
 //!
 //! A transport turns bytes into `Inbound` messages and gives each request a `Responder`.
-//! Frames handed to a responder are already serialized JSON-RPC messages without a trailing
+//! A frame that a responder receives is a serialized JSON-RPC message without a trailing
 //! newline. The engine never keeps a pointer into a frame after `finish` or `abort`.
 const std = @import("std");
 const Io = std.Io;
@@ -17,7 +17,7 @@ pub const CancelToken = struct {
         return self.flag.load(.acquire);
     }
 
-    /// Mark the request cancelled and wake anyone waiting on the event.
+    /// Mark the request as canceled and wake all tasks that wait on the event.
     pub fn cancel(self: *CancelToken, io: Io, reason: ?[]const u8) void {
         self.reason = reason;
         self.flag.store(true, .release);
@@ -28,7 +28,7 @@ pub const CancelToken = struct {
         if (self.isCancelled()) return error.Canceled;
     }
 
-    /// Wait until the request is cancelled.
+    /// Wait until a cancellation of the request.
     pub fn wait(self: *CancelToken, io: Io) Io.Cancelable!void {
         try self.event.wait(io);
     }
@@ -52,7 +52,7 @@ pub const Responder = struct {
         notify: *const fn (ptr: *anyopaque, io: Io, frame: []const u8) SendError!void,
         /// Send the final response (result or error) and close the request stream.
         finish: *const fn (ptr: *anyopaque, io: Io, frame: []const u8) SendError!void,
-        /// Close the request stream without a response (the request was cancelled).
+        /// Close the request stream without a response (after a cancellation).
         abort: *const fn (ptr: *anyopaque, io: Io) void,
     };
 
@@ -93,10 +93,9 @@ pub const ClientTransport = struct {
     pub const VTable = struct {
         kind: Kind,
         /// Send the request and deliver every frame of its stream to the sink. The last frame
-        /// is the response. Returns when the response was delivered, the request was
-        /// cancelled or the stream failed.
+        /// is the response. Returns after the response, a cancellation or a stream failure.
         exchange: *const fn (ptr: *anyopaque, io: Io, ex: *Exchange) ExchangeError!void,
-        /// Send a notification. Nothing comes back.
+        /// Send a notification. The peer sends nothing back.
         notify: *const fn (ptr: *anyopaque, io: Io, frame: []const u8) SendError!void,
     };
 

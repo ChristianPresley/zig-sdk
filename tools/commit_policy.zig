@@ -1,8 +1,8 @@
 //! Checks every commit in a range against the repository commit policy:
-//! - the maintainer is the sole author and committer,
-//! - no attribution trailer is present,
-//! - the subject follows Conventional Commits (`type(scope): description`),
-//! - the body describes every changed file on its own line (`path: what changed`).
+//! - The maintainer is the sole author and the sole committer.
+//! - The message has no attribution trailer.
+//! - The subject follows Conventional Commits (`type(scope): description`).
+//! - The body describes every changed file on its own line (`path: what changed`).
 //!
 //! Usage: `commit-policy <git range>` (default `origin/main..HEAD`).
 const std = @import("std");

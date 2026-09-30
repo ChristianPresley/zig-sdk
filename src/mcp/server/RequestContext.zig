@@ -29,7 +29,7 @@ meta: meta_mod.RequestMeta,
 params: ?Value,
 /// Responses to input requests from an earlier round, keyed by the server-chosen key.
 input_responses: ?types.InputResponses = null,
-/// The caller state that was sealed into `requestState` in an earlier round.
+/// The caller state that an earlier round sealed into `requestState`.
 request_state: ?[]const u8 = null,
 cancel: *Transport.CancelToken,
 responder: Transport.Responder,
@@ -62,7 +62,7 @@ pub fn principal(self: *const RequestContext) ?*const Principal {
     return @ptrCast(@alignCast(p));
 }
 
-/// Return `error.Canceled` when the client cancelled the request.
+/// Return `error.Canceled` when the client canceled the request.
 pub fn checkCancel(self: *RequestContext) error{Canceled}!void {
     try self.cancel.check();
 }
@@ -82,8 +82,8 @@ pub fn invalidParams(self: *RequestContext, comptime fmt: []const u8, args: anyt
     return self.setError(errors.invalidParams(msg));
 }
 
-/// Send `notifications/progress` on the request stream. Dropped when the request carried no
-/// progress token or when the per-request rate limit is exceeded.
+/// Send `notifications/progress` on the request stream. The server drops the notification
+/// when the request carried no progress token, or when it is over the per-request rate limit.
 pub fn progress(self: *RequestContext, value: f64, total: ?f64, note: ?[]const u8) Error!void {
     const token = self.meta.progress_token orelse return;
     if (self.progress_sent >= self.server.options.limits.max_progress_rate_per_s * 60) return;

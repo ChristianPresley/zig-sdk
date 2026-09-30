@@ -1,5 +1,6 @@
-//! Compares the vendored `schema.json` definitions with the fixture directories and reports
-//! definitions that have examples but no entry in the export map, plus a summary count.
+//! Compares the vendored `schema.json` definitions with the fixture directories. It reports
+//! the definitions that have examples but no entry in the export map, and a summary count.
+//!
 //! Usage: `census [fixtures-dir]`.
 const std = @import("std");
 const Io = std.Io;

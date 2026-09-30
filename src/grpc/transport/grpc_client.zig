@@ -79,7 +79,7 @@ pub const Channel = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    /// Connect now. Calls connect on demand when this was not called.
+    /// Connect now. Without this call, calls connect on demand.
     pub fn connect(self: *Channel) ConnectError!void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);

@@ -1,5 +1,5 @@
 //! The MCP server engine: registries, the dispatch ladder, multi round-trip requests,
-//! subscriptions and result stamping. Transports feed it `Inbound` messages.
+//! subscriptions and the result metadata. Transports feed it `Inbound` messages.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -42,8 +42,8 @@ pub const CacheHint = struct {
 pub const Options = struct {
     info: types.Implementation,
     instructions: ?[]const u8 = null,
-    /// Exact mirror of the advertised `ServerCapabilities`. Registering a tool, resource or
-    /// prompt declares the matching capability when it is absent.
+    /// Exact mirror of the advertised `ServerCapabilities`. The registration of a tool,
+    /// resource or prompt declares the matching capability when it is absent.
     capabilities: types.ServerCapabilities = .{},
     /// Which kinds of input requests handlers can issue.
     mrtr: struct {
@@ -53,15 +53,15 @@ pub const Options = struct {
         roots: bool = false,
     } = .{},
     limits: Limits = .{},
-    /// How `requestState` is protected. `unprotected` is only acceptable when tampering can
-    /// cause nothing worse than request failure.
+    /// How the server protects `requestState`. `unprotected` is only acceptable when tampering
+    /// can cause nothing worse than request failure.
     request_state: enum { sealed_ephemeral, unprotected } = .sealed_ephemeral,
     /// What happens when tool arguments violate the input schema.
     invalid_args_policy: enum { tool_error, rpc_error } = .tool_error,
     /// Mirror `structuredContent` into a text block when the handler gave none.
     structured_text_mirror: bool = true,
-    /// Ignore JSON Schema keywords the validator does not support instead of rejecting the
-    /// tool at registration.
+    /// Ignore JSON Schema keywords that the validator does not support. Without this option,
+    /// the registration of the tool fails.
     allow_unsupported_schema_keywords: bool = false,
     /// Enable the Tasks extension. The server then advertises it under `extensions`.
     tasks: ?tasks.Options = null,
@@ -372,8 +372,8 @@ fn parseSchemaObject(self: *Server, text: []const u8, require_object_type: bool)
     return tree;
 }
 
-/// Register a tool whose arguments are parsed into the handler's second parameter type. The
-/// input schema is derived from that type at compile time.
+/// Register a tool. The server parses the arguments into the type of the second parameter of
+/// the handler. The SDK derives the input schema from that type at compile time.
 pub fn addTool(self: *Server, def: ToolDef, comptime handler: anytype) RegisterError!void {
     const Fn = @TypeOf(handler);
     const params = @typeInfo(Fn).@"fn".params;
@@ -754,7 +754,7 @@ fn dispatch(self: *Server, ctx: *RequestContext) RequestContext.Error!void {
         try map.put(ctx.arena, "supportedVersions", .{ .array = versions });
         return ctx.setError(.{
             .code = errors.Code.method_not_found.int(),
-            .message = "Method not found: initialize. This server implements MCP 2026-07-28 only; use server/discover.",
+            .message = "Method not found: initialize. This server supports MCP 2026-07-28 only. Use server/discover.",
             .data = .{ .object = map },
         });
     }

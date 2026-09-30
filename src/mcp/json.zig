@@ -11,8 +11,8 @@ pub const wire_options: std.json.Stringify.Options = .{
     .emit_null_optional_fields = false,
 };
 
-/// Parse options used for every inbound message: unknown fields are ignored for forward
-/// compatibility, duplicate fields keep the last value.
+/// Parse options for every inbound message: the parser ignores unknown fields for forward
+/// compatibility, and duplicate fields keep the last value.
 pub const wire_parse_options: ParseOptions = .{
     .ignore_unknown_fields = true,
     .duplicate_field_behavior = .use_last,
@@ -82,8 +82,8 @@ pub fn Discriminated(comptime U: type, comptime key: []const u8) type {
     };
 }
 
-/// Hooks for a `union(enum)` that is serialized as its active payload and parsed by a
-/// caller-supplied `classify` function that inspects the object.
+/// Hooks for a `union(enum)` that serializes as its active payload. A `classify` function
+/// from the caller inspects the object and selects the payload to parse.
 pub fn Classified(comptime U: type, comptime classify: fn (Value) ?std.meta.Tag(U)) type {
     return struct {
         pub fn jsonParse(allocator: Allocator, source: anytype, options: ParseOptions) !U {

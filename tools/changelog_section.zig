@@ -1,4 +1,5 @@
 //! Prints the section of `CHANGELOG.md` for one version, for release notes.
+//!
 //! Usage: `changelog-section vX.Y.Z [--out PATH]`
 const std = @import("std");
 const Io = std.Io;

@@ -104,7 +104,7 @@ All prose in this repository uses ASD-STE100 Simplified Technical English, custo
 
 ## License
 
-Apache License 2.0. See `LICENSE`. Third-party material is listed in `THIRD_PARTY_LICENSES.md`.
+Apache License 2.0. See `LICENSE`. The file `THIRD_PARTY_LICENSES.md` lists the third-party material.
 
 [^mcp-spec]: Model Context Protocol Specification 2026-07-28. https://modelcontextprotocol.io/specification/2026-07-28
 [^wiki]: zig-sdk wiki. https://github.com/ChristianPresley/zig-sdk/wiki

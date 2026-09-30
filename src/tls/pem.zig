@@ -4,10 +4,10 @@ const Allocator = std.mem.Allocator;
 
 pub const Block = struct {
     label: []const u8,
-    /// The base64 text between the BEGIN and END lines.
+    /// The base64 text between the `BEGIN` and `END` lines.
     body: []const u8,
 
-    /// Decode the body. The result is owned by the caller.
+    /// Decode the body. The caller owns the result.
     pub fn decode(self: Block, gpa: Allocator) (Allocator.Error || error{InvalidEncoding})![]u8 {
         const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
         const max = decoder.calcSizeUpperBound(self.body.len);
@@ -25,7 +25,7 @@ pub const Iterator = struct {
         return .{ .rest = text };
     }
 
-    /// The next block, or null. Text outside blocks is skipped.
+    /// The next block, or null. The reader skips text outside blocks.
     pub fn next(self: *Iterator) ?Block {
         const begin = "-----BEGIN ";
         const start = std.mem.indexOf(u8, self.rest, begin) orelse return null;
