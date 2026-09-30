@@ -184,7 +184,7 @@ pub fn selectIcon(self: *const Client, list: ?[]const types.Icon, want: icons.Wa
     return icons.select(list, want, server_url, self.options.icons.effective(self.options.hooks.icon_decoder != null));
 }
 
-/// A result together with the raw `Value` it was parsed from.
+/// A result together with the raw `Value` that the client parsed.
 pub fn Response(comptime T: type) type {
     return struct {
         result: T,

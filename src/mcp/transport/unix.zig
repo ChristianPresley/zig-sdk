@@ -9,8 +9,8 @@
 //! On POSIX systems the server sets the mode `0600` on the socket file after it creates the
 //! file. Before that, the umask of the process applies. We recommend a socket directory that
 //! only the owner can open. The server refuses a path that is not a socket. It removes a
-//! stale socket file at start and its own socket file at shutdown. The server does not check
-//! the credentials of the peer. The file mode and the directory of the socket control access.
+//! stale socket file at start and its own socket file at shutdown. The file mode and the
+//! directory of the socket control access, because the server does not check the peer.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;

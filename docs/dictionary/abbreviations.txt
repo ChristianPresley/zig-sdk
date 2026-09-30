@@ -32,6 +32,16 @@ URI: uniform resource identifier
 URL: uniform resource locator
 UTC: Coordinated Universal Time
 UTF-8: the 8-bit encoding of Unicode
+GET: the HTTP method that reads a resource
+GIF: Graphics Interchange Format
+JPEG: the image format of the Joint Photographic Experts Group
+MIME: Multipurpose Internet Mail Extensions, the media type system
+PNG: Portable Network Graphics
+POST: the HTTP method that sends a request body
+SVG: Scalable Vector Graphics
+UI: user interface
+YAML: the data format of the skill frontmatter
+ECMA: Ecma International, the publisher of ECMA-262
 # AB-2 security abbreviations
 AEAD: authenticated encryption with associated data
 AES: Advanced Encryption Standard
@@ -55,6 +65,22 @@ SEC1: the elliptic curve private key format of SECG
 SHA: Secure Hash Algorithm
 SNI: server name indication
 TLS: Transport Layer Security
+CRT: the Chinese remainder theorem form of an RSA private key
+EMSA-PSS: the encoding method of RSASSA-PSS (RFC 8017)
+ES384: ECDSA with P-384 and SHA-384
+ID-JAG: identity assertion JWT authorization grant
+JAG: JWT authorization grant, in ID-JAG
+JOSE: JSON Object Signing and Encryption
+KEM: key encapsulation mechanism
+MGF1: the mask generation function of RSA-PSS (RFC 8017)
+ML-KEM: the module-lattice key encapsulation mechanism (FIPS 203)
+ML-KEM-768: the ML-KEM parameter set of security category 3
+RS384: RSA PKCS #1 version 1.5 signature with SHA-384
+RS512: RSA PKCS #1 version 1.5 signature with SHA-512
+RSASSA: RSA signature scheme with appendix (RFC 8017)
+PKCS1: PKCS #1, in names such as RSASSA-PKCS1-v1_5
+X25519MLKEM768: the hybrid TLS key exchange group of ML-KEM-768 and X25519 (RFC 10024)
+XOR: the exclusive or operation
 # AB-3 project and process abbreviations
 ASD: the association that publishes ASD-STE100
 ASD-STE100: the specification of Simplified Technical English

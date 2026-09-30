@@ -108,8 +108,8 @@ pub fn clientSupports(caps: types.ClientCapabilities) bool {
     return false;
 }
 
-/// The client capabilities with the extension declared for HTML views. Other extensions are
-/// kept.
+/// The client capabilities with the extension declared for HTML views. The function keeps
+/// the other extensions.
 pub fn declare(arena: Allocator, caps: types.ClientCapabilities) Allocator.Error!types.ClientCapabilities {
     var list: std.json.Array = .init(arena);
     try list.append(.{ .string = mime_type });
@@ -125,7 +125,7 @@ pub const MetaError = error{
 };
 
 /// The UI metadata of a tool, or null when the tool has none. The function reads
-/// `_meta.ui` and falls back to the deprecated flat key.
+/// `_meta.ui`. Without it, the function uses the deprecated flat key.
 pub fn toolMeta(arena: Allocator, tool: types.Tool) MetaError!?ToolMeta {
     const meta = tool._meta orelse return null;
     if (meta != .object) return null;

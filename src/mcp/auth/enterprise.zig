@@ -410,8 +410,8 @@ pub const IdJagValidator = struct {
 
     pub const ReplayCheck = struct {
         userdata: ?*anyopaque = null,
-        /// Return true when the pair of `issuer` and `jti` was seen before, else record it
-        /// until `expires_at`.
+        /// Return true when the store already has the pair of `issuer` and `jti`. Otherwise
+        /// record the pair until `expires_at`.
         seen: *const fn (userdata: ?*anyopaque, issuer: []const u8, jti: []const u8, expires_at: i64) bool,
     };
 

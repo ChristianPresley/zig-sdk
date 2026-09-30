@@ -93,7 +93,7 @@ pub const Formats = struct {
 pub const Origins = enum {
     /// The origin of the MCP endpoint and the trusted origins of the policy.
     same_origin,
-    /// Every `https` origin. This turns off the same-origin rule of the specification.
+    /// Every `https` origin. This disables the same-origin rule of the specification.
     any,
     /// No `https` icon. Only `data:` icons pass.
     none,

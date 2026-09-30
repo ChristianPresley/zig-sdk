@@ -45,7 +45,7 @@ const Int = struct {
     }
 };
 
-/// An RSA private key with the CRT components. The private exponent `d` is not kept.
+/// An RSA private key with the CRT components. The key does not keep the private exponent `d`.
 pub const PrivateKey = struct {
     n: Int,
     e: Int,
@@ -262,7 +262,7 @@ fn checkComponents(key: *const PrivateKey) ParseError!void {
     if (!std.mem.eql(u8, input[0..k], back[0..k])) return error.InvalidKey;
 }
 
-/// The next element as a non-negative INTEGER, without leading zero bytes.
+/// The next element as a non-negative `INTEGER`, without leading zero bytes.
 fn integer(it: *der.Iterator) ParseError![]const u8 {
     const elem = it.require() catch return error.InvalidEncoding;
     if (elem.tag != der.tag_integer or elem.content.len == 0) return error.InvalidEncoding;
@@ -272,7 +272,7 @@ fn integer(it: *der.Iterator) ParseError![]const u8 {
     return v;
 }
 
-/// EMSA-PSS-ENCODE (RFC 8017 section 9.1.1) with a salt as long as the hash. `em` has
+/// `EMSA-PSS-ENCODE` (RFC 8017 section 9.1.1) with a salt as long as the hash. `em` has
 /// ceil(`em_bits` / 8) bytes.
 pub fn emsaPssEncode(comptime Hash: type, message: []const u8, salt: *const [Hash.digest_length]u8, em_bits: usize, em: []u8) void {
     const h_len = Hash.digest_length;
@@ -343,7 +343,7 @@ fn encodeHeader(buf: []u8, tag: u8, len: usize) usize {
     return 4;
 }
 
-/// A minimal DER INTEGER for a non-negative value without leading zero bytes.
+/// A minimal DER `INTEGER` for a non-negative value without leading zero bytes.
 fn encodeInteger(buf: []u8, value: []const u8) usize {
     const pad: usize = if (value.len == 0 or value[0] & 0x80 != 0) 1 else 0;
     var len = encodeHeader(buf, der.tag_integer, value.len + pad);

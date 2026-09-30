@@ -25,7 +25,7 @@ key: union(Kind) {
 pub const ParseError = error{
     /// The DER structure is malformed.
     InvalidEncoding,
-    /// The key algorithm, the curve or the RSA key size is not supported.
+    /// The SDK does not support the key algorithm, the curve or the RSA key size.
     UnsupportedKey,
     /// The scalar is out of range or the key pair is inconsistent.
     InvalidKey,

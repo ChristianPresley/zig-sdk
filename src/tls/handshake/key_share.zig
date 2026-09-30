@@ -12,7 +12,7 @@ pub const Group = enum(u16) {
     secp256r1 = 0x0017,
     secp384r1 = 0x0018,
     x25519 = 0x001d,
-    /// The hybrid of ML-KEM-768 and X25519. The ML-KEM part comes first in every encoding.
+    /// The hybrid of ML-KEM-768 and X25519. The `ML-KEM` part comes first in every encoding.
     x25519_mlkem768 = 0x11ec,
 
     pub fn fromWire(value: u16) ?Group {

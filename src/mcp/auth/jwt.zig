@@ -454,7 +454,7 @@ pub fn integerClaim(payload: Value, key: []const u8) ?i64 {
 pub const JwksError = error{ OutOfMemory, Malformed };
 
 /// Parse a JWK set (RFC 7517 section 5) into verification keys. The parser keeps signature keys
-/// of the types EC (P-256, P-384), OKP (Ed25519) and RSA, and skips all other keys. An RSA
+/// of the types `EC` (P-256, P-384), `OKP` (Ed25519) and `RSA`, and skips all other keys. An RSA
 /// key without `alg` gives one key for RS256 and one for PS256. The keys are in `arena`.
 pub fn parseJwks(arena: Allocator, text: []const u8) JwksError![]Key {
     const tree = json.parseTree(arena, text) catch return error.Malformed;

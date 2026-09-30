@@ -12,7 +12,7 @@
 //! - A `-` next to a class escape in a class is a literal.
 //! - An identity escape can escape each code point that is not an ASCII letter or digit.
 //!
-//! A search is not anchored. A pattern matches when it matches a part of the input. The engine
+//! A search has no implicit anchor. A pattern matches when it matches a part of the input. The engine
 //! has no flags. Thus `^` and `$` match only at the start and at the end of the input.
 //!
 //! The engine rejects these features with `error.UnsupportedRegex`:
@@ -232,7 +232,7 @@ fn inRanges(ranges: []const Range, cp: u21) bool {
 
 const Decoded = struct { cp: u21, len: u3 };
 
-/// Decode one code point. Bytes that are not UTF-8 decode to U+FFFD one byte at a time.
+/// Decode one code point. Bytes that are not UTF-8 decode to `U+FFFD` one byte at a time.
 /// Encoded surrogates decode to their code point.
 fn decodeAt(s: []const u8, i: usize) ?Decoded {
     if (i >= s.len) return null;
@@ -270,8 +270,8 @@ const any_ranges = [_]Range{.{ .lo = 0, .hi = max_code_point }};
 const ascii_ranges = [_]Range{.{ .lo = 0, .hi = 0x7F }};
 const hex_ranges = [_]Range{ .{ .lo = '0', .hi = '9' }, .{ .lo = 'A', .hi = 'F' }, .{ .lo = 'a', .hi = 'f' } };
 
-/// Append `table` or its complement. The ranges of `table` are in ascending order and do
-/// not overlap.
+/// Append `table` or its complement. The ranges of `table` go up in order and do not
+/// overlap.
 fn appendTable(gpa: Allocator, out: *std.ArrayList(Range), table: []const Range, negate: bool) Allocator.Error!void {
     if (!negate) return out.appendSlice(gpa, table);
     var next: u32 = 0;

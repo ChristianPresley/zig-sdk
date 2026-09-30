@@ -58,7 +58,7 @@ pub const DefinitionError = error{
     OutOfMemory,
     /// The server has no `skills` option.
     ExtensionNotEnabled,
-    /// The name does not obey the naming rules of the Agent Skills specification.
+    /// The name does not obey the name rules of the Agent Skills specification.
     InvalidSkillName,
     /// The scheme or a segment of the prefix has characters that a URI does not allow.
     InvalidSkillPath,

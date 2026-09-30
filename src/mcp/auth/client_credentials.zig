@@ -34,7 +34,7 @@ pub const ClientCredentials = struct {
 
     pub const Options = struct {
         /// The pre-registered client and how it authenticates. The spec recommends
-        /// `private_key_jwt`. The `none` method is not allowed for this grant.
+        /// `private_key_jwt`. This grant does not permit the `none` method.
         client: common.ClientAuth,
         /// The scopes to request. Null takes the challenge scope, else the `scopes_supported`
         /// of the protected resource metadata, else no scope.
@@ -115,8 +115,8 @@ pub const ClientCredentials = struct {
     }
 
     /// The token for the next request, copied into `arena`. When the token expires within the
-    /// refresh margin, the client requests a new one first. When that fails, the old token is
-    /// kept until it expires.
+    /// refresh margin, the client requests a new one first. When that fails, the client keeps
+    /// the old token until it expires.
     pub fn currentToken(self: *ClientCredentials, arena: Allocator) ?[]const u8 {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);

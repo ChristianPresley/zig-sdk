@@ -154,7 +154,7 @@ pub const Server = struct {
         self.closed = true;
     }
 
-    /// Cancel every request in flight that is not cancelled yet.
+    /// Cancel every request in flight that has no cancel signal yet.
     fn cancelInFlight(self: *Server, reason: []const u8) void {
         self.in_flight_lock.lockUncancelable(self.io);
         defer self.in_flight_lock.unlock(self.io);

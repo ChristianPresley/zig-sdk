@@ -186,7 +186,7 @@ pub fn isDigest(text: []const u8) bool {
     return true;
 }
 
-/// True when `name` obeys the naming rules of the Agent Skills specification.
+/// True when `name` obeys the name rules of the Agent Skills specification.
 pub fn isValidName(name: []const u8) bool {
     if (name.len == 0 or name.len > 64) return false;
     if (name[0] == '-' or name[name.len - 1] == '-') return false;
@@ -910,7 +910,7 @@ fn allDigits(text: []const u8) bool {
     return true;
 }
 
-/// `( \. [0-9]+ | [0-9]+ ( \. [0-9]* )? ) ( [eE] [-+]? [0-9]+ )?`
+/// True when `text` is a YAML float: `( \. [0-9]+ | [0-9]+ ( \. [0-9]* )? ) ( [eE] [-+]? [0-9]+ )?`.
 fn isYamlFloat(text: []const u8) bool {
     var k: usize = 0;
     var mantissa_digits: usize = 0;

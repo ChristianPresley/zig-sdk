@@ -57,7 +57,7 @@ pub const Challenge = struct {
     }
 };
 
-/// Parse a `WWW-Authenticate` value. Only the `Bearer` scheme is understood.
+/// Parse a `WWW-Authenticate` value. The parser knows only the `Bearer` scheme.
 pub fn parseChallenge(arena: Allocator, header: []const u8) Allocator.Error!Challenge {
     var c: Challenge = .{};
     var rest = std.mem.trim(u8, header, " \t");
@@ -111,7 +111,7 @@ pub fn selectScope(arena: Allocator, configured: ?[]const u8, challenge: Challen
 
 pub const DiscoveryError = error{
     OutOfMemory,
-    /// No protected resource metadata was found.
+    /// The client found no protected resource metadata.
     NoResourceMetadata,
     NoAuthorizationServerMetadata,
 };

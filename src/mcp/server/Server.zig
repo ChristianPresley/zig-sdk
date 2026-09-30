@@ -245,8 +245,8 @@ pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
     return server;
 }
 
-/// Add an extension to `capabilities.extensions`. Other extensions the caller declared are
-/// kept.
+/// Add an extension to `capabilities.extensions`. The function keeps the other extensions
+/// that the caller declared.
 fn advertiseExtension(self: *Server, id: []const u8, settings: Value) Allocator.Error!void {
     const arena = self.registry_arena.allocator();
     var ext: std.json.ObjectMap = .empty;
