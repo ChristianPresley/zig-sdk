@@ -8,6 +8,7 @@ const http = std.http;
 
 const Transport = @import("Transport.zig");
 const envelope = @import("envelope.zig");
+const tls = @import("../../tls/tls.zig");
 const sse = @import("sse.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const RequestId = jsonrpc.RequestId;
@@ -38,6 +39,8 @@ pub const Options = struct {
     allowed_hosts: []const []const u8 = &.{},
     /// Answer a request-scoped stream with SSE even when the handler sends no notification.
     keepalive: bool = true,
+    /// Serve HTTPS with this TLS 1.3 server. Null serves plaintext HTTP.
+    tls: ?*const tls.Server = null,
 };
 
 pub const Server = struct {
@@ -194,18 +197,51 @@ const Connection = struct {
             self.permits.post(self.io);
             self.gpa.destroy(conn);
         }
-        const read_buf = self.gpa.alloc(u8, self.limits.http.max_head_bytes + 4096) catch return;
+        const read_buf = self.gpa.alloc(u8, @max(self.limits.http.max_head_bytes + 4096, tls.Connection.min_input_buffer_len)) catch return;
         defer self.gpa.free(read_buf);
-        var write_buf: [16 * 1024]u8 = undefined;
+        const write_buf = self.gpa.alloc(u8, tls.Connection.min_output_buffer_len) catch return;
+        defer self.gpa.free(write_buf);
         var reader = conn.stream.reader(self.io, read_buf);
-        var writer = conn.stream.writer(self.io, &write_buf);
-        var http_server: http.Server = .init(&reader.interface, &writer.interface);
+        var writer = conn.stream.writer(self.io, write_buf);
+
+        // With TLS, the HTTP server reads and writes plaintext through the TLS connection.
+        var tls_conn: tls.Connection = undefined;
+        var tls_active = false;
+        var tls_read_buf: []u8 = &.{};
+        var tls_write_buf: []u8 = &.{};
+        defer if (tls_active) {
+            tls_conn.end() catch {};
+            tls_conn.deinit();
+            self.gpa.free(tls_read_buf);
+            self.gpa.free(tls_write_buf);
+        };
+        if (self.options.tls) |tls_server| {
+            tls_read_buf = self.gpa.alloc(u8, tls.Connection.min_read_buffer_len) catch return;
+            tls_write_buf = self.gpa.alloc(u8, 16 * 1024) catch {
+                self.gpa.free(tls_read_buf);
+                return;
+            };
+            tls_conn = tls_server.accept(&reader.interface, &writer.interface, .{
+                .io = self.io,
+                .read_buffer = tls_read_buf,
+                .write_buffer = tls_write_buf,
+                .allow_truncation_attacks = true,
+            }) catch {
+                self.gpa.free(tls_read_buf);
+                self.gpa.free(tls_write_buf);
+                return;
+            };
+            tls_active = true;
+        }
+        const in: *Io.Reader = if (tls_active) &tls_conn.reader else &reader.interface;
+        const out: *Io.Writer = if (tls_active) &tls_conn.writer else &writer.interface;
+        var http_server: http.Server = .init(in, out);
         while (!self.closing.load(.acquire)) {
             var request = http_server.receiveHead() catch |e| switch (e) {
                 error.HttpConnectionClosing => return,
                 error.HttpHeadersOversize => {
-                    writer.interface.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch {};
-                    writer.interface.flush() catch {};
+                    out.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch {};
+                    out.flush() catch {};
                     return;
                 },
                 else => return,
@@ -214,7 +250,7 @@ const Connection = struct {
                 error.OutOfMemory => false,
                 else => false,
             };
-            if (!keep_alive) return;
+            if (!keep_alive or !request.head.keep_alive) return;
         }
     }
 };
@@ -284,11 +320,11 @@ fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
 
     // Router.
     if (!std.mem.eql(u8, head.path, self.options.path)) {
-        try request.respond("Not Found", .{ .status = .not_found, .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }} });
+        try request.respond("Not Found", .{ .status = .not_found, .keep_alive = request.head.keep_alive, .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }} });
         return true;
     }
     if (head.method != .POST) {
-        try request.respond("", .{ .status = .method_not_allowed, .extra_headers = &.{.{ .name = "allow", .value = "POST" }} });
+        try request.respond("", .{ .status = .method_not_allowed, .keep_alive = request.head.keep_alive, .extra_headers = &.{.{ .name = "allow", .value = "POST" }} });
         return true;
     }
     // Origin and Host validation (DNS rebinding protection).
@@ -306,14 +342,14 @@ fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
     }
     if (head.content_type) |ct| {
         if (!std.ascii.startsWithIgnoreCase(ct, "application/json")) {
-            try request.respond("", .{ .status = .unsupported_media_type });
+            try request.respond("", .{ .status = .unsupported_media_type, .keep_alive = request.head.keep_alive });
             return true;
         }
     }
     if (self.options.response_mode != .json) {
         if (head.accept) |accept| {
             if (!acceptsBoth(accept)) {
-                try request.respond("", .{ .status = .not_acceptable });
+                try request.respond("", .{ .status = .not_acceptable, .keep_alive = request.head.keep_alive });
                 return true;
             }
         }
@@ -352,7 +388,7 @@ fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
     };
     switch (msg) {
         .notification => {
-            try request.respond("", .{ .status = .accepted });
+            try request.respond("", .{ .status = .accepted, .keep_alive = request.head.keep_alive });
             return true;
         },
         .response, .error_response => {
@@ -372,7 +408,7 @@ fn respondErrorOptions(request: *http.Server.Request, status: http.Status, id: ?
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     var aw: Io.Writer.Allocating = .init(fba.allocator());
     message.writeErrorResponse(&aw.writer, id, err.toWire()) catch return;
-    try request.respond(aw.written(), .{ .status = status, .keep_alive = keep_alive, .extra_headers = &json_headers });
+    try request.respond(aw.written(), .{ .status = status, .keep_alive = keep_alive and request.head.keep_alive, .extra_headers = &json_headers });
 }
 
 fn handleRpcRequest(self: *Server, request: *http.Server.Request, arena: Allocator, head: Head, req: jsonrpc.Message.Request) !bool {
@@ -451,7 +487,7 @@ const Exchange = struct {
 
     fn startSse(self: *Exchange) Transport.SendError!void {
         if (self.body_writer != null) return;
-        self.body_writer = self.request.respondStreaming(&.{}, .{ .respond_options = .{ .status = .ok, .extra_headers = &sse_headers } }) catch return error.WriteFailed;
+        self.body_writer = self.request.respondStreaming(&.{}, .{ .respond_options = .{ .status = .ok, .keep_alive = self.request.head.keep_alive, .extra_headers = &sse_headers } }) catch return error.WriteFailed;
         self.reusable = false;
         if (self.long_lived and self.owner.options.keepalive) {
             self.keepalive_future = self.owner.io.concurrent(keepaliveLoop, .{self}) catch null;
@@ -520,7 +556,7 @@ fn exchangeFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendErro
             }
         }
     } else |_| {}
-    self.request.respond(frame, .{ .status = status, .extra_headers = &json_headers }) catch return error.WriteFailed;
+    self.request.respond(frame, .{ .status = status, .keep_alive = self.request.head.keep_alive, .extra_headers = &json_headers }) catch return error.WriteFailed;
 }
 
 fn exchangeAbort(ptr: *anyopaque, io: Io) void {

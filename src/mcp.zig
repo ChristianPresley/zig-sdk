@@ -17,6 +17,8 @@ pub const schema = struct {
     pub const validator = @import("mcp/schema/validator.zig");
 };
 pub const UriTemplate = @import("mcp/uri_template/UriTemplate.zig");
+/// TLS 1.3 server and certificate handling for HTTPS.
+pub const tls = @import("tls/tls.zig");
 pub const util = struct {
     pub const line_framer = @import("mcp/util/line_framer.zig");
 };
@@ -34,4 +36,6 @@ test {
     _ = @import("mcp/server/mrtr.zig");
     _ = @import("mcp/server/server_test.zig");
     _ = @import("mcp/transport/http_test.zig");
+    _ = @import("mcp/transport/https_test.zig");
+    _ = @import("tls/tls.zig");
 }

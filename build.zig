@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
 
     // Examples.
     const examples_step = b.step("examples", "Build all examples");
-    const example_names = [_][]const u8{"stdio_server"};
+    const example_names = [_][]const u8{ "stdio_server", "https_server" };
     for (example_names) |name| {
         const exe = b.addExecutable(.{
             .name = name,

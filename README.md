@@ -18,7 +18,8 @@ The project is in development. The table shows the parts that exist today.
 | Subscriptions (`subscriptions/listen`) | Done |
 | stdio transport (server) | Done |
 | Streamable HTTP transport (server) | Done, passes all 37 scored scenarios of the official conformance suite |
-| TLS 1.3 server and client | Planned |
+| TLS 1.3 server (HTTPS) | Done, tested against the std client, curl and openssl |
+| TLS 1.3 client | Planned |
 | Client | Planned |
 | Authorization (OAuth 2.1) | Planned |
 | gRPC transport (JSON-RPC tunnel over HTTP/2) | Planned |
