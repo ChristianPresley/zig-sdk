@@ -14,6 +14,7 @@ const Server = @import("Server.zig");
 
 const Principal = @import("../auth/resource_server.zig").Principal;
 const tasks = @import("tasks.zig");
+const rate_limit = @import("../util/rate_limit.zig");
 
 const RequestContext = @This();
 
@@ -44,7 +45,8 @@ task: ?*tasks.Task = null,
 rpc_error: ?errors.RpcError = null,
 /// `params.name` or `params.uri`, used to bind sealed state to its target.
 target: []const u8 = "",
-progress_sent: u32 = 0,
+/// The rate limit of the progress notifications of this request.
+progress_window: rate_limit.Window = .{},
 long_lived: bool = false,
 
 pub const Error = error{ Canceled, Rpc, OutOfMemory };
@@ -83,11 +85,11 @@ pub fn invalidParams(self: *RequestContext, comptime fmt: []const u8, args: anyt
 }
 
 /// Send `notifications/progress` on the request stream. The server drops the notification
-/// when the request carried no progress token, or when it is over the per-request rate limit.
+/// when the request carried no progress token, or when the request sent
+/// `limits.max_progress_rate_per_s` notifications in the current second.
 pub fn progress(self: *RequestContext, value: f64, total: ?f64, note: ?[]const u8) Error!void {
     const token = self.meta.progress_token orelse return;
-    if (self.progress_sent >= self.server.options.limits.max_progress_rate_per_s * 60) return;
-    self.progress_sent += 1;
+    if (!self.progress_window.admit(self.io, self.server.options.limits.max_progress_rate_per_s)) return;
     const params: types.ProgressNotificationParams = .{ .progressToken = token, .progress = value, .total = total, .message = note };
     try self.sendNotification("notifications/progress", params);
 }

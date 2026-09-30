@@ -69,6 +69,26 @@ fn waitForCancel(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(typ
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "not cancelled", .{}) };
 }
 
+/// Set when `pollCancel` started.
+var poll_started: std.atomic.Value(bool) = .init(false);
+/// Set when `pollCancel` saw the cancellation.
+var poll_cancelled: std.atomic.Value(bool) = .init(false);
+
+/// Polls for the cancellation and writes nothing, at most five seconds.
+fn pollCancel(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    poll_started.store(true, .release);
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        ctx.checkCancel() catch |e| {
+            poll_cancelled.store(true, .release);
+            return e;
+        };
+        try ctx.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "not cancelled", .{}) };
+}
+
 /// Sends progress until a send fails because the stream is gone.
 fn ticker(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
     _ = args;
@@ -126,6 +146,7 @@ fn initServer(server: *mcp.Server) !void {
     try server.addToolJson(.{ .name = "ask_name" }, askName);
     try server.addToolJson(.{ .name = "wait_for_cancel" }, waitForCancel);
     try server.addToolJson(.{ .name = "ticker" }, ticker);
+    try server.addToolJson(.{ .name = "poll_cancel" }, pollCancel);
     try server.addTool(.{ .name = "test_headers" }, echoHeaders);
     try server.addTool(.{ .name = "optional_headers" }, echoOptional);
     try server.addToolJson(.{ .name = "nested_headers", .input_schema = nested_schema }, echoNested);
@@ -702,6 +723,88 @@ test "streamable http server treats a closed SSE stream as the cancellation of t
     // The server still serves new requests.
     const disc = try f.post(arena, &.{ version_header, .{ .name = "mcp-method", .value = "server/discover" } }, try request(arena, 15, "server/discover", meta_none, ""));
     try std.testing.expectEqual(@as(u16, 200), disc.status);
+}
+
+fn waitFlag(flag: *const std.atomic.Value(bool)) !void {
+    var spins: usize = 0;
+    while (!flag.load(.acquire)) : (spins += 1) {
+        if (spins > 500) return error.TestTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
+test "streamable http server cancels a handler that only polls when the client disconnects" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    poll_started.store(false, .release);
+    poll_cancelled.store(false, .release);
+
+    {
+        // Without a progress token the handler writes nothing before its response.
+        const conn = try http1.Connection.open(io, gpa, "127.0.0.1", f.transport.bound_port, null);
+        defer conn.close();
+        const body = try request(arena, 21, "tools/call", meta_none, "\"name\":\"poll_cancel\"");
+        try conn.send("POST", "/mcp", f.host, &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "accept", .value = "application/json, text/event-stream" },
+            version_header,
+            .{ .name = "mcp-method", .value = "tools/call" },
+            .{ .name = "mcp-name", .value = "poll_cancel" },
+        }, body);
+        try waitFlag(&poll_started);
+    }
+    // The connection is closed. The server cancels the request at once, not at a write.
+    try waitFlag(&poll_cancelled);
+    const disc = try f.post(arena, &.{ version_header, .{ .name = "mcp-method", .value = "server/discover" } }, try request(arena, 22, "server/discover", meta_none, ""));
+    try std.testing.expectEqual(@as(u16, 200), disc.status);
+}
+
+test "streamable http server ends an idle listen stream when the client disconnects" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        const conn = try http1.Connection.open(io, gpa, "127.0.0.1", f.transport.bound_port, null);
+        defer conn.close();
+        const body = try request(arena, 23, "subscriptions/listen", meta_none, "\"notifications\":{\"toolsListChanged\":true}");
+        try conn.send("POST", "/mcp", f.host, &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "accept", .value = "application/json, text/event-stream" },
+            version_header,
+            .{ .name = "mcp-method", .value = "subscriptions/listen" },
+        }, body);
+        const response = try conn.receiveHead();
+        try std.testing.expectEqual(http.Status.ok, response.head.status);
+        // The acknowledgement is on the stream. After it the stream is idle.
+        var first: [16]u8 = undefined;
+        try conn.bodyReader(&response).readSliceAll(&first);
+        f.server.subscriptions_lock.lockUncancelable(io);
+        const open = f.server.subscriptions.items.len;
+        f.server.subscriptions_lock.unlock(io);
+        try std.testing.expectEqual(1, open);
+    }
+    // No event and no keepalive comes before the check: only the disconnect ends the stream.
+    var spins: usize = 0;
+    while (true) : (spins += 1) {
+        f.server.subscriptions_lock.lockUncancelable(io);
+        const open = f.server.subscriptions.items.len;
+        f.server.subscriptions_lock.unlock(io);
+        if (open == 0) break;
+        if (spins > 500) return error.TestTimeout;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
 }
 
 // -- Streamable HTTP client --------------------------------------------------------------------

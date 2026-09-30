@@ -7,6 +7,7 @@ const Value = std.json.Value;
 const framer = @import("../util/line_framer.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const RequestId = jsonrpc.RequestId;
+const Transport = @import("Transport.zig");
 
 /// Receives a notification that belongs to no request in flight.
 pub const NotificationFn = *const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void;
@@ -91,6 +92,7 @@ pub const Router = struct {
     }
 
     fn routeNotification(self: *Router, arena: Allocator, n: jsonrpc.Message.Notification, line: []const u8, on_notification: ?NotificationFn, userdata: ?*anyopaque) void {
+        if (std.mem.eql(u8, n.method, "notifications/cancelled")) logCancelled(arena, n.params);
         if (n.params) |params| if (params == .object) {
             // Request-scoped notifications carry the progress token or the subscription id,
             // both of which equal the request id.
@@ -140,6 +142,15 @@ pub const Router = struct {
     }
 };
 
+/// Log the request id and the reason of a `notifications/cancelled` from the server.
+fn logCancelled(arena: Allocator, params: ?Value) void {
+    const p = params orelse return;
+    if (p != .object) return;
+    const id = RequestId.fromValue(arena, p.object.get("requestId") orelse return) orelse return;
+    const reason: ?[]const u8 = if (p.object.get("reason")) |r| (if (r == .string) r.string else null) else null;
+    Transport.logCancellation(id, reason);
+}
+
 /// True when `frame` is a response. A response has "result" or "error" and no "method" at
 /// the top level. The frames come from the SDK parser, so a cheap check is enough.
 pub fn frameIsResponse(frame: []const u8) bool {
@@ -169,4 +180,57 @@ test "router routes responses by id and progress by token" {
     defer gpa.free(second);
     try std.testing.expect(frameIsResponse(second));
     try std.testing.expect(router.takeFrame(&p) == null);
+}
+
+test "router routes the progress of two concurrent requests by their tokens" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var router: Router = .init(io, gpa);
+    defer router.deinit();
+    var a: Router.Pending = .{ .id = .{ .integer = 1 } };
+    defer a.deinit(gpa);
+    var b: Router.Pending = .{ .id = .{ .string = "b" } };
+    defer b.deinit(gpa);
+    try router.register(&a);
+    defer router.unregister(&a);
+    try router.register(&b);
+    defer router.unregister(&b);
+    // The frames of the two requests arrive interleaved. The router drops a progress
+    // notification with the token of no request in flight.
+    var in: Io.Reader = .fixed(
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":0}}
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"b","progress":0}}
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"b","progress":1}}
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":99,"progress":0}}
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":1,"progress":1}}
+        \\{"jsonrpc":"2.0","id":"b","result":{}}
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+        \\
+    );
+    const Unrouted = struct {
+        var count: usize = 0;
+        fn record(userdata: ?*anyopaque, method: []const u8, params: ?Value) void {
+            _ = userdata;
+            _ = method;
+            _ = params;
+            count += 1;
+        }
+    };
+    router.readUntilEof(&in, 1024, Unrouted.record, null);
+    try std.testing.expectEqual(0, Unrouted.count);
+    for ([_]*Router.Pending{ &a, &b }) |p| {
+        const want_token = if (p == &a) "\"progressToken\":1," else "\"progressToken\":\"b\",";
+        for (0..2) |i| {
+            const frame = router.takeFrame(p).?;
+            defer gpa.free(frame);
+            try std.testing.expect(!frameIsResponse(frame));
+            try std.testing.expect(std.mem.indexOf(u8, frame, want_token) != null);
+            var buf: [16]u8 = undefined;
+            try std.testing.expect(std.mem.indexOf(u8, frame, try std.fmt.bufPrint(&buf, "\"progress\":{d}", .{i})) != null);
+        }
+        const last = router.takeFrame(p).?;
+        defer gpa.free(last);
+        try std.testing.expect(frameIsResponse(last));
+        try std.testing.expect(router.takeFrame(p) == null);
+    }
 }

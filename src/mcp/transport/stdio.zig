@@ -58,6 +58,9 @@ pub const Server = struct {
         arena: std.heap.ArenaAllocator,
         token: Transport.CancelToken = .{},
         id: ?RequestId = null,
+        /// True for a `subscriptions/listen` request. Only such a request can end with a
+        /// server-sent `notifications/cancelled`.
+        listen: bool = false,
         done: bool = false,
         message: jsonrpc.Message = undefined,
     };
@@ -129,6 +132,7 @@ pub const Server = struct {
             switch (slot.message) {
                 .request => |req| {
                     slot.id = req.id;
+                    slot.listen = std.mem.eql(u8, req.method, "subscriptions/listen");
                     self.permits.waitUncancelable(self.io);
                     self.track(slot);
                     self.group.concurrent(self.io, runSlot, .{slot}) catch {
@@ -176,6 +180,7 @@ pub const Server = struct {
         if (!std.mem.eql(u8, n.method, "notifications/cancelled")) return;
         const params = n.params orelse return;
         const parsed = json.parseValue(types.CancelledNotificationParams, arena, params) catch return;
+        Transport.logCancellation(parsed.requestId, parsed.reason);
         self.in_flight_lock.lockUncancelable(self.io);
         defer self.in_flight_lock.unlock(self.io);
         for (self.in_flight.items) |slot| {
@@ -234,6 +239,8 @@ pub const Server = struct {
     fn slotNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
         const slot: *Slot = @ptrCast(@alignCast(ptr));
         if (slot.done) return error.Closed;
+        // After a cancellation by the peer, the server sends nothing more for the request.
+        if (slot.token.isCancelledByPeer()) return error.Closed;
         try slot.owner.writeFrame(io, frame);
     }
 
@@ -241,16 +248,17 @@ pub const Server = struct {
         const slot: *Slot = @ptrCast(@alignCast(ptr));
         if (slot.done) return error.Closed;
         slot.done = true;
+        // A handler that ignored the cancellation gets no response out.
+        if (slot.token.isCancelledByPeer()) return error.Closed;
         try slot.owner.writeFrame(io, frame);
-        // A server-initiated end of a listen stream is followed by a cancellation notification.
-        if (slot.token.reason) |r| {
-            if (std.mem.eql(u8, r, McpServer.shutdown_reason)) {
-                var buf: [256]u8 = undefined;
-                var fba: std.heap.FixedBufferAllocator = .init(&buf);
-                var aw: Io.Writer.Allocating = .init(fba.allocator());
-                message.writeNotification(&aw.writer, "notifications/cancelled", types.CancelledNotificationParams{ .requestId = slot.id.?, .reason = "server shutdown" }) catch return;
-                slot.owner.writeFrame(io, aw.written()) catch {};
-            }
+        // Only a listen stream that the server ends at shutdown gets a cancellation
+        // notification after its result.
+        if (slot.listen and slot.token.isCancelled() and slot.token.server_shutdown) {
+            var buf: [256]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&buf);
+            var aw: Io.Writer.Allocating = .init(fba.allocator());
+            message.writeNotification(&aw.writer, "notifications/cancelled", types.CancelledNotificationParams{ .requestId = slot.id.?, .reason = McpServer.shutdown_reason }) catch return;
+            slot.owner.writeFrame(io, aw.written()) catch {};
         }
     }
 

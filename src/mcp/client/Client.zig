@@ -17,6 +17,7 @@ const message = @import("../jsonrpc/message.zig");
 const RequestId = @import("../jsonrpc/id.zig").RequestId;
 const Transport = @import("../transport/Transport.zig");
 const Limits = @import("../Limits.zig");
+const rate_limit = @import("../util/rate_limit.zig");
 const tasks = @import("../server/tasks.zig");
 const skills = @import("../protocol/skills.zig");
 const apps = @import("../protocol/apps.zig");
@@ -97,8 +98,15 @@ pub const Diagnostics = struct {
 };
 
 pub const RequestOptions = struct {
-    /// Relative timeout for the whole request, with all multi round-trip rounds.
+    /// Relative timeout for the whole request, with all multi round-trip rounds. Null uses
+    /// `limits.request_timeout`. A `subscriptions/listen` stream has no default timeout.
+    /// Progress notifications do not extend the timeout. When the timeout ends, the client
+    /// cancels the request and returns `error.Timeout`.
     timeout: ?Io.Duration = null,
+    /// The upper limit of `timeout`. Null uses `limits.max_total_timeout`. A longer `timeout`
+    /// gets this value. A `subscriptions/listen` stream has this limit only when the caller
+    /// sets it.
+    max_total_timeout: ?Io.Duration = null,
     cancel: ?*Transport.CancelToken = null,
     on_progress: ?*const fn (userdata: ?*anyopaque, params: types.ProgressNotificationParams) void = null,
     on_log: ?*const fn (userdata: ?*anyopaque, params: types.LoggingMessageNotificationParams) void = null,
@@ -555,9 +563,10 @@ const Collector = struct {
     invalid: bool = false,
     /// Frames delivered so far. The client retries a lost stream only when nothing arrived.
     frames: u32 = 0,
+    /// The rate limit of the progress notifications of this request.
+    progress: rate_limit.Window = .{},
 
     fn onFrame(ptr: *anyopaque, io: Io, frame: []const u8) anyerror!void {
-        _ = io;
         const self: *Collector = @ptrCast(@alignCast(ptr));
         self.frames += 1;
         const msg = message.Message.parse(self.arena, frame) catch {
@@ -573,7 +582,14 @@ const Collector = struct {
                 if (e.id) |id| if (!id.eql(self.id)) return;
                 self.rpc_error = .{ .code = e.code, .message = e.message, .data = e.data };
             },
-            .notification => |n| self.client.dispatchNotification(n.method, n.params, self.options),
+            .notification => |n| {
+                // A flood of progress does not reach the callback: the client drops the
+                // notifications over `limits.max_progress_rate_per_s`.
+                if (std.mem.eql(u8, n.method, "notifications/progress")) {
+                    if (!self.progress.admit(io, self.client.options.limits.max_progress_rate_per_s)) return;
+                }
+                self.client.dispatchNotification(n.method, n.params, self.options);
+            },
             .request => {
                 // Servers do not send requests in this revision.
                 self.invalid = true;
@@ -615,7 +631,8 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
     if (params != .object) return error.InvalidResponse;
     var own_token: Transport.CancelToken = .{};
     const cancel = options.cancel orelse &own_token;
-    const deadline: Io.Timeout = if (options.timeout) |d| .{ .deadline = Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake }) } else .none;
+    const is_listen = if (known) |m| m == .@"subscriptions/listen" else std.mem.eql(u8, method_name, "subscriptions/listen");
+    const deadline: Io.Timeout = if (self.requestTimeout(options, is_listen)) |d| .{ .deadline = Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake }) } else .none;
 
     // The cache serves idempotent reads that a server marked with a lifetime. A retry of a
     // multi round-trip request depends on inputs outside the key, so it is not cacheable.
@@ -746,6 +763,18 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
         request_state = ir.requestState;
     }
     return error.TooManyRounds;
+}
+
+/// The timeout of a request: `options.timeout`, or `limits.request_timeout` when the caller
+/// set none, at most the maximum timeout. A listen stream has no default timeout and no
+/// default maximum.
+fn requestTimeout(self: *const Client, options: RequestOptions, is_listen: bool) ?Io.Duration {
+    const limits = self.options.limits;
+    const cap: ?Io.Duration = if (is_listen) options.max_total_timeout else options.max_total_timeout orelse limits.max_total_timeout;
+    const wanted: ?Io.Duration = if (is_listen) options.timeout else options.timeout orelse limits.request_timeout;
+    const span = wanted orelse return cap;
+    const limit = cap orelse return span;
+    return if (span.nanoseconds > limit.nanoseconds) limit else span;
 }
 
 /// True when the client can send a request again with a new id after it lost the stream.

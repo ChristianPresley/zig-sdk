@@ -38,6 +38,17 @@ fn waitCancel(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.
     return error.Canceled;
 }
 
+/// Sends five progress notifications, 20 milliseconds apart, then completes.
+fn pulse(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try ctx.progress(@floatFromInt(i), 5, null);
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "pulsed", .{}) };
+}
+
 fn resetCounters() void {
     started.store(0, .release);
     cancelled.store(0, .release);
@@ -73,6 +84,7 @@ const Fixture = struct {
         errdefer self.server.deinit();
         try self.server.addTool(.{ .name = "add" }, add);
         try self.server.addTool(.{ .name = "wait_cancel" }, waitCancel);
+        try self.server.addTool(.{ .name = "pulse" }, pulse);
         self.transport = .init(io, gpa, &self.server, .{ .path = self.path });
         errdefer self.transport.deinit();
         try self.transport.bind();
@@ -146,7 +158,7 @@ test "unix socket client lists, calls and cancels over the socket" {
     const disc = try client.discover(arena, .{ .timeout = .fromSeconds(10) });
     try std.testing.expect(disc.capabilities.tools != null);
     const tools = try client.listTools(arena, null, .{ .timeout = .fromSeconds(10) });
-    try std.testing.expectEqual(2, tools.tools.len);
+    try std.testing.expectEqual(3, tools.tools.len);
     const sum = try client.callTool(arena, "add", .{ .a = 40, .b = 2 }, .{ .timeout = .fromSeconds(10) });
     try std.testing.expectEqualStrings("42", sum.content[0].text.text);
 
@@ -220,6 +232,58 @@ test "unix socket server serves several clients at once" {
     for (&jobs) |*job| try group.concurrent(io, Job.run, .{job});
     try group.await(io);
     for (jobs) |job| try std.testing.expect(job.ok);
+}
+
+/// One `pulse` call that records the progress tokens it receives.
+const PulseJob = struct {
+    client: *Client,
+    tokens: [16]i64 = undefined,
+    count: usize = 0,
+    ok: bool = false,
+
+    fn onProgress(userdata: ?*anyopaque, params: types.ProgressNotificationParams) void {
+        const job: *PulseJob = @ptrCast(@alignCast(userdata.?));
+        if (job.count == job.tokens.len) return;
+        job.tokens[job.count] = switch (params.progressToken) {
+            .integer => |i| i,
+            else => -1,
+        };
+        job.count += 1;
+    }
+
+    fn run(job: *PulseJob) void {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        const result = job.client.callTool(arena_state.allocator(), "pulse", null, .{ .timeout = .fromSeconds(10), .on_progress = onProgress, .userdata = job }) catch return;
+        job.ok = std.mem.eql(u8, "pulsed", result.content[0].text.text);
+    }
+};
+
+test "unix socket client routes the progress of concurrent requests by token" {
+    if (!unix.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(.{});
+    defer f.stop();
+    var t: *unix.Client = undefined;
+    var client: Client = undefined;
+    try connectClient(f.path, &t, &client);
+    defer t.deinit();
+    defer client.deinit();
+
+    // Two calls share the connection and run at the same time.
+    var jobs = [_]PulseJob{ .{ .client = &client }, .{ .client = &client } };
+    var first = try io.concurrent(PulseJob.run, .{&jobs[0]});
+    var second = try io.concurrent(PulseJob.run, .{&jobs[1]});
+    first.await(io);
+    second.await(io);
+    // Each call got the five notifications of its own token, and the tokens differ.
+    for (jobs) |job| {
+        try std.testing.expect(job.ok);
+        try std.testing.expectEqual(5, job.count);
+        for (job.tokens[0..job.count]) |token| try std.testing.expectEqual(job.tokens[0], token);
+    }
+    try std.testing.expect(jobs[0].tokens[0] != jobs[1].tokens[0]);
 }
 
 test "unix socket server drops an oversize line and keeps the connection" {

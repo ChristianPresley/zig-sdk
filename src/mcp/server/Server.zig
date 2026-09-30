@@ -1314,7 +1314,7 @@ fn listen(self: *Server, ctx: *RequestContext, params: types.SubscriptionsListen
         owned = false;
     }
     ctx.long_lived = true;
-    if (self.shutting_down.load(.acquire)) ctx.cancel.cancel(ctx.io, shutdown_reason);
+    if (self.shutting_down.load(.acquire)) ctx.cancel.shutdown(ctx.io, shutdown_reason);
 
     // The acknowledgement is always the first message on the stream.
     const ack: types.SubscriptionsAcknowledgedNotificationParams = .{
@@ -1345,7 +1345,8 @@ fn removeSubscription(self: *Server, io: Io, sub: *Subscription) bool {
             break;
         }
     }
-    const by_server = sub.cancel.reason != null and std.mem.eql(u8, sub.cancel.reason.?, shutdown_reason);
+    // The flag, not the reason text, tells a shutdown: a client can send any reason text.
+    const by_server = sub.cancel.isCancelled() and sub.cancel.server_shutdown;
     sub.arena.deinit();
     self.gpa.destroy(sub);
     return by_server;
@@ -1367,7 +1368,7 @@ pub fn shutdownSubscriptions(self: *Server, io: Io) void {
         count += 1;
     }
     self.subscriptions_lock.unlock(io);
-    for (tokens[0..count]) |t| t.cancel(io, shutdown_reason);
+    for (tokens[0..count]) |t| t.shutdown(io, shutdown_reason);
 }
 
 fn publish(self: *Server, io: Io, event: Event, uri: ?[]const u8) void {

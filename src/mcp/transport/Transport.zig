@@ -10,16 +10,40 @@ const jsonrpc = @import("../jsonrpc.zig");
 /// Cooperative cancellation shared between a transport and the request handler.
 pub const CancelToken = struct {
     flag: std.atomic.Value(bool) = .init(false),
+    /// Set by the first call to `cancel` or `shutdown`. The later calls have no effect.
+    claimed: std.atomic.Value(bool) = .init(false),
     event: Io.Event = .unset,
     reason: ?[]const u8 = null,
+    /// True when the server itself ended the request at shutdown, not the peer. The reason
+    /// text does not set this flag: a peer can send any reason text.
+    server_shutdown: bool = false,
 
     pub fn isCancelled(self: *const CancelToken) bool {
         return self.flag.load(.acquire);
     }
 
-    /// Mark the request as canceled and wake all tasks that wait on the event.
+    /// True when the peer, the transport or a deadline canceled the request. A request that
+    /// the server ended at shutdown gives false.
+    pub fn isCancelledByPeer(self: *const CancelToken) bool {
+        return self.isCancelled() and !self.server_shutdown;
+    }
+
+    /// Mark the request as canceled and wake all tasks that wait on the event. Only the first
+    /// cancellation counts.
     pub fn cancel(self: *CancelToken, io: Io, reason: ?[]const u8) void {
+        self.fire(io, reason, false);
+    }
+
+    /// Mark the request as ended by the server at shutdown. A listen stream then ends with its
+    /// result. Only the first cancellation counts.
+    pub fn shutdown(self: *CancelToken, io: Io, reason: ?[]const u8) void {
+        self.fire(io, reason, true);
+    }
+
+    fn fire(self: *CancelToken, io: Io, reason: ?[]const u8, by_server: bool) void {
+        if (self.claimed.swap(true, .acq_rel)) return;
         self.reason = reason;
+        self.server_shutdown = by_server;
         self.flag.store(true, .release);
         self.event.set(io);
     }
@@ -31,6 +55,24 @@ pub const CancelToken = struct {
     /// Wait until a cancellation of the request.
     pub fn wait(self: *CancelToken, io: Io) Io.Cancelable!void {
         try self.event.wait(io);
+    }
+};
+
+const cancel_log = std.log.scoped(.mcp_cancel);
+
+/// Log a cancellation that the peer sent, with its reason, at the debug level of the scope
+/// `mcp_cancel`. The receiver of `notifications/cancelled` calls this function.
+pub fn logCancellation(id: jsonrpc.RequestId, reason: ?[]const u8) void {
+    cancel_log.debug("{f}", .{CancellationNote{ .id = id, .reason = reason }});
+}
+
+/// The text of the log line of a cancellation.
+pub const CancellationNote = struct {
+    id: jsonrpc.RequestId,
+    reason: ?[]const u8,
+
+    pub fn format(self: CancellationNote, w: *Io.Writer) Io.Writer.Error!void {
+        try w.print("the peer canceled request {f}: {s}", .{ self.id, self.reason orelse "no reason given" });
     }
 };
 
@@ -171,4 +213,33 @@ test "cancel token" {
     try std.testing.expect(token.isCancelled());
     try std.testing.expectError(error.Canceled, token.check());
     try token.wait(std.testing.io);
+}
+
+test "only the first cancellation counts, and only shutdown marks the server as the origin" {
+    const io = std.testing.io;
+    var by_peer: CancelToken = .{};
+    by_peer.cancel(io, "server shutdown");
+    by_peer.shutdown(io, "later");
+    try std.testing.expect(by_peer.isCancelledByPeer());
+    try std.testing.expect(!by_peer.server_shutdown);
+    try std.testing.expectEqualStrings("server shutdown", by_peer.reason.?);
+
+    var by_server: CancelToken = .{};
+    by_server.shutdown(io, "server shutdown");
+    by_server.cancel(io, "user");
+    try std.testing.expect(by_server.isCancelled());
+    try std.testing.expect(!by_server.isCancelledByPeer());
+    try std.testing.expectEqualStrings("server shutdown", by_server.reason.?);
+}
+
+test "the log line of a cancellation has the id and the reason" {
+    var buf: [128]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try w.print("{f}", .{CancellationNote{ .id = .{ .integer = 7 }, .reason = "user pressed stop" }});
+    try std.testing.expectEqualStrings("the peer canceled request 7: user pressed stop", w.buffered());
+    w = .fixed(&buf);
+    try w.print("{f}", .{CancellationNote{ .id = .{ .string = "a" }, .reason = null }});
+    try std.testing.expectEqualStrings("the peer canceled request \"a\": no reason given", w.buffered());
+    // The call does not fail without a log function for the debug level.
+    logCancellation(.{ .integer = 7 }, "user pressed stop");
 }

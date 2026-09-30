@@ -249,7 +249,7 @@ const Connection = struct {
                 },
                 else => return,
             };
-            const keep_alive = handleRequest(self, &request) catch |err| switch (err) {
+            const keep_alive = handleRequest(self, &request, &reader) catch |err| switch (err) {
                 error.OutOfMemory => false,
                 else => false,
             };
@@ -317,7 +317,8 @@ fn statusForCode(code: i64) http.Status {
 }
 
 /// Handle one request on a connection. Returns whether the connection can carry one more request.
-fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
+/// `socket` is the reader of the socket. It detects a disconnect while a handler runs.
+fn handleRequest(self: *Server, request: *http.Server.Request, socket: *Io.net.Stream.Reader) !bool {
     var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -431,7 +432,7 @@ fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
             try respondError(request, .bad_request, null, errors.invalidRequest("Clients must not send responses"));
             return true;
         },
-        .request => |req| return handleRpcRequest(self, request, arena, head, req, principal),
+        .request => |req| return handleRpcRequest(self, request, socket, arena, head, req, principal),
     }
 }
 
@@ -447,7 +448,7 @@ fn respondErrorOptions(request: *http.Server.Request, status: http.Status, id: ?
     try request.respond(aw.written(), .{ .status = status, .keep_alive = keep_alive and request.head.keep_alive, .extra_headers = &json_headers });
 }
 
-fn handleRpcRequest(self: *Server, request: *http.Server.Request, arena: Allocator, head: Head, req: jsonrpc.Message.Request, principal: ?*resource_server.Principal) !bool {
+fn handleRpcRequest(self: *Server, request: *http.Server.Request, socket: *Io.net.Stream.Reader, arena: Allocator, head: Head, req: jsonrpc.Message.Request, principal: ?*resource_server.Principal) !bool {
     // Header presence, mirror validation and version support run before dispatch on HTTP.
     const schema = if (std.mem.eql(u8, req.method, "tools/call")) toolSchema(self, req.params) else null;
     if (try envelope.verify(arena, head.envelope_headers, req.method, req.params, schema)) |rejection| {
@@ -472,9 +473,13 @@ fn handleRpcRequest(self: *Server, request: *http.Server.Request, arena: Allocat
         .request = request,
         .arena = arena,
         .id = req.id,
+        .token = &token,
         .long_lived = std.mem.eql(u8, req.method, "subscriptions/listen"),
         .force_sse = self.options.response_mode == .sse,
     };
+    // A disconnect of the client cancels the request, also while the handler does not write.
+    var watch: Watch = .{ .socket = socket, .token = &token, .id = req.id };
+    var watcher: ?Io.Future(void) = self.io.concurrent(Watch.run, .{ &watch, self.io }) catch null;
     self.server.handle(self.io, .{
         .kind = .streamable_http,
         .arena = arena,
@@ -491,8 +496,52 @@ fn handleRpcRequest(self: *Server, request: *http.Server.Request, arena: Allocat
         // The handler ended without a response (cancelled): close the stream.
         if (exchange.body_writer) |*bw| bw.end() catch {} else request.respond("", .{ .status = .service_unavailable }) catch {};
     }
-    return exchange.reusable;
+    // The connection of a canceled request does not carry one more request.
+    const reuse = exchange.reusable and !token.isCancelled() and request.head.keep_alive;
+    if (watcher) |*w| watch.stop(self.io, w, reuse);
+    return reuse;
 }
+
+/// The cancellation reason of a request whose client closed the connection.
+pub const disconnect_reason = "client disconnected";
+
+/// Reads the socket of one request while its handler runs. The end of the connection
+/// cancels the request. The task reads only into the free space at the end of the buffer of
+/// `socket`. Thus the bytes of the request head stay in place, and the next request on the
+/// connection uses the bytes that arrive.
+const Watch = struct {
+    socket: *Io.net.Stream.Reader,
+    token: *Transport.CancelToken,
+    id: RequestId,
+    /// Set when the handler returned. After that, the watch ends at the next read.
+    handler_done: std.atomic.Value(bool) = .init(false),
+    /// Set when bytes from the client arrived while the handler ran.
+    saw_data: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Watch, io: Io) void {
+        const r = &self.socket.interface;
+        while (r.end < r.buffer.len) {
+            if (self.token.isCancelled() or self.handler_done.load(.acquire)) return;
+            r.fillMore() catch |e| {
+                if (e == error.ReadFailed) if (self.socket.err) |err| if (err == error.Canceled) return;
+                if (self.handler_done.load(.acquire)) return;
+                log.debug("the client of request {f} disconnected", .{self.id});
+                self.token.cancel(io, disconnect_reason);
+                return;
+            };
+            if (self.handler_done.load(.acquire)) return;
+            self.saw_data.store(true, .release);
+        }
+    }
+
+    /// End the watch. For a connection that carries one more request, wait until the read
+    /// ends at the next bytes from the client. A canceled read can lose the bytes that
+    /// arrive at the same time. For a connection that closes, cancel the read.
+    fn stop(self: *Watch, io: Io, future: *Io.Future(void), reuse: bool) void {
+        self.handler_done.store(true, .release);
+        if (reuse and !self.saw_data.load(.acquire)) future.await(io) else future.cancel(io);
+    }
+};
 
 fn toolSchema(self: *Server, params: ?Value) ?Value {
     const p = params orelse return null;
@@ -507,6 +556,7 @@ const Exchange = struct {
     request: *http.Server.Request,
     arena: Allocator,
     id: RequestId,
+    token: *Transport.CancelToken,
     long_lived: bool,
     force_sse: bool,
     body_writer: ?http.BodyWriter = null,
@@ -563,6 +613,8 @@ fn exchangeNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendErro
     self.write_lock.lockUncancelable(io);
     defer self.write_lock.unlock(io);
     if (self.done) return error.Closed;
+    // After a cancellation by the client, the server sends nothing more for the request.
+    if (self.token.isCancelledByPeer()) return error.Closed;
     try self.startSse();
     try self.writeSse(frame);
 }
@@ -572,6 +624,7 @@ fn exchangeFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendErro
     self.write_lock.lockUncancelable(io);
     defer self.write_lock.unlock(io);
     if (self.done) return error.Closed;
+    if (self.token.isCancelledByPeer()) return error.Closed;
     self.done = true;
     if (self.body_writer != null or self.force_sse or self.long_lived) {
         try self.startSse();

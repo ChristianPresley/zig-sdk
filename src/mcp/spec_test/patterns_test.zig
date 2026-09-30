@@ -70,6 +70,8 @@ fn add(ctx: *RequestContext, args: AddArgs) anyerror!mcp.Outcome(types.CallToolR
 
 const Probe = struct {
     saw_cancel: std.atomic.Value(bool) = .init(false),
+    /// Set when the transport refused a frame that a handler wrote after the cancellation.
+    late_write_refused: std.atomic.Value(bool) = .init(false),
 };
 
 /// Runs until the client cancels the request, at most five seconds.
@@ -172,6 +174,44 @@ fn floodProgress(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.C
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "flooded", .{}) };
 }
 
+/// Waits for the cancellation, then ignores it: it writes one more notification and returns a
+/// result. The transport must send neither.
+fn ignoreCancel(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    const probe: *Probe = @ptrCast(@alignCast(ctx.userdata.?));
+    var i: usize = 0;
+    while (!ctx.isCancelled() and i < 1000) : (i += 1) try ctx.io.sleep(.fromMilliseconds(5), .awake);
+    probe.saw_cancel.store(true, .release);
+    const late = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"late\"}}";
+    ctx.responder.notify(ctx.io, late) catch |e| {
+        if (e == error.Closed) probe.late_write_refused.store(true, .release);
+    };
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "ignored the cancellation", .{}) };
+}
+
+/// Sends five progress notifications, 20 milliseconds apart, then completes.
+fn pulse(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try ctx.progress(@floatFromInt(i), 5, null);
+        try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "pulsed", .{}) };
+}
+
+/// Sends five progress notifications at once, waits a little more than one second, and sends
+/// five more.
+fn burstProgress(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        if (i == 5) try ctx.io.sleep(.fromMilliseconds(1100), .awake);
+        try ctx.progress(@floatFromInt(i), 10, null);
+    }
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "bursts", .{}) };
+}
+
 fn register(server: *Server, probe: *Probe) !void {
     try server.addTool(.{ .name = "add" }, add);
     try server.addToolJson(.{ .name = "wait_for_cancel", .userdata = probe }, waitForCancel);
@@ -183,6 +223,9 @@ fn register(server: *Server, probe: *Probe) !void {
     try server.addToolJson(.{ .name = "ask_roots" }, askRoots);
     try server.addToolJson(.{ .name = "report_progress" }, reportProgress);
     try server.addToolJson(.{ .name = "flood_progress" }, floodProgress);
+    try server.addToolJson(.{ .name = "ignore_cancel", .userdata = probe }, ignoreCancel);
+    try server.addToolJson(.{ .name = "pulse" }, pulse);
+    try server.addToolJson(.{ .name = "burst_progress" }, burstProgress);
     try server.addResource(.{ .uri = "test://ask", .name = "ask" }, readAsk);
     try server.addPrompt(.{ .name = "ask_prompt" }, promptAsk);
 }
@@ -427,19 +470,28 @@ test "progress needs a progress token of string or integer type" {
     try std.testing.expectEqual(1, f.harness.out.items.len);
 }
 
-test "progress notifications of one request are capped" {
+test "progress notifications of one request are rate limited per second" {
     var options = default_options;
-    options.limits.max_progress_rate_per_s = 1;
+    options.limits.max_progress_rate_per_s = 2;
     var f: Fixture = undefined;
     try f.init(options);
     defer f.deinit();
     const meta_token =
         \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":"flood"}
     ;
+    // A flood of 100 notifications in one second: two go out, then the response.
     const done = try f.call(1, "tools/call", meta_token, "\"name\":\"flood_progress\",\"arguments\":{}");
     try std.testing.expectEqualStrings("flooded", result(done).object.get("content").?.array.items[0].object.get("text").?.string);
-    // 60 progress notifications (one per second for a minute), then the response.
-    try std.testing.expectEqual(61, f.harness.out.items.len);
+    try std.testing.expectEqual(3, f.harness.out.items.len);
+
+    // Two bursts of five, more than one second apart: two of each burst go out.
+    _ = try f.call(2, "tools/call", meta_token, "\"name\":\"burst_progress\",\"arguments\":{}");
+    try std.testing.expectEqual(5, f.harness.out.items.len);
+    const values = [_]f64{ 0, 1, 5, 6 };
+    for (values, 0..) |want, i| {
+        const params = (try f.frame(i)).object.get("params").?;
+        try std.testing.expectEqual(want, number(params.object.get("progress").?));
+    }
 }
 
 // -- stdio server -----------------------------------------------------------------------------
@@ -590,6 +642,114 @@ test "stdio server ends a listen stream with a result and then notifications/can
         };
     }
     try std.testing.expectEqual(1, cancellations);
+}
+
+test "stdio server takes a client cancellation with the reason server shutdown as a client cancellation" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var probe: Probe = .{};
+    var server = try Server.init(gpa, std.testing.io, default_options);
+    defer server.deinit();
+    try register(&server, &probe);
+
+    const frames = try runStdio(arena, &server, &.{
+        .{ .line = try request(arena, 1, "subscriptions/listen", meta_none, "\"notifications\":{\"toolsListChanged\":true}") },
+        .{ .after_frames = 1, .line = try request(arena, 2, "tools/call", meta_none, "\"name\":\"ignore_cancel\",\"arguments\":{}") },
+        // The client picks the reason text of the server. The server must not take it as its own shutdown.
+        .{ .line = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1,\"reason\":\"server shutdown\"}}" },
+        .{ .line = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2,\"reason\":\"server shutdown\"}}" },
+        .{ .line = try request(arena, 3, "subscriptions/listen", meta_none, "\"notifications\":{\"toolsListChanged\":true}") },
+        // The end of the input shuts the server down: only listen stream 3 is still open.
+        .{ .after_frames = 2, .line = "" },
+    });
+    try std.testing.expect(probe.saw_cancel.load(.acquire));
+
+    // The acknowledgements of 1 and 3, the result of 3 and one notifications/cancelled for 3.
+    try std.testing.expectEqual(4, frames.len);
+    var cancellations: usize = 0;
+    for (frames) |v| {
+        if (idOf(v)) |id| try std.testing.expectEqual(@as(i64, 3), id);
+        if (methodOf(v)) |m| if (std.mem.eql(u8, m, "notifications/cancelled")) {
+            cancellations += 1;
+            try std.testing.expectEqual(@as(i64, 3), v.object.get("params").?.object.get("requestId").?.integer);
+        };
+    }
+    try std.testing.expectEqual(1, cancellations);
+    try std.testing.expectEqualStrings("notifications/cancelled", methodOf(frames[3]).?);
+}
+
+test "stdio server writes nothing for a cancelled request whose handler ignores the cancellation" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var probe: Probe = .{};
+    var server = try Server.init(gpa, std.testing.io, default_options);
+    defer server.deinit();
+    try register(&server, &probe);
+
+    const meta_token =
+        \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":5}
+    ;
+    const frames = try runStdio(arena, &server, &.{
+        .{ .line = try request(arena, 5, "tools/call", meta_token, "\"name\":\"ignore_cancel\",\"arguments\":{}") },
+        .{ .line = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":5,\"reason\":\"user\"}}" },
+        .{ .line = try request(arena, 6, "tools/call", meta_none, "\"name\":\"add\",\"arguments\":{\"a\":1,\"b\":1}") },
+    });
+    try std.testing.expect(probe.saw_cancel.load(.acquire));
+    // The handler wrote a notification and a result after the cancellation. The transport
+    // refused both.
+    try std.testing.expect(probe.late_write_refused.load(.acquire));
+    try std.testing.expectEqual(1, frames.len);
+    try std.testing.expectEqual(@as(i64, 6), idOf(frames[0]).?);
+}
+
+test "stdio server keeps the progress token of each of two concurrent requests" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var probe: Probe = .{};
+    var server = try Server.init(gpa, std.testing.io, default_options);
+    defer server.deinit();
+    try register(&server, &probe);
+
+    const meta_a =
+        \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":"token-a"}
+    ;
+    const meta_b =
+        \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":"token-b"}
+    ;
+    // Request 2 starts before request 1 is done: the two requests run at the same time.
+    const frames = try runStdio(arena, &server, &.{
+        .{ .line = try request(arena, 1, "tools/call", meta_a, "\"name\":\"pulse\",\"arguments\":{}") },
+        .{ .after_frames = 1, .line = try request(arena, 2, "tools/call", meta_b, "\"name\":\"pulse\",\"arguments\":{}") },
+    });
+    try std.testing.expectEqual(12, frames.len);
+    var next = [_]f64{ 0, 0 };
+    var done = [_]bool{ false, false };
+    var response_of_1: usize = 0;
+    var first_progress_of_2: ?usize = null;
+    for (frames, 0..) |v, i| {
+        if (idOf(v)) |id| {
+            done[@intCast(id - 1)] = true;
+            if (id == 1) response_of_1 = i;
+            continue;
+        }
+        const params = v.object.get("params").?;
+        const token = params.object.get("progressToken").?.string;
+        const which: usize = if (std.mem.eql(u8, token, "token-a")) 0 else if (std.mem.eql(u8, token, "token-b")) 1 else return error.TestUnexpectedResult;
+        // No progress after the response of its request, and the values of each token count up.
+        try std.testing.expect(!done[which]);
+        try std.testing.expectEqual(next[which], number(params.object.get("progress").?));
+        next[which] += 1;
+        if (which == 1 and first_progress_of_2 == null) first_progress_of_2 = i;
+    }
+    try std.testing.expectEqual([_]f64{ 5, 5 }, next);
+    // The requests overlapped: progress of request 2 went out before the response of request 1.
+    try std.testing.expect(first_progress_of_2.? < response_of_1);
 }
 
 // -- Client over a scripted transport ---------------------------------------------------------
@@ -772,6 +932,132 @@ test "client rejects server requests and input required results on other methods
     try std.testing.expectEqual(@as(u32, 0), calls);
 }
 
+/// A client transport that records the deadline of each exchange and then fails it.
+const DeadlineProbe = struct {
+    /// The time from the start of the exchange to its deadline. Null means no deadline.
+    spans: [8]?Io.Duration = undefined,
+    count: usize = 0,
+
+    fn transport(self: *DeadlineProbe) Transport.ClientTransport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = notify };
+
+    fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
+        const self: *DeadlineProbe = @ptrCast(@alignCast(ptr));
+        self.spans[self.count] = if (ex.timeout.toDurationFromNow(io)) |d| d.raw else null;
+        self.count += 1;
+        return error.Closed;
+    }
+
+    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        _ = ptr;
+        _ = io;
+        _ = frame;
+    }
+
+    /// Expect a deadline between `seconds` minus one second and `seconds` from the start.
+    fn expectSpan(self: *DeadlineProbe, index: usize, seconds: i64) !void {
+        const span = self.spans[index].?;
+        try std.testing.expect(span.nanoseconds <= Io.Duration.fromSeconds(seconds).nanoseconds);
+        try std.testing.expect(span.nanoseconds > Io.Duration.fromSeconds(seconds - 1).nanoseconds);
+    }
+};
+
+test "client gives every request a default timeout and a maximum timeout, but not a listen stream" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var probe: DeadlineProbe = .{};
+    var client: Client = .init(std.testing.allocator, std.testing.io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(probe.transport());
+
+    // No timeout from the caller: `limits.request_timeout` (60 seconds).
+    try std.testing.expectError(error.Closed, client.listTools(arena, null, .{ .retry = .never }));
+    try probe.expectSpan(0, 60);
+    // A longer timeout gets the maximum timeout (600 seconds).
+    try std.testing.expectError(error.Closed, client.callTool(arena, "t", null, .{ .timeout = .fromSeconds(3600), .retry = .never }));
+    try probe.expectSpan(1, 600);
+    // The caller can set both values for each request.
+    try std.testing.expectError(error.Closed, client.callTool(arena, "t", null, .{ .timeout = .fromSeconds(30), .max_total_timeout = .fromSeconds(5), .retry = .never }));
+    try probe.expectSpan(2, 5);
+    // A listen stream is long-lived: it has no default timeout.
+    const filter: types.SubscriptionsListenRequestParams = .{
+        ._meta = .{ .@"io.modelcontextprotocol/protocolVersion" = "2026-07-28", .@"io.modelcontextprotocol/clientCapabilities" = .{} },
+        .notifications = .{ .toolsListChanged = true },
+    };
+    try std.testing.expectError(error.Closed, client.listen(arena, filter, .{ .retry = .never }));
+    try std.testing.expect(probe.spans[3] == null);
+    // A timeout that the caller sets on a listen stream counts.
+    try std.testing.expectError(error.Closed, client.listen(arena, filter, .{ .timeout = .fromSeconds(10), .retry = .never }));
+    try probe.expectSpan(4, 10);
+    try std.testing.expectEqual(5, probe.count);
+
+    // The limits give the defaults.
+    var limited: Client = .init(std.testing.allocator, std.testing.io, .{ .info = .{ .name = "cli", .version = "1" }, .limits = .{ .request_timeout = .fromSeconds(20), .max_total_timeout = .fromSeconds(40) } });
+    defer limited.deinit();
+    limited.connect(probe.transport());
+    try std.testing.expectError(error.Closed, limited.listTools(arena, null, .{ .retry = .never }));
+    try probe.expectSpan(5, 20);
+    try std.testing.expectError(error.Closed, limited.listTools(arena, null, .{ .timeout = .fromSeconds(100), .retry = .never }));
+    try probe.expectSpan(6, 40);
+}
+
+/// A client transport that floods the request stream with progress, then answers.
+const ProgressFlood = struct {
+    arena: Allocator,
+    count: usize,
+
+    fn transport(self: *ProgressFlood) Transport.ClientTransport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = notify };
+
+    fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
+        const self: *ProgressFlood = @ptrCast(@alignCast(ptr));
+        const id = ex.id.integer;
+        for (0..self.count) |i| {
+            const frame = std.fmt.allocPrint(self.arena, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":{d},\"progress\":{d}}}}}", .{ id, i }) catch return error.OutOfMemory;
+            ex.sink.deliver(io, frame) catch return error.InvalidFrame;
+        }
+        const reply = std.fmt.allocPrint(self.arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ id, done_reply }) catch return error.OutOfMemory;
+        ex.sink.deliver(io, reply) catch return error.InvalidFrame;
+    }
+
+    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        _ = ptr;
+        _ = io;
+        _ = frame;
+    }
+};
+
+const ProgressCount = struct {
+    count: u32 = 0,
+
+    fn onProgress(userdata: ?*anyopaque, params: types.ProgressNotificationParams) void {
+        _ = params;
+        const self: *ProgressCount = @ptrCast(@alignCast(userdata.?));
+        self.count += 1;
+    }
+};
+
+test "client drops the progress notifications of a request over the rate limit" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var flood: ProgressFlood = .{ .arena = arena, .count = 200 };
+    var client: Client = .init(std.testing.allocator, std.testing.io, .{ .info = .{ .name = "cli", .version = "1" }, .limits = .{ .max_progress_rate_per_s = 5 } });
+    defer client.deinit();
+    client.connect(flood.transport());
+    var seen: ProgressCount = .{};
+    const r = try client.callTool(arena, "t", null, .{ .on_progress = ProgressCount.onProgress, .userdata = &seen });
+    try std.testing.expectEqualStrings("done", r.content[0].text.text);
+    try std.testing.expectEqual(@as(u32, 5), seen.count);
+}
+
 // -- stdio client against the example server process ------------------------------------------
 
 fn exampleServerPath() []const u8 {
@@ -938,5 +1224,42 @@ test "http server stops a handler that writes after the client disconnects" {
     stream.close(io);
     closed = true;
     // The next write fails and the handler stops.
+    try waitUntil(&probe.saw_cancel);
+}
+
+test "client cancels a request at the default timeout although progress keeps arriving" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var probe: Probe = .{};
+    var server = try Server.init(gpa, io, default_options);
+    defer server.deinit();
+    try register(&server, &probe);
+    var transport: mcp.transport.http.Server = .init(io, gpa, &server, .{ .port = 0 });
+    try transport.bind();
+    const Serve = struct {
+        fn run(t: *mcp.transport.http.Server) void {
+            t.serve() catch {};
+        }
+    };
+    var serving = try io.concurrent(Serve.run, .{&transport});
+    defer {
+        transport.shutdown();
+        serving.await(io);
+        transport.deinit();
+    }
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/mcp", .{transport.bound_port});
+    const http = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url });
+    defer http.deinit();
+    // The ticker sends progress every 10 ms for 4 s. The request timeout is 300 ms.
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" }, .limits = .{ .request_timeout = .fromMilliseconds(300) } });
+    defer client.deinit();
+    client.connect(http.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var seen: ProgressCount = .{};
+    try std.testing.expectError(error.Timeout, client.callTool(arena_state.allocator(), "ticker", null, .{ .on_progress = ProgressCount.onProgress, .userdata = &seen }));
+    try std.testing.expect(seen.count > 0);
+    // The client closed the stream: the server canceled the handler.
     try waitUntil(&probe.saw_cancel);
 }

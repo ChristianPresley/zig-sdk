@@ -45,9 +45,16 @@ max_listen_subscriptions: u32 = 1024,
 max_resource_subscription_uris: u32 = 1024,
 /// Maximum serialized bytes of a subscription filter. Overflow: `-32603`.
 max_filter_bytes: usize = 64 << 10,
-/// Maximum progress notifications per second per request. Overflow: dropped.
+/// Maximum progress notifications per second per request, on the server and on the client.
+/// Overflow: the server does not send the notification, and the client does not give it to
+/// `RequestOptions.on_progress`.
 max_progress_rate_per_s: u32 = 50,
+/// The timeout of a client request without `RequestOptions.timeout`. A listen stream has no
+/// default timeout. Overflow: the client cancels the request and returns `error.Timeout`.
 request_timeout: Io.Duration = .fromSeconds(60),
+/// The upper limit of the timeout of a client request without
+/// `RequestOptions.max_total_timeout`. Progress notifications do not extend a timeout.
+/// Overflow: the client cancels the request and returns `error.Timeout`.
 max_total_timeout: Io.Duration = .fromSeconds(600),
 shutdown_grace: Io.Duration = .fromSeconds(2),
 /// How often the client re-issues a request after it lost the stream before any response
