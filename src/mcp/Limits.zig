@@ -56,6 +56,8 @@ max_lost_stream_retries: u32 = 3,
 cancel_notify_timeout: Io.Duration = .fromSeconds(5),
 request_state_ttl: Io.Duration = .fromSeconds(600),
 page_size: u32 = 100,
+/// Maximum pages that the client reads in one automatic list refresh, for example the
+/// `tools/list` refresh after a `-32020` error. Overflow: the client stops the refresh.
 max_auto_pages: u32 = 64,
 completion_max_values: u32 = 100,
 mrtr_max_rounds_client: u8 = 10,

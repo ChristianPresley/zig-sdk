@@ -27,12 +27,17 @@ pub const icons = @import("icons.zig");
 
 const Client = @This();
 
+const log = std.log.scoped(.mcp_client);
+
 gpa: Allocator,
 io: Io,
 options: Options,
 transport: ?Transport.ClientTransport = null,
 next_id: std.atomic.Value(i64) = .init(1),
 cache: cache_mod.Cache,
+/// The `outputSchema` of each tool from `listTools`, as JSON text, by tool name.
+output_schemas: std.StringHashMapUnmanaged([]u8) = .empty,
+output_schemas_lock: Io.Mutex = .init,
 
 pub const Options = struct {
     info: types.Implementation,
@@ -86,7 +91,8 @@ pub const Diagnostics = struct {
     rpc_error: ?types.Error = null,
     /// True when the result had no `resultType` (a specification violation the SDK tolerates).
     result_type_absent: bool = false,
-    /// True when `structuredContent` did not match `outputSchema`.
+    /// True when the `structuredContent` of a `callTool` result does not match the
+    /// `outputSchema` of the tool. The client knows the schema from `listTools`.
     structured_content_invalid: bool = false,
 };
 
@@ -139,6 +145,9 @@ pub const RequestError = error{
     NotConnected,
     /// The task ended with the status `cancelled`.
     TaskCancelled,
+    /// The transport cannot send the request. For example, an argument for a mirrored
+    /// header is an integer outside the safe range of JavaScript.
+    InvalidRequest,
 };
 
 pub fn init(gpa: Allocator, io: Io, options: Options) Client {
@@ -146,6 +155,12 @@ pub fn init(gpa: Allocator, io: Io, options: Options) Client {
 }
 
 pub fn deinit(self: *Client) void {
+    var it = self.output_schemas.iterator();
+    while (it.next()) |kv| {
+        self.gpa.free(kv.key_ptr.*);
+        self.gpa.free(kv.value_ptr.*);
+    }
+    self.output_schemas.deinit(self.gpa);
     self.cache.deinit();
     self.* = undefined;
 }
@@ -210,8 +225,12 @@ pub fn discover(self: *Client, arena: Allocator, options: RequestOptions) Reques
     return (try self.request(arena, .@"server/discover", .{ .object = .empty }, options)).result;
 }
 
+/// List the tools. The client keeps the `outputSchema` of each tool to check the results of
+/// `callTool`.
 pub fn listTools(self: *Client, arena: Allocator, cursor: ?[]const u8, options: RequestOptions) RequestError!types.ListToolsResult {
-    return (try self.request(arena, .@"tools/list", try cursorParams(arena, cursor), options)).result;
+    const result = (try self.request(arena, .@"tools/list", try cursorParams(arena, cursor), options)).result;
+    try self.learnOutputSchemas(arena, result.tools);
+    return result;
 }
 
 pub fn listResources(self: *Client, arena: Allocator, cursor: ?[]const u8, options: RequestOptions) RequestError!types.ListResourcesResult {
@@ -227,8 +246,9 @@ pub fn listPrompts(self: *Client, arena: Allocator, cursor: ?[]const u8, options
 }
 
 /// Call a tool. `arguments` is any value that serializes to a JSON object, or null.
-/// Call a tool. The server can turn the call into a task of the Tasks extension. The client
-/// then waits for the task, answers its input requests with the hooks and returns its result.
+/// The server can turn the call into a task of the Tasks extension. The client then waits
+/// for the task, answers its input requests with the hooks and returns its result. The
+/// client checks `structuredContent` against the `outputSchema` from `listTools`.
 pub fn callTool(self: *Client, arena: Allocator, name: []const u8, arguments: anytype, options: RequestOptions) RequestError!types.CallToolResult {
     var params: std.json.ObjectMap = .empty;
     try params.put(arena, "name", .{ .string = name });
@@ -236,6 +256,7 @@ pub fn callTool(self: *Client, arena: Allocator, name: []const u8, arguments: an
     var wait_options = options;
     wait_options.allow_task = false;
     const response = try self.request(arena, .@"tools/call", .{ .object = params }, wait_options);
+    try self.checkStructuredContent(arena, name, response.result, options);
     return response.result;
 }
 
@@ -248,7 +269,57 @@ pub fn callToolOrTask(self: *Client, arena: Allocator, name: []const u8, argumen
     task_options.allow_task = true;
     const response = try self.request(arena, .@"tools/call", .{ .object = params }, task_options);
     if (response.task) |t| return .{ .task = t };
+    try self.checkStructuredContent(arena, name, response.result, options);
     return .{ .complete = response.result };
+}
+
+/// Keep the `outputSchema` of each listed tool. A tool without an output schema drops the
+/// schema that the client kept for it.
+fn learnOutputSchemas(self: *Client, arena: Allocator, tools: []const types.Tool) Allocator.Error!void {
+    self.output_schemas_lock.lockUncancelable(self.io);
+    defer self.output_schemas_lock.unlock(self.io);
+    for (tools) |tool| {
+        if (self.output_schemas.fetchRemove(tool.name)) |old| {
+            self.gpa.free(old.key);
+            self.gpa.free(old.value);
+        }
+        const schema = tool.outputSchema orelse continue;
+        const text = try json.writeAlloc(arena, schema);
+        const key = try self.gpa.dupe(u8, tool.name);
+        errdefer self.gpa.free(key);
+        const value = try self.gpa.dupe(u8, text);
+        errdefer self.gpa.free(value);
+        try self.output_schemas.put(self.gpa, key, value);
+    }
+}
+
+/// Check the `structuredContent` of a tool result against the `outputSchema` of the tool.
+/// A result without structured content does not match. A mismatch sets
+/// `Diagnostics.structured_content_invalid` and logs a warning. The result stays usable.
+fn checkStructuredContent(self: *Client, arena: Allocator, tool: []const u8, result: types.CallToolResult, options: RequestOptions) Allocator.Error!void {
+    if (result.isError == true) return;
+    const text = blk: {
+        self.output_schemas_lock.lockUncancelable(self.io);
+        defer self.output_schemas_lock.unlock(self.io);
+        const t = self.output_schemas.get(tool) orelse return;
+        break :blk try arena.dupe(u8, t);
+    };
+    const valid = valid: {
+        const content = result.structuredContent orelse break :valid false;
+        const schema = validator.compileText(arena, text, .{ .allow_unsupported_keywords = true, .limits = self.options.limits.schema }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // The client cannot check against a schema that it cannot compile.
+            else => return,
+        };
+        const report = validator.validate(arena, &schema, content) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => break :valid false,
+        };
+        break :valid report.valid;
+    };
+    if (valid) return;
+    log.warn("the structuredContent of the tool '{s}' does not match its outputSchema", .{tool});
+    if (options.diagnostics) |d| d.structured_content_invalid = true;
 }
 
 pub const ToolOutcome = union(enum) {
@@ -560,6 +631,7 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
 
     var round: u32 = 0;
     var version_retried = false;
+    var header_retried = false;
     var lost_retries: u32 = 0;
     var input_responses: ?std.json.ObjectMap = null;
     var request_state: ?[]const u8 = null;
@@ -590,6 +662,7 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             error.Timeout => return error.Timeout,
             error.Canceled => return error.Canceled,
             error.InvalidFrame, error.HttpStatus => return error.InvalidResponse,
+            error.InvalidRequest => return error.InvalidRequest,
             error.Closed, error.WriteFailed, error.ReadFailed => {
                 if (self.canRetryLost(options, known, collector.frames, lost_retries)) {
                     lost_retries += 1;
@@ -609,6 +682,14 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             // An invalid cursor: the cached pages of the list are no longer reliable.
             if (rpc.code == errors.Code.invalid_params.int() and known != null and known.?.isCacheable() and params.object.get("cursor") != null) {
                 self.cache.invalidate(method_name);
+            }
+            // A header mismatch (-32020) on a tool call: the tool schema can have new
+            // x-mcp-header annotations. Refresh tools/list one time and retry.
+            if (rpc.code == errors.Code.header_mismatch.int() and known == .@"tools/call" and !header_retried and mirrorsParams(transport.kind())) {
+                header_retried = true;
+                self.refreshTools(arena, options);
+                round -|= 1;
+                continue;
             }
             if (options.diagnostics) |d| d.rpc_error = rpc;
             return error.Rpc;
@@ -676,6 +757,22 @@ fn canRetryLost(self: *Client, options: RequestOptions, known: ?methods.Method, 
         .force => true,
         .auto => frames == 0 and known != null and known.?.isIdempotent(),
     };
+}
+
+/// True when the transport mirrors tool parameters into `Mcp-Param-*` headers.
+fn mirrorsParams(kind: Transport.Kind) bool {
+    return kind == .streamable_http or kind == .grpc;
+}
+
+/// Read all pages of `tools/list` again, up to `limits.max_auto_pages`. The transport learns
+/// the new `x-mcp-header` annotations from the result. A failure keeps the old annotations.
+fn refreshTools(self: *Client, arena: Allocator, options: RequestOptions) void {
+    var cursor: ?[]const u8 = null;
+    var pages: u32 = 0;
+    while (pages < self.options.limits.max_auto_pages) : (pages += 1) {
+        const page = self.listTools(arena, cursor, .{ .timeout = options.timeout, .cancel = options.cancel, .cache_mode = .bypass }) catch return;
+        cursor = page.nextCursor orelse return;
+    }
 }
 
 /// True when `data.supported` of a -32022 error lists the revision this SDK speaks.

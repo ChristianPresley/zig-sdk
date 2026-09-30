@@ -275,7 +275,11 @@ pub const Channel = struct {
         const stream = link.h2.openStream() catch return error.Closed;
         defer stream.close();
         var headers: std.ArrayList(Header) = .empty;
-        try self.callHeaders(arena, &headers, method_name, null, null);
+        self.callHeaders(arena, &headers, method_name, null, null) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Without params, the call mirrors no parameter.
+            error.UnsafeInteger => unreachable,
+        };
         stream.sendHeaders(headers.items, false) catch return error.WriteFailed;
         var out: std.ArrayList(u8) = .empty;
         try messages.encodeJsonRpcMessage(arena, &out, frame);
@@ -290,7 +294,7 @@ pub const Channel = struct {
     }
 
     /// The pseudo-headers and the metadata of one call.
-    fn callHeaders(self: *Channel, arena: Allocator, headers: *std.ArrayList(Header), method_name: []const u8, params: ?Value, deadline: ?Io.Duration) Allocator.Error!void {
+    fn callHeaders(self: *Channel, arena: Allocator, headers: *std.ArrayList(Header), method_name: []const u8, params: ?Value, deadline: ?Io.Duration) tool_headers.Map.AppendError!void {
         const authority = self.options.authority orelse try std.fmt.allocPrint(arena, "{s}:{d}", .{ self.options.host, self.options.port });
         try headers.append(arena, .{ .name = ":method", .value = "POST" });
         try headers.append(arena, .{ .name = ":scheme", .value = if (self.options.tls != null) "https" else "http" });
@@ -339,7 +343,10 @@ pub const Channel = struct {
             remaining = if (left.nanoseconds > 0) left else .{ .nanoseconds = 1 };
         }
         var headers: std.ArrayList(Header) = .empty;
-        try self.callHeaders(arena, &headers, ex.method, ex.params, remaining);
+        self.callHeaders(arena, &headers, ex.method, ex.params, remaining) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsafeInteger => return error.InvalidRequest,
+        };
         stream.sendHeaders(headers.items, false) catch |e| return mapStream(e);
         var out: std.ArrayList(u8) = .empty;
         try messages.encodeJsonRpcMessage(arena, &out, ex.frame);

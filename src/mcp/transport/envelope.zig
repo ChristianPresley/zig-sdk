@@ -55,17 +55,56 @@ pub fn decodeValue(arena: Allocator, value: []const u8) DecodeError![]const u8 {
     return out;
 }
 
+/// The largest safe integer of JavaScript, 2^53 - 1. A mirrored integer must be in the range
+/// from `-max_safe_integer` to `max_safe_integer`.
+pub const max_safe_integer: i64 = (1 << 53) - 1;
+
+/// True when `value` is in the safe integer range of JavaScript.
+pub fn isSafeInteger(value: i64) bool {
+    return value >= -max_safe_integer and value <= max_safe_integer;
+}
+
+/// True when a JSON number is not an integer outside the safe range. An integer outside the
+/// range cannot go into a header.
+pub fn isSafeNumber(value: Value) bool {
+    return switch (value) {
+        .integer => |i| isSafeInteger(i),
+        .float => |f| @trunc(f) != f or @abs(f) <= @as(f64, @floatFromInt(max_safe_integer)),
+        .number_string => false,
+        else => true,
+    };
+}
+
+pub const EncodeParamError = error{
+    OutOfMemory,
+    /// The value is an integer outside the safe range of JavaScript.
+    UnsafeInteger,
+};
+
 /// Encode a JSON parameter value for an `Mcp-Param-*` header. The function accepts only
-/// strings, integers and booleans. Null means "omit the header".
-pub fn encodeParam(arena: Allocator, value: Value) Allocator.Error!?[]const u8 {
+/// strings, integers and booleans. Null means "omit the header". An integer outside the
+/// safe range gives `error.UnsafeInteger`.
+pub fn encodeParam(arena: Allocator, value: Value) EncodeParamError!?[]const u8 {
+    if (!isSafeNumber(value)) return error.UnsafeInteger;
     return switch (value) {
         .null => null,
         .string => |s| try encodeValue(arena, s),
         .integer => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+        // JSON Schema counts 42.0 as an integer.
+        .float => |f| if (@trunc(f) == f) try std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(f))}) else null,
         .bool => |b| if (b) "true" else "false",
-        .number_string => |s| s,
         else => null,
     };
+}
+
+/// True when `value` has only the characters of an HTTP field value: visible ASCII, space
+/// and horizontal tab. A value with other characters must use the base64 sentinel.
+pub fn isFieldValue(value: []const u8) bool {
+    for (value) |c| {
+        if (c == 0x09) continue;
+        if (c < 0x20 or c > 0x7e) return false;
+    }
+    return true;
 }
 
 /// A rejection of a request because of a header problem. The message is the mandated
@@ -106,6 +145,7 @@ pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?V
         if (!std.mem.eql(u8, hv, mv)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: MCP-Protocol-Version header value '{s}' does not match body value '{s}'", .{ hv, mv }) };
     }
     const hm = headers.method orelse return .{ .message = "Header mismatch: the Mcp-Method header is missing" };
+    if (!isFieldValue(hm)) return .{ .message = "Header mismatch: Mcp-Method has invalid characters" };
     if (!std.mem.eql(u8, hm, method)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Method header value '{s}' does not match body method '{s}'", .{ hm, method }) };
 
     const source: methods.HeaderNameSource = if (methods.Method.fromName(method)) |m| m.headerNameSource() else if (isTaskMethod(method)) .task_id else .none;
@@ -121,6 +161,7 @@ pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?V
             break :blk json.getString(p, key);
         };
         const raw = headers.name orelse return .{ .message = "Header mismatch: the Mcp-Name header is missing" };
+        if (!isFieldValue(raw)) return .{ .message = "Header mismatch: Mcp-Name has invalid characters" };
         const decoded = decodeValue(arena, raw) catch return .{ .message = "Header mismatch: Mcp-Name header has an invalid encoding" };
         if (body_value) |bv| {
             if (!std.mem.eql(u8, decoded, bv)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Name header value '{s}' does not match body value '{s}'", .{ decoded, bv }) };
@@ -129,36 +170,32 @@ pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?V
 
     // Mcp-Param-* headers declared by the tool schema.
     if (schema) |s| {
-        const props = blk: {
-            if (s != .object) break :blk null;
-            const p = s.object.get("properties") orelse break :blk null;
-            break :blk if (p == .object) p.object else null;
+        const annotations = switch (try headerAnnotations(arena, s)) {
+            .valid => |list| list,
+            // Registration rejects such a schema. The server mirrors no parameter of it.
+            .invalid => &.{},
         };
         const arguments: ?Value = blk: {
             const p = params orelse break :blk null;
             if (p != .object) break :blk null;
             break :blk p.object.get("arguments");
         };
-        if (props) |properties| {
-            var it = properties.iterator();
-            while (it.next()) |kv| {
-                const annotation_name = json.getString(kv.value_ptr.*, "x-mcp-header") orelse continue;
-                const body_value: ?Value = blk: {
-                    const a = arguments orelse break :blk null;
-                    if (a != .object) break :blk null;
-                    const v = a.object.get(kv.key_ptr.*) orelse break :blk null;
-                    break :blk if (v == .null) null else v;
-                };
-                const header_value = headers.param(annotation_name);
-                if (body_value == null) {
-                    if (header_value != null) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} is present but the body has no value", .{annotation_name}) };
-                    continue;
-                }
-                const raw = header_value orelse return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: the Mcp-Param-{s} header is missing", .{annotation_name}) };
-                const decoded = decodeValue(arena, raw) catch return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} has an invalid encoding", .{annotation_name}) };
-                if (!paramMatches(decoded, body_value.?)) {
-                    return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} header value '{s}' does not match the body", .{ annotation_name, decoded }) };
-                }
+        for (annotations) |annotation| {
+            const name = annotation.header;
+            const body_value: ?Value = if (arguments) |a| valueAtPath(a, annotation.path) else null;
+            const header_value = headers.param(name);
+            if (header_value) |raw| {
+                if (!isFieldValue(raw)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} has invalid characters", .{name}) };
+            }
+            const bv = body_value orelse {
+                if (header_value != null) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} is present but the body has no value", .{name}) };
+                continue;
+            };
+            if (!isSafeNumber(bv)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: the value of Mcp-Param-{s} is an integer outside the safe range", .{name}) };
+            const raw = header_value orelse return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: the Mcp-Param-{s} header is missing", .{name}) };
+            const decoded = decodeValue(arena, raw) catch return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} has an invalid encoding", .{name}) };
+            if (!paramMatches(decoded, bv)) {
+                return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Param-{s} header value '{s}' does not match the body", .{ name, decoded }) };
             }
         }
     }
@@ -201,31 +238,156 @@ fn isTchar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", c) != null;
 }
 
-/// Check every `x-mcp-header` annotation of a tool input schema. Returns false when
-/// transports that carry headers must not show the tool in `tools/list`.
-pub fn schemaHeadersValid(schema: Value) bool {
-    if (schema != .object) return true;
-    const props = schema.object.get("properties") orelse return true;
-    if (props != .object) return true;
-    var seen: [64][]const u8 = undefined;
-    var count: usize = 0;
-    var it = props.object.iterator();
-    while (it.next()) |kv| {
-        const prop = kv.value_ptr.*;
-        if (prop != .object) continue;
-        const annotation = prop.object.get("x-mcp-header") orelse continue;
-        if (annotation != .string) return false;
-        const name = annotation.string;
-        if (!isValidHeaderAnnotation(name)) return false;
-        const t = json.getString(prop, "type") orelse return false;
-        if (!(std.mem.eql(u8, t, "string") or std.mem.eql(u8, t, "integer") or std.mem.eql(u8, t, "boolean"))) return false;
-        for (seen[0..count]) |s| if (std.ascii.eqlIgnoreCase(s, name)) return false;
-        if (count == seen.len) return false;
-        seen[count] = name;
-        count += 1;
+/// The deepest schema nesting that the `x-mcp-header` walk follows.
+pub const max_header_schema_depth = 64;
+/// The largest number of `x-mcp-header` annotations in one input schema.
+pub const max_header_annotations = 64;
+
+/// One `x-mcp-header` annotation on a property that a chain of `properties` keywords
+/// reaches from the schema root.
+pub const HeaderAnnotation = struct {
+    /// The property names from the root to the annotated property.
+    path: []const []const u8,
+    /// The name part of the `Mcp-Param-{name}` header.
+    header: []const u8,
+};
+
+/// The reason why an `x-mcp-header` annotation is invalid.
+pub const HeaderProblem = enum {
+    not_string,
+    invalid_name,
+    not_primitive,
+    duplicate,
+    not_reachable,
+    too_many,
+    too_deep,
+
+    /// A short text for a log message.
+    pub fn text(self: HeaderProblem) []const u8 {
+        return switch (self) {
+            .not_string => "the x-mcp-header value is not a string",
+            .invalid_name => "the x-mcp-header value is empty or is not an HTTP token",
+            .not_primitive => "the annotated property does not have the type string, integer or boolean",
+            .duplicate => "two x-mcp-header values are equal without regard to case",
+            .not_reachable => "the annotation is not on a property that a chain of properties keywords reaches from the schema root",
+            .too_many => "the schema has too many x-mcp-header annotations",
+            .too_deep => "the schema is too deep",
+        };
     }
-    return true;
+};
+
+/// The result of the `x-mcp-header` walk over a tool input schema.
+pub const HeaderAnnotations = union(enum) {
+    /// All annotations are valid. The list has them in schema order.
+    valid: []const HeaderAnnotation,
+    /// The first invalid annotation. The tool must not show in `tools/list`.
+    invalid: Invalid,
+
+    pub const Invalid = struct {
+        problem: HeaderProblem,
+        /// The `x-mcp-header` value, when it is a string.
+        annotation: ?[]const u8 = null,
+    };
+};
+
+/// Find and check every `x-mcp-header` annotation of a tool input schema. The walk goes into
+/// every subschema. An annotation is valid only on a property that a chain of `properties`
+/// keywords reaches from the root. A chain through `items`, `anyOf`, `if`, `$defs` or
+/// another keyword makes the annotation invalid. The walk ignores the data of `const`, `enum`,
+/// `default` and `examples`.
+pub fn headerAnnotations(arena: Allocator, schema: Value) Allocator.Error!HeaderAnnotations {
+    var walker: HeaderWalker = .{ .arena = arena };
+    var path: [max_header_schema_depth][]const u8 = undefined;
+    try walker.walk(schema, &path, 0, 0);
+    if (walker.invalid) |invalid| return .{ .invalid = invalid };
+    return .{ .valid = walker.found.items };
 }
+
+/// True when every `x-mcp-header` annotation of a tool input schema is valid. Transports that
+/// carry headers must not show a tool with an invalid annotation in `tools/list`.
+pub fn schemaHeadersValid(arena: Allocator, schema: Value) Allocator.Error!bool {
+    return (try headerAnnotations(arena, schema)) == .valid;
+}
+
+/// The value at `path` in the arguments of a tool call. Null when a step is absent or is
+/// not an object, and when the value is null.
+pub fn valueAtPath(arguments: Value, path: []const []const u8) ?Value {
+    var current = arguments;
+    for (path) |key| {
+        if (current != .object) return null;
+        current = current.object.get(key) orelse return null;
+    }
+    return if (current == .null) null else current;
+}
+
+/// Keywords whose operand is data and not a schema.
+const data_keywords = std.StaticStringMap(void).initComptime(.{
+    .{"const"}, .{"enum"}, .{"default"}, .{"examples"}, .{"x-mcp-header"},
+});
+
+/// Keywords whose operand is an object of subschemas under names that are not keywords.
+const schema_map_keywords = std.StaticStringMap(void).initComptime(.{
+    .{"patternProperties"}, .{"$defs"}, .{"definitions"}, .{"dependentSchemas"}, .{"dependencies"}, .{"dependentRequired"},
+});
+
+const HeaderWalker = struct {
+    arena: Allocator,
+    found: std.ArrayList(HeaderAnnotation) = .empty,
+    invalid: ?HeaderAnnotations.Invalid = null,
+
+    fn fail(self: *HeaderWalker, problem: HeaderProblem, annotation: ?[]const u8) void {
+        if (self.invalid == null) self.invalid = .{ .problem = problem, .annotation = annotation };
+    }
+
+    /// Walk one schema node. `path_len` is the length of the `properties` chain to the node,
+    /// or null when another keyword is on the way from the root.
+    fn walk(self: *HeaderWalker, node: Value, path: *[max_header_schema_depth][]const u8, path_len: ?usize, depth: usize) Allocator.Error!void {
+        if (self.invalid != null) return;
+        if (node != .object) return;
+        if (depth >= max_header_schema_depth) return self.fail(.too_deep, null);
+        if (node.object.get("x-mcp-header")) |annotation| {
+            try self.record(node, annotation, path[0 .. path_len orelse 0], path_len != null);
+        }
+        var it = node.object.iterator();
+        while (it.next()) |kv| {
+            const key = kv.key_ptr.*;
+            const value = kv.value_ptr.*;
+            if (data_keywords.has(key)) continue;
+            if (std.mem.eql(u8, key, "properties") or schema_map_keywords.has(key)) {
+                if (value != .object) continue;
+                const chain = std.mem.eql(u8, key, "properties");
+                var entries = value.object.iterator();
+                while (entries.next()) |entry| {
+                    var child_len: ?usize = null;
+                    if (chain) if (path_len) |n| {
+                        path[n] = entry.key_ptr.*;
+                        child_len = n + 1;
+                    };
+                    try self.walk(entry.value_ptr.*, path, child_len, depth + 1);
+                }
+                continue;
+            }
+            switch (value) {
+                .object => try self.walk(value, path, null, depth + 1),
+                .array => |list| for (list.items) |item| try self.walk(item, path, null, depth + 1),
+                else => {},
+            }
+        }
+    }
+
+    fn record(self: *HeaderWalker, node: Value, annotation: Value, path: []const []const u8, reachable: bool) Allocator.Error!void {
+        const name: ?[]const u8 = if (annotation == .string) annotation.string else null;
+        // The root is not a property.
+        if (!reachable or path.len == 0) return self.fail(.not_reachable, name);
+        const header = name orelse return self.fail(.not_string, null);
+        if (!isValidHeaderAnnotation(header)) return self.fail(.invalid_name, header);
+        const t = json.getString(node, "type") orelse return self.fail(.not_primitive, header);
+        if (!(std.mem.eql(u8, t, "string") or std.mem.eql(u8, t, "integer") or std.mem.eql(u8, t, "boolean"))) return self.fail(.not_primitive, header);
+        for (self.found.items) |f| if (std.ascii.eqlIgnoreCase(f.header, header)) return self.fail(.duplicate, header);
+        if (self.found.items.len == max_header_annotations) return self.fail(.too_many, header);
+        try self.found.append(self.arena, .{ .path = try self.arena.dupe([]const u8, path), .header = header });
+    }
+};
 
 test "sentinel encoding" {
     const gpa = std.testing.allocator;
@@ -268,11 +430,49 @@ test "verify headers against body" {
     try std.testing.expect((try verify(arena, missing_version, "tools/call", params, null)) != null);
     const extra_param: Headers = .{ .protocol_version = "2026-07-28", .method = "tools/call", .name = "echo", .params = &.{ .{ .name = "region", .value = "us-west1" }, .{ .name = "priority", .value = "42" }, .{ .name = "verbose", .value = "true" } } };
     try std.testing.expect((try verify(arena, extra_param, "tools/call", params, schema)) != null);
-    try std.testing.expect(schemaHeadersValid(schema));
+    try std.testing.expect(try schemaHeadersValid(arena, schema));
     const dup = try json.parseTree(arena, "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"x-mcp-header\":\"X\"},\"b\":{\"type\":\"string\",\"x-mcp-header\":\"x\"}}}");
-    try std.testing.expect(!schemaHeadersValid(dup));
+    try std.testing.expect(!try schemaHeadersValid(arena, dup));
     const num = try json.parseTree(arena, "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\",\"x-mcp-header\":\"X\"}}}");
-    try std.testing.expect(!schemaHeadersValid(num));
+    try std.testing.expect(!try schemaHeadersValid(arena, num));
+}
+
+test "header annotation walk, value paths, field values and safe integers" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const nested = try json.parseTree(arena,
+        \\{"type":"object","properties":{"a":{"type":"object","properties":{"b":{"type":"integer","x-mcp-header":"B"}}}}}
+    );
+    const found = (try headerAnnotations(arena, nested)).valid;
+    try std.testing.expectEqual(1, found.len);
+    try std.testing.expectEqualStrings("B", found[0].header);
+    try std.testing.expectEqual(2, found[0].path.len);
+    try std.testing.expectEqualStrings("a", found[0].path[0]);
+    try std.testing.expectEqualStrings("b", found[0].path[1]);
+    const args = try json.parseTree(arena, "{\"a\":{\"b\":5},\"b\":6}");
+    try std.testing.expectEqual(5, valueAtPath(args, found[0].path).?.integer);
+    try std.testing.expect(valueAtPath(try json.parseTree(arena, "{\"a\":7}"), found[0].path) == null);
+
+    // A schema deeper than the walk limit is invalid.
+    var deep: std.ArrayList(u8) = .empty;
+    for (0..max_header_schema_depth) |_| try deep.appendSlice(arena, "{\"properties\":{\"p\":");
+    try deep.appendSlice(arena, "{\"type\":\"string\"}");
+    for (0..max_header_schema_depth) |_| try deep.appendSlice(arena, "}}");
+    const too_deep = try headerAnnotations(arena, try json.parseTree(arena, deep.items));
+    try std.testing.expectEqual(HeaderProblem.too_deep, too_deep.invalid.problem);
+
+    try std.testing.expect(isFieldValue("us west\t1"));
+    try std.testing.expect(!isFieldValue("Gr\u{fc}\u{df}e"));
+    try std.testing.expect(!isFieldValue("a\x7fb"));
+    try std.testing.expect(!isFieldValue("a\rb"));
+    try std.testing.expect(isSafeInteger(max_safe_integer) and isSafeInteger(-max_safe_integer));
+    try std.testing.expect(!isSafeInteger(max_safe_integer + 1) and !isSafeInteger(-max_safe_integer - 1));
+    try std.testing.expect(isSafeNumber(.{ .float = 0.5 }));
+    try std.testing.expect(!isSafeNumber(.{ .float = 9007199254740992.0 }));
+    try std.testing.expect(!isSafeNumber(.{ .number_string = "1e999" }));
 }
 
 /// The Tasks extension methods that mirror `params.taskId` into `Mcp-Name`.

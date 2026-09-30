@@ -103,6 +103,15 @@ fn echoOptional(ctx: *mcp.RequestContext, args: OptionalArgs) anyerror!mcp.Outco
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "{s}", .{args.region orelse "none"}) };
 }
 
+fn echoNested(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "nested", .{}) };
+}
+
+const nested_schema =
+    \\{"type":"object","properties":{"target":{"type":"object","properties":{"region":{"type":"string","x-mcp-header":"Region"}}},"count":{"type":"integer","x-mcp-header":"Count"}}}
+;
+
 fn readStatic(ctx: *mcp.RequestContext, uri: []const u8) anyerror!mcp.Outcome(types.ReadResourceResult) {
     const contents = try ctx.arena.alloc(types.ResourceContents, 1);
     contents[0] = .{ .text = .{ .uri = uri, .mimeType = "text/plain", .text = "static" } };
@@ -119,6 +128,7 @@ fn initServer(server: *mcp.Server) !void {
     try server.addToolJson(.{ .name = "ticker" }, ticker);
     try server.addTool(.{ .name = "test_headers" }, echoHeaders);
     try server.addTool(.{ .name = "optional_headers" }, echoOptional);
+    try server.addToolJson(.{ .name = "nested_headers", .input_schema = nested_schema }, echoNested);
     try server.addResource(.{ .uri = "test://static", .name = "static" }, readStatic);
 }
 
@@ -443,6 +453,65 @@ test "streamable http server expects Mcp-Param headers only for values in the bo
     try expectHeaderMismatch(arena, try f.post(arena, callHeaders("optional_headers", &.{.{ .name = "mcp-param-verbose", .value = "false" }}), with_value), 8);
 }
 
+test "streamable http server reads Mcp-Param values at the nested property path" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const full = try request(arena, 11, "tools/call", meta_none, "\"name\":\"nested_headers\",\"arguments\":{\"target\":{\"region\":\"eu\"},\"count\":3}");
+    try std.testing.expectEqual(@as(u16, 200), (try f.post(arena, callHeaders("nested_headers", &.{ .{ .name = "mcp-param-region", .value = "eu" }, .{ .name = "mcp-param-count", .value = "3" } }), full)).status);
+    // The nested value needs its header, and the header must match the nested value.
+    try expectHeaderMismatch(arena, try f.post(arena, callHeaders("nested_headers", &.{.{ .name = "mcp-param-count", .value = "3" }}), full), 11);
+    try expectHeaderMismatch(arena, try f.post(arena, callHeaders("nested_headers", &.{ .{ .name = "mcp-param-region", .value = "us" }, .{ .name = "mcp-param-count", .value = "3" } }), full), 11);
+    // Without a value at the path, the server expects no header.
+    const no_target = try request(arena, 12, "tools/call", meta_none, "\"name\":\"nested_headers\",\"arguments\":{\"count\":3}");
+    try std.testing.expectEqual(@as(u16, 200), (try f.post(arena, callHeaders("nested_headers", &.{.{ .name = "mcp-param-count", .value = "3" }}), no_target)).status);
+    try expectHeaderMismatch(arena, try f.post(arena, callHeaders("nested_headers", &.{ .{ .name = "mcp-param-region", .value = "eu" }, .{ .name = "mcp-param-count", .value = "3" } }), no_target), 12);
+    const null_region = try request(arena, 13, "tools/call", meta_none, "\"name\":\"nested_headers\",\"arguments\":{\"target\":{\"region\":null}}");
+    try std.testing.expectEqual(@as(u16, 200), (try f.post(arena, callHeaders("nested_headers", &.{}), null_region)).status);
+    // A property with the same name at the root is not the annotated property.
+    const root_region = try request(arena, 14, "tools/call", meta_none, "\"name\":\"nested_headers\",\"arguments\":{\"region\":\"eu\"}");
+    try std.testing.expectEqual(@as(u16, 200), (try f.post(arena, callHeaders("nested_headers", &.{}), root_region)).status);
+}
+
+test "streamable http server rejects invalid characters and unsafe integers in mirrored headers" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const encode = mcp.transport.envelope.encodeValue;
+
+    // Raw non-ASCII bytes and control characters are invalid, also when they equal the body.
+    const greeting = try request(arena, 21, "tools/call", meta_none, "\"name\":\"test_headers\",\"arguments\":{\"region\":\"Gr\u{fc}\u{df}e\",\"priority\":7}");
+    try expectHeaderMismatch(arena, try f.post(arena, callHeaders("test_headers", &.{ .{ .name = "mcp-param-region", .value = "Gr\u{fc}\u{df}e" }, .{ .name = "mcp-param-priority", .value = "7" } }), greeting), 21);
+    const greeting_b64 = try encode(arena, "Gr\u{fc}\u{df}e");
+    const greeting_ok = try f.post(arena, &.{ version_header, .{ .name = "mcp-method", .value = "tools/call" }, .{ .name = "mcp-name", .value = "test_headers" }, .{ .name = "mcp-param-region", .value = greeting_b64 }, .{ .name = "mcp-param-priority", .value = "7" } }, greeting);
+    try std.testing.expectEqual(@as(u16, 200), greeting_ok.status);
+    const delete = try request(arena, 22, "tools/call", meta_none, "\"name\":\"test_headers\",\"arguments\":{\"region\":\"a\\u007fb\",\"priority\":7}");
+    try expectHeaderMismatch(arena, try f.post(arena, callHeaders("test_headers", &.{ .{ .name = "mcp-param-region", .value = "a\x7fb" }, .{ .name = "mcp-param-priority", .value = "7" } }), delete), 22);
+    // The same rule applies to Mcp-Name.
+    const uri = "test://\u{fc}ber";
+    const read = try request(arena, 23, "resources/read", meta_none, "\"uri\":\"" ++ uri ++ "\"");
+    try expectHeaderMismatch(arena, try f.post(arena, &.{ version_header, .{ .name = "mcp-method", .value = "resources/read" }, .{ .name = "mcp-name", .value = uri } }, read), 23);
+    const read_encoded = try f.post(arena, &.{ version_header, .{ .name = "mcp-method", .value = "resources/read" }, .{ .name = "mcp-name", .value = try encode(arena, uri) } }, read);
+    try std.testing.expect(errorCode(try read_encoded.tree(arena)) != -32020);
+
+    // A mirrored integer must be in the safe range of JavaScript.
+    const largest = try request(arena, 24, "tools/call", meta_none, "\"name\":\"test_headers\",\"arguments\":{\"region\":\"eu\",\"priority\":9007199254740991}");
+    try std.testing.expectEqual(@as(u16, 200), (try f.post(arena, callHeaders("test_headers", &.{ .{ .name = "mcp-param-region", .value = "eu" }, .{ .name = "mcp-param-priority", .value = "9007199254740991" } }), largest)).status);
+    const too_large = try request(arena, 25, "tools/call", meta_none, "\"name\":\"test_headers\",\"arguments\":{\"region\":\"eu\",\"priority\":9007199254740992}");
+    try expectHeaderMismatch(arena, try f.post(arena, callHeaders("test_headers", &.{ .{ .name = "mcp-param-region", .value = "eu" }, .{ .name = "mcp-param-priority", .value = "9007199254740992" } }), too_large), 25);
+    const too_small = try request(arena, 26, "tools/call", meta_none, "\"name\":\"test_headers\",\"arguments\":{\"region\":\"eu\",\"priority\":-9007199254740992}");
+    try expectHeaderMismatch(arena, try f.post(arena, callHeaders("test_headers", &.{ .{ .name = "mcp-param-region", .value = "eu" }, .{ .name = "mcp-param-priority", .value = "-9007199254740992" } }), too_small), 26);
+}
+
 test "streamable http server answers notifications with 202 and rejects bodies it cannot accept" {
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
@@ -647,6 +716,10 @@ const Capture = struct {
     connections: usize = 0,
     requests: std.ArrayList(Captured) = .empty,
     future: Io.Future(void),
+    /// With `refresh`, the tool schemas change after the first `tools/list` and tool calls
+    /// without the `Mcp-Param-Region` header get a `-32020` error.
+    mode: enum { fixed, refresh } = .fixed,
+    lists: usize = 0,
 
     fn start(self: *Capture) !void {
         const io = std.testing.io;
@@ -691,16 +764,34 @@ const Capture = struct {
         var body_buf: [4096]u8 = undefined;
         const body = try req.readerExpectNone(&body_buf).allocRemaining(arena, .limited(1 << 20));
         try self.requests.append(arena, .{ .method = method, .target = target, .headers = headers.items, .body = body });
-        const reply = try replyFor(arena, body);
+        const reply = try self.replyFor(arena, body, headers.items);
         // The header name is in upper case: the client must match it without regard to case.
-        try req.respond(reply, .{ .status = .ok, .keep_alive = false, .extra_headers = &.{.{ .name = "CONTENT-TYPE", .value = "application/json" }} });
+        try req.respond(reply.body, .{ .status = reply.status, .keep_alive = false, .extra_headers = &.{.{ .name = "CONTENT-TYPE", .value = "application/json" }} });
     }
 
-    fn replyFor(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+    const Reply = struct { status: http.Status = .ok, body: []const u8 };
+
+    fn replyFor(self: *Capture, arena: std.mem.Allocator, body: []const u8, headers: []const http.Header) !Reply {
         const tree = try json.parseTree(arena, body);
         const id = tree.object.get("id").?.integer;
         const method = json.getString(tree, "method").?;
         const params = tree.object.get("params").?;
+        if (self.mode == .refresh) {
+            if (std.mem.eql(u8, method, "tools/list")) {
+                self.lists += 1;
+                const tools = if (self.lists == 1) refresh_tools_before else refresh_tools_after;
+                return .{ .body = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ id, tools }) };
+            }
+            if (std.mem.eql(u8, method, "tools/call")) {
+                var mirrored = false;
+                for (headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "mcp-param-region")) {
+                    mirrored = true;
+                };
+                if (!mirrored or std.mem.eql(u8, json.getString(params, "name").?, "never")) {
+                    return .{ .status = .bad_request, .body = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":-32020,\"message\":\"Header mismatch: the Mcp-Param-Region header is missing\"}}}}", .{id}) };
+                }
+            }
+        }
         const result: []const u8 = if (std.mem.eql(u8, method, "server/discover"))
             "{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"tools\":{},\"resources\":{}}}"
         else if (std.mem.eql(u8, method, "tools/list"))
@@ -711,9 +802,21 @@ const Capture = struct {
             "{\"resultType\":\"input_required\",\"inputRequests\":{\"user_name\":{\"method\":\"elicitation/create\",\"params\":{\"mode\":\"form\",\"message\":\"Name?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}}}}}"
         else
             "{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}";
-        return std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ id, result });
+        return .{ .body = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ id, result }) };
     }
 };
+
+const refresh_tools_before =
+    \\{"resultType":"complete","tools":[
+    \\{"name":"late","inputSchema":{"type":"object","properties":{"target":{"type":"object","properties":{"region":{"type":"string"}}}}}},
+    \\{"name":"never","inputSchema":{"type":"object"}}]}
+;
+
+const refresh_tools_after =
+    \\{"resultType":"complete","tools":[
+    \\{"name":"late","inputSchema":{"type":"object","properties":{"target":{"type":"object","properties":{"region":{"type":"string","x-mcp-header":"Region"}}}}}},
+    \\{"name":"never","inputSchema":{"type":"object"}}]}
+;
 
 fn answerForm(ctx: *Client.HookContext, params: types.ElicitRequestFormParams) anyerror!types.ElicitResult {
     _ = params;
@@ -796,6 +899,10 @@ test "streamable http client mirrors x-mcp-header parameters with the value enco
     defer client.deinit();
     client.connect(transport.transport());
 
+    // The log messages for the removed tools are expected here.
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
     // Tools with invalid annotations are not in the list.
     const tools = try client.listTools(arena, null, .{});
     try std.testing.expectEqual(2, tools.tools.len);
@@ -839,6 +946,81 @@ test "streamable http client mirrors x-mcp-header parameters with the value enco
     try std.testing.expectEqualStrings(try sentinel(arena, uri), reqs[4].header("mcp-name").?);
 }
 
+test "streamable http client refuses to mirror an integer outside the safe range" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var capture: Capture = undefined;
+    try capture.start();
+    defer capture.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/mcp", .{capture.port});
+    const transport = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url });
+    defer transport.deinit();
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "g2", .version = "1" } });
+    defer client.deinit();
+    client.connect(transport.transport());
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
+    _ = try client.listTools(arena, null, .{});
+
+    // The client does not send the call.
+    try std.testing.expectError(error.InvalidRequest, client.callTool(arena, "hdr", try json.parseTree(arena, "{\"count\":9007199254740992}"), .{}));
+    try std.testing.expectError(error.InvalidRequest, client.callTool(arena, "hdr", try json.parseTree(arena, "{\"count\":-9007199254740992}"), .{}));
+    try std.testing.expectEqual(1, capture.requests.items.len);
+    _ = try client.callTool(arena, "hdr", try json.parseTree(arena, "{\"count\":-9007199254740991}"), .{});
+    try std.testing.expectEqual(2, capture.requests.items.len);
+    try std.testing.expectEqualStrings("-9007199254740991", capture.requests.items[1].header("mcp-param-count").?);
+}
+
+test "streamable http client refreshes tools/list and retries once after a header mismatch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var capture: Capture = undefined;
+    try capture.start();
+    defer capture.stop();
+    capture.mode = .refresh;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/mcp", .{capture.port});
+    const transport = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url });
+    defer transport.deinit();
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "g2", .version = "1" } });
+    defer client.deinit();
+    client.connect(transport.transport());
+
+    // The first list has no annotation. The server then adds one to the schema of "late".
+    _ = try client.listTools(arena, null, .{});
+    const args = try json.parseTree(arena, "{\"target\":{\"region\":\"eu\"}}");
+    const done = try client.callTool(arena, "late", args, .{});
+    try std.testing.expectEqualStrings("ok", done.content[0].text.text);
+    const reqs = capture.requests.items;
+    try std.testing.expectEqual(4, reqs.len);
+    try std.testing.expectEqualStrings("tools/call", reqs[1].header("mcp-method").?);
+    try std.testing.expect(reqs[1].header("mcp-param-region") == null);
+    try std.testing.expectEqualStrings("tools/list", reqs[2].header("mcp-method").?);
+    // The retry is the same call with a new id and the header from the new schema.
+    try std.testing.expectEqualStrings("tools/call", reqs[3].header("mcp-method").?);
+    try std.testing.expectEqualStrings("eu", reqs[3].header("mcp-param-region").?);
+    const first = try json.parseTree(arena, reqs[1].body);
+    const retry = try json.parseTree(arena, reqs[3].body);
+    try std.testing.expect(first.object.get("id").?.integer != retry.object.get("id").?.integer);
+
+    // The client retries only one time. Then the caller gets the -32020 error.
+    var diag: Client.Diagnostics = .{};
+    try std.testing.expectError(error.Rpc, client.callTool(arena, "never", args, .{ .diagnostics = &diag }));
+    try std.testing.expectEqual(@as(i64, -32020), diag.rpc_error.?.code);
+    try std.testing.expectEqual(7, capture.requests.items.len);
+    try std.testing.expectEqualStrings("tools/call", capture.requests.items[4].header("mcp-method").?);
+    try std.testing.expectEqualStrings("tools/list", capture.requests.items[5].header("mcp-method").?);
+    try std.testing.expectEqualStrings("tools/call", capture.requests.items[6].header("mcp-method").?);
+}
+
 test "client header map removes tools whose x-mcp-header annotations are invalid" {
     const gpa = std.testing.allocator;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -866,6 +1048,10 @@ test "client header map removes tools whose x-mcp-header annotations are invalid
         \\{"name":"plain","inputSchema":{"type":"object"}}
         \\]}}
     ;
+    // The log messages for the removed tools are expected here.
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
     const rewritten = (try map.learn(arena, frame)).?;
     const tree = try json.parseTree(arena, rewritten);
     const kept = tree.object.get("result").?.object.get("tools").?.array.items;

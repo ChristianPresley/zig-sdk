@@ -119,10 +119,12 @@ test "http client: json, sse, header mirroring and mrtr" {
     try std.testing.expectEqualStrings("5", sum.content[0].text.text);
     try std.testing.expectEqual(3, rec.progress);
 
-    // Without the annotations learned from tools/list the server rejects the call.
+    // Without the annotations learned from tools/list the server rejects the call with
+    // -32020. The client then reads tools/list and retries the call with the headers.
     var diag: Client.Diagnostics = .{};
-    try std.testing.expectError(error.Rpc, f.client.callTool(arena, "test_headers", .{ .region = "us west", .priority = 7 }, .{ .diagnostics = &diag }));
-    try std.testing.expectEqual(@as(i64, -32020), diag.rpc_error.?.code);
+    const first = try f.client.callTool(arena, "test_headers", .{ .region = "us west", .priority = 7 }, .{ .diagnostics = &diag });
+    try std.testing.expectEqualStrings("us west/7", first.content[0].text.text);
+    try std.testing.expect(diag.rpc_error == null);
     // After tools/list the headers are mirrored, including the base64 sentinel for the space.
     const tools = try f.client.listTools(arena, null, .{});
     try std.testing.expectEqual(4, tools.tools.len);

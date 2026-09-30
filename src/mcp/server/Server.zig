@@ -400,7 +400,11 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
     const arena = self.registry_arena.allocator();
     const input_schema = try self.parseSchemaObject(def.input_schema orelse "{\"type\":\"object\"}", true);
     const output_schema: ?Value = if (def.output_schema) |t| try self.parseSchemaObject(t, false) else null;
-    if (!envelope.schemaHeadersValid(input_schema)) return error.InvalidHeaderAnnotation;
+    {
+        var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+        defer scratch.deinit();
+        if (!try envelope.schemaHeadersValid(scratch.allocator(), input_schema)) return error.InvalidHeaderAnnotation;
+    }
     const input = try self.compileSchema(input_schema);
     const output: ?validator.Schema = if (output_schema) |o| try self.compileSchema(o) else null;
     const meta = try self.toolMetaValue(def);

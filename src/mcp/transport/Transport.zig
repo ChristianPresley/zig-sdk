@@ -133,6 +133,9 @@ pub const ExchangeError = error{
     InvalidFrame,
     /// The HTTP status carried no JSON-RPC body (for example 404 for a wrong path).
     HttpStatus,
+    /// The transport cannot send the request. For example, an argument for a mirrored
+    /// header is an integer outside the safe range of JavaScript.
+    InvalidRequest,
 } || Io.Cancelable;
 
 /// One request in flight on a client transport.

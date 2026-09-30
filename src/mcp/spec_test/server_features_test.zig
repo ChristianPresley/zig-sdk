@@ -431,6 +431,10 @@ test "the client drops tools with invalid x-mcp-header annotations from tools/li
         \\{"name":"plain_tool","inputSchema":{"type":"object"}}
         \\]}}
     ;
+    // The log messages for the removed tools are expected here.
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
     const rewritten = (try map.learn(arena, frame)) orelse return error.TestExpectedRewrite;
     const tree = try json.parseTree(arena, rewritten);
     const tools = result(tree).object.get("tools").?.array.items;
@@ -453,6 +457,282 @@ test "the client drops tools with invalid x-mcp-header annotations from tools/li
         \\{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"valid_tool","inputSchema":{"type":"object"}}]}}
     ;
     try std.testing.expect((try map.learn(arena, clean)) == null);
+}
+
+/// Annotations that a chain of `properties` keywords does not reach from the root.
+const unreachable_header_schemas = [_][]const u8{
+    // On the root itself.
+    \\{"type":"object","x-mcp-header":"Root"}
+    ,
+    // Array keywords.
+    \\{"type":"object","properties":{"list":{"type":"array","items":{"type":"string","x-mcp-header":"Item"}}}}
+    ,
+    \\{"type":"object","properties":{"list":{"type":"array","prefixItems":[{"type":"string","x-mcp-header":"Item"}]}}}
+    ,
+    \\{"type":"object","properties":{"list":{"type":"array","contains":{"type":"string","x-mcp-header":"Item"}}}}
+    ,
+    \\{"type":"object","properties":{"list":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string","x-mcp-header":"Id"}}}}}}
+    ,
+    // Composition keywords.
+    \\{"type":"object","anyOf":[{"properties":{"v":{"type":"string","x-mcp-header":"V"}}}]}
+    ,
+    \\{"type":"object","oneOf":[{"properties":{"v":{"type":"string","x-mcp-header":"V"}}}]}
+    ,
+    \\{"type":"object","allOf":[{"properties":{"v":{"type":"string","x-mcp-header":"V"}}}]}
+    ,
+    \\{"type":"object","not":{"properties":{"v":{"type":"string","x-mcp-header":"V"}}}}
+    ,
+    \\{"type":"object","properties":{"v":{"anyOf":[{"type":"string","x-mcp-header":"V"}]}}}
+    ,
+    // Conditional keywords.
+    \\{"type":"object","if":{"properties":{"v":{"type":"string","x-mcp-header":"V"}}}}
+    ,
+    \\{"type":"object","then":{"properties":{"v":{"type":"string","x-mcp-header":"V"}}}}
+    ,
+    \\{"type":"object","else":{"properties":{"v":{"type":"string","x-mcp-header":"V"}}}}
+    ,
+    // A reference: the annotation is in $defs.
+    \\{"type":"object","properties":{"v":{"$ref":"#/$defs/region"}},"$defs":{"region":{"type":"string","x-mcp-header":"Region"}}}
+    ,
+    // Other keywords with subschemas.
+    \\{"type":"object","additionalProperties":{"type":"string","x-mcp-header":"Extra"}}
+    ,
+    \\{"type":"object","patternProperties":{"^r":{"type":"string","x-mcp-header":"R"}}}
+    ,
+    \\{"type":"object","dependentSchemas":{"a":{"properties":{"b":{"type":"string","x-mcp-header":"B"}}}}}
+    ,
+};
+
+/// A nested annotation and data that only looks like an annotation.
+const reachable_header_schema =
+    \\{"type":"object","properties":{
+    \\"target":{"type":"object","properties":{"region":{"type":"string","x-mcp-header":"Region"},"zone":{"type":"object","properties":{"id":{"type":"integer","x-mcp-header":"Zone"}}}}},
+    \\"flag":{"type":"boolean","x-mcp-header":"Flag"},
+    \\"x-mcp-header":{"type":"string"},
+    \\"data":{"type":"object","default":{"x-mcp-header":"D"},"examples":[{"x-mcp-header":"E"}],"const":{"x-mcp-header":"C"},"enum":[{"x-mcp-header":"N"}]}
+    \\}}
+;
+
+test "x-mcp-header annotations must be reachable through a chain of properties keywords" {
+    const gpa = std.testing.allocator;
+    var server = try Server.init(gpa, std.testing.io, .{ .info = info });
+    defer server.deinit();
+    for (unreachable_header_schemas, 0..) |schema, i| {
+        var name_buf: [24]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "unreachable_{d}", .{i});
+        try std.testing.expectError(error.InvalidHeaderAnnotation, server.addToolJson(.{ .name = name, .input_schema = schema }, okTool));
+    }
+    // Nested object properties are valid. The data of default, examples, const and enum and a
+    // property with the name x-mcp-header are not annotations.
+    try server.addToolJson(.{ .name = "nested", .input_schema = reachable_header_schema }, okTool);
+    // A nested annotation still must follow the other constraints.
+    try std.testing.expectError(error.InvalidHeaderAnnotation, server.addToolJson(.{
+        .name = "nested_number",
+        .input_schema =
+        \\{"type":"object","properties":{"a":{"type":"object","properties":{"b":{"type":"number","x-mcp-header":"B"}}}}}
+        ,
+    }, okTool));
+    try std.testing.expectError(error.InvalidHeaderAnnotation, server.addToolJson(.{
+        .name = "nested_duplicate",
+        .input_schema =
+        \\{"type":"object","properties":{"a":{"type":"object","properties":{"b":{"type":"string","x-mcp-header":"B"}}},"b":{"type":"string","x-mcp-header":"b"}}}
+        ,
+    }, okTool));
+}
+
+/// Records the tools that a header map removes.
+const Rejections = struct {
+    tools: [32][]const u8 = undefined,
+    problems: [32]mcp.transport.envelope.HeaderProblem = undefined,
+    count: usize = 0,
+    arena: std.mem.Allocator,
+
+    fn record(userdata: ?*anyopaque, rejection: mcp.transport.tool_headers.Rejection) void {
+        const self: *Rejections = @ptrCast(@alignCast(userdata.?));
+        self.tools[self.count] = self.arena.dupe(u8, rejection.tool) catch return;
+        self.problems[self.count] = rejection.problem;
+        self.count += 1;
+    }
+};
+
+test "the client removes tools with unreachable x-mcp-header annotations, logs them and mirrors nested values" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var map: mcp.transport.tool_headers.Map = .init(gpa, std.testing.io);
+    defer map.deinit();
+    var rejections: Rejections = .{ .arena = arena };
+    map.on_reject = .{ .userdata = &rejections, .call = Rejections.record };
+
+    var frame: std.ArrayList(u8) = .empty;
+    try frame.appendSlice(arena, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"tools\":[");
+    try frame.print(arena, "{{\"name\":\"nested\",\"inputSchema\":{s}}}", .{reachable_header_schema});
+    for (unreachable_header_schemas, 0..) |schema, i| try frame.print(arena, ",{{\"name\":\"unreachable_{d}\",\"inputSchema\":{s}}}", .{ i, schema });
+    try frame.appendSlice(arena, ",{\"name\":\"bad_name\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"v\":{\"type\":\"string\",\"x-mcp-header\":\"A B\"}}}}]}}");
+
+    // The log messages are expected here.
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
+    const rewritten = (try map.learn(arena, frame.items)) orelse return error.TestExpectedRewrite;
+    const tree = try json.parseTree(arena, rewritten);
+    const tools = result(tree).object.get("tools").?.array.items;
+    try std.testing.expectEqual(1, tools.len);
+    try std.testing.expectEqualStrings("nested", tools[0].object.get("name").?.string);
+
+    // The client reports each removed tool with its name and the reason.
+    try std.testing.expectEqual(unreachable_header_schemas.len + 1, rejections.count);
+    for (0..unreachable_header_schemas.len) |i| {
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "unreachable_{d}", .{i}), rejections.tools[i]);
+        try std.testing.expectEqual(.not_reachable, rejections.problems[i]);
+    }
+    try std.testing.expectEqualStrings("bad_name", rejections.tools[unreachable_header_schemas.len]);
+    try std.testing.expectEqual(.invalid_name, rejections.problems[unreachable_header_schemas.len]);
+
+    // The client reads each value at the exact property path of its annotation.
+    var headers: std.ArrayList(mcp.transport.tool_headers.Header) = .empty;
+    try map.appendParamHeaders(arena, &headers, "nested", try json.parseTree(arena,
+        \\{"target":{"region":"eu","zone":{"id":3}},"flag":true,"region":"other","x-mcp-header":"x","data":{}}
+    ), false);
+    try std.testing.expectEqual(3, headers.items.len);
+    for (headers.items) |h| {
+        if (std.mem.eql(u8, h.name, "mcp-param-Region")) {
+            try std.testing.expectEqualStrings("eu", h.value);
+        } else if (std.mem.eql(u8, h.name, "mcp-param-Zone")) {
+            try std.testing.expectEqualStrings("3", h.value);
+        } else {
+            try std.testing.expectEqualStrings("mcp-param-Flag", h.name);
+            try std.testing.expectEqualStrings("true", h.value);
+        }
+    }
+    // A missing step, a step that is not an object and a null value omit the header.
+    headers.clearRetainingCapacity();
+    try map.appendParamHeaders(arena, &headers, "nested", try json.parseTree(arena,
+        \\{"target":{"region":null,"zone":"z"}}
+    ), false);
+    try std.testing.expectEqual(0, headers.items.len);
+    try map.appendParamHeaders(arena, &headers, "nested", try json.parseTree(arena, "{\"flag\":false}"), false);
+    try std.testing.expectEqual(1, headers.items.len);
+}
+
+test "the client mirrors only integers in the safe range of JavaScript" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var map: mcp.transport.tool_headers.Map = .init(gpa, std.testing.io);
+    defer map.deinit();
+    const frame =
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[
+        \\{"name":"count","inputSchema":{"type":"object","properties":{"n":{"type":"integer","x-mcp-header":"N"}}}}
+        \\]}}
+    ;
+    try std.testing.expect((try map.learn(arena, frame)) == null);
+    var headers: std.ArrayList(mcp.transport.tool_headers.Header) = .empty;
+    const cases = [_]struct { args: []const u8, value: ?[]const u8 }{
+        .{ .args = "{\"n\":9007199254740991}", .value = "9007199254740991" },
+        .{ .args = "{\"n\":-9007199254740991}", .value = "-9007199254740991" },
+        .{ .args = "{\"n\":42.0}", .value = "42" },
+        .{ .args = "{\"n\":9007199254740992}", .value = null },
+        .{ .args = "{\"n\":-9007199254740992}", .value = null },
+        .{ .args = "{\"n\":9007199254740992.0}", .value = null },
+        .{ .args = "{\"n\":123456789012345678901234567890}", .value = null },
+    };
+    for (cases) |c| {
+        headers.clearRetainingCapacity();
+        const args = try json.parseTree(arena, c.args);
+        if (c.value) |v| {
+            try map.appendParamHeaders(arena, &headers, "count", args, false);
+            try std.testing.expectEqualStrings(v, headers.items[0].value);
+        } else {
+            try std.testing.expectError(error.UnsafeInteger, map.appendParamHeaders(arena, &headers, "count", args, false));
+        }
+    }
+}
+
+/// Answers `tools/list` with a tool that has an output schema, and each `tools/call` with the
+/// next scripted result.
+const StructuredServer = struct {
+    calls: []const []const u8,
+    next: usize = 0,
+
+    fn transport(self: *StructuredServer) Transport.ClientTransport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = notify };
+
+    const tools =
+        \\{"resultType":"complete","tools":[{"name":"weather","inputSchema":{"type":"object"},"outputSchema":{"type":"object","properties":{"temperature":{"type":"integer"}},"required":["temperature"]}},{"name":"plain","inputSchema":{"type":"object"}}]}
+    ;
+
+    fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
+        const self: *StructuredServer = @ptrCast(@alignCast(ptr));
+        const body = if (std.mem.eql(u8, ex.method, "tools/list")) tools else blk: {
+            const b = self.calls[self.next];
+            self.next += 1;
+            break :blk b;
+        };
+        var buf: [2048]u8 = undefined;
+        const frame = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ ex.id.integer, body }) catch return error.OutOfMemory;
+        ex.sink.deliver(io, frame) catch return error.InvalidFrame;
+    }
+
+    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        _ = ptr;
+        _ = io;
+        _ = frame;
+    }
+};
+
+test "the client validates structured content against the output schema of the tool" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const good = "{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":{\"temperature\":21}}";
+    const wrong_type = "{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":{\"temperature\":\"warm\"}}";
+    const missing = "{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"21\"}]}";
+    const failed = "{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"no data\"}],\"isError\":true}";
+    var fake: StructuredServer = .{ .calls = &.{ wrong_type, good, wrong_type, missing, failed, wrong_type } };
+    var client: Client = .init(gpa, io, .{ .info = info });
+    defer client.deinit();
+    client.connect(fake.transport());
+
+    // The log messages are expected here.
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
+
+    // Before tools/list the client does not know the output schema.
+    var diag: Client.Diagnostics = .{};
+    _ = try client.callTool(arena, "weather", null, .{ .diagnostics = &diag });
+    try std.testing.expect(!diag.structured_content_invalid);
+
+    _ = try client.listTools(arena, null, .{});
+    diag = .{};
+    const ok = try client.callTool(arena, "weather", null, .{ .diagnostics = &diag });
+    try std.testing.expectEqual(21, ok.structuredContent.?.object.get("temperature").?.integer);
+    try std.testing.expect(!diag.structured_content_invalid);
+    // A mismatch is not fatal: the caller gets the result and the diagnostic.
+    diag = .{};
+    const bad = try client.callTool(arena, "weather", null, .{ .diagnostics = &diag });
+    try std.testing.expectEqualStrings("warm", bad.structuredContent.?.object.get("temperature").?.string);
+    try std.testing.expect(diag.structured_content_invalid);
+    // A result without structured content does not match the schema either.
+    diag = .{};
+    _ = try client.callTool(arena, "weather", null, .{ .diagnostics = &diag });
+    try std.testing.expect(diag.structured_content_invalid);
+    // A tool execution error needs no structured content.
+    diag = .{};
+    _ = try client.callTool(arena, "weather", null, .{ .diagnostics = &diag });
+    try std.testing.expect(!diag.structured_content_invalid);
+    // A tool without an output schema is not checked.
+    diag = .{};
+    _ = try client.callTool(arena, "plain", null, .{ .diagnostics = &diag });
+    try std.testing.expect(!diag.structured_content_invalid);
 }
 
 test "structured content is mirrored into a text block and must match the output schema" {

@@ -57,6 +57,17 @@ fn hidden(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.Call
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "hidden", .{}) };
 }
 
+const nested_schema =
+    \\{"type":"object","properties":{"target":{"type":"object","properties":{"region":{"type":"string","x-mcp-header":"Region"}}},"count":{"type":"integer","x-mcp-header":"Count"}}}
+;
+
+fn echoNested(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    const target = args.object.get("target") orelse Value.null;
+    const region = if (target == .object) json.getString(target, "region") orelse "-" else "-";
+    const count = if (args.object.get("count")) |c| c.integer else 0;
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "{s}/{d}", .{ region, count }) };
+}
+
 fn answerForm(ctx: *Client.HookContext, params: types.ElicitRequestFormParams) anyerror!types.ElicitResult {
     _ = params;
     return .{ .action = .accept, .content = try json.parseTree(ctx.arena, "{\"name\":\"Bob\"}") };
@@ -83,6 +94,7 @@ const Fixture = struct {
         try self.server.addToolJson(.{ .name = "ask_name" }, askName);
         try self.server.addToolJson(.{ .name = "slow" }, slow);
         try self.server.addToolJson(.{ .name = "hidden" }, hidden);
+        try self.server.addToolJson(.{ .name = "nested_headers", .input_schema = nested_schema }, echoNested);
         _ = self.server.setToolEnabled(io, "hidden", false);
         self.transport = .init(io, gpa, &self.server, .{ .port = 0, .tls = server_tls });
         try self.transport.bind();
@@ -142,7 +154,7 @@ test "grpc: discover, tools, progress, header mirroring, mrtr and errors" {
     const disc = try f.client.discover(arena, .{ .timeout = .fromSeconds(10) });
     try std.testing.expectEqualStrings("2026-07-28", disc.supportedVersions[0]);
     const tools = try f.client.listTools(arena, null, .{ .timeout = .fromSeconds(10) });
-    try std.testing.expectEqual(4, tools.tools.len);
+    try std.testing.expectEqual(5, tools.tools.len);
 
     var rec: Recorder = .{};
     const sum = try f.client.callTool(arena, "add", .{ .a = 40, .b = 2 }, .{ .timeout = .fromSeconds(10), .on_progress = Recorder.onProgress, .userdata = &rec });
@@ -302,6 +314,42 @@ fn freeRaw(gpa: std.mem.Allocator, r: RawCall) void {
     if (r.grpc_status) |v| gpa.free(v);
     if (r.error_code) |v| gpa.free(v);
     if (r.error_bin) |v| gpa.free(v);
+}
+
+test "grpc: nested header parameters, the safe integer range and one retry after a header mismatch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = try json.parseTree(arena, "{\"target\":{\"region\":\"eu\"},\"count\":3}");
+
+    // The client does not know the annotations yet: the server rejects the call with -32020.
+    // The client then reads tools/list and retries with the nested value in the metadata.
+    var diag: Client.Diagnostics = .{};
+    const done = try f.client.callTool(arena, "nested_headers", args, .{ .timeout = .fromSeconds(10), .diagnostics = &diag });
+    try std.testing.expectEqualStrings("eu/3", done.content[0].text.text);
+    try std.testing.expect(diag.rpc_error == null);
+
+    // An integer outside the safe range of JavaScript does not go into the metadata.
+    try std.testing.expectError(error.InvalidRequest, f.client.callTool(arena, "nested_headers", try json.parseTree(arena, "{\"count\":9007199254740992}"), .{ .timeout = .fromSeconds(10) }));
+
+    // The server rejects raw non-ASCII bytes in mirrored metadata, also when they equal the body.
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}},\"name\":\"nested_headers\",\"arguments\":{\"target\":{\"region\":\"\u{fc}\"}}}}";
+    const common = [_]Connection.Header{
+        .{ .name = "mcp-protocol-version", .value = "2026-07-28" },
+        .{ .name = "mcp-method", .value = "tools/call" },
+        .{ .name = "mcp-name", .value = "nested_headers" },
+    };
+    const raw = try rawCall(gpa, io, f.transport.bound_port, grpc_server.call_path, "application/grpc", &(common ++ [_]Connection.Header{.{ .name = "mcp-param-region", .value = "\u{fc}" }}), body);
+    defer freeRaw(gpa, raw);
+    try std.testing.expectEqualStrings("-32020", raw.error_code.?);
+    const encoded = try rawCall(gpa, io, f.transport.bound_port, grpc_server.call_path, "application/grpc", &(common ++ [_]Connection.Header{.{ .name = "mcp-param-region", .value = "=?base64?w7w=?=" }}), body);
+    defer freeRaw(gpa, encoded);
+    try std.testing.expectEqualStrings("0", encoded.grpc_status.?);
 }
 
 test "grpc: unknown path, wrong content type and missing metadata" {

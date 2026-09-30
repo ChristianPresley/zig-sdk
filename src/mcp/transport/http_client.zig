@@ -223,7 +223,10 @@ pub const Client = struct {
         const io = self.io;
         var headers: std.ArrayList(http.Header) = .empty;
         try self.standardHeaders(arena, &headers, ex.method);
-        try self.mirrorHeaders(arena, &headers, ex);
+        self.mirrorHeaders(arena, &headers, ex) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsafeInteger => return error.InvalidRequest,
+        };
 
         const conn = self.open() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -279,7 +282,7 @@ pub const Client = struct {
     }
 
     /// Add `Mcp-Name` and the `Mcp-Param-*` headers the request needs.
-    fn mirrorHeaders(self: *Client, arena: Allocator, headers: *std.ArrayList(http.Header), ex: *Transport.Exchange) Allocator.Error!void {
+    fn mirrorHeaders(self: *Client, arena: Allocator, headers: *std.ArrayList(http.Header), ex: *Transport.Exchange) tool_headers.Map.AppendError!void {
         const params = ex.params orelse return;
         if (params != .object) return;
         const method = methods.Method.fromName(ex.method) orelse {
