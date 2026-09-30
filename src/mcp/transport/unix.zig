@@ -103,7 +103,7 @@ pub const Server = struct {
                 try Io.Dir.cwd().deleteFile(io, path);
             },
         }
-        const address = try Io.net.UnixAddress.init(path);
+        const address = try unixAddress(path);
         self.listener = address.listen(io, .{}) catch |e| switch (e) {
             error.AddressFamilyUnsupported => return error.Unsupported,
             else => |err| return err,
@@ -283,7 +283,7 @@ pub const Client = struct {
         if (!supported) return error.Unsupported;
         const path = try resolvePath(io, gpa, options.path);
         defer gpa.free(path);
-        const address = try Io.net.UnixAddress.init(path);
+        const address = try unixAddress(path);
         const stream = address.connect(io) catch |e| switch (e) {
             error.AddressFamilyUnsupported => return error.Unsupported,
             else => |err| return err,
@@ -473,10 +473,24 @@ fn windowsPathState(io: Io, path: []const u8) !PathState {
     return if (@as(Tag, @bitCast(info.ReparseTag)) == af_unix) .socket else .other;
 }
 
+/// The longest socket path that the `sockaddr_un` of the target holds. The std check allows
+/// 108 bytes on every POSIX target, but macOS and the BSD systems have 104 bytes.
+pub const max_path_len: usize = switch (builtin.os.tag) {
+    .windows => Io.net.UnixAddress.max_len,
+    else => if (@hasDecl(std.posix.sockaddr, "un")) @typeInfo(@FieldType(std.posix.sockaddr.un, "path")).array.len else 0,
+};
+
+/// Make the socket address. A path that does not fit the `sockaddr_un` of the target gives
+/// `error.NameTooLong`.
+fn unixAddress(path: []const u8) error{NameTooLong}!Io.net.UnixAddress {
+    if (path.len > max_path_len) return error.NameTooLong;
+    return Io.net.UnixAddress.init(path);
+}
+
 /// Fail when a server accepts connections on the socket at `path`. A refused connection
 /// means that the socket file is stale.
 fn refuseLiveServer(io: Io, path: []const u8) error{ AddressInUse, AccessDenied, NameTooLong }!void {
-    const address = try Io.net.UnixAddress.init(path);
+    const address = try unixAddress(path);
     if (address.connect(io)) |stream| {
         stream.close(io);
         return error.AddressInUse;
@@ -484,4 +498,14 @@ fn refuseLiveServer(io: Io, path: []const u8) error{ AddressInUse, AccessDenied,
         error.AccessDenied, error.PermissionDenied => return error.AccessDenied,
         else => {},
     }
+}
+
+test "a socket path longer than sockaddr_un gives NameTooLong" {
+    if (!supported) return error.SkipZigTest;
+    const long = try std.testing.allocator.alloc(u8, max_path_len + 1);
+    defer std.testing.allocator.free(long);
+    @memset(long, 'a');
+    try std.testing.expectError(error.NameTooLong, unixAddress(long));
+    _ = try unixAddress(long[0..max_path_len]);
+    if (builtin.os.tag.isDarwin()) try std.testing.expectEqual(104, max_path_len);
 }

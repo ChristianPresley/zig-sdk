@@ -517,6 +517,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | UI | user interface |
 | YAML | the data format of the skill frontmatter |
 | ECMA | Ecma International, the publisher of ECMA-262 |
+| BSD | the Berkeley Software Distribution family of operating systems |
 | AEAD | authenticated encryption with associated data |
 | AES | Advanced Encryption Standard |
 | ALPN | application-layer protocol negotiation (RFC 7301) |

@@ -42,6 +42,7 @@ SVG: Scalable Vector Graphics
 UI: user interface
 YAML: the data format of the skill frontmatter
 ECMA: Ecma International, the publisher of ECMA-262
+BSD: the Berkeley Software Distribution family of operating systems
 # AB-2 security abbreviations
 AEAD: authenticated encryption with associated data
 AES: Advanced Encryption Standard

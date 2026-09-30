@@ -467,7 +467,8 @@ pub fn finish(arena: Allocator, image: Image, decoder: ?Decoder) Error!Image {
 // -- Selection ----------------------------------------------------------------------------------
 
 pub const Want = struct {
-    /// The edge length in pixels that the interface shows. Null prefers the largest icon.
+    /// The edge length in pixels that the interface shows. Null prefers an icon for every
+    /// size (`any` or no `sizes`), then the largest icon.
     size: ?u32 = null,
     /// The background of the interface. Null accepts every theme equally.
     theme: ?Theme = null,
