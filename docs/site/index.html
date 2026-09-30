@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zig-sdk documentation</title>
+<meta name="description" content="API documentation of zig-sdk, the unofficial Zig SDK for the Model Context Protocol, revision 2026-07-28.">
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1f2328;
+    --muted: #59636e;
+    --line: #d1d9e0;
+    --card: #f6f8fa;
+    --link: #0969da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #9198a1;
+      --line: #3d444d;
+      --card: #151b23;
+      --link: #4493f8;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 52rem; margin: 0 auto; padding: 2.5rem 1rem 3rem; }
+  h1 { font-size: 2rem; margin: 0 0 0.5rem; }
+  h2 { font-size: 1.25rem; margin: 2.25rem 0 0.75rem; }
+  p { margin: 0 0 0.75rem; }
+  a { color: var(--link); }
+  code { font: 0.9em ui-monospace, SFMono-Regular, Consolas, monospace; }
+  .lead { color: var(--muted); font-size: 1.1rem; }
+  ul.cards { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.75rem; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); }
+  ul.cards li { border: 1px solid var(--line); background: var(--card); border-radius: 8px; padding: 0.9rem 1rem; }
+  ul.cards a { font-weight: 600; text-decoration: none; }
+  ul.cards a:hover { text-decoration: underline; }
+  ul.cards p { margin: 0.35rem 0 0; color: var(--muted); font-size: 0.95rem; }
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>zig-sdk</h1>
+  <p class="lead">zig-sdk is an unofficial SDK for the Model Context Protocol (MCP). It is written in Zig 0.16.0 and has no dependencies. It implements MCP specification revision 2026-07-28.</p>
+
+  <h2>API reference</h2>
+  <p>The Zig compiler makes these pages from the doc comments of the source code.</p>
+  <ul class="cards">
+    <li>
+      <a href="api/mcp/index.html">Module <code>mcp</code></a>
+      <p>The protocol types, the server, the client, the stdio and HTTP transports, authorization and TLS.</p>
+    </li>
+    <li>
+      <a href="api/mcp_grpc/index.html">Module <code>mcp_grpc</code></a>
+      <p>The gRPC transport. It carries JSON-RPC messages over HTTP/2.</p>
+    </li>
+  </ul>
+
+  <h2>Guides</h2>
+  <ul class="cards">
+    <li>
+      <a href="https://github.com/ChristianPresley/zig-sdk/wiki">Wiki</a>
+      <p>Getting started, the server and client guides, the transports and the security model.</p>
+    </li>
+    <li>
+      <a href="https://github.com/ChristianPresley/zig-sdk/wiki/Conformance">Conformance</a>
+      <p>The results of the official conformance suite.</p>
+    </li>
+    <li>
+      <a href="https://github.com/ChristianPresley/zig-sdk/blob/main/docs/generated/conformance-matrix.md">Conformance matrix</a>
+      <p>Each normative sentence of the specification and the tests that check it.</p>
+    </li>
+  </ul>
+
+  <h2>Source</h2>
+  <ul class="cards">
+    <li>
+      <a href="https://github.com/ChristianPresley/zig-sdk">Repository</a>
+      <p>The source code, the issues and the pull requests.</p>
+    </li>
+    <li>
+      <a href="https://github.com/ChristianPresley/zig-sdk/releases">Releases</a>
+      <p>The signed release tags and their notes.</p>
+    </li>
+    <li>
+      <a href="https://github.com/ChristianPresley/zig-sdk/blob/main/CHANGELOG.md">Changelog</a>
+      <p>The changes of each version.</p>
+    </li>
+  </ul>
+
+  <footer>
+    <p>zig-sdk is licensed under the Apache License, Version 2.0. It is not an official product of the Model Context Protocol project.</p>
+  </footer>
+</main>
+</body>
+</html>

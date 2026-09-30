@@ -96,11 +96,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
-      - run: zig build docs
+      - run: zig build docs site
       - uses: actions/upload-artifact@v7
         with:
-          name: autodocs
-          path: zig-out/docs
+          name: site
+          path: zig-out/site
 
   grpc-interop:
     name: grpc-interop

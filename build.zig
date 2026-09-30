@@ -102,6 +102,34 @@ pub fn build(b: *std.Build) void {
     });
     b.step("docs", "Generate API documentation").dependOn(&install_docs.step);
 
+    // The documentation site for GitHub Pages: the landing page of docs/site and the API
+    // documentation of both modules under api/.
+    const grpc_docs_obj = b.addObject(.{
+        .name = "mcp_grpc",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mcp_grpc.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "mcp", .module = mcp }},
+        }),
+    });
+    const site_step = b.step("site", "Build the documentation site in zig-out/site");
+    site_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = b.path("docs/site"),
+        .install_dir = .prefix,
+        .install_subdir = "site",
+    }).step);
+    site_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "site/api/mcp",
+    }).step);
+    site_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = grpc_docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "site/api/mcp_grpc",
+    }).step);
+
     // Benchmarks: ReleaseFast, run with `zig build bench` or `zig build bench -- --smoke`.
     const bench = b.addExecutable(.{
         .name = "bench",
