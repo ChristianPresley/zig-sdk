@@ -1,6 +1,6 @@
 .{
     .name = .consumer,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .fingerprint = 0x705b3727ce3c0059,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
