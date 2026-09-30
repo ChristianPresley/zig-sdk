@@ -1,0 +1,14 @@
+# Past participles that the project uses as adjectives after "is" or "are" (STE-3.6).
+# Such a participle tells a state, not an action. The passive check ignores them.
+# One word per line.
+closed
+connected
+disabled
+enabled
+expired
+finished
+gone
+installed
+limited
+malformed
+signed

@@ -1,0 +1,24 @@
+# One term for one concept (PRJ-4). Each line is a term that the project does not use and the project term.
+# Format: term -> project term. The project terms are in technical_nouns.txt and in the wiki Glossary.
+plugin -> extension
+plugins -> extensions
+plug-in -> extension
+reply -> response
+replies -> responses
+invocation -> call
+invocations -> calls
+tool invocation -> tool call
+method call -> request
+rpc call -> request, or gRPC call
+multi-round-trip -> multi round-trip
+e-mail -> email
+whitelist -> allowlist
+blacklist -> denylist
+filesystem -> file system
+subprocess -> child process
+subprocesses -> child processes
+websocket -> (not a transport of the protocol: name stdio, Streamable HTTP or gRPC)
+json schema draft 2020-12 -> JSON Schema 2020-12
+lib -> library
+repo -> repository
+config -> configuration

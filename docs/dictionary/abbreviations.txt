@@ -1,0 +1,80 @@
+# Abbreviations and names with a fixed case that the project uses (PRJ-2).
+# Format: ABBREVIATION: meaning. The case of the abbreviation is significant.
+# An abbreviation that is not in this list is a finding. Write the full words, or add it here.
+# AB-1 protocol and format abbreviations
+API: application programming interface
+ASCII: the 7-bit character set of RFC 20
+CIMD: client ID metadata document, a client registration method of MCP
+DCR: dynamic client registration (RFC 7591)
+DNS: Domain Name System
+HPACK: the header compression format of HTTP/2 (RFC 7541)
+HTML: HyperText Markup Language
+HTTP: Hypertext Transfer Protocol
+HTTP/2: version 2 of HTTP (RFC 9113)
+HTTPS: HTTP over TLS
+ID: identifier
+IP: Internet Protocol
+JSON: JavaScript Object Notation
+JSON-RPC: the remote procedure call protocol that MCP uses
+JWK: JSON Web Key
+JWKS: JSON Web Key Set
+JWS: JSON Web Signature
+JWT: JSON Web Token
+MCP: Model Context Protocol
+MRTR: multi round-trip request
+PKCE: proof key for code exchange (RFC 7636)
+POSIX: the portable operating system interface
+RPC: remote procedure call
+SEP: specification enhancement proposal of MCP
+SSE: server-sent events
+TCP: Transmission Control Protocol
+URI: uniform resource identifier
+URL: uniform resource locator
+UTC: Coordinated Universal Time
+UTF-8: the 8-bit encoding of Unicode
+# AB-2 security abbreviations
+AEAD: authenticated encryption with associated data
+AES: Advanced Encryption Standard
+ALPN: application-layer protocol negotiation (RFC 7301)
+CA: certificate authority
+CVE: an entry in the Common Vulnerabilities and Exposures list
+DER: Distinguished Encoding Rules of ASN.1
+ASN.1: Abstract Syntax Notation One
+ECDSA: elliptic curve digital signature algorithm
+ES256: ECDSA with P-256 and SHA-256
+GCM: Galois/Counter Mode
+HMAC: hash-based message authentication code
+HS256: HMAC with SHA-256
+IV: initialization vector
+PEM: the text form of keys and certificates (RFC 7468)
+PS256: RSA-PSS with SHA-256
+PSS: the probabilistic signature scheme of RSA
+RS256: RSA PKCS #1 version 1.5 signature with SHA-256
+RSA: the Rivest-Shamir-Adleman public key algorithm
+SEC1: the elliptic curve private key format of SECG
+SHA: Secure Hash Algorithm
+SNI: server name indication
+TLS: Transport Layer Security
+# AB-3 project and process abbreviations
+ASD: the association that publishes ASD-STE100
+ASD-STE100: the specification of Simplified Technical English
+CI: continuous integration
+CPU: central processing unit
+GPG: GNU Privacy Guard
+GR: a general rule of the project profile, in rule ids such as STE-GR-6
+IETF: Internet Engineering Task Force
+PRJ: a project rule, in rule ids such as PRJ-1
+README: the first page of the repository
+RFC: request for comments, a document of the IETF
+SDK: software development kit
+STE: Simplified Technical English
+US: United States
+WHATWG: Web Hypertext Application Technology Working Group
+# AB-4 names that start with a lowercase letter
+gRPC: the remote procedure call framework that the gRPC transport uses
+stdio: standard input and standard output
+zig-sdk: the name of this project
+curl: the command line HTTP client
+openssl: the command line tool of OpenSSL
+npx: the package runner of Node.js
+macOS: the operating system of Apple computers

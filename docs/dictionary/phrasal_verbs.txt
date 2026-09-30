@@ -1,0 +1,59 @@
+# Phrasal verbs that the project does not use (PRJ-5), with a one-word verb.
+# Format: phrasal verb -> replacement. Each form of the verb has its own line.
+set up -> configure, or prepare
+sets up -> configures, or prepares
+find out -> find
+finds out -> finds
+carry out -> do
+carries out -> does
+look up -> find
+looks up -> finds
+point out -> show
+points out -> shows
+fill in -> write
+fills in -> writes
+fill out -> complete
+turn on -> enable
+turns on -> enables
+turn off -> disable
+turns off -> disables
+switch on -> enable
+switch off -> disable
+shut down -> stop
+shuts down -> stops
+start up -> start
+starts up -> starts
+clean up -> remove, or release
+cleans up -> removes, or releases
+hand off -> give
+hands off -> gives
+give up -> stop
+gives up -> stops
+go through -> examine
+goes through -> examines
+come back -> return
+comes back -> returns
+figure out -> find
+figures out -> finds
+time out -> expire
+times out -> expires, or has no response in the time limit
+fall back -> use ... instead
+falls back -> uses ... instead
+back off -> wait
+backs off -> waits
+pick up -> get, or read
+picks up -> gets, or reads
+end up -> become
+ends up -> becomes
+tear down -> remove
+tears down -> removes
+spin up -> start
+spins up -> starts
+wake up -> wake
+wakes up -> wakes
+log in -> authenticate
+logs in -> authenticates
+opt in -> enable
+opts in -> enables
+opt out -> disable
+opts out -> disables
