@@ -18,6 +18,8 @@ const RequestId = @import("../jsonrpc/id.zig").RequestId;
 const Transport = @import("../transport/Transport.zig");
 const Limits = @import("../Limits.zig");
 const tasks = @import("../server/tasks.zig");
+const skills = @import("../protocol/skills.zig");
+const apps = @import("../protocol/apps.zig");
 const cache_mod = @import("cache.zig");
 
 const Client = @This();
@@ -294,6 +296,75 @@ fn taskParams(arena: Allocator, task_id: []const u8) Allocator.Error!Value {
     var params: std.json.ObjectMap = .empty;
     try params.put(arena, "taskId", .{ .string = task_id });
     return .{ .object = params };
+}
+
+// -- Skills extension ---------------------------------------------------------------------------
+
+/// List the skills of the server. A server that declares the extension provides it. An
+/// empty or partial list does not prove that the server has no other skills.
+pub fn listSkills(self: *Client, arena: Allocator, cursor: ?[]const u8, options: RequestOptions) RequestError!skills.ListSkillsResult {
+    return (try self.requestAs(arena, skills.ListSkillsResult, skills.method_list, try cursorParams(arena, cursor), options)).result;
+}
+
+/// Get the entry of one skill by the URI of its `SKILL.md`. An unknown URI gives
+/// `error.Rpc` with code `-32602`.
+pub fn getSkill(self: *Client, arena: Allocator, uri: []const u8, options: RequestOptions) RequestError!skills.GetSkillResult {
+    var params: std.json.ObjectMap = .empty;
+    try params.put(arena, "uri", .{ .string = uri });
+    return (try self.requestAs(arena, skills.GetSkillResult, skills.method_get, .{ .object = params }, options)).result;
+}
+
+/// List the direct children of a directory resource. Send it only to a server that declares
+/// `directoryRead: true` (see `skills.serverSupportsDirectoryRead`). The result is a live
+/// observation. It does not extend the file list of a held entry.
+pub fn readDirectory(self: *Client, arena: Allocator, uri: []const u8, cursor: ?[]const u8, options: RequestOptions) RequestError!skills.ReadDirectoryResult {
+    var params: std.json.ObjectMap = .empty;
+    try params.put(arena, "uri", .{ .string = uri });
+    if (cursor) |c| try params.put(arena, "cursor", .{ .string = c });
+    return (try self.requestAs(arena, skills.ReadDirectoryResult, skills.method_directory_read, .{ .object = params }, options)).result;
+}
+
+pub const SkillReadError = RequestError || skills.VerifyError || skills.EntryError;
+
+/// Read one file of a skill under the held entry and verify it. The function refuses a URI
+/// that the file list of the entry does not name, before it sends a request. It then checks
+/// the size and the SHA-256 digest. For `SKILL.md` it also compares the frontmatter field by
+/// field. A failure means that the content must not be used. Refresh the entry with
+/// `getSkill` and ask the user again for approval.
+pub fn readSkillFile(self: *Client, arena: Allocator, entry: skills.Skill, uri: []const u8, options: RequestOptions) SkillReadError![]const u8 {
+    const limits = self.options.limits.skills;
+    try skills.validateEntry(entry, @max(limits.max_files, skills.max_files_per_skill), @max(limits.max_bytes, skills.max_bytes_per_skill));
+    try skills.checkReadable(entry, uri);
+    const result = try self.readResource(arena, uri, options);
+    for (result.contents) |c| {
+        if (!std.mem.eql(u8, c.uri(), uri)) continue;
+        const bytes = skills.contentBytes(arena, c) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidBlob => return error.InvalidResponse,
+        };
+        try skills.verifyFile(arena, entry, uri, bytes);
+        return bytes;
+    }
+    return error.InvalidResponse;
+}
+
+// -- MCP Apps extension -------------------------------------------------------------------------
+
+/// The UI metadata of a tool. Null when the tool has none, or when this client did not
+/// declare the extension. Such a client uses the tool as a plain tool.
+pub fn toolUi(self: *const Client, arena: Allocator, tool: types.Tool) apps.MetaError!?apps.ToolMeta {
+    if (!apps.clientSupports(self.options.capabilities)) return null;
+    return apps.toolMeta(arena, tool);
+}
+
+pub const UiReadError = RequestError || apps.ReadError;
+
+/// Read a view with `resources/read`. `listing_meta` is the `_meta` of the resource from
+/// `resources/list`, or null. The UI metadata of the content item has priority over it.
+pub fn readUiResource(self: *Client, arena: Allocator, uri: []const u8, listing_meta: ?Value, options: RequestOptions) UiReadError!apps.UiResource {
+    if (!apps.isUiUri(uri)) return error.NotUiUri;
+    const result = try self.readResource(arena, uri, options);
+    return apps.uiResourceFromRead(arena, uri, result, listing_meta);
 }
 
 pub fn readResource(self: *Client, arena: Allocator, uri: []const u8, options: RequestOptions) RequestError!types.ReadResourceResult {

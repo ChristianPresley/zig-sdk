@@ -13,6 +13,12 @@ pub const Client = @import("mcp/client/Client.zig");
 pub const auth = @import("mcp/auth.zig");
 /// The Tasks extension: task support levels, results and the store.
 pub const tasks = @import("mcp/server/tasks.zig");
+/// The Skills extension: skill definitions and the registry of the server. The wire types,
+/// the frontmatter parser and the host checks are in `protocol.skills`.
+pub const skills = @import("mcp/server/skills.zig");
+/// The MCP Apps extension: view definitions of the server. The UI metadata types and the
+/// client helpers are in `protocol.apps`.
+pub const apps = @import("mcp/server/apps.zig");
 pub const RequestContext = Server.RequestContext;
 pub const Outcome = Server.Outcome;
 pub const InputRequired = Server.InputRequired;
@@ -44,6 +50,7 @@ test {
     _ = @import("mcp/server/mrtr.zig");
     _ = @import("mcp/server/server_test.zig");
     _ = @import("mcp/client/client_test.zig");
+    _ = @import("mcp/extensions_test.zig");
     _ = @import("mcp/transport/http_test.zig");
     _ = @import("mcp/transport/https_test.zig");
     _ = @import("mcp/transport/http_client_test.zig");

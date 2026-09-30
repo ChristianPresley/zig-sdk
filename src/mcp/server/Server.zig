@@ -24,6 +24,10 @@ const mrtr = @import("mrtr.zig");
 const tasks = @import("tasks.zig");
 const client_credentials = @import("../auth/client_credentials.zig");
 const enterprise = @import("../auth/enterprise.zig");
+const skills = @import("skills.zig");
+const skills_proto = @import("../protocol/skills.zig");
+const apps = @import("apps.zig");
+const apps_proto = @import("../protocol/apps.zig");
 pub const RequestContext = @import("RequestContext.zig");
 pub const Outcome = mrtr.Outcome;
 pub const InputRequired = mrtr.InputRequired;
@@ -69,6 +73,12 @@ pub const Options = struct {
         /// `io.modelcontextprotocol/enterprise-managed-authorization`.
         enterprise_managed: bool = false,
     } = .{},
+    /// Enable the Skills extension. The server then advertises it under `extensions` and
+    /// declares the `resources` capability. Register skills with `addSkill`.
+    skills: ?skills.Options = null,
+    /// Enable the MCP Apps extension. The server then advertises it under `extensions`.
+    /// Register views with `addUiResource` and link tools to them with `ToolDef.ui`.
+    apps: ?apps.Options = null,
     cache: struct {
         discover: CacheHint = .{},
         lists: CacheHint = .{},
@@ -97,6 +107,11 @@ pub const ToolDef = struct {
     requires_client: ?types.ClientCapabilities = null,
     /// How the tool relates to the Tasks extension.
     task_support: tasks.TaskSupport = .none,
+    /// The `_meta` object of the tool. The server copies it.
+    meta: ?Value = null,
+    /// The MCP Apps metadata. The server puts it under `_meta.ui`. `resourceUri` must be a
+    /// `ui://` URI. `checkUiLinks` checks that the resource exists.
+    ui: ?apps_proto.ToolMeta = null,
     userdata: ?*anyopaque = null,
 };
 
@@ -108,6 +123,8 @@ pub const ResourceDef = struct {
     mime_type: ?[]const u8 = null,
     annotations: ?types.Annotations = null,
     size: ?i64 = null,
+    /// The `_meta` object of the resource. The server copies it.
+    meta: ?Value = null,
     userdata: ?*anyopaque = null,
 };
 
@@ -137,6 +154,8 @@ const ToolEntry = struct {
     handler: ToolHandler,
     requires_client: ?types.ClientCapabilities,
     task_support: tasks.TaskSupport,
+    /// The MCP Apps metadata, also present under `def._meta.ui`.
+    ui: ?apps_proto.ToolMeta = null,
     userdata: ?*anyopaque,
     enabled: bool = true,
 };
@@ -189,6 +208,7 @@ subscriptions: std.ArrayList(*Subscription) = .empty,
 subscriptions_lock: Io.Mutex = .init,
 state_codec: ?request_state.Codec = null,
 task_store: ?tasks.Store = null,
+skill_registry: ?skills.Registry = null,
 /// Counts of protocol violations by peers, for diagnostics.
 violations: std.atomic.Value(u64) = .init(0),
 /// Set once `shutdownSubscriptions` ran. Later listen requests end immediately.
@@ -205,30 +225,42 @@ pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
     if (options.request_state == .sealed_ephemeral) {
         server.state_codec = try request_state.Codec.initRandom(io, options.limits.request_state_ttl);
     }
+    errdefer {
+        if (server.state_codec) |*c| c.deinit();
+        server.registry_arena.deinit();
+    }
     if (options.tasks) |task_options| {
         server.task_store = tasks.Store.init(gpa, io, task_options);
-        try server.advertiseExtension(tasks.extension_id);
+        try server.advertiseExtension(tasks.extension_id, .{ .object = .empty });
     }
-    if (options.authorization_extensions.client_credentials) try server.advertiseExtension(client_credentials.extension_id);
-    if (options.authorization_extensions.enterprise_managed) try server.advertiseExtension(enterprise.extension_id);
+    if (options.skills) |skill_options| {
+        server.skill_registry = skills.Registry.init(skill_options);
+        try server.advertiseExtension(skills.extension_id, try server.skill_registry.?.settings(server.registry_arena.allocator()));
+        // Skill files are resources. The extension needs the `resources` capability.
+        if (server.options.capabilities.resources == null) server.options.capabilities.resources = .{ .listChanged = true, .subscribe = true };
+    }
+    if (options.apps != null) try server.advertiseExtension(apps.extension_id, .{ .object = .empty });
+    if (options.authorization_extensions.client_credentials) try server.advertiseExtension(client_credentials.extension_id, .{ .object = .empty });
+    if (options.authorization_extensions.enterprise_managed) try server.advertiseExtension(enterprise.extension_id, .{ .object = .empty });
     return server;
 }
 
-/// Add an extension to the `extensions` capability. Other extensions the caller declared are
+/// Add an extension to `capabilities.extensions`. Other extensions the caller declared are
 /// kept.
-fn advertiseExtension(server: *Server, id: []const u8) Allocator.Error!void {
-    const arena = server.registry_arena.allocator();
+fn advertiseExtension(self: *Server, id: []const u8, settings: Value) Allocator.Error!void {
+    const arena = self.registry_arena.allocator();
     var ext: std.json.ObjectMap = .empty;
-    if (server.options.capabilities.extensions) |existing| if (existing == .object) {
+    if (self.options.capabilities.extensions) |existing| if (existing == .object) {
         var it = existing.object.iterator();
         while (it.next()) |kv| try ext.put(arena, kv.key_ptr.*, kv.value_ptr.*);
     };
-    try ext.put(arena, id, .{ .object = .empty });
-    server.options.capabilities.extensions = .{ .object = ext };
+    try ext.put(arena, id, settings);
+    self.options.capabilities.extensions = .{ .object = ext };
 }
 
 pub fn deinit(self: *Server) void {
     if (self.task_store) |*store| store.deinit();
+    if (self.skill_registry) |*r| r.deinit(self.gpa);
     if (self.state_codec) |*c| c.deinit();
     self.tools.deinit(self.gpa);
     self.resources.deinit(self.gpa);
@@ -263,7 +295,46 @@ pub const RegisterError = error{
     UnsupportedDialect,
     DuplicateName,
     InvalidUriTemplate,
+    /// `ToolDef.meta` or `ResourceDef.meta` is not an object, or `ToolDef.meta` has a `ui`
+    /// key and `ToolDef.ui` is also set.
+    InvalidMeta,
+    /// A UI resource URI is not a `ui://` URI, or the visibility list is empty or repeats a
+    /// value.
+    InvalidUiMeta,
+    /// The server has no option for the extension.
+    ExtensionNotEnabled,
 };
+
+/// The errors of `addSkill` and `addDynamicSkill`.
+pub const SkillRegisterError = RegisterError || skills.DefinitionError;
+
+/// Copy a JSON value into the registry arena.
+fn copyValue(self: *Server, value: Value) Allocator.Error!Value {
+    const arena = self.registry_arena.allocator();
+    const text = try json.writeAlloc(arena, value);
+    return json.parseTree(arena, text) catch return error.OutOfMemory;
+}
+
+/// Build the `_meta` object of a tool from `def.meta` and `def.ui`.
+fn toolMetaValue(self: *Server, def: ToolDef) RegisterError!?Value {
+    const arena = self.registry_arena.allocator();
+    var meta: ?Value = null;
+    if (def.meta) |m| {
+        if (m != .object) return error.InvalidMeta;
+        meta = try self.copyValue(m);
+    }
+    const ui = def.ui orelse return meta;
+    if (ui.resourceUri) |uri| if (!apps_proto.isUiUri(uri)) return error.InvalidUiMeta;
+    if (ui.visibility) |list| {
+        if (list.len == 0) return error.InvalidUiMeta;
+        for (list, 0..) |v, i| for (list[0..i]) |w| if (v == w) return error.InvalidUiMeta;
+    }
+    if (meta == null) meta = .{ .object = .empty };
+    if (meta.?.object.get("ui") != null) return error.InvalidMeta;
+    const ui_value = (try apps_proto.metaValue(arena, ui)).object.get("ui").?;
+    try meta.?.object.put(arena, "ui", ui_value);
+    return meta;
+}
 
 fn compileSchema(self: *Server, root: Value) RegisterError!validator.Schema {
     return validator.compile(self.registry_arena.allocator(), root, .{
@@ -332,6 +403,7 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
     if (!envelope.schemaHeadersValid(input_schema)) return error.InvalidHeaderAnnotation;
     const input = try self.compileSchema(input_schema);
     const output: ?validator.Schema = if (output_schema) |o| try self.compileSchema(o) else null;
+    const meta = try self.toolMetaValue(def);
     const entry: ToolEntry = .{
         .def = .{
             .name = try arena.dupe(u8, def.name),
@@ -341,12 +413,17 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
             .inputSchema = input_schema,
             .outputSchema = output_schema,
             .annotations = def.annotations,
+            ._meta = meta,
         },
         .input = input,
         .output = output,
         .handler = handler,
         .requires_client = def.requires_client,
         .task_support = def.task_support,
+        .ui = if (def.ui) |ui| .{
+            .resourceUri = if (ui.resourceUri) |u| try arena.dupe(u8, u) else null,
+            .visibility = if (ui.visibility) |v| try arena.dupe(apps_proto.Visibility, v) else null,
+        } else null,
         .userdata = def.userdata,
     };
     self.registry_lock.lockSharedUncancelable(std.Io.Threaded.global_single_threaded.io());
@@ -359,6 +436,8 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
 pub fn addResource(self: *Server, def: ResourceDef, handler: ResourceHandler) RegisterError!void {
     const arena = self.registry_arena.allocator();
     for (self.resources.items) |r| if (std.mem.eql(u8, r.def.uri, def.uri)) return error.DuplicateName;
+    if (def.meta) |m| if (m != .object) return error.InvalidMeta;
+    const meta: ?Value = if (def.meta) |m| try self.copyValue(m) else null;
     try self.resources.append(self.gpa, .{
         .def = .{
             .uri = try arena.dupe(u8, def.uri),
@@ -368,11 +447,132 @@ pub fn addResource(self: *Server, def: ResourceDef, handler: ResourceHandler) Re
             .mimeType = if (def.mime_type) |t| try arena.dupe(u8, t) else null,
             .annotations = def.annotations,
             .size = def.size,
+            ._meta = meta,
         },
         .handler = handler,
         .userdata = def.userdata,
     });
     if (self.options.capabilities.resources == null) self.options.capabilities.resources = .{ .listChanged = true, .subscribe = true };
+}
+
+/// Register a skill of the Skills extension from files in memory. The function parses the
+/// frontmatter of `SKILL.md`. It checks the rules of the extension and of the Agent Skills
+/// specification. Then it computes the digests and registers every file as a resource. The
+/// server copies all bytes.
+pub fn addSkill(self: *Server, def: skills.SkillDef) SkillRegisterError!void {
+    const registry = if (self.skill_registry) |*r| r else return error.ExtensionNotEnabled;
+    const arena = self.registry_arena.allocator();
+    const limits = self.options.limits.skills;
+    const prepared = try registry.prepare(arena, def, limits.max_files, limits.max_bytes);
+    for (prepared.new_files) |file| {
+        try self.addResource(.{
+            .uri = file.uri,
+            .name = file.name,
+            .description = file.description,
+            .mime_type = file.mime_type,
+            .size = @intCast(file.content.len),
+            .userdata = file,
+        }, skills.readFile);
+    }
+    try registry.commit(self.gpa, prepared);
+}
+
+/// Register a skill whose content the application generates. The entry has
+/// `"resources": "dynamic"`. The application serves the files with its own resources or
+/// resource templates. `def.skill_md` gives the frontmatter of the entry.
+pub fn addDynamicSkill(self: *Server, def: skills.DynamicSkillDef) SkillRegisterError!void {
+    const registry = if (self.skill_registry) |*r| r else return error.ExtensionNotEnabled;
+    const prepared = try registry.prepareDynamic(self.registry_arena.allocator(), def);
+    try registry.commit(self.gpa, prepared);
+}
+
+/// Register a view of the MCP Apps extension with static HTML. The server copies the HTML.
+pub fn addUiResource(self: *Server, def: apps.UiResourceDef, html: []const u8) RegisterError!void {
+    return self.addUiEntry(def, try self.registry_arena.allocator().dupe(u8, html), null);
+}
+
+/// Register a view of the MCP Apps extension whose content `handler` gives. The server sets
+/// the MIME type and the UI metadata of each content item.
+pub fn addUiResourceHandler(self: *Server, def: apps.UiResourceDef, handler: apps.ResourceHandler) RegisterError!void {
+    return self.addUiEntry(def, null, handler);
+}
+
+fn addUiEntry(self: *Server, def: apps.UiResourceDef, html: ?[]const u8, handler: ?apps.ResourceHandler) RegisterError!void {
+    if (!apps_proto.isUiUri(def.uri)) return error.InvalidUiMeta;
+    const arena = self.registry_arena.allocator();
+    const meta: ?Value = if (def.meta) |m| try apps_proto.metaValue(arena, m) else null;
+    const entry = try arena.create(apps.UiEntry);
+    entry.* = .{ .html = html, .meta = meta, .handler = handler, .userdata = def.userdata };
+    try self.addResource(.{
+        .uri = def.uri,
+        .name = def.name,
+        .title = def.title,
+        .description = def.description,
+        .mime_type = apps_proto.mime_type,
+        .size = if (html) |h| @intCast(h.len) else null,
+        .meta = if (def.meta_in_listing) meta else null,
+        .userdata = entry,
+    }, apps.readUi);
+}
+
+pub const UiLinkError = error{
+    /// A tool names a `resourceUri` that no resource or resource template of the server
+    /// serves. `checkUiLinks` stores the tool name in `broken_tool`.
+    UnknownUiResource,
+};
+
+/// Check that the `_meta.ui.resourceUri` of every tool names a resource of this server.
+/// The extension requires that the resource exists. Call it after the registration.
+pub fn checkUiLinks(self: *Server, broken_tool: ?*[]const u8) UiLinkError!void {
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    var vars: std.ArrayList(UriTemplate.Variable) = .empty;
+    for (self.tools.items) |t| {
+        const ui = t.ui orelse continue;
+        const uri = ui.resourceUri orelse continue;
+        const found = blk: {
+            for (self.resources.items) |r| if (std.mem.eql(u8, r.def.uri, uri)) break :blk true;
+            for (self.templates.items) |tpl| {
+                vars.clearRetainingCapacity();
+                if (tpl.template.match(uri, &vars, scratch.allocator()) catch false) break :blk true;
+            }
+            break :blk false;
+        };
+        if (!found) {
+            if (broken_tool) |out| out.* = t.def.name;
+            return error.UnknownUiResource;
+        }
+    }
+}
+
+/// True when the tool must stay hidden from the client of `ctx`. This occurs when the Apps
+/// fallback applies to the client and only a view can call the tool.
+fn hiddenFromClient(self: *const Server, ctx: *const RequestContext, entry: *const ToolEntry) bool {
+    const ui = entry.ui orelse return false;
+    if (!self.plainToolsFor(ctx)) return false;
+    return !ui.visibleToModel();
+}
+
+/// True when the client of `ctx` gets tools without UI metadata.
+fn plainToolsFor(self: *const Server, ctx: *const RequestContext) bool {
+    const options = self.options.apps orelse return false;
+    if (!options.fallback_for_other_clients) return false;
+    return !apps_proto.clientSupports(ctx.meta.client_capabilities);
+}
+
+/// A copy of a tool definition without the UI keys in `_meta`.
+fn withoutUiMeta(arena: Allocator, def: types.Tool) Allocator.Error!types.Tool {
+    const meta = def._meta orelse return def;
+    if (meta != .object) return def;
+    var copy: std.json.ObjectMap = .empty;
+    var it = meta.object.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.key_ptr.*, "ui") or std.mem.eql(u8, kv.key_ptr.*, apps_proto.legacy_resource_uri_key)) continue;
+        try copy.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+    }
+    var out = def;
+    out._meta = if (copy.count() == 0) null else .{ .object = copy };
+    return out;
 }
 
 pub fn addResourceTemplate(self: *Server, def: ResourceTemplateDef, handler: TemplateHandler) RegisterError!void {
@@ -531,7 +731,8 @@ fn finishResult(self: *Server, ctx: *RequestContext, result: anytype) RequestCon
         }
     }
     if (@hasField(T, "ttlMs") and @hasField(T, "cacheScope")) {
-        const hint = if (T == types.DiscoverResult) self.options.cache.discover else if (T == types.ReadResourceResult) self.options.cache.reads else self.options.cache.lists;
+        // `skills/get` carries the same cache fields as `resources/read`.
+        const hint = if (T == types.DiscoverResult) self.options.cache.discover else if (T == types.ReadResourceResult or T == skills_proto.GetSkillResult) self.options.cache.reads else self.options.cache.lists;
         if (stamped.ttlMs == null) stamped.ttlMs = @max(hint.ttl_ms, 0);
         if (stamped.cacheScope == null) stamped.cacheScope = hint.scope;
         if (stamped.ttlMs.? < 0) stamped.ttlMs = 0;
@@ -575,6 +776,8 @@ fn dispatch(self: *Server, ctx: *RequestContext) RequestContext.Error!void {
 
     // The Tasks extension has its own methods.
     if (std.mem.startsWith(u8, ctx.method, "tasks/")) return self.dispatchTask(ctx);
+    // So has the Skills extension.
+    if (std.mem.startsWith(u8, ctx.method, "skills/") or std.mem.eql(u8, ctx.method, skills_proto.method_directory_read)) return self.dispatchSkills(ctx);
 
     // Method table and capability gate.
     const method = methods.Method.fromName(ctx.method) orelse {
@@ -636,7 +839,11 @@ fn dispatchTyped(self: *Server, ctx: *RequestContext, comptime method: methods.M
         },
         .@"tools/list" => {
             var items: std.ArrayList(types.Tool) = .empty;
-            for (self.tools.items) |t| if (t.enabled) try items.append(ctx.arena, t.def);
+            const plain = self.plainToolsFor(ctx);
+            for (self.tools.items) |*t| {
+                if (!t.enabled or self.hiddenFromClient(ctx, t)) continue;
+                try items.append(ctx.arena, if (plain and t.ui != null) try withoutUiMeta(ctx.arena, t.def) else t.def);
+            }
             const page = try self.paginate(ctx, types.Tool, items.items, params.cursor);
             try self.finishResult(ctx, types.ListToolsResult{ .tools = page.items, .nextCursor = page.next_cursor });
         },
@@ -805,7 +1012,8 @@ fn finishInputRequired(self: *Server, ctx: *RequestContext, method: methods.Meth
 }
 
 fn callTool(self: *Server, ctx: *RequestContext, params: types.CallToolRequestParams) RequestContext.Error!void {
-    const entry = self.findTool(params.name) orelse {
+    const found = self.findTool(params.name);
+    const entry = if (found != null and !self.hiddenFromClient(ctx, found.?)) found.? else {
         const msg = try std.fmt.allocPrint(ctx.arena, "Unknown tool: {s}", .{params.name});
         return ctx.setError(errors.invalidParams(msg));
     };
@@ -1395,4 +1603,40 @@ fn dispatchTask(self: *Server, ctx: *RequestContext) RequestContext.Error!void {
         self.settleTask(ctx.io, task, .cancelled, null, null);
     }
     return self.finishResult(ctx, types.EmptyResult{});
+}
+
+// ---------------------------------------------------------------------------------------------
+// Skills extension
+// ---------------------------------------------------------------------------------------------
+
+fn dispatchSkills(self: *Server, ctx: *RequestContext) RequestContext.Error!void {
+    const registry: *skills.Registry = if (self.skill_registry) |*r| r else {
+        const msg = try std.fmt.allocPrint(ctx.arena, "Method not found: {s}", .{ctx.method});
+        return ctx.setError(errors.methodNotFound(msg));
+    };
+    if (std.mem.eql(u8, ctx.method, skills_proto.method_list)) {
+        const params = try parseParams(ctx, types.PaginatedRequestParams);
+        const page = try self.paginate(ctx, skills_proto.Skill, registry.entries.items, params.cursor);
+        return self.finishResult(ctx, skills_proto.ListSkillsResult{ .skills = page.items, .nextCursor = page.next_cursor });
+    }
+    if (std.mem.eql(u8, ctx.method, skills_proto.method_get)) {
+        const params = try parseParams(ctx, skills_proto.GetSkillParams);
+        const skill = registry.findSkill(params.uri) orelse {
+            const msg = try std.fmt.allocPrint(ctx.arena, "No skill is served at {s}", .{params.uri});
+            return ctx.setError(errors.invalidParams(msg));
+        };
+        return self.finishResult(ctx, skills_proto.GetSkillResult{ .skill = skill });
+    }
+    // Without `directoryRead` the method is unknown, as the extension says.
+    if (std.mem.eql(u8, ctx.method, skills_proto.method_directory_read) and registry.options.directory_read) {
+        const params = try parseParams(ctx, skills_proto.ReadDirectoryParams);
+        const children = try registry.directoryChildren(ctx.arena, params.uri) orelse {
+            const msg = try std.fmt.allocPrint(ctx.arena, "{s} is not a directory resource", .{params.uri});
+            return ctx.setError(errors.invalidParams(msg));
+        };
+        const page = try self.paginate(ctx, types.Resource, children, params.cursor);
+        return self.finishResult(ctx, skills_proto.ReadDirectoryResult{ .resources = page.items, .nextCursor = page.next_cursor });
+    }
+    const msg = try std.fmt.allocPrint(ctx.arena, "Method not found: {s}", .{ctx.method});
+    return ctx.setError(errors.methodNotFound(msg));
 }

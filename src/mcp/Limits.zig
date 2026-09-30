@@ -57,6 +57,17 @@ max_step_up_attempts: u8 = 3,
 
 schema: Schema = .{},
 
+/// Limits of one skill of the Skills extension. The defaults are the limits of the extension.
+/// A server rejects a larger skill at registration with `error.SkillTooLarge`. A client
+/// rejects a larger entry in `skills.validateEntry`. A host must accept skills up to the
+/// limits of the extension, thus a client can raise these values but must not lower them.
+skills: struct {
+    /// Maximum files in one skill, `SKILL.md` included.
+    max_files: u32 = 512,
+    /// Maximum sum of the file sizes of one skill, in bytes.
+    max_bytes: u64 = 16 << 20,
+} = .{},
+
 uri_template: struct {
     max_template_bytes: usize = 64 << 10,
     max_expressions: u16 = 256,
@@ -92,4 +103,11 @@ test "defaults are sane" {
     const l: Limits = .{};
     try std.testing.expect(l.stdio.max_line_bytes > l.http.max_body_bytes);
     try std.testing.expectEqual(64, l.json_max_depth);
+}
+
+test "skill limits are the limits of the extension" {
+    const skills = @import("protocol/skills.zig");
+    const l: Limits = .{};
+    try std.testing.expectEqual(skills.max_files_per_skill, l.skills.max_files);
+    try std.testing.expectEqual(skills.max_bytes_per_skill, l.skills.max_bytes);
 }

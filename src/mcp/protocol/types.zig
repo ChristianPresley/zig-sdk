@@ -193,6 +193,20 @@ pub const ClientCapabilities = struct {
         const ext = self.extensions orelse return false;
         return ext == .object and ext.object.get(id) != null;
     }
+
+    /// A copy with the extension `id` declared with `settings`. The copy keeps the other
+    /// extensions. The function allocates the new `extensions` object in `arena`.
+    pub fn withExtension(self: ClientCapabilities, arena: Allocator, id: []const u8, settings: Value) Allocator.Error!ClientCapabilities {
+        var ext: std.json.ObjectMap = .empty;
+        if (self.extensions) |existing| if (existing == .object) {
+            var it = existing.object.iterator();
+            while (it.next()) |kv| try ext.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+        };
+        try ext.put(arena, id, settings);
+        var out = self;
+        out.extensions = .{ .object = ext };
+        return out;
+    }
 };
 
 pub const ServerCapabilities = struct {
