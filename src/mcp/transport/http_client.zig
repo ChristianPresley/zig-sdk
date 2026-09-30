@@ -257,7 +257,12 @@ pub const Client = struct {
     fn mirrorHeaders(self: *Client, arena: Allocator, headers: *std.ArrayList(http.Header), ex: *Transport.Exchange) Allocator.Error!void {
         const params = ex.params orelse return;
         if (params != .object) return;
-        const method = methods.Method.fromName(ex.method) orelse return;
+        const method = methods.Method.fromName(ex.method) orelse {
+            if (envelope.isTaskMethod(ex.method)) if (json.getString(params, "taskId")) |value| {
+                try headers.append(arena, .{ .name = envelope.header_name, .value = try envelope.encodeValue(arena, value) });
+            };
+            return;
+        };
         const name_key: ?[]const u8 = switch (method.headerNameSource()) {
             .none => null,
             .name => "name",

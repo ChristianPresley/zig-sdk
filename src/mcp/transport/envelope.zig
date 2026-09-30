@@ -275,6 +275,6 @@ test "verify headers against body" {
 }
 
 /// The Tasks extension methods that mirror `params.taskId` into `Mcp-Name`.
-fn isTaskMethod(method: []const u8) bool {
+pub fn isTaskMethod(method: []const u8) bool {
     return std.mem.eql(u8, method, "tasks/get") or std.mem.eql(u8, method, "tasks/update") or std.mem.eql(u8, method, "tasks/cancel");
 }

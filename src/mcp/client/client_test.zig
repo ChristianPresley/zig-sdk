@@ -45,6 +45,19 @@ fn everything(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.Call
     return .{ .input_required = ir };
 }
 
+fn slowTask(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    if (!ctx.inTask()) return .start_task;
+    try ctx.io.sleep(.fromMilliseconds(20), .awake);
+    if (try ctx.elicitResponse("user_name")) |resp| {
+        const name = json.getString(resp.content.?, "name") orelse "?";
+        return .{ .complete = try types.CallToolResult.text(ctx.arena, "task hello {s}", .{name}) };
+    }
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.elicitForm("user_name", "What is your name?", try mcp.InputRequired.stringSchema(ctx.arena, "name", null, true));
+    return .{ .input_required = ir };
+}
+
 fn readStatic(ctx: *RequestContext, uri: []const u8) anyerror!mcp.Outcome(types.ReadResourceResult) {
     const contents = try ctx.arena.alloc(types.ResourceContents, 1);
     contents[0] = .{ .text = .{ .uri = uri, .mimeType = "text/plain", .text = "static text" } };
@@ -59,8 +72,9 @@ const Fixture = struct {
     fn init(self: *Fixture, options: Client.Options) !void {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
-        self.server = try Server.init(gpa, io, .{ .info = .{ .name = "srv", .version = "1" }, .mrtr = .{ .elicitation = true, .sampling = true, .roots = true } });
+        self.server = try Server.init(gpa, io, .{ .info = .{ .name = "srv", .version = "1" }, .mrtr = .{ .elicitation = true, .sampling = true, .roots = true }, .tasks = .{ .poll_interval_ms = 10 } });
         try self.server.addTool(.{ .name = "add" }, add);
+        try self.server.addToolJson(.{ .name = "slow_task", .task_support = .optional }, slowTask);
         try self.server.addToolJson(.{ .name = "ask_name" }, askName);
         try self.server.addToolJson(.{ .name = "everything" }, everything);
         try self.server.addResource(.{ .uri = "test://static", .name = "static" }, readStatic);
@@ -114,7 +128,7 @@ test "discover, list and call through the memory link" {
     const disc = try f.client.discover(arena, .{});
     try std.testing.expectEqualStrings("2026-07-28", disc.supportedVersions[0]);
     const tools = try f.client.listTools(arena, null, .{});
-    try std.testing.expectEqual(3, tools.tools.len);
+    try std.testing.expectEqual(4, tools.tools.len);
 
     var rec: Recorder = .{};
     const result = try f.client.callTool(arena, "add", .{ .a = 2, .b = 3 }, .{ .on_progress = Recorder.onProgress, .userdata = &rec });
@@ -204,4 +218,48 @@ test "stdio client spawns and closes without requests" {
     Io.Dir.cwd().access(io, exampleServerPath(), .{}) catch return error.SkipZigTest;
     const proc = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = &.{exampleServerPath()} });
     proc.deinit();
+}
+
+test "tasks are awaited and their input requests answered" {
+    var f: Fixture = undefined;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const caps = try json.parseTree(arena, "{\"elicitation\":{},\"extensions\":{\"io.modelcontextprotocol/tasks\":{}}}");
+    try f.init(.{
+        .info = .{ .name = "cli", .version = "1" },
+        .capabilities = try json.parseValue(types.ClientCapabilities, arena, caps),
+        .hooks = .{ .elicit_form = answerForm },
+    });
+    defer f.deinit();
+
+    // `callTool` hides the task: it polls, answers the elicitation and returns the tool result.
+    const hidden = try f.client.callTool(arena, "slow_task", null, .{ .timeout = .fromSeconds(10) });
+    try std.testing.expectEqualStrings("task hello Alice", hidden.content[0].text.text);
+
+    // `callToolOrTask` returns the task record; the caller drives it.
+    const outcome = try f.client.callToolOrTask(arena, "slow_task", null, .{});
+    try std.testing.expect(outcome == .task);
+    try std.testing.expectEqualStrings("working", outcome.task.status);
+    const done = try f.client.awaitTask(arena, outcome.task.taskId, .{ .timeout = .fromSeconds(10) });
+    try std.testing.expectEqualStrings("completed", done.status);
+    const result = try Client.taskResult(arena, done);
+    try std.testing.expectEqualStrings("task hello Alice", result.content[0].text.text);
+
+    // Cancellation ends the wait with `error.TaskCancelled`.
+    const second = try f.client.callToolOrTask(arena, "slow_task", null, .{});
+    try f.client.cancelTask(arena, second.task.taskId, .{});
+    try std.testing.expectError(error.TaskCancelled, f.client.awaitTask(arena, second.task.taskId, .{ .timeout = .fromSeconds(10) }));
+}
+
+test "a task result without the extension is invalid" {
+    var f: Fixture = undefined;
+    try f.init(.{ .info = .{ .name = "cli", .version = "1" }, .capabilities = .{ .elicitation = .{} }, .hooks = .{ .elicit_form = answerForm } });
+    defer f.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The server runs the tool at once because the client did not declare the extension.
+    const direct = try f.client.callTool(arena, "slow_task", null, .{});
+    try std.testing.expectEqualStrings("task hello Alice", direct.content[0].text.text);
 }

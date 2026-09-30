@@ -17,6 +17,7 @@ const message = @import("../jsonrpc/message.zig");
 const RequestId = @import("../jsonrpc/id.zig").RequestId;
 const Transport = @import("../transport/Transport.zig");
 const Limits = @import("../Limits.zig");
+const tasks = @import("../server/tasks.zig");
 
 const Client = @This();
 
@@ -80,6 +81,9 @@ pub const RequestOptions = struct {
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
     /// Return an `InputRequiredResult` to the caller instead of driving the hooks.
     allow_input_required: bool = false,
+    /// Return the `CreateTaskResult` of a `tools/call` in `Response.task` instead of waiting
+    /// for the task. Only meaningful when `capabilities.extensions` declares the extension.
+    allow_task: bool = false,
     diagnostics: ?*Diagnostics = null,
     userdata: ?*anyopaque = null,
 };
@@ -100,6 +104,8 @@ pub const RequestError = error{
     HookFailed,
     TooManyRounds,
     NotConnected,
+    /// The task ended with the status `cancelled`.
+    TaskCancelled,
 };
 
 pub fn init(gpa: Allocator, io: Io, options: Options) Client {
@@ -121,6 +127,8 @@ pub fn Response(comptime T: type) type {
         raw: Value,
         /// Set when the server returned `InputRequiredResult` and `allow_input_required` was on.
         input_required: ?types.InputRequiredResult = null,
+        /// Set when the server returned `CreateTaskResult` and `allow_task` was on.
+        task: ?tasks.CreateTaskResult = null,
     };
 }
 
@@ -147,11 +155,121 @@ pub fn listPrompts(self: *Client, arena: Allocator, cursor: ?[]const u8, options
 }
 
 /// Call a tool. `arguments` is any value that serializes to a JSON object, or null.
+/// Call a tool. The server can turn the call into a task of the Tasks extension. The client
+/// then waits for the task, answers its input requests with the hooks and returns its result.
 pub fn callTool(self: *Client, arena: Allocator, name: []const u8, arguments: anytype, options: RequestOptions) RequestError!types.CallToolResult {
     var params: std.json.ObjectMap = .empty;
     try params.put(arena, "name", .{ .string = name });
     if (@TypeOf(arguments) != @TypeOf(null)) try params.put(arena, "arguments", try toValue(arena, arguments));
-    return (try self.request(arena, .@"tools/call", .{ .object = params }, options)).result;
+    var wait_options = options;
+    wait_options.allow_task = false;
+    const response = try self.request(arena, .@"tools/call", .{ .object = params }, wait_options);
+    return response.result;
+}
+
+/// Call a tool and return the `CreateTaskResult` when the server created a task.
+pub fn callToolOrTask(self: *Client, arena: Allocator, name: []const u8, arguments: anytype, options: RequestOptions) RequestError!ToolOutcome {
+    var params: std.json.ObjectMap = .empty;
+    try params.put(arena, "name", .{ .string = name });
+    if (@TypeOf(arguments) != @TypeOf(null)) try params.put(arena, "arguments", try toValue(arena, arguments));
+    var task_options = options;
+    task_options.allow_task = true;
+    const response = try self.request(arena, .@"tools/call", .{ .object = params }, task_options);
+    if (response.task) |t| return .{ .task = t };
+    return .{ .complete = response.result };
+}
+
+pub const ToolOutcome = union(enum) {
+    complete: types.CallToolResult,
+    task: tasks.CreateTaskResult,
+};
+
+// -- Tasks extension ----------------------------------------------------------------------------
+
+pub const AwaitOptions = struct {
+    /// The poll interval. Null uses `pollIntervalMs` from the task, or one second.
+    poll_interval: ?Io.Duration = null,
+    /// The whole wait. Null waits without limit.
+    timeout: ?Io.Duration = null,
+    cancel: ?*Transport.CancelToken = null,
+    /// Options for every `tasks/get` and `tasks/update` request.
+    request: RequestOptions = .{},
+};
+
+/// Read a task.
+pub fn getTask(self: *Client, arena: Allocator, task_id: []const u8, options: RequestOptions) RequestError!tasks.DetailedTask {
+    return (try self.requestAs(arena, tasks.DetailedTask, "tasks/get", try taskParams(arena, task_id), options)).result;
+}
+
+/// Deliver answers to the input requests of a task. `input_responses` is an object keyed by
+/// the request keys of the task.
+pub fn updateTask(self: *Client, arena: Allocator, task_id: []const u8, input_responses: Value, options: RequestOptions) RequestError!void {
+    var params = try taskParams(arena, task_id);
+    try params.object.put(arena, "inputResponses", input_responses);
+    _ = try self.requestAs(arena, types.EmptyResult, "tasks/update", params, options);
+}
+
+/// Ask the server to cancel a task. The call on a finished task is also accepted.
+pub fn cancelTask(self: *Client, arena: Allocator, task_id: []const u8, options: RequestOptions) RequestError!void {
+    _ = try self.requestAs(arena, types.EmptyResult, "tasks/cancel", try taskParams(arena, task_id), options);
+}
+
+/// Poll a task until it ends. Input requests are answered with the hooks. The returned task
+/// has the status `completed`. A failed task sets `Diagnostics.rpc_error` from the task and
+/// returns `error.Rpc`. A cancelled task returns `error.TaskCancelled`.
+pub fn awaitTask(self: *Client, arena: Allocator, task_id: []const u8, options: AwaitOptions) RequestError!tasks.DetailedTask {
+    const deadline: ?Io.Clock.Timestamp = if (options.timeout) |d| Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake }) else null;
+    var default_interval: Io.Duration = .fromMilliseconds(1000);
+    while (true) {
+        if (options.cancel) |c| if (c.isCancelled()) return error.Canceled;
+        const task = try self.getTask(arena, task_id, options.request);
+        if (task.pollIntervalMs) |ms| if (ms > 0) {
+            default_interval = .fromMilliseconds(ms);
+        };
+        const status = std.meta.stringToEnum(tasks.Status, task.status) orelse return error.InvalidResponse;
+        switch (status) {
+            .completed => return task,
+            .failed => {
+                if (options.request.diagnostics) |d| d.rpc_error = task.@"error";
+                return error.Rpc;
+            },
+            .cancelled => return error.TaskCancelled,
+            .input_required => {
+                const requests = task.inputRequests orelse return error.InvalidResponse;
+                if (requests != .object) return error.InvalidResponse;
+                var answers: std.json.ObjectMap = .empty;
+                var it = requests.object.iterator();
+                while (it.next()) |kv| {
+                    const req = json.parseValue(types.InputRequest, arena, kv.value_ptr.*) catch return error.InvalidResponse;
+                    try answers.put(arena, kv.key_ptr.*, try self.answerInput(arena, kv.key_ptr.*, "tools/call", req));
+                }
+                try self.updateTask(arena, task_id, .{ .object = answers }, options.request);
+                continue;
+            },
+            .working => {},
+        }
+        const interval = options.poll_interval orelse default_interval;
+        if (deadline) |dl| {
+            const now = Io.Clock.Timestamp.now(self.io, .awake);
+            if (now.durationTo(dl).raw.nanoseconds <= 0) return error.Timeout;
+        }
+        self.io.sleep(interval, .awake) catch return error.Canceled;
+    }
+}
+
+/// The tool result of a completed task.
+pub fn taskResult(arena: Allocator, task: tasks.DetailedTask) RequestError!types.CallToolResult {
+    const raw = task.result orelse return error.InvalidResponse;
+    return json.parseValue(types.CallToolResult, arena, raw) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidResponse,
+    };
+}
+
+fn taskParams(arena: Allocator, task_id: []const u8) Allocator.Error!Value {
+    var params: std.json.ObjectMap = .empty;
+    try params.put(arena, "taskId", .{ .string = task_id });
+    return .{ .object = params };
 }
 
 pub fn readResource(self: *Client, arena: Allocator, uri: []const u8, options: RequestOptions) RequestError!types.ReadResourceResult {
@@ -195,6 +313,10 @@ fn finishResponse(comptime T: type, arena: Allocator, raw: Raw, options: Request
         std.debug.assert(options.allow_input_required);
         return .{ .result = undefined, .raw = raw.value, .input_required = ir };
     }
+    if (raw.task) |t| {
+        std.debug.assert(options.allow_task);
+        return .{ .result = undefined, .raw = raw.value, .task = t };
+    }
     const result = json.parseValue(T, arena, raw.value) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidResponse,
@@ -205,6 +327,7 @@ fn finishResponse(comptime T: type, arena: Allocator, raw: Raw, options: Request
 const Raw = struct {
     value: Value,
     input_required: ?types.InputRequiredResult = null,
+    task: ?tasks.CreateTaskResult = null,
 };
 
 // -- Pipeline -----------------------------------------------------------------------------------
@@ -331,6 +454,18 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             return .{ .value = result };
         }
         if (std.mem.eql(u8, result_type.?, types.result_type_complete)) return .{ .value = result };
+        if (std.mem.eql(u8, result_type.?, "task")) {
+            // Only a `tools/call` can become a task, and only when the client declared the extension.
+            if (known != .@"tools/call" or !self.options.capabilities.hasExtension(tasks.extension_id)) return error.InvalidResponse;
+            const created = json.parseValue(tasks.CreateTaskResult, arena, result) catch return error.InvalidResponse;
+            if (options.allow_task) return .{ .value = result, .task = created };
+            const done = try self.awaitTask(arena, created.taskId, .{
+                .timeout = options.timeout,
+                .cancel = options.cancel,
+                .request = options,
+            });
+            return .{ .value = done.result orelse return error.InvalidResponse };
+        }
         if (!std.mem.eql(u8, result_type.?, types.result_type_input_required)) return error.InvalidResponse;
         if (known) |m| if (!m.allowsInputRequired()) return error.InvalidResponse;
         const ir = json.parseValue(types.InputRequiredResult, arena, result) catch return error.InvalidResponse;

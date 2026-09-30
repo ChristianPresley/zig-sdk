@@ -32,7 +32,7 @@ The project is in development. The table shows the parts that exist today.
 | Authorization: OAuth 2.1 client | Done, passes every scored `auth/*` scenario of the official suite |
 | Authorization: resource server helpers (bearer checks, metadata, JWT) | Done |
 | gRPC transport (JSON-RPC tunnel over HTTP/2) | Planned |
-| Tasks extension (server) | Done, passes the functional checks of the ten unscored scenarios |
+| Tasks extension (server and client) | Done, passes the functional checks of the ten unscored scenarios |
 
 ## Requirements
 

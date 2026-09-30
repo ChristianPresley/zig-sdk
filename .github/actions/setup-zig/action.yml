@@ -27,7 +27,7 @@ runs:
         {
           echo "key=$key"; echo "version=$version"; echo "tarball=$tarball"; echo "shasum=$shasum"
           echo "file=$(basename "$tarball")"
-          echo "dir=${RUNNER_TEMP//\//}/zig-toolchain"
+          echo "dir=${RUNNER_TEMP//\\//}/zig-toolchain"
         } >> "$GITHUB_OUTPUT"
     - name: Restore toolchain cache
       id: cache
@@ -78,7 +78,7 @@ runs:
       shell: bash
       run: |
         echo "${{ steps.target.outputs.dir }}" >> "$GITHUB_PATH"
-        echo "ZIG_GLOBAL_CACHE_DIR=${RUNNER_TEMP//\//}/zig-global-cache" >> "$GITHUB_ENV"
+        echo "ZIG_GLOBAL_CACHE_DIR=${RUNNER_TEMP//\\//}/zig-global-cache" >> "$GITHUB_ENV"
     - name: Report
       shell: bash
       run: zig version
