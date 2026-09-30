@@ -47,6 +47,7 @@ All notable changes to this project are recorded in this file. The format follow
 
 ### Fixed
 
+- `zig build test --fuzz` did not compile on Zig 0.16.0, because the fuzz path of the test runner of the toolchain gives a `builtin.StackTrace` to `std.debug.writeStackTrace`. The option `-Dfuzz` makes a copy of the runner with `std.debug.writeErrorReturnTrace` in that call, and the nightly `fuzz` job uses it.
 - The stdio line framer drops all of a line that is longer than the limit. Before, the rest of the line arrived as a separate frame.
 - The JSON Schema compiler compiles the target of each local `$ref`. Before, a reference into an unknown member could reach the validator unchecked and stop the process.
 - An HTTP/1.1 GET request of the SDK client has no `content-length` header.

@@ -10,8 +10,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Unit tests.
-    const mod_tests = b.addTest(.{ .root_module = mcp });
+    // Unit tests. `-Dfuzz` replaces the test runner for `zig build test -Dfuzz --fuzz`.
+    const fuzz = b.option(bool, "fuzz", "Use a test runner whose fuzz path compiles on Zig 0.16.0 (for --fuzz)") orelse false;
+    const test_runner: ?std.Build.Step.Compile.TestRunner = if (fuzz) fuzzTestRunner(b) else null;
+    const mod_tests = b.addTest(.{ .root_module = mcp, .test_runner = test_runner });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
@@ -23,7 +25,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "mcp", .module = mcp }},
     });
-    const grpc_tests = b.addTest(.{ .root_module = mcp_grpc });
+    const grpc_tests = b.addTest(.{ .root_module = mcp_grpc, .test_runner = test_runner });
     test_step.dependOn(&b.addRunArtifact(grpc_tests).step);
 
     // The tests of the documentation tools.
@@ -161,6 +163,22 @@ pub fn build(b: *std.Build) void {
         const tool_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(path), .target = b.graph.host }) });
         test_step.dependOn(&b.addRunArtifact(tool_tests).step);
     }
+}
+
+/// The fuzz path of the test runner of Zig 0.16.0 gives a `builtin.StackTrace` to
+/// `std.debug.writeStackTrace`, which takes a `debug.StackTrace`, so no test with a fuzz
+/// target compiles with `-ffuzz`. This makes a copy of the runner of the installed toolchain
+/// with `std.debug.writeErrorReturnTrace` in that call. The repository keeps no copy.
+fn fuzzTestRunner(b: *std.Build) std.Build.Step.Compile.TestRunner {
+    const sub_path = "compiler/test_runner.zig";
+    const source = b.graph.zig_lib_directory.handle.readFileAlloc(b.graph.io, sub_path, b.allocator, .limited(1 << 20)) catch |err|
+        std.debug.panic("cannot read {s} of the Zig library: {t}", .{ sub_path, err });
+    const needle = "std.debug.writeStackTrace(trace, stderr)";
+    if (std.mem.count(u8, source, needle) != 1)
+        std.debug.panic("{s} of the Zig library does not have one '{s}'; remove -Dfuzz", .{ sub_path, needle });
+    const fixed = std.mem.replaceOwned(u8, b.allocator, source, needle, "std.debug.writeErrorReturnTrace(trace, stderr)") catch @panic("OOM");
+    const files = b.addWriteFiles();
+    return .{ .path = files.add("fuzz_test_runner.zig", fixed), .mode = .server };
 }
 
 fn addTool(b: *std.Build, step_name: []const u8, description: []const u8, source: []const u8, default_args: []const []const u8) void {

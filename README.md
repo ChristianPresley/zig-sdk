@@ -76,7 +76,7 @@ zig build test
 zig build examples
 ```
 
-Other build steps: `fmt`, `docs`, `site`, `lint-docs`, `census`, `extract-requirements`, `spec-matrix`, `gen-bibliography`, `gen-dictionary`, `commit-policy`, `bench` (`-- --smoke` for a quick run), and `test --fuzz` for the fuzz targets.
+Other build steps: `fmt`, `docs`, `site`, `lint-docs`, `census`, `extract-requirements`, `spec-matrix`, `gen-bibliography`, `gen-dictionary`, `commit-policy`, `bench` (`-- --smoke` for a quick run), and `test -Dfuzz --fuzz` for the fuzz targets (not on Windows).
 
 ## Documentation
 

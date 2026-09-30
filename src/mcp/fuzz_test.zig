@@ -1,5 +1,5 @@
 //! Fuzz targets for the parsers of the core module. Each target must never crash. Errors
-//! are the expected outcome for bad input. `zig build test --fuzz` explores them, and the
+//! are the expected outcome for bad input. `zig build test -Dfuzz --fuzz` explores them, and the
 //! plain test run executes each once.
 const std = @import("std");
 const Smith = std.testing.Smith;
