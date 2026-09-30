@@ -36,6 +36,8 @@ pub fn build(b: *std.Build) void {
         });
         const install = b.addInstallArtifact(exe, .{});
         examples_step.dependOn(&install.step);
+        // The client tests spawn the stdio example.
+        if (std.mem.eql(u8, name, "stdio_server")) run_mod_tests.step.dependOn(&install.step);
         const run = b.addRunArtifact(exe);
         if (b.args) |args| run.addArgs(args);
         b.step(b.fmt("run-{s}", .{name}), b.fmt("Run the {s} example", .{name})).dependOn(&run.step);

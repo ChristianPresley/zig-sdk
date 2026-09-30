@@ -166,3 +166,42 @@ test "undeclared input kinds are rejected on the client" {
     const r = f.client.callTool(arena, "everything", null, .{ .diagnostics = &diag });
     try std.testing.expect(r == error.Rpc or r == error.UndeclaredInputRequest);
 }
+
+fn exampleServerPath() []const u8 {
+    return if (@import("builtin").os.tag == .windows) "zig-out/bin/stdio_server.exe" else "zig-out/bin/stdio_server";
+}
+
+test "stdio client drives the example server process" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // The build installs the example before the tests run.
+    Io.Dir.cwd().access(io, exampleServerPath(), .{}) catch return error.SkipZigTest;
+    const proc = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = &.{exampleServerPath()} });
+    defer proc.deinit();
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(proc.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const disc = try client.discover(arena, .{ .timeout = .fromSeconds(20) });
+    try std.testing.expect(disc.capabilities.tools != null);
+    var rec: Recorder = .{};
+    const sum = try client.callTool(arena, "add", .{ .a = 40, .b = 2 }, .{ .timeout = .fromSeconds(20), .on_progress = Recorder.onProgress, .userdata = &rec });
+    try std.testing.expectEqualStrings("42", sum.content[0].text.text);
+    try std.testing.expectEqual(0, rec.progress);
+    const prompts = try client.listPrompts(arena, null, .{ .timeout = .fromSeconds(20) });
+    try std.testing.expect(prompts.prompts.len >= 1);
+    var diag: Client.Diagnostics = .{};
+    try std.testing.expectError(error.Rpc, client.callTool(arena, "missing", null, .{ .timeout = .fromSeconds(20), .diagnostics = &diag }));
+    try std.testing.expectEqual(@as(i64, -32602), diag.rpc_error.?.code);
+}
+
+test "stdio client spawns and closes without requests" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    Io.Dir.cwd().access(io, exampleServerPath(), .{}) catch return error.SkipZigTest;
+    const proc = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = &.{exampleServerPath()} });
+    proc.deinit();
+}

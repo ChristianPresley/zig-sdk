@@ -10,6 +10,7 @@ const types = @import("../protocol/types.zig");
 const errors = @import("../protocol/errors.zig");
 const message = @import("../jsonrpc/message.zig");
 const json = @import("../json.zig");
+const Value = std.json.Value;
 const Limits = @import("../Limits.zig");
 const McpServer = @import("../server/Server.zig");
 
@@ -249,3 +250,290 @@ pub fn serve(io: Io, gpa: Allocator, server: *McpServer) !void {
     defer transport.deinit();
     try transport.run(&stdin_reader.interface);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------------------------
+
+/// Spawns a server process and speaks MCP over its stdin and stdout. One reader task demuxes
+/// the frames to the requests in flight by id, progress token and subscription id.
+pub const Client = struct {
+    io: Io,
+    gpa: Allocator,
+    limits: Limits,
+    child: std.process.Child,
+    in_buf: []u8,
+    out_buf: []u8,
+    stdout_reader: Io.File.Reader,
+    stdin_writer: Io.File.Writer,
+    out_lock: Io.Mutex = .init,
+    pending: std.ArrayList(*Pending) = .empty,
+    pending_lock: Io.Mutex = .init,
+    reader_future: ?Io.Future(void) = null,
+    closed: std.atomic.Value(bool) = .init(false),
+    /// Receives notifications that belong to no request in flight.
+    on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
+    userdata: ?*anyopaque = null,
+
+    pub const SpawnOptions = struct {
+        argv: []const []const u8,
+        /// Environment for the child. Null inherits the parent environment.
+        environ_map: ?*const std.process.Environ.Map = null,
+        cwd: std.process.Child.Cwd = .inherit,
+        limits: Limits = .{},
+        /// How often a waiting request checks for cancellation.
+        poll_interval: Io.Duration = .fromMilliseconds(50),
+    };
+
+    const Pending = struct {
+        id: RequestId,
+        frames: std.ArrayList([]u8) = .empty,
+        lock: Io.Mutex = .init,
+        event: Io.Event = .unset,
+    };
+
+    /// Spawn the server process and start the reader task.
+    pub fn spawn(io: Io, gpa: Allocator, options: SpawnOptions) !*Client {
+        const self = try gpa.create(Client);
+        errdefer gpa.destroy(self);
+        const child = try std.process.spawn(io, .{
+            .argv = options.argv,
+            .environ_map = options.environ_map,
+            .cwd = options.cwd,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .inherit,
+            .create_no_window = true,
+        });
+        const in_buf = try gpa.alloc(u8, options.limits.stdio.read_buffer);
+        errdefer gpa.free(in_buf);
+        const out_buf = try gpa.alloc(u8, 64 * 1024);
+        errdefer gpa.free(out_buf);
+        self.* = .{
+            .io = io,
+            .gpa = gpa,
+            .limits = options.limits,
+            .child = child,
+            .in_buf = in_buf,
+            .out_buf = out_buf,
+            .stdout_reader = undefined,
+            .stdin_writer = undefined,
+        };
+        self.stdout_reader = self.child.stdout.?.readerStreaming(io, self.in_buf);
+        self.stdin_writer = self.child.stdin.?.writerStreaming(io, self.out_buf);
+        self.reader_future = try io.concurrent(readerLoop, .{self});
+        return self;
+    }
+
+    pub fn transport(self: *Client) Transport.ClientTransport {
+        return .{ .ptr = self, .vtable = &client_vtable };
+    }
+
+    /// Close stdin, wait for the reader to see the end of the stream, and reap the process.
+    pub fn close(self: *Client) void {
+        const io = self.io;
+        if (!self.closed.swap(true, .acq_rel)) {
+            self.out_lock.lockUncancelable(io);
+            self.stdin_writer.interface.flush() catch {};
+            self.out_lock.unlock(io);
+            if (self.child.stdin) |stdin| {
+                stdin.close(io);
+                self.child.stdin = null;
+            }
+        }
+        if (self.reader_future) |*f| {
+            f.await(io);
+            self.reader_future = null;
+        }
+        if (self.child.id != null) _ = self.child.wait(io) catch {};
+    }
+
+    /// Terminate the process at once.
+    pub fn kill(self: *Client) void {
+        self.closed.store(true, .release);
+        self.child.kill(self.io);
+        if (self.reader_future) |*f| {
+            f.await(self.io);
+            self.reader_future = null;
+        }
+    }
+
+    pub fn deinit(self: *Client) void {
+        self.close();
+        self.gpa.free(self.in_buf);
+        self.gpa.free(self.out_buf);
+        self.pending.deinit(self.gpa);
+        self.gpa.destroy(self);
+    }
+
+    const client_vtable: Transport.ClientTransport.VTable = .{
+        .kind = .stdio,
+        .exchange = exchange,
+        .notify = notify,
+    };
+
+    fn writeFrame(self: *Client, frame: []const u8) Transport.SendError!void {
+        if (self.closed.load(.acquire)) return error.Closed;
+        self.out_lock.lockUncancelable(self.io);
+        defer self.out_lock.unlock(self.io);
+        framer.writeFrame(&self.stdin_writer.interface, frame) catch return error.WriteFailed;
+        self.stdin_writer.interface.flush() catch return error.WriteFailed;
+    }
+
+    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        _ = io;
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        return self.writeFrame(frame);
+    }
+
+    fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        var pending: Pending = .{ .id = ex.id };
+        defer {
+            for (pending.frames.items) |f| self.gpa.free(f);
+            pending.frames.deinit(self.gpa);
+        }
+        try self.register(&pending);
+        defer self.unregister(&pending);
+        self.writeFrame(ex.frame) catch |e| switch (e) {
+            error.Closed => return error.Closed,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.WriteFailed,
+        };
+        const deadline: ?Io.Clock.Timestamp = ex.timeout.toTimestamp(io);
+        while (true) {
+            // Deliver everything that arrived.
+            while (self.takeFrame(&pending)) |frame| {
+                defer self.gpa.free(frame);
+                const is_response = frameIsResponse(frame);
+                ex.sink.deliver(io, frame) catch return error.InvalidFrame;
+                if (is_response) return;
+            }
+            if (ex.cancel.isCancelled()) {
+                self.sendCancelled(ex.id, ex.cancel.reason);
+                return error.Canceled;
+            }
+            if (deadline) |d| {
+                if (Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw.nanoseconds <= 0) {
+                    self.sendCancelled(ex.id, "timeout");
+                    return error.Timeout;
+                }
+            }
+            if (self.closed.load(.acquire)) return error.Closed;
+            pending.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }) catch |e| switch (e) {
+                error.Timeout => {},
+                error.Canceled => return error.Canceled,
+            };
+            pending.event.reset();
+        }
+    }
+
+    fn sendCancelled(self: *Client, id: RequestId, reason: ?[]const u8) void {
+        var buf: [512]u8 = undefined;
+        var fba: std.heap.FixedBufferAllocator = .init(&buf);
+        var aw: Io.Writer.Allocating = .init(fba.allocator());
+        message.writeNotification(&aw.writer, "notifications/cancelled", types.CancelledNotificationParams{ .requestId = id, .reason = reason }) catch return;
+        self.writeFrame(aw.written()) catch {};
+    }
+
+    fn register(self: *Client, p: *Pending) error{OutOfMemory}!void {
+        self.pending_lock.lockUncancelable(self.io);
+        defer self.pending_lock.unlock(self.io);
+        try self.pending.append(self.gpa, p);
+    }
+
+    fn unregister(self: *Client, p: *Pending) void {
+        self.pending_lock.lockUncancelable(self.io);
+        defer self.pending_lock.unlock(self.io);
+        for (self.pending.items, 0..) |item, i| if (item == p) {
+            _ = self.pending.swapRemove(i);
+            return;
+        };
+    }
+
+    fn takeFrame(self: *Client, p: *Pending) ?[]u8 {
+        p.lock.lockUncancelable(self.io);
+        defer p.lock.unlock(self.io);
+        if (p.frames.items.len == 0) return null;
+        return p.frames.orderedRemove(0);
+    }
+
+    fn push(self: *Client, p: *Pending, frame: []const u8) void {
+        const copy = self.gpa.dupe(u8, frame) catch return;
+        p.lock.lockUncancelable(self.io);
+        p.frames.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+        };
+        p.lock.unlock(self.io);
+        p.event.set(self.io);
+    }
+
+    fn frameIsResponse(frame: []const u8) bool {
+        // A response has "result" or "error" and no "method" at the top level. The frames
+        // come from the SDK's own parser, so a cheap check on the first key is enough.
+        return std.mem.indexOf(u8, frame, "\"result\"") != null or std.mem.indexOf(u8, frame, "\"error\"") != null;
+    }
+
+    fn readerLoop(self: *Client) void {
+        const io = self.io;
+        var line_reader: framer.Framer = .{ .reader = &self.stdout_reader.interface, .max_line_bytes = self.limits.stdio.max_line_bytes };
+        while (true) {
+            var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const line = line_reader.next(arena) catch |e| switch (e) {
+                error.LineTooLong, error.InvalidUtf8, error.ControlCharacter => continue,
+                else => break,
+            };
+            const msg = jsonrpc.Message.parse(arena, line) catch continue;
+            switch (msg) {
+                .response => |r| self.route(r.id, line),
+                .error_response => |e| if (e.id) |id| self.route(id, line),
+                .notification => |n| self.routeNotification(arena, n, line),
+                .request => {}, // servers do not send requests in this revision
+            }
+        }
+        self.closed.store(true, .release);
+        // Wake every waiter so it can see the end of the stream.
+        self.pending_lock.lockUncancelable(io);
+        defer self.pending_lock.unlock(io);
+        for (self.pending.items) |p| p.event.set(io);
+    }
+
+    fn route(self: *Client, id: RequestId, line: []const u8) void {
+        self.pending_lock.lockUncancelable(self.io);
+        defer self.pending_lock.unlock(self.io);
+        for (self.pending.items) |p| if (p.id.eql(id)) {
+            self.push(p, line);
+            return;
+        };
+    }
+
+    fn routeNotification(self: *Client, arena: Allocator, n: jsonrpc.Message.Notification, line: []const u8) void {
+        if (n.params) |params| if (params == .object) {
+            // Request-scoped notifications carry the progress token or the subscription id,
+            // both of which equal the request id.
+            if (params.object.get("progressToken")) |token| {
+                if (RequestId.fromValue(arena, token)) |id| {
+                    self.route(id, line);
+                    return;
+                }
+            }
+            if (params.object.get("_meta")) |m| if (m == .object) {
+                if (m.object.get("io.modelcontextprotocol/subscriptionId")) |sid| {
+                    if (RequestId.fromValue(arena, sid)) |id| {
+                        self.route(id, line);
+                        return;
+                    }
+                }
+                if (m.object.get("progressToken")) |token| {
+                    if (RequestId.fromValue(arena, token)) |id| {
+                        self.route(id, line);
+                        return;
+                    }
+                }
+            };
+        };
+        if (self.on_notification) |f| f(self.userdata, n.method, n.params);
+    }
+};

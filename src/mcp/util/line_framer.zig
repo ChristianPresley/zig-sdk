@@ -36,7 +36,8 @@ pub const Framer = struct {
         // Fast path: the whole line is already in (or fits into) the reader buffer.
         if (self.reader.takeDelimiterExclusive('\n')) |line| {
             if (line.len > self.max_line_bytes) return error.LineTooLong;
-            self.reader.toss(1);
+            // At the end of the stream the last line comes without its delimiter.
+            if (self.reader.bufferedLen() > 0 and self.reader.buffered()[0] == '\n') self.reader.toss(1);
             return try arena.dupe(u8, line);
         } else |e| switch (e) {
             error.StreamTooLong => {},
