@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("conformance/everything_server.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "mcp", .module = mcp }},
+            .imports = &.{ .{ .name = "mcp", .module = mcp }, .{ .name = "mcp_grpc", .module = mcp_grpc } },
         }),
     });
     b.step("conformance-server", "Build the conformance everything server").dependOn(&b.addInstallArtifact(conformance_server, .{}).step);

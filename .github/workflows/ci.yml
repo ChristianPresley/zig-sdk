@@ -102,6 +102,54 @@ jobs:
           name: autodocs
           path: zig-out/docs
 
+  grpc-interop:
+    name: grpc-interop
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build conformance-server -Doptimize=ReleaseSafe
+      - name: Start the everything server with gRPC
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/mcp-conformance-server --port 3000 --grpc-port 50051 > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 50); do
+            if curl -s --max-time 2 -o /dev/null -X POST http://127.0.0.1:3000/mcp; then exit 0; fi
+            sleep 0.2
+          done
+          echo "server did not start" >&2
+          cat server.log >&2
+          exit 1
+      - name: Call the server from the Node http2 peer
+        run: node .github/interop/h2_peer.mjs 50051
+      - name: Call the server with curl over HTTP/2 prior knowledge
+        run: |
+          set -euo pipefail
+          body='{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+          len=${#body}
+          # JsonRpcMessage: field 1, length-delimited, then the gRPC length prefix.
+          printf '\x0a' > message.bin
+          printf "$(printf '\\x%02x' $((len & 0x7f | 0x80)) $((len >> 7)))" >> message.bin
+          printf '%s' "$body" >> message.bin
+          total=$(stat -c %s message.bin)
+          { printf '\x00'; printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $((total >> 24 & 255)) $((total >> 16 & 255)) $((total >> 8 & 255)) $((total & 255)))"; cat message.bin; } > call.bin
+          status=$(curl -s --http2-prior-knowledge -o response.bin -w '%{http_code} %{content_type}' \
+            -H 'content-type: application/grpc+proto' -H 'te: trailers' \
+            -H 'mcp-protocol-version: 2026-07-28' -H 'mcp-method: server/discover' \
+            --data-binary @call.bin http://127.0.0.1:50051/mcp.zig.transport.v1.Mcp/Call)
+          echo "curl: $status"
+          case "$status" in
+            "200 application/grpc+proto") ;;
+            *) echo "unexpected status" >&2; exit 1 ;;
+          esac
+          grep -q '"supportedVersions"' response.bin
+      - name: Stop the everything server
+        if: always()
+        run: |
+          kill "$(cat server.pid)" || true
+          cat server.log || true
+
   conformance:
     name: conformance
     runs-on: ubuntu-24.04

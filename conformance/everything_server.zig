@@ -2,9 +2,10 @@
 //! conformance suite for MCP 2026-07-28 expects. Serves Streamable HTTP by default and
 //! stdio with `--stdio`.
 //!
-//! Usage: mcp-conformance-server [--port N] [--stdio]
+//! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--stdio]
 const std = @import("std");
 const mcp = @import("mcp");
+const mcp_grpc = @import("mcp_grpc");
 const types = mcp.types;
 const Ctx = mcp.RequestContext;
 const Result = mcp.Outcome(types.CallToolResult);
@@ -460,11 +461,15 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     var port: u16 = 3000;
     var use_stdio = false;
+    var grpc_port: ?u16 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             i += 1;
             port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--grpc-port") and i + 1 < args.len) {
+            i += 1;
+            grpc_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
         } else if (std.mem.eql(u8, args[i], "--stdio")) {
             use_stdio = true;
         }
@@ -545,5 +550,22 @@ pub fn main(init: std.process.Init) !void {
     defer transport.deinit();
     try transport.bind();
     std.log.info("everything server listening on http://127.0.0.1:{d}/mcp", .{transport.bound_port});
+    if (grpc_port) |gp| {
+        var grpc_transport: mcp_grpc.Server = .init(io, gpa, &server, .{ .port = gp });
+        defer grpc_transport.deinit();
+        try grpc_transport.bind();
+        std.log.info("everything server listening for gRPC on 127.0.0.1:{d}", .{grpc_transport.bound_port});
+        var grpc_future = try io.concurrent(serveGrpc, .{&grpc_transport});
+        defer {
+            grpc_transport.shutdown();
+            grpc_future.await(io);
+        }
+        try transport.serve();
+        return;
+    }
     try transport.serve();
+}
+
+fn serveGrpc(transport: *mcp_grpc.Server) void {
+    transport.serve() catch |e| std.log.err("gRPC server failed: {t}", .{e});
 }

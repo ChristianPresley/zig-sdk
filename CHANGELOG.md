@@ -22,7 +22,7 @@ All notable changes to this project are recorded in this file. The format follow
 - In-tree TLS 1.3 client (`mcp.tls.connect`): chain validation with a CA set, the std bundle, a pinned leaf or a self-signed policy; host name and IP address checks; CA constraints; ALPN; HelloRetryRequest; client certificates. The server can ask for client certificates (`client_auth`, `client_trust`).
 - The Streamable HTTP client runs on an SDK-owned HTTP/1.1 connection (`mcp.transport.http1`) and uses the SDK TLS client for `https` (`HttpClient.Options.tls`).
 - gRPC transport in the module `mcp_grpc`: a JSON-RPC tunnel over HTTP/2 (`proto/mcp_zig_transport_v1.proto`) with its own protobuf wire format, HPACK with the RFC 7541 tables, an HTTP/2 connection with flow control, and the gRPC server (`mcp_grpc.Server`) and client (`mcp_grpc.Channel`) transports. Metadata mirrors the HTTP headers; errors before the first message travel in the trailers with `mcp-error-code` and `mcp-error-bin`.
-- Conformance fixture server and a CI job that runs the official conformance suite.
+- Conformance fixture server and a CI job that runs the official conformance suite. The fixture server serves gRPC with `--grpc-port`; the CI job `grpc-interop` calls it from a Node `http2` peer and from `curl` over HTTP/2.
 - Comptime JSON Schema derivation from Zig types.
 - JSON Schema 2020-12 subset validator. Tool arguments are checked against the input schema and structured output against the output schema.
 - Build steps `test`, `fmt`, `examples`, `docs`, `lint-docs`, `census`, `commit-policy`, `conformance-server`, `conformance-client`, `gen-bibliography`, `gen-dictionary`.
