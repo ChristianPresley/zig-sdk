@@ -541,11 +541,12 @@ const windows_access_tests = struct {
         try std.testing.expect(report.protected);
         try std.testing.expectEqual(1, report.ace_count);
         try std.testing.expect(report.only_current_user);
-        // Windows checks the list when a client connects: the owner connects, and after a
-        // list without entries nobody connects.
+        // Windows checks the list when a client connects: the owner connects, and without the
+        // data rights nobody connects. The owner keeps the right to delete, so the server
+        // removes the file at shutdown.
         const address = try Io.net.UnixAddress.init(path);
         (try address.connect(io)).close(io);
-        try windows_acl.denyAll(path);
+        try windows_acl.refuseConnections(path);
         if (address.connect(io)) |stream| {
             stream.close(io);
             return error.TestUnexpectedResult;

@@ -20,13 +20,24 @@ pub const Report = struct {
 /// Give the file at `path` a protected access control list that allows access only to the
 /// user of the process. `path` is an absolute path.
 pub fn restrictToCurrentUser(path: []const u8) Error!void {
+    return allowCurrentUser(path, FILE_ALL_ACCESS);
+}
+
+/// Give the file at `path` a protected access control list without the data rights. The user
+/// of the process can read and change the list and delete the file. Then no client can
+/// connect, and the server can still remove the file. For tests.
+pub fn refuseConnections(path: []const u8) Error!void {
+    return allowCurrentUser(path, DELETE | READ_CONTROL | WRITE_DAC | SYNCHRONIZE | FILE_READ_ATTRIBUTES);
+}
+
+fn allowCurrentUser(path: []const u8, mask: windows.DWORD) Error!void {
     var token_user: TokenUserBuffer align(@alignOf(TOKEN_USER)) = undefined;
     const sid = try currentUserSid(&token_user);
     var acl_buf: [256]u8 align(@alignOf(u32)) = undefined;
     const acl_len: windows.DWORD = @sizeOf(ACL) + @sizeOf(ACCESS_ALLOWED_ACE) - @sizeOf(windows.DWORD) + GetLengthSid(sid);
     if (acl_len > acl_buf.len) return error.AccessControlFailed;
     if (InitializeAcl(&acl_buf, acl_len, ACL_REVISION) == 0) return fail("InitializeAcl");
-    if (AddAccessAllowedAce(&acl_buf, ACL_REVISION, FILE_ALL_ACCESS, sid) == 0) return fail("AddAccessAllowedAce");
+    if (AddAccessAllowedAce(&acl_buf, ACL_REVISION, mask, sid) == 0) return fail("AddAccessAllowedAce");
     const handle = try openForSecurity(path, READ_CONTROL | WRITE_DAC);
     defer windows.CloseHandle(handle);
     const status = SetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, null, null, &acl_buf, null);
@@ -55,17 +66,6 @@ pub fn inspect(path: []const u8) Error!Report {
             EqualSid(@ptrCast(@constCast(&ace.SidStart)), sid) != 0;
     }
     return .{ .protected = control & SE_DACL_PROTECTED != 0, .ace_count = acl.AceCount, .only_current_user = only };
-}
-
-/// Give the file at `path` a protected access control list without entries, so that nobody
-/// gets access. For tests.
-pub fn denyAll(path: []const u8) Error!void {
-    var acl_buf: [@sizeOf(ACL)]u8 align(@alignOf(u32)) = undefined;
-    if (InitializeAcl(&acl_buf, acl_buf.len, ACL_REVISION) == 0) return fail("InitializeAcl");
-    const handle = try openForSecurity(path, READ_CONTROL | WRITE_DAC);
-    defer windows.CloseHandle(handle);
-    const status = SetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, null, null, &acl_buf, null);
-    if (status != 0) return failCode("SetSecurityInfo", status);
 }
 
 const TokenUserBuffer = [@sizeOf(TOKEN_USER) + SECURITY_MAX_SID_SIZE]u8;
@@ -118,7 +118,10 @@ const SE_FILE_OBJECT = 1;
 const DACL_SECURITY_INFORMATION = 0x00000004;
 const PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000;
 const SE_DACL_PROTECTED = 0x1000;
+const DELETE = 0x00010000;
 const READ_CONTROL = 0x00020000;
+const SYNCHRONIZE = 0x00100000;
+const FILE_READ_ATTRIBUTES = 0x0080;
 const WRITE_DAC = 0x00040000;
 const FILE_ALL_ACCESS = 0x001F01FF;
 const FILE_SHARE_READ = 0x1;
