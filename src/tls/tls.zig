@@ -8,6 +8,7 @@ pub const Suite = suites.Suite;
 pub const der = @import("der.zig");
 pub const pem = @import("pem.zig");
 pub const PrivateKey = @import("PrivateKey.zig");
+pub const rsa = @import("rsa.zig");
 pub const CertChain = @import("CertChain.zig");
 pub const Connection = @import("Connection.zig");
 pub const key_share = @import("handshake/key_share.zig");

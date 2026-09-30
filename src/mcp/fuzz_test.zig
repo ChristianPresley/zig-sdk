@@ -197,6 +197,10 @@ fn tlsParsers(_: void, smith: *Smith) anyerror!void {
     _ = tls.client.CertificateRequest.parse(copy[0..bytes.len]) catch {};
     _ = tls.der.parse(bytes) catch {};
     _ = tls.PrivateKey.parseDer(bytes) catch {};
+    _ = tls.rsa.parsePkcs1(bytes) catch {};
+    var share_public: [tls.key_share.max_public_len]u8 = undefined;
+    var share_secret: [tls.key_share.max_shared_len]u8 = undefined;
+    _ = tls.key_share.respond(std.testing.io, .x25519_mlkem768, bytes, &share_public, &share_secret) catch {};
     _ = tls.x509.basicConstraints(bytes) catch {};
     _ = tls.x509.keyUsage(bytes) catch {};
     _ = tls.verify.verifyChain(&.{bytes}, "localhost", .self_signed, 0) catch {};
@@ -208,5 +212,5 @@ fn tlsParsers(_: void, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: TLS message, DER, PEM and key parsers" {
-    try std.testing.fuzz({}, tlsParsers, .{ .corpus = &.{ "\x03\x03" ++ "\x00" ** 32 ++ "\x00\x00\x02\x13\x01\x01\x00\x00\x00", "0\x82\x01\x00", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n" } });
+    try std.testing.fuzz({}, tlsParsers, .{ .corpus = &.{ "\x03\x03" ++ "\x00" ** 32 ++ "\x00\x00\x02\x13\x01\x01\x00\x00\x00", "0\x82\x01\x00", "0\x82\x04\xa4\x02\x01\x00\x02\x82\x01\x01\x00", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n" } });
 }

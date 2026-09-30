@@ -82,7 +82,7 @@ pub fn fromDerOwned(gpa: Allocator, certs: [][]u8, key: PrivateKey) Error!CertCh
     for (certs) |c| x509.precheck(c) catch return error.InvalidCertificate;
     const leaf: Certificate = .{ .buffer = certs[0], .index = 0 };
     const parsed = leaf.parse() catch return error.InvalidCertificate;
-    var pk_buf: [97]u8 = undefined;
+    var pk_buf: [PrivateKey.max_public_key_len]u8 = undefined;
     const pk = key.publicKeyBytes(&pk_buf);
     if (!std.mem.eql(u8, pk, parsed.pubKey())) return error.KeyMismatch;
     const algo_ok = switch (parsed.pub_key_algo) {
@@ -92,6 +92,7 @@ pub fn fromDerOwned(gpa: Allocator, certs: [][]u8, key: PrivateKey) Error!CertCh
             else => false,
         },
         .curveEd25519 => key.kind() == .ed25519,
+        .rsaEncryption => key.kind() == .rsa,
         else => false,
     };
     if (!algo_ok) return error.KeyMismatch;
@@ -158,6 +159,8 @@ test "load fixture chains" {
         .{ .cert = "test/fixtures/tls/pem/p384.crt", .key = "test/fixtures/tls/pem/p384.key", .count = 1 },
         .{ .cert = "test/fixtures/tls/pem/ed25519.crt", .key = "test/fixtures/tls/pem/ed25519.key", .count = 1 },
         .{ .cert = "test/fixtures/tls/pem/chain.crt", .key = "test/fixtures/tls/pem/chain-leaf.key", .count = 2 },
+        .{ .cert = "test/fixtures/tls/pem/rsa2048.crt", .key = "test/fixtures/tls/pem/rsa2048.key", .count = 1 },
+        .{ .cert = "test/fixtures/tls/pem/rsa3072.crt", .key = "test/fixtures/tls/pem/rsa3072-pkcs1.key", .count = 1 },
     };
     for (cases) |case| {
         var chain = try loadFiles(gpa, io, case.cert, case.key);
@@ -169,4 +172,6 @@ test "load fixture chains" {
     }
     // A key that belongs to another certificate is rejected.
     try std.testing.expectError(error.KeyMismatch, loadFiles(gpa, io, "test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/p384.key"));
+    try std.testing.expectError(error.KeyMismatch, loadFiles(gpa, io, "test/fixtures/tls/pem/rsa2048.crt", "test/fixtures/tls/pem/rsa3072.key"));
+    try std.testing.expectError(error.KeyMismatch, loadFiles(gpa, io, "test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/rsa2048.key"));
 }

@@ -31,7 +31,10 @@ pub const Options = struct {
     /// Application protocols in preference order. Empty sends no ALPN extension.
     alpn: []const []const u8 = &.{},
     cipher_suites: []const Suite = suites.default_suites,
-    /// Groups in preference order. The key share is sent for the first one.
+    /// Groups in preference order. The client sends a key share for the first group. When
+    /// the first group is a hybrid group, the client also sends a key share for the first
+    /// group without a post-quantum part. A server without the hybrid group then needs no
+    /// HelloRetryRequest.
     groups: []const key_share.Group = key_share.default_groups,
     /// The certificate chain to present when the server asks for one. Without it the
     /// client answers a request with an empty certificate list.
@@ -53,6 +56,45 @@ pub const ConnectError = common.Error;
 const offered_schemes = common.signature_schemes;
 const client_verify_context = codec.client_certificate_verify_context;
 
+/// The largest HelloRetryRequest cookie the client echoes. A larger cookie ends the
+/// handshake with `illegal_parameter`.
+pub const max_cookie_len = 8 << 10;
+/// The ClientHello buffer: two key shares, the cookie and the other extensions.
+const client_hello_buffer_len = max_cookie_len + 2 * (4 + key_share.max_public_len) + 2048;
+
+/// The key shares of a ClientHello: one, or a hybrid share and a fallback share.
+const Shares = struct {
+    items: [2]key_share.KeyShare = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const Shares) []const key_share.KeyShare {
+        return self.items[0..self.len];
+    }
+
+    fn find(self: *const Shares, group: key_share.Group) ?*const key_share.KeyShare {
+        for (self.items[0..self.len]) |*s| if (s.group() == group) return s;
+        return null;
+    }
+
+    fn wipe(self: *Shares) void {
+        for (self.items[0..self.len]) |*s| s.wipe();
+        self.len = 0;
+    }
+
+    /// The shares for the first ClientHello.
+    fn generate(self: *Shares, io: std.Io, groups: []const key_share.Group) error{EntropyUnavailable}!void {
+        self.items[0] = try key_share.KeyShare.generate(io, groups[0]);
+        self.len = 1;
+        if (!groups[0].isHybrid()) return;
+        for (groups[1..]) |g| {
+            if (g.isHybrid()) continue;
+            self.items[1] = try key_share.KeyShare.generate(io, g);
+            self.len = 2;
+            return;
+        }
+    }
+};
+
 /// Run the client side of a handshake on a connected stream.
 pub fn connect(input: *Reader, output: *Writer, options: Options) ConnectError!Connection {
     if (options.cipher_suites.len == 0 or options.groups.len == 0) return error.TlsInternalError;
@@ -65,11 +107,12 @@ pub fn connect(input: *Reader, output: *Writer, options: Options) ConnectError!C
     options.io.randomSecure(&random) catch return error.EntropyUnavailable;
     var session_id: [32]u8 = undefined;
     options.io.randomSecure(&session_id) catch return error.EntropyUnavailable;
-    var share = key_share.KeyShare.generate(options.io, options.groups[0]) catch return error.EntropyUnavailable;
-    defer share.wipe();
+    var shares: Shares = .{};
+    defer shares.wipe();
+    shares.generate(options.io, options.groups) catch return error.EntropyUnavailable;
 
-    var ch_buf: [2048]u8 = undefined;
-    const hello1 = clientHello(&ch_buf, random, &session_id, options, &share, null);
+    var ch_buf: [client_hello_buffer_len]u8 = undefined;
+    const hello1 = clientHello(&ch_buf, random, &session_id, options, shares.slice(), null);
     c.writeRecord(.handshake, hello1) catch return error.WriteFailed;
     c.output.flush() catch return error.WriteFailed;
 
@@ -78,7 +121,7 @@ pub fn connect(input: *Reader, output: *Writer, options: Options) ConnectError!C
     const sh = ServerHello.parse(first.body) catch |e| return common.abortParse(&c, options.alert, e);
     const suite = offeredSuite(options, sh.cipher_suite) orelse return common.abort(&c, options.alert, .illegal_parameter, error.TlsIllegalParameter);
     switch (suite) {
-        inline else => |s| return run(Suite.Type(s), s, &c, &reader, options, &share, random, &session_id, hello1, first, sh),
+        inline else => |s| return run(Suite.Type(s), s, &c, &reader, options, &shares, random, &session_id, &ch_buf, hello1, first, sh),
     }
 }
 
@@ -88,9 +131,10 @@ fn run(
     c: *Connection,
     reader: *common.MessageReader,
     options: Options,
-    share: *key_share.KeyShare,
+    shares: *Shares,
     random: [32]u8,
     session_id: *const [32]u8,
+    ch_buf: *[client_hello_buffer_len]u8,
     hello1: []const u8,
     first: common.Message,
     first_sh: ServerHello,
@@ -107,17 +151,20 @@ fn run(
         if (!std.mem.eql(u8, sh.session_id, session_id)) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
         const wanted = sh.key_share_group orelse return common.abort(c, alert_out, .missing_extension, error.TlsMissingExtension);
         const group = key_share.Group.fromWire(wanted) orelse return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
-        if (!offersGroup(options, group) or group == share.group()) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
+        // The group must be offered, and must not be one that already has a key share.
+        if (!offersGroup(options, group) or shares.find(group) != null) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
+        if (sh.cookie) |cookie| if (cookie.len > max_cookie_len) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
         transcript.update(hello1);
         const ch1_hash = transcript.peek(S);
         transcript = .init(S);
         transcript.update(codec.messageHash(&msg_buf, &ch1_hash));
         transcript.update(first.raw);
 
-        share.wipe();
-        share.* = key_share.KeyShare.generate(options.io, group) catch return common.abort(c, alert_out, .internal_error, error.EntropyUnavailable);
-        var ch2_buf: [2048]u8 = undefined;
-        const hello2 = clientHello(&ch2_buf, random, session_id, options, share, sh.cookie);
+        shares.wipe();
+        shares.items[0] = key_share.KeyShare.generate(options.io, group) catch return common.abort(c, alert_out, .internal_error, error.EntropyUnavailable);
+        shares.len = 1;
+        // The first ClientHello is in the transcript, so its buffer is free again.
+        const hello2 = clientHello(ch_buf, random, session_id, options, shares.slice(), sh.cookie);
         c.writeChangeCipherSpec() catch return error.WriteFailed;
         ccs_sent = true;
         c.writeRecord(.handshake, hello2) catch return error.WriteFailed;
@@ -140,7 +187,8 @@ fn run(
 
     // Key exchange.
     const peer_group = sh.key_share_group orelse return common.abort(c, alert_out, .missing_extension, error.TlsMissingExtension);
-    if (peer_group != share.group().wire()) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
+    const selected = key_share.Group.fromWire(peer_group) orelse return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
+    const share = shares.find(selected) orelse return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
     const peer_public = sh.key_share_public orelse return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
     var shared_buf: [key_share.max_shared_len]u8 = undefined;
     defer crypto.secureZero(u8, &shared_buf);
@@ -253,16 +301,17 @@ fn sendClientCertificate(comptime S: type, c: *Connection, transcript: *suites.T
     transcript.update(cert_msg);
 
     const chain = options.identity orelse return;
-    const scheme = chain.key.scheme();
-    if (!req.offersScheme(@intFromEnum(scheme))) return common.abort(c, alert_out, .handshake_failure, error.TlsHandshakeFailure);
+    const scheme = for (chain.key.schemes()) |s| {
+        if (req.offersScheme(@intFromEnum(s))) break s;
+    } else return common.abort(c, alert_out, .handshake_failure, error.TlsHandshakeFailure);
     var to_sign: [client_verify_context.len + S.digest_length]u8 = undefined;
     @memcpy(to_sign[0..client_verify_context.len], client_verify_context);
     to_sign[client_verify_context.len..].* = transcript.peek(S);
     var noise: [48]u8 = undefined;
     options.io.randomSecure(&noise) catch return common.abort(c, alert_out, .internal_error, error.EntropyUnavailable);
     var sig_buf: [PrivateKey.max_signature_len]u8 = undefined;
-    const signature = chain.key.sign(&to_sign, noise, &sig_buf) catch return common.abort(c, alert_out, .internal_error, error.TlsInternalError);
-    var cv_buf: [256]u8 = undefined;
+    const signature = chain.key.signScheme(scheme, &to_sign, noise, &sig_buf) catch return common.abort(c, alert_out, .internal_error, error.TlsInternalError);
+    var cv_buf: [8 + PrivateKey.max_signature_len]u8 = undefined;
     const cv = codec.certificateVerify(&cv_buf, @intFromEnum(scheme), signature);
     c.writeRecord(.handshake, cv) catch return error.WriteFailed;
     transcript.update(cv);
@@ -278,7 +327,7 @@ fn isServerName(host: []const u8) bool {
     return true;
 }
 
-fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Options, share: *const key_share.KeyShare, cookie: ?[]const u8) []u8 {
+fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Options, shares: []const key_share.KeyShare, cookie: ?[]const u8) []u8 {
     var b: codec.Builder = .{ .buf = buf };
     b.byte(@intFromEnum(tls.HandshakeType.client_hello));
     const msg = b.beginLen(u24);
@@ -330,10 +379,12 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
         const ext = b.beginLen(u16);
         const list = b.beginLen(u16);
         var public_buf: [key_share.max_public_len]u8 = undefined;
-        const public = share.publicBytes(&public_buf);
-        b.int(u16, share.group().wire());
-        b.int(u16, @intCast(public.len));
-        b.bytes(public);
+        for (shares) |*share| {
+            const public = share.publicBytes(&public_buf);
+            b.int(u16, share.group().wire());
+            b.int(u16, @intCast(public.len));
+            b.bytes(public);
+        }
         b.endLen(u16, list);
         b.endLen(u16, ext);
     }

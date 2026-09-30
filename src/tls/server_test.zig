@@ -9,6 +9,10 @@ const Echo = struct {
     listener: Io.net.Server,
     io: Io,
     alpn: ?[]const u8 = null,
+    /// Run the handshake only, then wait for the client to close.
+    handshake_only: bool = false,
+    /// The group the server negotiated.
+    group: u16 = 0,
     result: anyerror!void = {},
     alert: std.crypto.tls.Alert = undefined,
 
@@ -33,6 +37,12 @@ const Echo = struct {
             .alert = &self.alert,
         });
         defer conn.deinit();
+        self.group = conn.group;
+        if (self.handshake_only) {
+            _ = conn.reader.discardRemaining() catch {};
+            conn.end() catch {};
+            return;
+        }
         if (conn.alpn()) |a| self.alpn = a;
         const line = try conn.reader.takeDelimiterExclusive('\n');
         try conn.writer.print("echo: {s}\n", .{line});
@@ -55,9 +65,14 @@ fn loadChain(gpa: std.mem.Allocator, io: Io, name: []const u8, key: []const u8) 
 }
 
 fn roundTrip(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, config_alpn: []const []const u8) !void {
+    return roundTripGroups(gpa, io, chain, config_alpn, tls.key_share.default_groups, null);
+}
+
+/// One echo with the std client. The test compares `expect_group` with the server group.
+fn roundTripGroups(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, config_alpn: []const []const u8, groups: []const tls.key_share.Group, expect_group: ?tls.key_share.Group) !void {
     const chains = [_]*const tls.CertChain{chain};
     var echo: Echo = .{
-        .server = try tls.Server.init(.{ .chains = &chains, .alpn = config_alpn }),
+        .server = try tls.Server.init(.{ .chains = &chains, .alpn = config_alpn, .groups = groups }),
         .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
         .io = io,
     };
@@ -96,6 +111,7 @@ fn roundTrip(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, config
     try writer.interface.flush();
     future.await(io);
     try echo.result;
+    if (expect_group) |g| try std.testing.expectEqual(g.wire(), echo.group);
     _ = gpa;
 }
 
@@ -107,6 +123,8 @@ test "handshake and echo with the std client for every key type" {
         .{ "p384.crt", "p384.key" },
         // Ed25519 is covered by the openssl interop test: the std client cannot verify it.
         .{ "chain.crt", "chain-leaf.key" },
+        .{ "rsa2048.crt", "rsa2048.key" },
+        .{ "rsa3072.crt", "rsa3072-pkcs1.key" },
     };
     for (cases) |case| {
         var chain = try loadChain(gpa, io, case[0], case[1]);
@@ -197,4 +215,125 @@ test "a TLS 1.2 client hello is refused with protocol_version" {
     try std.testing.expectEqual(@intFromEnum(std.crypto.tls.Alert.Description.missing_extension), alert[6]);
     future.await(io);
     try std.testing.expectError(error.TlsMissingExtension, echo.result);
+}
+
+test "the std client negotiates X25519MLKEM768" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var chain = try loadChain(gpa, io, "rsa2048.crt", "rsa2048.key");
+    defer chain.deinit();
+    // The std client sends a hybrid share. The server prefers it by default.
+    try roundTripGroups(gpa, io, &chain, &.{}, tls.key_share.default_groups, .x25519_mlkem768);
+    // Without the hybrid group the server takes a classical share.
+    try roundTripGroups(gpa, io, &chain, &.{}, &.{ .secp384r1, .x25519 }, .secp384r1);
+}
+
+/// The major and minor version of OpenSSL, or null when it is absent or is LibreSSL.
+fn opensslVersion(io: Io, gpa: std.mem.Allocator) ?[2]u32 {
+    const result = std.process.run(gpa, io, .{ .argv = &.{ "openssl", "version" }, .stdout_limit = .limited(256), .stderr_limit = .limited(256) }) catch return null;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return null;
+    const prefix = "OpenSSL ";
+    if (!std.mem.startsWith(u8, result.stdout, prefix)) return null;
+    var parts = std.mem.splitScalar(u8, result.stdout[prefix.len..], '.');
+    const major = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
+    const minor = std.fmt.parseInt(u32, parts.next() orelse return null, 10) catch return null;
+    return .{ major, minor };
+}
+
+/// Run `openssl s_client` with `extra` arguments against the SDK server and return its
+/// output. The server result and group are in `echo`.
+fn opensslClient(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, groups: []const tls.key_share.Group, extra: []const []const u8, echo: *Echo) ![]u8 {
+    const chains = [_]*const tls.CertChain{chain};
+    echo.* = .{
+        .server = try tls.Server.init(.{ .chains = &chains, .groups = groups }),
+        .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
+        .io = io,
+        .handshake_only = true,
+    };
+    defer echo.listener.deinit(io);
+    const port = echo.listener.socket.address.getPort();
+    var future = try io.concurrent(Echo.serve, .{echo});
+    defer _ = future.cancel(io);
+    var target_buf: [32]u8 = undefined;
+    const target = try std.fmt.bufPrint(&target_buf, "127.0.0.1:{d}", .{port});
+    var argv_buf: [32][]const u8 = undefined;
+    const base = [_][]const u8{ "openssl", "s_client", "-connect", target, "-tls1_3", "-servername", "localhost" };
+    @memcpy(argv_buf[0..base.len], &base);
+    @memcpy(argv_buf[base.len..][0..extra.len], extra);
+    // s_client reads its stdin until end of file. A pipe that is closed at once ends the session.
+    var child = try std.process.spawn(io, .{
+        .argv = argv_buf[0 .. base.len + extra.len],
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .create_no_window = true,
+    });
+    child.stdin.?.close(io);
+    child.stdin = null;
+    var out_buf: [4096]u8 = undefined;
+    var out_reader = child.stdout.?.reader(io, &out_buf);
+    const out = try out_reader.interface.allocRemaining(gpa, .limited(1 << 20));
+    errdefer gpa.free(out);
+    _ = try child.wait(io);
+    future.await(io);
+    return out;
+}
+
+fn expectContains(haystack: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, haystack, needle) == null) {
+        std.debug.print("missing \"{s}\" in:\n{s}\n", .{ needle, haystack });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "interop: openssl s_client with RSA-PSS and X25519MLKEM768" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const version = opensslVersion(io, gpa) orelse return error.SkipZigTest;
+    const has_mlkem = version[0] > 3 or (version[0] == 3 and version[1] >= 5);
+    var chain = try loadChain(gpa, io, "rsa2048.crt", "rsa2048.key");
+    defer chain.deinit();
+    var echo: Echo = undefined;
+
+    // Every RSA-PSS hash, chosen by the client.
+    for ([_][2][]const u8{
+        .{ "rsa_pss_rsae_sha256", "Peer signing digest: SHA256" },
+        .{ "rsa_pss_rsae_sha384", "Peer signing digest: SHA384" },
+        .{ "rsa_pss_rsae_sha512", "Peer signing digest: SHA512" },
+    }) |case| {
+        const out = try opensslClient(gpa, io, &chain, tls.key_share.default_groups, &.{ "-sigalgs", case[0], "-CAfile", "test/fixtures/tls/pem/rsa2048.crt", "-verify_return_error" }, &echo);
+        defer gpa.free(out);
+        try echo.result;
+        try expectContains(out, "Verify return code: 0 (ok)");
+        // OpenSSL 3.5 names the scheme. Older versions name the algorithm.
+        if (std.mem.indexOf(u8, out, "RSA-PSS") == null) try expectContains(out, case[0]);
+        try expectContains(out, case[1]);
+    }
+    // A client that offers only PKCS#1 v1.5 gets no RSA signature: TLS 1.3 forbids it.
+    {
+        const out = try opensslClient(gpa, io, &chain, tls.key_share.default_groups, &.{ "-sigalgs", "rsa_pkcs1_sha256" }, &echo);
+        defer gpa.free(out);
+        try std.testing.expectError(error.TlsHandshakeFailure, echo.result);
+    }
+    if (!has_mlkem) return;
+
+    var chain3072 = try loadChain(gpa, io, "rsa3072.crt", "rsa3072.key");
+    defer chain3072.deinit();
+    // The hybrid group in the first flight.
+    {
+        const out = try opensslClient(gpa, io, &chain3072, tls.key_share.default_groups, &.{ "-groups", "X25519MLKEM768:X25519" }, &echo);
+        defer gpa.free(out);
+        try echo.result;
+        try std.testing.expectEqual(tls.key_share.Group.x25519_mlkem768.wire(), echo.group);
+        try expectContains(out, "Negotiated TLS1.3 group: X25519MLKEM768");
+    }
+    // The client sends an X25519 share first. The server asks for the hybrid group.
+    {
+        const out = try opensslClient(gpa, io, &chain3072, tls.key_share.default_groups, &.{ "-groups", "X25519:X25519MLKEM768" }, &echo);
+        defer gpa.free(out);
+        try echo.result;
+        try std.testing.expectEqual(tls.key_share.Group.x25519_mlkem768.wire(), echo.group);
+    }
 }

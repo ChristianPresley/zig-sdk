@@ -36,6 +36,9 @@ pub const Config = struct {
     /// Reject clients that do not negotiate an application protocol.
     require_alpn: bool = false,
     cipher_suites: []const Suite = suites.default_suites,
+    /// Groups in preference order. A hybrid group that the client supports wins, even when
+    /// it costs a HelloRetryRequest. Among the other groups, a group with a client key share
+    /// wins.
     groups: []const key_share.Group = key_share.default_groups,
     /// What to do when the client asks for a server name no chain covers.
     server_name_mismatch: enum { ignore, alert } = .ignore,
@@ -93,7 +96,13 @@ const GroupChoice = struct {
     share: ?[]const u8,
 };
 
+/// A hybrid group from `config.groups` that the client supports wins, even when it costs a
+/// HelloRetryRequest. Else the first group with a client key share wins, else the first
+/// group that the client supports.
 fn selectGroup(config: Config, hello: *const codec.ClientHello) ?GroupChoice {
+    for (config.groups) |g| {
+        if (g.isHybrid() and hello.offersGroup(g.wire())) return .{ .group = g, .share = hello.keyShare(g.wire()) };
+    }
     for (config.groups) |g| {
         if (hello.keyShare(g.wire())) |share| return .{ .group = g, .share = share };
     }
@@ -142,7 +151,8 @@ fn run(
 
     var hello = hello1.*;
     var choice = selectGroup(config, &hello) orelse return abort(c, options, .handshake_failure, error.TlsHandshakeFailure);
-    var msg_buf: [1024]u8 = undefined;
+    // Large enough for a ServerHello with a hybrid key share and for an RSA CertificateVerify.
+    var msg_buf: [2048]u8 = undefined;
 
     if (choice.share == null) {
         // HelloRetryRequest: replace ClientHello1 in the transcript with its hash.
@@ -171,22 +181,23 @@ fn run(
     // Decisions that depend on the final ClientHello.
     if (hello.server_name) |name| c.setServerName(name);
     const chain = selectChain(config, c.serverName()) orelse return abort(c, options, .unrecognized_name, error.TlsUnrecognizedName);
-    const scheme = chain.key.scheme();
-    if (!hello.offersScheme(@intFromEnum(scheme))) return abort(c, options, .handshake_failure, error.TlsHandshakeFailure);
+    const scheme = for (chain.key.schemes()) |s| {
+        if (hello.offersScheme(@intFromEnum(s))) break s;
+    } else return abort(c, options, .handshake_failure, error.TlsHandshakeFailure);
     const alpn = selectAlpn(config, &hello) catch return abort(c, options, .no_application_protocol, error.TlsNoApplicationProtocol);
     if (alpn) |name| c.setAlpn(name);
 
     // Key exchange.
-    var share = key_share.KeyShare.generate(options.io, choice.group) catch return abort(c, options, .internal_error, error.EntropyUnavailable);
-    defer share.wipe();
     var shared_buf: [key_share.max_shared_len]u8 = undefined;
     defer crypto.secureZero(u8, &shared_buf);
-    const shared = share.sharedSecret(choice.share.?, &shared_buf) catch |e| switch (e) {
+    var public_buf: [key_share.max_public_len]u8 = undefined;
+    const answer = key_share.respond(options.io, choice.group, choice.share.?, &public_buf, &shared_buf) catch |e| switch (e) {
         error.IllegalParameter => return abort(c, options, .illegal_parameter, error.TlsIllegalParameter),
         error.DecryptError => return abort(c, options, .decrypt_error, error.TlsDecryptError),
+        error.EntropyUnavailable => return abort(c, options, .internal_error, error.EntropyUnavailable),
     };
-    var public_buf: [key_share.max_public_len]u8 = undefined;
-    const public = share.publicBytes(&public_buf);
+    const shared = answer.shared;
+    const public = answer.public;
 
     // ServerHello.
     var random: [32]u8 = undefined;
@@ -223,7 +234,7 @@ fn run(
     var noise: [48]u8 = undefined;
     options.io.randomSecure(&noise) catch return abort(c, options, .internal_error, error.EntropyUnavailable);
     var sig_buf: [PrivateKey.max_signature_len]u8 = undefined;
-    const signature = chain.key.sign(&to_sign, noise, &sig_buf) catch return abort(c, options, .internal_error, error.TlsInternalError);
+    const signature = chain.key.signScheme(scheme, &to_sign, noise, &sig_buf) catch return abort(c, options, .internal_error, error.TlsInternalError);
     const cv = codec.certificateVerify(&msg_buf, @intFromEnum(scheme), signature);
     c.writeRecord(.handshake, cv) catch return error.WriteFailed;
     transcript.update(cv);
