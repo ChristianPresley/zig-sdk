@@ -1,0 +1,23 @@
+.{
+    .repo = "https://github.com/json-schema-org/JSON-Schema-Test-Suite",
+    .commit = "5b0ee1613e45fcc2bddac00e07c19cd49b00d8a8",
+    .fetched = "2026-09-30",
+    .license = "LICENSE (MIT)",
+    .modified = false,
+    // Copied directories and files, below the root of the upstream repository:
+    // tests/draft2020-12/*.json: every file of the required tests.
+    // tests/draft2020-12/optional/: only the files that src/mcp/schema/suite_test.zig runs.
+    // remotes/draft2020-12/: the remote documents without a custom meta-schema.
+    .copied = .{
+        "tests/draft2020-12/*.json",
+        "tests/draft2020-12/optional/anchor.json",
+        "tests/draft2020-12/optional/dynamicRef.json",
+        "tests/draft2020-12/optional/ecmascript-regex.json",
+        "tests/draft2020-12/optional/id.json",
+        "tests/draft2020-12/optional/non-bmp-regex.json",
+        "tests/draft2020-12/optional/no-schema.json",
+        "tests/draft2020-12/optional/refOfUnknownKeyword.json",
+        "tests/draft2020-12/optional/unknownKeyword.json",
+        "remotes/draft2020-12/ (without metaschema-*.json and format-assertion-*.json)",
+    },
+}
