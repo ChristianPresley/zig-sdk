@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # rewrite/** branches carry a candidate main head so its checks run before main moves.
+    branches: [main, "rewrite/**"]
   pull_request:
   workflow_dispatch:
 
@@ -26,14 +27,21 @@ jobs:
 
   commit-policy:
     name: commit-policy
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # On a pull request, check its head commits, not the synthetic merge commit.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: ./.github/actions/setup-zig
-      - run: zig build commit-policy -- "origin/${{ github.base_ref }}..HEAD"
+      - name: Check every commit of a pull request, or every reachable commit of a push
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            zig build commit-policy -- "origin/${{ github.base_ref }}..HEAD"
+          else
+            zig build commit-policy -- HEAD
+          fi
 
   test:
     name: test (${{ matrix.os }}, ${{ matrix.optimize }})
