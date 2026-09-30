@@ -58,6 +58,15 @@ fn slowTask(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallTo
     return .{ .input_required = ir };
 }
 
+var read_count: std.atomic.Value(u32) = .init(0);
+
+fn readCounted(ctx: *RequestContext, uri: []const u8) anyerror!mcp.Outcome(types.ReadResourceResult) {
+    _ = read_count.fetchAdd(1, .monotonic);
+    const contents = try ctx.arena.alloc(types.ResourceContents, 1);
+    contents[0] = .{ .text = .{ .uri = uri, .mimeType = "text/plain", .text = "counted" } };
+    return .{ .complete = .{ .contents = contents } };
+}
+
 fn readStatic(ctx: *RequestContext, uri: []const u8) anyerror!mcp.Outcome(types.ReadResourceResult) {
     const contents = try ctx.arena.alloc(types.ResourceContents, 1);
     contents[0] = .{ .text = .{ .uri = uri, .mimeType = "text/plain", .text = "static text" } };
@@ -72,12 +81,13 @@ const Fixture = struct {
     fn init(self: *Fixture, options: Client.Options) !void {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
-        self.server = try Server.init(gpa, io, .{ .info = .{ .name = "srv", .version = "1" }, .mrtr = .{ .elicitation = true, .sampling = true, .roots = true }, .tasks = .{ .poll_interval_ms = 10 } });
+        self.server = try Server.init(gpa, io, .{ .info = .{ .name = "srv", .version = "1" }, .mrtr = .{ .elicitation = true, .sampling = true, .roots = true }, .tasks = .{ .poll_interval_ms = 10 }, .cache = .{ .reads = .{ .ttl_ms = 60_000 } } });
         try self.server.addTool(.{ .name = "add" }, add);
         try self.server.addToolJson(.{ .name = "slow_task", .task_support = .optional }, slowTask);
         try self.server.addToolJson(.{ .name = "ask_name" }, askName);
         try self.server.addToolJson(.{ .name = "everything" }, everything);
         try self.server.addResource(.{ .uri = "test://static", .name = "static" }, readStatic);
+        try self.server.addResource(.{ .uri = "test://counted", .name = "counted" }, readCounted);
         self.link = .init(io, gpa, &self.server);
         self.client = .init(gpa, io, options);
         self.client.connect(self.link.transport());
@@ -296,4 +306,33 @@ test "a task result without the extension is invalid" {
     // The server runs the tool at once because the client did not declare the extension.
     const direct = try f.client.callTool(arena, "slow_task", null, .{});
     try std.testing.expectEqualStrings("task hello Alice", direct.content[0].text.text);
+}
+
+test "the result cache serves reads with a lifetime until invalidated" {
+    var f: Fixture = undefined;
+    try f.init(.{ .info = .{ .name = "cli", .version = "1" }, .cache = .{ .enabled = true } });
+    defer f.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    read_count.store(0, .monotonic);
+
+    _ = try f.client.readResource(arena, "test://counted", .{});
+    _ = try f.client.readResource(arena, "test://counted", .{});
+    try std.testing.expectEqual(1, read_count.load(.monotonic));
+    // Bypass and refresh reach the server; a plain read is served from the cache again.
+    _ = try f.client.readResource(arena, "test://counted", .{ .cache_mode = .bypass });
+    try std.testing.expectEqual(2, read_count.load(.monotonic));
+    _ = try f.client.readResource(arena, "test://counted", .{ .cache_mode = .refresh });
+    try std.testing.expectEqual(3, read_count.load(.monotonic));
+    _ = try f.client.readResource(arena, "test://counted", .{});
+    try std.testing.expectEqual(3, read_count.load(.monotonic));
+    f.client.invalidateCache();
+    _ = try f.client.readResource(arena, "test://counted", .{});
+    try std.testing.expectEqual(4, read_count.load(.monotonic));
+    // Every read carries the lifetime hint of the server; discovery carries none.
+    _ = try f.client.readResource(arena, "test://static", .{});
+    try std.testing.expectEqual(2, f.client.cache.count());
+    _ = try f.client.discover(arena, .{});
+    try std.testing.expectEqual(2, f.client.cache.count());
 }

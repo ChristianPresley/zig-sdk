@@ -18,6 +18,7 @@ const RequestId = @import("../jsonrpc/id.zig").RequestId;
 const Transport = @import("../transport/Transport.zig");
 const Limits = @import("../Limits.zig");
 const tasks = @import("../server/tasks.zig");
+const cache_mod = @import("cache.zig");
 
 const Client = @This();
 
@@ -26,6 +27,7 @@ io: Io,
 options: Options,
 transport: ?Transport.ClientTransport = null,
 next_id: std.atomic.Value(i64) = .init(1),
+cache: cache_mod.Cache,
 
 pub const Options = struct {
     info: types.Implementation,
@@ -34,6 +36,8 @@ pub const Options = struct {
     limits: Limits = .{},
     /// Ask the server for log messages at this level and above (deprecated feature).
     log_level: ?types.LoggingLevel = null,
+    /// The result cache for results that carry a positive `ttlMs`. Off by default.
+    cache: cache_mod.Options = .{},
 };
 
 /// The context every hook receives.
@@ -86,6 +90,8 @@ pub const RequestOptions = struct {
     allow_task: bool = false,
     /// What to do when the stream is lost before any response byte arrived.
     retry: Retry = .auto,
+    /// How this request uses the result cache.
+    cache_mode: cache_mod.Mode = .default,
     diagnostics: ?*Diagnostics = null,
     userdata: ?*anyopaque = null,
 };
@@ -121,11 +127,17 @@ pub const RequestError = error{
 };
 
 pub fn init(gpa: Allocator, io: Io, options: Options) Client {
-    return .{ .gpa = gpa, .io = io, .options = options };
+    return .{ .gpa = gpa, .io = io, .options = options, .cache = .init(gpa, io, options.cache) };
 }
 
 pub fn deinit(self: *Client) void {
+    self.cache.deinit();
     self.* = undefined;
+}
+
+/// Drop every cached result.
+pub fn invalidateCache(self: *Client) void {
+    self.cache.invalidate(null);
 }
 
 pub fn connect(self: *Client, transport: Transport.ClientTransport) void {
@@ -384,6 +396,8 @@ const Collector = struct {
 };
 
 fn dispatchNotification(self: *Client, method_name: []const u8, params: ?Value, options: RequestOptions) void {
+    // A change notification invalidates the cached lists and reads.
+    if (cache_mod.Cache.methodForNotification(method_name)) |m| self.cache.invalidate(m);
     // Parsed notification params live only for the callback.
     var scratch: std.heap.ArenaAllocator = .init(self.gpa);
     defer scratch.deinit();
@@ -414,6 +428,14 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
     var own_token: Transport.CancelToken = .{};
     const cancel = options.cancel orelse &own_token;
     const deadline: Io.Timeout = if (options.timeout) |d| .{ .deadline = Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake }) } else .none;
+
+    // The cache serves idempotent reads that a server marked with a lifetime.
+    const cacheable = self.options.cache.enabled and options.cache_mode != .bypass and known != null and known.?.isCacheable() and params.object.get("inputResponses") == null;
+    const cache_key: ?[]u8 = if (cacheable) try cache_mod.Cache.key(arena, method_name, params) else null;
+    if (cache_key) |k| if (options.cache_mode == .default) if (self.cache.get(k)) |text| {
+        const value = json.parseTree(arena, text) catch return error.InvalidResponse;
+        return .{ .value = value };
+    };
 
     var round: u32 = 0;
     var version_retried = false;
@@ -475,7 +497,13 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             if (options.diagnostics) |d| d.result_type_absent = true;
             return .{ .value = result };
         }
-        if (std.mem.eql(u8, result_type.?, types.result_type_complete)) return .{ .value = result };
+        if (std.mem.eql(u8, result_type.?, types.result_type_complete)) {
+            if (cache_key) |k| if (input_responses == null) if (result.object.get("ttlMs")) |ttl| if (ttl == .integer) {
+                const text = try json.writeAlloc(arena, result);
+                try self.cache.put(k, method_name, text, ttl.integer);
+            };
+            return .{ .value = result };
+        }
         if (std.mem.eql(u8, result_type.?, "task")) {
             // Only a `tools/call` can become a task, and only when the client declared the extension.
             if (known != .@"tools/call" or !self.options.capabilities.hasExtension(tasks.extension_id)) return error.InvalidResponse;
