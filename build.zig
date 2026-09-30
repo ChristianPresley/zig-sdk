@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
 
     // Formatting check.
     const fmt_step = b.step("fmt", "Check formatting");
-    const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "build.zig.zon", "src", "examples", "tools" }, .check = true });
+    const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "build.zig.zon", "src", "examples", "tools", "conformance" }, .check = true });
     fmt_step.dependOn(&fmt.step);
 
     // Examples.
@@ -41,6 +41,18 @@ pub fn build(b: *std.Build) void {
         b.step(b.fmt("run-{s}", .{name}), b.fmt("Run the {s} example", .{name})).dependOn(&run.step);
     }
 
+    // Conformance fixtures.
+    const conformance_server = b.addExecutable(.{
+        .name = "mcp-conformance-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("conformance/everything_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mcp", .module = mcp }},
+        }),
+    });
+    b.step("conformance-server", "Build the conformance everything server").dependOn(&b.addInstallArtifact(conformance_server, .{}).step);
+
     // Autodocs.
     const docs_obj = b.addObject(.{
         .name = "mcp",
@@ -58,7 +70,7 @@ pub fn build(b: *std.Build) void {
     b.step("docs", "Generate API documentation").dependOn(&install_docs.step);
 
     // Tools written in Zig and run through `zig build <step>`.
-    addTool(b, "lint-docs", "Check prose against the project STE profile", "tools/lint_docs.zig", &.{ "README.md", "docs", "src" });
+    addTool(b, "lint-docs", "Check prose against the project STE profile", "tools/lint_docs.zig", &.{ "README.md", "docs", "src", "conformance" });
     addTool(b, "census", "Check the schema fixtures against the Zig types", "tools/schema_census.zig", &.{});
     addTool(b, "commit-policy", "Check commits for a sole signed author", "tools/commit_policy.zig", &.{});
 }

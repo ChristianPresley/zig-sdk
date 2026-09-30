@@ -16,7 +16,7 @@ The project is in development. The table shows the parts that exist today.
 | Multi round-trip requests with sealed request state | Done |
 | Subscriptions (`subscriptions/listen`) | Done |
 | stdio transport (server) | Done |
-| Streamable HTTP transport | Planned |
+| Streamable HTTP transport (server) | Done, passes all 37 scored scenarios of the official conformance suite |
 | TLS 1.3 server and client | Planned |
 | Client | Planned |
 | Authorization (OAuth 2.1) | Planned |

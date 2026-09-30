@@ -324,7 +324,11 @@ fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
             return false;
         }
     }
-    // Body.
+    // Body. A request without Content-Length and without Transfer-Encoding has an empty
+    // body (RFC 9112 section 6.3). Without this, std reads the connection until EOF.
+    if (request.head.transfer_encoding == .none and request.head.content_length == null) {
+        request.head.content_length = 0;
+    }
     var body_buf: [4096]u8 = undefined;
     const body_reader = request.readerExpectNone(&body_buf);
     const body = body_reader.allocRemaining(arena, .limited(self.limits.http.max_body_bytes)) catch |e| switch (e) {

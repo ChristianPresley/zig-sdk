@@ -46,14 +46,9 @@ pub const DecodeError = error{ InvalidEncoding, OutOfMemory };
 pub fn decodeValue(arena: Allocator, value: []const u8) DecodeError![]const u8 {
     if (!(std.mem.startsWith(u8, value, sentinel_start) and std.mem.endsWith(u8, value, sentinel_end))) return value;
     const body = value[sentinel_start.len .. value.len - sentinel_end.len];
+    // Standard alphabet with mandatory padding: unpadded or non-alphabet input is rejected.
     const decoder = std.base64.standard.Decoder;
-    const len = decoder.calcSizeForSlice(body) catch {
-        const unpadded = std.base64.standard_no_pad.Decoder;
-        const len2 = unpadded.calcSizeForSlice(body) catch return error.InvalidEncoding;
-        const out2 = try arena.alloc(u8, len2);
-        unpadded.decode(out2, body) catch return error.InvalidEncoding;
-        return out2;
-    };
+    const len = decoder.calcSizeForSlice(body) catch return error.InvalidEncoding;
     const out = try arena.alloc(u8, len);
     decoder.decode(out, body) catch return error.InvalidEncoding;
     return out;
@@ -245,6 +240,12 @@ test "sentinel encoding" {
     try std.testing.expect(std.mem.startsWith(u8, try encodeValue(arena, "=?base64?x?="), "=?base64?"));
     try std.testing.expect(std.mem.startsWith(u8, try encodeValue(arena, "line1\nline2"), "=?base64?"));
     try std.testing.expectEqualStrings("", try encodeValue(arena, ""));
+    // SEP-2243 test-case table: padding is mandatory and the alphabet is strict.
+    try std.testing.expectEqualStrings("Hello", try decodeValue(arena, "=?base64?SGVsbG8=?="));
+    try std.testing.expectError(error.InvalidEncoding, decodeValue(arena, "=?base64?SGVsbG8?="));
+    try std.testing.expectError(error.InvalidEncoding, decodeValue(arena, "=?base64?SGVs!!!bG8=?="));
+    try std.testing.expectEqualStrings("SGVsbG8=", try decodeValue(arena, "SGVsbG8="));
+    try std.testing.expectEqualStrings("=?base64?SGVsbG8=", try decodeValue(arena, "=?base64?SGVsbG8="));
 }
 
 test "verify headers against body" {
