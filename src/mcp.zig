@@ -62,4 +62,12 @@ test {
     _ = @import("mcp/transport/router.zig");
     _ = @import("mcp/transport/unix_test.zig");
     _ = @import("tls/tls.zig");
+    _ = @import("mcp/spec_test/base_protocol_test.zig");
+    _ = @import("mcp/spec_test/transports_test.zig");
+    _ = @import("mcp/spec_test/authorization_test.zig");
+    _ = @import("mcp/spec_test/authorization_discovery_test.zig");
+    _ = @import("mcp/spec_test/patterns_test.zig");
+    _ = @import("mcp/spec_test/server_features_test.zig");
+    _ = @import("mcp/spec_test/utilities_test.zig");
+    _ = @import("mcp/spec_test/client_features_test.zig");
 }
