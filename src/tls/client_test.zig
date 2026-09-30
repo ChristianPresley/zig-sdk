@@ -8,9 +8,15 @@ const Echo = struct {
     server: tls.Server,
     listener: Io.net.Server,
     io: Io,
-    alpn: ?[]const u8 = null,
+    /// A copy of the negotiated protocol: the connection lives only inside `serveInner`.
+    alpn_buf: [32]u8 = undefined,
+    alpn_len: u8 = 0,
     result: anyerror!void = {},
     alert: std.crypto.tls.Alert = undefined,
+
+    fn alpn(self: *const Echo) ?[]const u8 {
+        return if (self.alpn_len == 0) null else self.alpn_buf[0..self.alpn_len];
+    }
 
     fn serve(self: *Echo) void {
         self.result = self.serveInner();
@@ -32,7 +38,10 @@ const Echo = struct {
             .alert = &self.alert,
         });
         defer conn.deinit();
-        if (conn.alpn()) |a| self.alpn = a;
+        if (conn.alpn()) |a| {
+            @memcpy(self.alpn_buf[0..a.len], a);
+            self.alpn_len = @intCast(a.len);
+        }
         const line = try conn.reader.takeDelimiterExclusive('\n');
         try conn.writer.print("echo: {s}\n", .{line});
         try conn.writer.flush();
@@ -70,8 +79,8 @@ const ServerSetup = struct {
 };
 
 /// One handshake and echo between the SDK client and the SDK server. Returns the client
-/// error, if any. The server result is in `echo`.
-fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, client_setup: ClientSetup, echo_out: *Echo) !?[]const u8 {
+/// error, if any. The server result is in `echo`. `expect_alpn` is checked on the client.
+fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, client_setup: ClientSetup, echo_out: *Echo, expect_alpn: ?[]const u8) !void {
     const chains = [_]*const tls.CertChain{chain};
     echo_out.* = .{
         .server = try tls.Server.init(.{ .chains = &chains, .alpn = server_setup.alpn, .groups = server_setup.groups, .client_auth = server_setup.client_auth, .client_trust = server_setup.client_trust }),
@@ -115,11 +124,15 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
     try writer.interface.flush();
     const line = try conn.reader.takeDelimiterExclusive('\n');
     try std.testing.expectEqualStrings("echo: hello", line);
+    if (expect_alpn) |want| {
+        try std.testing.expectEqualStrings(want, conn.alpn() orelse "");
+    } else {
+        try std.testing.expect(conn.alpn() == null);
+    }
     try conn.end();
     try writer.interface.flush();
     future.await(io);
     try echo_out.result;
-    return conn.alpn();
 }
 
 test "handshake with every self-signed key type" {
@@ -134,9 +147,8 @@ test "handshake with every self-signed key type" {
         var chain = try loadChain(gpa, io, case[0], case[1]);
         defer chain.deinit();
         var echo: Echo = undefined;
-        const alpn = try roundTrip(io, &chain, .{ .alpn = &.{ "h2", "http/1.1" } }, .{ .trust = .self_signed, .alpn = &.{"http/1.1"} }, &echo);
-        try std.testing.expectEqualStrings("http/1.1", alpn.?);
-        try std.testing.expectEqualStrings("http/1.1", echo.alpn.?);
+        try roundTrip(io, &chain, .{ .alpn = &.{ "h2", "http/1.1" } }, .{ .trust = .self_signed, .alpn = &.{"http/1.1"} }, &echo, "http/1.1");
+        try std.testing.expectEqualStrings("http/1.1", echo.alpn().?);
     }
 }
 
@@ -149,12 +161,12 @@ test "a chain verifies against the CA set, by name and by address" {
     defer set.deinit();
     try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
     var echo: Echo = undefined;
-    _ = try roundTrip(io, &chain, .{}, .{ .trust = .{ .ca_set = &set }, .host = "localhost" }, &echo);
-    _ = try roundTrip(io, &chain, .{}, .{ .trust = .{ .ca_set = &set }, .host = "127.0.0.1" }, &echo);
+    try roundTrip(io, &chain, .{}, .{ .trust = .{ .ca_set = &set }, .host = "localhost" }, &echo, null);
+    try roundTrip(io, &chain, .{}, .{ .trust = .{ .ca_set = &set }, .host = "127.0.0.1" }, &echo, null);
     // The leaf alone, without the intermediate, is the same chain here: the CA signs it.
     var leaf_only = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
     defer leaf_only.deinit();
-    _ = try roundTrip(io, &leaf_only, .{}, .{ .trust = .{ .ca_set = &set } }, &echo);
+    try roundTrip(io, &leaf_only, .{}, .{ .trust = .{ .ca_set = &set } }, &echo, null);
 }
 
 test "certificate problems end the handshake with an alert" {
@@ -169,16 +181,16 @@ test "certificate problems end the handshake with an alert" {
     try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
     var echo: Echo = undefined;
 
-    try std.testing.expectError(error.TlsCertificateHostMismatch, roundTrip(io, &chain, .{}, .{ .trust = .{ .ca_set = &set }, .host = "example.com" }, &echo));
+    try std.testing.expectError(error.TlsCertificateHostMismatch, roundTrip(io, &chain, .{}, .{ .trust = .{ .ca_set = &set }, .host = "example.com" }, &echo, null));
     try std.testing.expectError(error.TlsAlert, echo.result);
     try std.testing.expectEqual(std.crypto.tls.Alert.Description.bad_certificate, echo.alert.description);
 
-    try std.testing.expectError(error.TlsCertificateIssuerNotFound, roundTrip(io, &self_signed, .{}, .{ .trust = .{ .ca_set = &set } }, &echo));
+    try std.testing.expectError(error.TlsCertificateIssuerNotFound, roundTrip(io, &self_signed, .{}, .{ .trust = .{ .ca_set = &set } }, &echo, null));
     try std.testing.expectEqual(std.crypto.tls.Alert.Description.unknown_ca, echo.alert.description);
 
-    try std.testing.expectError(error.TlsCertificateNotVerified, roundTrip(io, &chain, .{}, .{ .trust = .self_signed }, &echo));
-    try std.testing.expectError(error.TlsCertificateNotVerified, roundTrip(io, &chain, .{}, .{ .trust = .{ .pinned_leaf = self_signed.certs[0] } }, &echo));
-    _ = try roundTrip(io, &chain, .{}, .{ .trust = .{ .pinned_leaf = chain.certs[0] }, .host = "anything.invalid" }, &echo);
+    try std.testing.expectError(error.TlsCertificateNotVerified, roundTrip(io, &chain, .{}, .{ .trust = .self_signed }, &echo, null));
+    try std.testing.expectError(error.TlsCertificateNotVerified, roundTrip(io, &chain, .{}, .{ .trust = .{ .pinned_leaf = self_signed.certs[0] } }, &echo, null));
+    try roundTrip(io, &chain, .{}, .{ .trust = .{ .pinned_leaf = chain.certs[0] }, .host = "anything.invalid" }, &echo, null);
 }
 
 test "hello retry request when the server wants another group" {
@@ -188,9 +200,9 @@ test "hello retry request when the server wants another group" {
     defer chain.deinit();
     var echo: Echo = undefined;
     // The client shares x25519 first; the server only takes P-384.
-    _ = try roundTrip(io, &chain, .{ .groups = &.{.secp384r1} }, .{ .trust = .self_signed, .groups = &.{ .x25519, .secp384r1 } }, &echo);
+    try roundTrip(io, &chain, .{ .groups = &.{.secp384r1} }, .{ .trust = .self_signed, .groups = &.{ .x25519, .secp384r1 } }, &echo, null);
     // No common group: the server refuses.
-    try std.testing.expectError(error.TlsAlert, roundTrip(io, &chain, .{ .groups = &.{.secp384r1} }, .{ .trust = .self_signed, .groups = &.{.x25519} }, &echo));
+    try std.testing.expectError(error.TlsAlert, roundTrip(io, &chain, .{ .groups = &.{.secp384r1} }, .{ .trust = .self_signed, .groups = &.{.x25519} }, &echo, null));
     try std.testing.expectError(error.TlsHandshakeFailure, echo.result);
 }
 
@@ -209,20 +221,20 @@ test "mutual authentication with client certificates" {
     var echo: Echo = undefined;
 
     // Required and presented: both sides see the peer.
-    _ = try roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed, .identity = &identity }, &echo);
+    try roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed, .identity = &identity }, &echo, null);
     // Required and absent: the server refuses with certificate_required. The client has
     // already sent its Finished, so it sees the alert or the closed socket afterwards.
-    const absent = roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed }, &echo);
+    const absent = roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed }, &echo, null);
     try std.testing.expect(std.meta.isError(absent));
     try std.testing.expectError(error.TlsCertificateRequired, echo.result);
     // Optional and absent: fine.
-    _ = try roundTrip(io, &server_chain, .{ .client_auth = .optional, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed }, &echo);
+    try roundTrip(io, &server_chain, .{ .client_auth = .optional, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed }, &echo, null);
     // Presented but not trusted: the server refuses with unknown_ca.
-    const untrusted = roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed, .identity = &self_signed }, &echo);
+    const untrusted = roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed, .identity = &self_signed }, &echo, null);
     try std.testing.expect(std.meta.isError(untrusted));
     try std.testing.expectError(error.TlsCertificateIssuerNotFound, echo.result);
     // An Ed25519 identity under a self-signed policy.
-    _ = try roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .self_signed }, .{ .trust = .self_signed, .identity = &self_signed }, &echo);
+    try roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .self_signed }, .{ .trust = .self_signed, .identity = &self_signed }, &echo, null);
 }
 
 test "every cipher suite negotiates with the SDK client" {
