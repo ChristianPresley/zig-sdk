@@ -18,6 +18,7 @@ const IconServer = struct {
     future: Io.Future(void),
     ca: tls.CaSet,
     requests: std.atomic.Value(u32) = .init(0),
+    stopping: std.atomic.Value(bool) = .init(false),
     /// The header names of the last request, lowercase and joined with commas.
     header_names: [512]u8 = undefined,
     header_names_len: usize = 0,
@@ -44,7 +45,7 @@ const IconServer = struct {
 
     fn stop(self: *IconServer) void {
         const io = std.testing.io;
-        _ = self.future.cancel(io);
+        mcp.util.wake.cancelAcceptLoop(io, &self.future, self.listener.socket.address, &self.stopping);
         self.listener.deinit(io);
         self.chain.deinit();
         self.ca.deinit();
@@ -64,9 +65,10 @@ const IconServer = struct {
 
     fn acceptLoop(self: *IconServer) void {
         const io = std.testing.io;
-        while (true) {
+        while (!self.stopping.load(.acquire)) {
             const stream = self.listener.accept(io) catch return;
             defer stream.close(io);
+            if (self.stopping.load(.acquire)) return;
             self.serveOne(stream) catch |e| switch (e) {
                 error.Canceled => return,
                 else => {},

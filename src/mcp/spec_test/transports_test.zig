@@ -844,6 +844,7 @@ const capture_tools =
 const Capture = struct {
     arena_state: std.heap.ArenaAllocator,
     listener: Io.net.Server,
+    stopping: std.atomic.Value(bool) = .init(false),
     port: u16,
     connections: usize = 0,
     requests: std.ArrayList(Captured) = .empty,
@@ -863,16 +864,17 @@ const Capture = struct {
 
     fn stop(self: *Capture) void {
         const io = std.testing.io;
-        _ = self.future.cancel(io);
+        mcp.util.wake.cancelAcceptLoop(io, &self.future, self.listener.socket.address, &self.stopping);
         self.listener.deinit(io);
         self.arena_state.deinit();
     }
 
     fn acceptLoop(self: *Capture) void {
         const io = std.testing.io;
-        while (true) {
+        while (!self.stopping.load(.acquire)) {
             const stream = self.listener.accept(io) catch return;
             defer stream.close(io);
+            if (self.stopping.load(.acquire)) return;
             self.connections += 1;
             self.serveOne(stream) catch {};
         }

@@ -17,6 +17,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Transport = @import("Transport.zig");
 const framer = @import("../util/line_framer.zig");
+const wake = @import("../util/wake.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const RequestId = jsonrpc.RequestId;
 const types = @import("../protocol/types.zig");
@@ -119,6 +120,7 @@ pub const Server = struct {
         if (self.listener == null) try self.bind();
         var accept_future = try self.io.concurrent(acceptLoop, .{self});
         self.stop_event.wait(self.io) catch {};
+        if (self.path) |p| wake.wakeUnix(self.io, p);
         _ = accept_future.cancel(self.io);
         // A connection accepted during the shutdown also gets the end of its input.
         self.endInputs();
@@ -168,6 +170,11 @@ pub const Server = struct {
                     continue;
                 },
             };
+            // The connection of `wake` or a peer that came during the shutdown.
+            if (self.closing.load(.acquire)) {
+                stream.close(self.io);
+                break;
+            }
             const conn = self.admit(stream) orelse {
                 stream.close(self.io);
                 continue;

@@ -36,6 +36,7 @@ const FakeAuth = struct {
     io: Io,
     mode: Mode,
     listener: Io.net.Server,
+    stopping: std.atomic.Value(bool) = .init(false),
     future: Io.Future(void),
     base: []u8,
     idp_issuer: []u8,
@@ -75,7 +76,7 @@ const FakeAuth = struct {
 
     fn stop(self: *FakeAuth) void {
         const gpa = std.testing.allocator;
-        _ = self.future.cancel(self.io);
+        mcp.util.wake.cancelAcceptLoop(self.io, &self.future, self.listener.socket.address, &self.stopping);
         self.listener.deinit(self.io);
         gpa.free(self.base);
         gpa.free(self.idp_issuer);
@@ -86,9 +87,10 @@ const FakeAuth = struct {
     }
 
     fn acceptLoop(self: *FakeAuth) void {
-        while (true) {
+        while (!self.stopping.load(.acquire)) {
             var stream = self.listener.accept(self.io) catch return;
             defer stream.close(self.io);
+            if (self.stopping.load(.acquire)) return;
             self.serveOne(stream) catch {};
         }
     }

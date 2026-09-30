@@ -24,6 +24,7 @@ const Limits = @import("../Limits.zig");
 const McpServer = @import("../server/Server.zig");
 
 const log = std.log.scoped(.mcp_http);
+const wake = @import("../util/wake.zig");
 
 pub const ResponseMode = enum { auto, sse, json };
 
@@ -107,6 +108,7 @@ pub const Server = struct {
         if (self.listener == null) try self.bind();
         var accept_future = try self.io.concurrent(acceptLoop, .{self});
         self.stop_event.wait(self.io) catch {};
+        wake.wakeIp(self.io, self.listener.?.socket.address);
         _ = accept_future.cancel(self.io);
         self.server.shutdownSubscriptions(self.io);
         self.group.await(self.io) catch {};
@@ -121,6 +123,11 @@ pub const Server = struct {
                     continue;
                 },
             };
+            // The connection of `wake` or a peer that came during the shutdown.
+            if (self.closing.load(.acquire)) {
+                stream.close(self.io);
+                break;
+            }
             self.permits.waitUncancelable(self.io);
             const conn = self.gpa.create(Connection) catch {
                 self.permits.post(self.io);

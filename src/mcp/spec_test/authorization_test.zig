@@ -37,6 +37,7 @@ const Mock = struct {
     gpa: Allocator,
     io: Io,
     listener: Io.net.Server = undefined,
+    stopping: std.atomic.Value(bool) = .init(false),
     future: Io.Future(void) = undefined,
     base: []u8 = &.{},
     lock: Io.Mutex = .init,
@@ -63,7 +64,7 @@ const Mock = struct {
     }
 
     fn stop(self: *Mock) void {
-        _ = self.future.cancel(self.io);
+        mcp.util.wake.cancelAcceptLoop(self.io, &self.future, self.listener.socket.address, &self.stopping);
         self.listener.deinit(self.io);
         for (self.entries.items) |e| {
             self.gpa.free(e.target);
@@ -75,12 +76,13 @@ const Mock = struct {
     }
 
     fn acceptLoop(self: *Mock) void {
-        while (true) {
+        while (!self.stopping.load(.acquire)) {
             const stream = self.listener.accept(self.io) catch |e| switch (e) {
                 error.Canceled => return,
                 else => continue,
             };
             defer stream.close(self.io);
+            if (self.stopping.load(.acquire)) return;
             self.handle(stream) catch {};
         }
     }
