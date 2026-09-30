@@ -23,3 +23,5 @@ Add `--stdio` to the start command to serve on standard input and output instead
 ## Scope
 
 The suite scores 37 server scenarios for revision 2026-07-28. The fixture server passes all of them. The suite also runs scenarios that it does not score. The ten scenarios for the Tasks extension pass their functional checks. Their check `wire-schema-valid` fails, because the suite validates the task result against the core `CallToolResult` schema, which requires `content`.
+
+The client suite also runs six scenarios for the authorization extensions that it does not score. The fixture client passes `auth/client-credentials-jwt`, `auth/client-credentials-basic` and `auth/enterprise-managed-authorization`. The scenarios `auth/dpop`, `auth/dpop-nonce` and `auth/wif-jwt-bearer` fail, because the SDK does not provide DPoP and workload identity federation.

@@ -22,6 +22,8 @@ const UriTemplate = @import("../uri_template/UriTemplate.zig");
 const request_state = @import("request_state.zig");
 const mrtr = @import("mrtr.zig");
 const tasks = @import("tasks.zig");
+const client_credentials = @import("../auth/client_credentials.zig");
+const enterprise = @import("../auth/enterprise.zig");
 pub const RequestContext = @import("RequestContext.zig");
 pub const Outcome = mrtr.Outcome;
 pub const InputRequired = mrtr.InputRequired;
@@ -59,6 +61,14 @@ pub const Options = struct {
     allow_unsupported_schema_keywords: bool = false,
     /// Enable the Tasks extension. The server then advertises it under `extensions`.
     tasks: ?tasks.Options = null,
+    /// The authorization extensions that the authorization server of this MCP server
+    /// provides. The server advertises each enabled one under `extensions`.
+    authorization_extensions: struct {
+        /// `io.modelcontextprotocol/oauth-client-credentials`.
+        client_credentials: bool = false,
+        /// `io.modelcontextprotocol/enterprise-managed-authorization`.
+        enterprise_managed: bool = false,
+    } = .{},
     cache: struct {
         discover: CacheHint = .{},
         lists: CacheHint = .{},
@@ -197,17 +207,24 @@ pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
     }
     if (options.tasks) |task_options| {
         server.task_store = tasks.Store.init(gpa, io, task_options);
-        // Advertise the extension. Other extensions the caller declared are kept.
-        const arena = server.registry_arena.allocator();
-        var ext: std.json.ObjectMap = .empty;
-        if (options.capabilities.extensions) |existing| if (existing == .object) {
-            var it = existing.object.iterator();
-            while (it.next()) |kv| try ext.put(arena, kv.key_ptr.*, kv.value_ptr.*);
-        };
-        try ext.put(arena, tasks.extension_id, .{ .object = .empty });
-        server.options.capabilities.extensions = .{ .object = ext };
+        try server.advertiseExtension(tasks.extension_id);
     }
+    if (options.authorization_extensions.client_credentials) try server.advertiseExtension(client_credentials.extension_id);
+    if (options.authorization_extensions.enterprise_managed) try server.advertiseExtension(enterprise.extension_id);
     return server;
+}
+
+/// Add an extension to the `extensions` capability. Other extensions the caller declared are
+/// kept.
+fn advertiseExtension(server: *Server, id: []const u8) Allocator.Error!void {
+    const arena = server.registry_arena.allocator();
+    var ext: std.json.ObjectMap = .empty;
+    if (server.options.capabilities.extensions) |existing| if (existing == .object) {
+        var it = existing.object.iterator();
+        while (it.next()) |kv| try ext.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+    };
+    try ext.put(arena, id, .{ .object = .empty });
+    server.options.capabilities.extensions = .{ .object = ext };
 }
 
 pub fn deinit(self: *Server) void {

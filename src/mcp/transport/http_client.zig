@@ -18,6 +18,7 @@ const methods = @import("../protocol/methods.zig");
 const version = @import("../protocol/version.zig");
 const message = @import("../jsonrpc/message.zig");
 const OAuthClient = @import("../auth/oauth_client.zig").Client;
+const AuthProvider = @import("../auth/common.zig").Provider;
 
 const log = std.log.scoped(.mcp_http_client);
 
@@ -42,6 +43,9 @@ pub const Client = struct {
         poll_interval: Io.Duration = .fromMilliseconds(50),
         /// Answers 401 and 403 challenges with OAuth 2.1. Null sends no credentials.
         auth: ?*OAuthClient = null,
+        /// Answers 401 and 403 challenges with another flow, for example `ClientCredentials` or
+        /// `EnterpriseClient`. It has priority over `auth`.
+        auth_provider: ?AuthProvider = null,
         /// The trust policy and identity for `https` URLs. Null uses the system trust store.
         tls: ?http1.TlsSetup = null,
     };
@@ -171,12 +175,18 @@ pub const Client = struct {
         try headers.append(arena, .{ .name = "accept", .value = "application/json, text/event-stream" });
         try headers.append(arena, .{ .name = "content-type", .value = "application/json" });
         try headers.append(arena, .{ .name = "accept-encoding", .value = "identity" });
-        if (self.options.auth) |auth| if (auth.currentToken()) |token| {
+        if (self.authProvider()) |auth| if (auth.token(arena)) |token| {
             try headers.append(arena, .{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Bearer ", token }) });
         };
         try headers.append(arena, .{ .name = envelope.header_protocol_version, .value = version.version });
         try headers.append(arena, .{ .name = envelope.header_method, .value = method_name });
         for (self.options.extra_headers) |h| try headers.append(arena, h);
+    }
+
+    fn authProvider(self: *Client) ?AuthProvider {
+        if (self.options.auth_provider) |p| return p;
+        if (self.options.auth) |a| return a.provider();
+        return null;
     }
 
     const Challenge = struct { status: u16, www_authenticate: ?[]const u8 };
@@ -186,12 +196,12 @@ pub const Client = struct {
         var attempt: u8 = 0;
         while (true) {
             const challenge = (try self.performOnce(arena, ex)) orelse return;
-            const auth = self.options.auth orelse {
+            const auth = self.authProvider() orelse {
                 ex.http_status = challenge.status;
                 return error.HttpStatus;
             };
             attempt += 1;
-            _ = auth.handleChallenge(arena, self.url, challenge.status, challenge.www_authenticate, attempt) catch {
+            auth.handleChallenge(arena, self.url, challenge.status, challenge.www_authenticate, attempt) catch {
                 ex.http_status = challenge.status;
                 return error.HttpStatus;
             };

@@ -1,13 +1,56 @@
-//! Authorization: the OAuth 2.1 client of the HTTP client transport, and the resource server
-//! helpers of the HTTP server.
+//! Authorization: the OAuth 2.1 client of the HTTP client transport, the authorization
+//! extensions, and the resource server helpers of the HTTP server.
+const std = @import("std");
+const types = @import("protocol/types.zig");
+
+pub const common = @import("auth/common.zig");
+/// The interface through which the HTTP client transport gets tokens.
+pub const Provider = common.Provider;
+/// How a client authenticates at a token endpoint.
+pub const ClientAuth = common.ClientAuth;
 pub const oauth_client = @import("auth/oauth_client.zig");
 pub const OAuthClient = oauth_client.Client;
+/// The OAuth Client Credentials extension.
+pub const client_credentials = @import("auth/client_credentials.zig");
+pub const ClientCredentials = client_credentials.ClientCredentials;
+/// The Enterprise-Managed Authorization extension.
+pub const enterprise = @import("auth/enterprise.zig");
+pub const EnterpriseClient = enterprise.EnterpriseClient;
+pub const IdJagValidator = enterprise.IdJagValidator;
 pub const jwt = @import("auth/jwt.zig");
 pub const resource_server = @import("auth/resource_server.zig");
 pub const ResourceServer = resource_server.ResourceServer;
 pub const Principal = resource_server.Principal;
 pub const JwtVerifier = resource_server.JwtVerifier;
 
+/// Return a copy of `capabilities` that declares the extension `id` under `extensions`. The
+/// copy keeps the extensions that `capabilities` declares already. The new map is in `arena`.
+pub fn withExtension(arena: std.mem.Allocator, capabilities: types.ClientCapabilities, id: []const u8) std.mem.Allocator.Error!types.ClientCapabilities {
+    var ext: std.json.ObjectMap = .empty;
+    if (capabilities.extensions) |existing| if (existing == .object) {
+        var it = existing.object.iterator();
+        while (it.next()) |kv| try ext.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+    };
+    if (ext.get(id) == null) try ext.put(arena, id, .{ .object = .empty });
+    var out = capabilities;
+    out.extensions = .{ .object = ext };
+    return out;
+}
+
 test {
-    @import("std").testing.refAllDecls(@This());
+    std.testing.refAllDecls(@This());
+    _ = @import("auth/rsa.zig");
+    _ = @import("auth/extensions_test.zig");
+}
+
+test "declare an extension" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const first = try withExtension(arena, .{ .roots = .{} }, client_credentials.extension_id);
+    const both = try withExtension(arena, first, enterprise.extension_id);
+    try std.testing.expect(both.hasExtension(client_credentials.extension_id));
+    try std.testing.expect(both.hasExtension(enterprise.extension_id));
+    try std.testing.expect(both.roots != null);
+    try std.testing.expect(!first.hasExtension(enterprise.extension_id));
 }

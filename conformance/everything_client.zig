@@ -3,6 +3,10 @@
 //!
 //! The suite passes `MCP_CONFORMANCE_CONTEXT` (JSON) with scenario data and expects a silent
 //! exit code 0 when the scenario ran.
+//!
+//! The scenarios `auth/client-credentials-*` use `ClientCredentials`, and the scenario
+//! `auth/enterprise-managed-authorization` uses `EnterpriseClient`. All other `auth/*`
+//! scenarios use `OAuthClient`.
 const std = @import("std");
 const mcp = @import("mcp");
 const types = mcp.types;
@@ -121,6 +125,11 @@ const Runner = struct {
     }
 };
 
+fn missingContext(scenario: []const u8) u8 {
+    std.log.err("scenario {s} needs MCP_CONFORMANCE_CONTEXT with its credentials", .{scenario});
+    return 1;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
@@ -142,11 +151,56 @@ pub fn main(init: std.process.Init) !u8 {
     };
     var oauth: mcp.auth.OAuthClient = .init(io, gpa, .{ .registration = registration, .allow_http = true, .authorize = .headless_redirect });
     defer oauth.deinit();
-    const http = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url, .auth = &oauth });
+    var capabilities: types.ClientCapabilities = .{ .roots = .{}, .sampling = .{}, .elicitation = .{ .form = .{ .object = .empty }, .url = .{ .object = .empty } } };
+
+    // The authorization extensions replace the interactive flow.
+    var provider: mcp.auth.Provider = oauth.provider();
+    var signing_key: ?mcp.auth.jwt.SigningKey = null;
+    defer if (signing_key) |*k| k.deinit(gpa);
+    var client_credentials: ?mcp.auth.ClientCredentials = null;
+    defer if (client_credentials) |*c| c.deinit();
+    var enterprise: ?mcp.auth.EnterpriseClient = null;
+    defer if (enterprise) |*e| e.deinit();
+    if (std.mem.startsWith(u8, scenario, "auth/client-credentials-")) {
+        const ctx = context orelse return missingContext(scenario);
+        const client_id = json.getString(ctx, "client_id") orelse return missingContext(scenario);
+        var auth: mcp.auth.ClientAuth = undefined;
+        if (json.getString(ctx, "private_key_pem")) |pem_text| {
+            signing_key = try mcp.auth.jwt.SigningKey.fromPem(gpa, pem_text);
+            auth = .{ .private_key_jwt = .{ .client_id = client_id, .key = &signing_key.? } };
+        } else {
+            const secret = json.getString(ctx, "client_secret") orelse return missingContext(scenario);
+            auth = .{ .client_secret = .{ .client_id = client_id, .client_secret = secret } };
+        }
+        client_credentials = .init(io, gpa, .{ .client = auth, .allow_http = true });
+        provider = client_credentials.?.provider();
+        capabilities = try mcp.auth.withExtension(arena, capabilities, mcp.auth.client_credentials.extension_id);
+    } else if (std.mem.eql(u8, scenario, "auth/enterprise-managed-authorization")) {
+        const ctx = context orelse return missingContext(scenario);
+        const get = struct {
+            fn field(c: Value, key: []const u8) ![]const u8 {
+                return json.getString(c, key) orelse error.MissingContext;
+            }
+        }.field;
+        enterprise = .init(io, gpa, .{
+            .idp = .{
+                .token_endpoint = try get(ctx, "idp_token_endpoint"),
+                .issuer = json.getString(ctx, "idp_issuer"),
+                .client = .{ .none = .{ .client_id = try get(ctx, "idp_client_id") } },
+            },
+            .assertion = .{ .static = .{ .token = try get(ctx, "idp_id_token") } },
+            .client = .{ .client_secret = .{ .client_id = try get(ctx, "client_id"), .client_secret = try get(ctx, "client_secret") } },
+            .allow_http = true,
+        });
+        provider = enterprise.?.provider();
+        capabilities = try mcp.auth.withExtension(arena, capabilities, mcp.auth.enterprise.extension_id);
+    }
+
+    const http = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url, .auth_provider = provider });
     defer http.deinit();
     var client: Client = .init(gpa, io, .{
         .info = .{ .name = "zig-sdk-conformance-client", .version = "0.1.0" },
-        .capabilities = .{ .roots = .{}, .sampling = .{}, .elicitation = .{ .form = .{ .object = .empty }, .url = .{ .object = .empty } } },
+        .capabilities = capabilities,
         .hooks = .{ .elicit_form = acceptForm, .elicit_url = declineUrl, .sample = sample, .list_roots = listRoots },
     });
     defer client.deinit();
