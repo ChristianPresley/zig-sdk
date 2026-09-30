@@ -6,6 +6,16 @@ This page lists every source that the wiki, the README and the design documents 
 
 ## Model Context Protocol
 
+### AGENT-SKILLS-SPEC
+
+- Title: Agent Skills specification
+- Author: Agent Skills project
+- Publisher: agentskills.io
+- Date: living document
+- URL: <https://agentskills.io/specification>
+- Accessed: 2026-09-30
+- Note: SKILL.md layout and frontmatter fields.
+
 ### MCP-ARCH-2026-07-28
 
 - Title: Architecture 2026-07-28
@@ -163,6 +173,16 @@ This page lists every source that the wiki, the README and the design documents 
 - URL: <https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation>
 - Accessed: 2026-09-29
 
+### MCP-EXT-APPS
+
+- Title: MCP Apps extension (overview page and ext-apps repository)
+- Author: Model Context Protocol project
+- Publisher: modelcontextprotocol.io / GitHub
+- Date: stable 2026-01-26
+- URL: <https://modelcontextprotocol.io/extensions/apps/overview>
+- Accessed: 2026-09-30
+- Note: Specification in https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx. Extension id io.modelcontextprotocol/ui, MIME type text/html;profile=mcp-app.
+
 ### MCP-EXT-AUTH
 
 - Title: MCP Authorization Extensions repository (ext-auth)
@@ -173,6 +193,26 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-29
 - Note: MIT.
 
+### MCP-EXT-AUTH-CLIENT-CREDENTIALS
+
+- Title: OAuth Client Credentials extension (io.modelcontextprotocol/oauth-client-credentials)
+- Author: Model Context Protocol project
+- Publisher: GitHub (modelcontextprotocol/ext-auth)
+- Date: draft
+- URL: <https://github.com/modelcontextprotocol/ext-auth/blob/main/specification/draft/oauth-client-credentials.mdx>
+- Accessed: 2026-09-30
+- Note: SEP-1046. JWT client authentication (RFC 7523 section 2.2) recommended, client secret allowed.
+
+### MCP-EXT-AUTH-ENTERPRISE
+
+- Title: Enterprise-Managed Authorization extension (io.modelcontextprotocol/enterprise-managed-authorization)
+- Author: Model Context Protocol project
+- Publisher: GitHub (modelcontextprotocol/ext-auth)
+- Date: stable
+- URL: <https://github.com/modelcontextprotocol/ext-auth/blob/main/specification/stable/enterprise-managed-authorization.mdx>
+- Accessed: 2026-09-30
+- Note: SEP-990. RFC 8693 token exchange at the IdP for an ID-JAG, then the RFC 7523 JWT bearer grant at the MCP authorization server.
+
 ### MCP-EXT-OVERVIEW
 
 - Title: Extensions overview
@@ -181,6 +221,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Date: living document
 - URL: <https://modelcontextprotocol.io/extensions/overview>
 - Accessed: 2026-09-29
+
+### MCP-EXT-SKILLS
+
+- Title: Skills extension (overview page and ext-skills repository)
+- Author: Model Context Protocol project
+- Publisher: modelcontextprotocol.io / GitHub
+- Date: living document
+- URL: <https://modelcontextprotocol.io/extensions/skills/overview>
+- Accessed: 2026-09-30
+- Note: Specification in https://github.com/modelcontextprotocol/ext-skills/blob/main/specification/stable/skills.mdx. Extension id io.modelcontextprotocol/skills.
 
 ### MCP-EXT-TASKS
 
@@ -371,6 +421,15 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-29
 - Note: Moved out of the normative spec tree into docs/tutorials. raw: https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/main/docs/docs/2026-07-28/tutorials/security/security_best_practices.mdx
 
+### MCP-SEP-1865
+
+- Title: SEP-1865: MCP Apps - Interactive User Interfaces for MCP
+- Author: I. Salomon, L. Yosef, O. Chafik and others
+- Publisher: modelcontextprotocol.io
+- Date: created 2025-11-21, Final
+- URL: <https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp>
+- Accessed: 2026-09-30
+
 ### MCP-SEP-2243
 
 - Title: SEP-2243: HTTP Standardization
@@ -433,6 +492,15 @@ This page lists every source that the wiki, the README and the design documents 
 - Date: opened 2026-04-17; open as of 2026-09-29
 - URL: <https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2598>
 - Accessed: 2026-09-29
+
+### MCP-SEP-2640
+
+- Title: SEP-2640: Skills Extension
+- Author: P. Alexander, O. Hungerford, S. Kothari, A. Kumar (Skills Over MCP Working Group)
+- Publisher: modelcontextprotocol.io
+- Date: created 2026-04-23, Final
+- URL: <https://modelcontextprotocol.io/seps/2640-skills-extension>
+- Accessed: 2026-09-30
 
 ### MCP-SEP-2663
 
@@ -531,6 +599,26 @@ This page lists every source that the wiki, the README and the design documents 
 
 ## JSON-RPC and JSON Schema
 
+### COX-REGEXP-VM
+
+- Title: Regular Expression Matching: the Virtual Machine Approach
+- Author: R. Cox
+- Publisher: swtch.com
+- Date: December 2009
+- URL: <https://swtch.com/~rsc/regexp/regexp2.html>
+- Accessed: 2026-09-30
+- Note: Pike VM design of src/mcp/schema/regex.zig.
+
+### ECMA-262-REGEXP
+
+- Title: ECMAScript Language Specification: RegExp (Regular Expression) Objects
+- Author: Ecma International TC39
+- Publisher: Ecma International (ECMA-262)
+- Date: living document
+- URL: <https://tc39.es/ecma262/multipage/text-processing.html#sec-regexp-regular-expression-objects>
+- Accessed: 2026-09-30
+- Note: The dialect that JSON Schema 2020-12 names for pattern and patternProperties. Annex B.1.2 covers the relaxed pattern syntax.
+
 ### JSONRPC2
 
 - Title: JSON-RPC 2.0 Specification
@@ -570,6 +658,26 @@ This page lists every source that the wiki, the README and the design documents 
 
 ## HTTP, TLS and URIs
 
+### FIPS-203
+
+- Title: Module-Lattice-Based Key-Encapsulation Mechanism Standard
+- Author: National Institute of Standards and Technology
+- Publisher: NIST (FIPS 203)
+- Date: August 2024
+- URL: <https://doi.org/10.6028/NIST.FIPS.203>
+- Accessed: 2026-09-30
+- Note: ML-KEM-768.
+
+### RFC10024
+
+- Title: Post-Quantum Traditional (PQ/T) Hybrid Key Agreement Mechanisms for TLS 1.3
+- Author: K. Kwiatkowski, P. Kampanakis, B. E. Westerbaan, D. Stebila
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: August 2026
+- URL: <https://datatracker.ietf.org/doc/rfc10024/>
+- Accessed: 2026-09-30
+- Note: Formerly draft-ietf-tls-ecdhe-mlkem. X25519MLKEM768, code point 0x11EC, ML-KEM part first.
+
 ### RFC2119
 
 - Title: Key words for use in RFCs to Indicate Requirement Levels (BCP 14)
@@ -580,6 +688,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-29
 - Note: With RFC 8174 (May 2017, https://www.rfc-editor.org/rfc/rfc8174.html). Added: MCP and STE requirement wording.
 
+### RFC2397
+
+- Title: The "data" URL scheme
+- Author: L. Masinter
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: August 1998
+- URL: <https://www.rfc-editor.org/rfc/rfc2397.html>
+- Accessed: 2026-09-30
+- Note: Syntax of data: icon URIs.
+
 ### RFC3986
 
 - Title: Uniform Resource Identifier (URI): Generic Syntax
@@ -588,6 +706,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Date: January 2005
 - URL: <https://www.rfc-editor.org/rfc/rfc3986.html>
 - Accessed: 2026-09-29
+
+### RFC6454
+
+- Title: The Web Origin Concept
+- Author: A. Barth
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: December 2011
+- URL: <https://www.rfc-editor.org/rfc/rfc6454.html>
+- Accessed: 2026-09-30
+- Note: Origin of an https icon and of each redirect.
 
 ### RFC6570
 
@@ -608,6 +736,16 @@ This page lists every source that the wiki, the README and the design documents 
 - URL: <https://www.rfc-editor.org/rfc/rfc7301.html>
 - Accessed: 2026-09-29
 - Note: Required for h2 over TLS; Zig std TLS client lacks ALPN.
+
+### RFC8017
+
+- Title: PKCS #1: RSA Cryptography Specifications Version 2.2
+- Author: K. Moriarty, B. Kaliski, J. Jonsson, A. Rusch
+- Publisher: IETF / RFC Editor (Informational)
+- Date: November 2016
+- URL: <https://www.rfc-editor.org/rfc/rfc8017.html>
+- Accessed: 2026-09-30
+- Note: RSASSA-PSS (section 8.1), RSASSA-PKCS1-v1_5 (section 8.2), EMSA-PSS (section 9.1), MGF1 (appendix B.2.1).
 
 ### RFC8446
 
@@ -699,6 +837,15 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-29
 - Note: Latest revision verified; -00 URL collected by other agents is stale.
 
+### OAUTH-ID-JAG-DRAFT
+
+- Title: Identity Assertion JWT Authorization Grant (draft-ietf-oauth-identity-assertion-authz-grant-04)
+- Author: A. Parecki, K. McGuinness, B. Campbell
+- Publisher: IETF OAuth WG (Internet-Draft)
+- Date: 2026-05-21 (revision 04)
+- URL: <https://datatracker.ietf.org/doc/draft-ietf-oauth-identity-assertion-authz-grant/>
+- Accessed: 2026-09-30
+
 ### OAUTH21-DRAFT
 
 - Title: The OAuth 2.1 Authorization Framework (draft-ietf-oauth-v2-1-16)
@@ -736,6 +883,42 @@ This page lists every source that the wiki, the README and the design documents 
 - URL: <https://www.rfc-editor.org/rfc/rfc6750.html>
 - Accessed: 2026-09-29
 
+### RFC7515
+
+- Title: JSON Web Signature (JWS)
+- Author: M. Jones, J. Bradley, N. Sakimura
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: May 2015
+- URL: <https://www.rfc-editor.org/rfc/rfc7515.html>
+- Accessed: 2026-09-30
+
+### RFC7517
+
+- Title: JSON Web Key (JWK)
+- Author: M. Jones
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: May 2015
+- URL: <https://www.rfc-editor.org/rfc/rfc7517.html>
+- Accessed: 2026-09-30
+
+### RFC7521
+
+- Title: Assertion Framework for OAuth 2.0 Client Authentication and Authorization Grants
+- Author: B. Campbell, C. Mortimore, M. Jones, Y. Goland
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: May 2015
+- URL: <https://www.rfc-editor.org/rfc/rfc7521.html>
+- Accessed: 2026-09-30
+
+### RFC7523
+
+- Title: JSON Web Token (JWT) Profile for OAuth 2.0 Client Authentication and Authorization Grants
+- Author: M. Jones, B. Campbell, C. Mortimore
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: May 2015
+- URL: <https://www.rfc-editor.org/rfc/rfc7523.html>
+- Accessed: 2026-09-30
+
 ### RFC7591
 
 - Title: OAuth 2.0 Dynamic Client Registration Protocol
@@ -763,6 +946,15 @@ This page lists every source that the wiki, the README and the design documents 
 - Date: June 2018
 - URL: <https://www.rfc-editor.org/rfc/rfc8414.html>
 - Accessed: 2026-09-29
+
+### RFC8693
+
+- Title: OAuth 2.0 Token Exchange
+- Author: M. Jones, A. Nadalin, B. Campbell, J. Bradley, C. Mortimore
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: January 2020
+- URL: <https://www.rfc-editor.org/rfc/rfc8693.html>
+- Accessed: 2026-09-30
 
 ### RFC8707
 
