@@ -110,7 +110,7 @@ pub const EnterpriseClient = struct {
         /// Get a new token when the current one expires within this number of seconds.
         refresh_margin_seconds: i64 = 60,
         max_step_up_attempts: u8 = 3,
-        /// Accept `http` token endpoints. Tests only, production needs https.
+        /// Accept `http` metadata and token endpoints. Tests only, production needs https.
         allow_http: bool = false,
         max_document_bytes: usize = 1 << 20,
         /// The clock for token lifetimes and assertions. Null uses the real clock.
@@ -143,7 +143,7 @@ pub const EnterpriseClient = struct {
     };
 
     pub fn init(io: Io, gpa: Allocator, options: Options) EnterpriseClient {
-        return .{ .io = io, .gpa = gpa, .fetcher = .init(io, gpa, options.max_document_bytes), .options = options };
+        return .{ .io = io, .gpa = gpa, .fetcher = .init(io, gpa, options.max_document_bytes, options.allow_http), .options = options };
     }
 
     pub fn deinit(self: *EnterpriseClient) void {
@@ -259,6 +259,7 @@ pub const EnterpriseClient = struct {
             const idp_issuer = self.options.idp.issuer orelse return error.NoIdpTokenEndpoint;
             const m = self.fetcher.authorizationServer(arena, idp_issuer) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.InsecureEndpoint => return error.InsecureEndpoint,
                 else => return error.NoIdpTokenEndpoint,
             };
             if (!std.mem.eql(u8, m.issuer, idp_issuer)) return error.IssuerMismatch;

@@ -114,6 +114,8 @@ pub const DiscoveryError = error{
     /// The client found no protected resource metadata.
     NoResourceMetadata,
     NoAuthorizationServerMetadata,
+    /// A metadata URL does not use https, and the fetcher does not accept `http`.
+    InsecureEndpoint,
 };
 
 pub const ResourceMetadata = struct {
@@ -169,9 +171,11 @@ pub const TokenResult = union(enum) {
 pub const Fetcher = struct {
     http_client: http.Client,
     max_document_bytes: usize,
+    /// Accept `http` metadata URLs. Tests only, production needs https.
+    allow_http: bool,
 
-    pub fn init(io: Io, gpa: Allocator, max_document_bytes: usize) Fetcher {
-        return .{ .http_client = .{ .allocator = gpa, .io = io }, .max_document_bytes = max_document_bytes };
+    pub fn init(io: Io, gpa: Allocator, max_document_bytes: usize, allow_http: bool) Fetcher {
+        return .{ .http_client = .{ .allocator = gpa, .io = io }, .max_document_bytes = max_document_bytes, .allow_http = allow_http };
     }
 
     pub fn deinit(self: *Fetcher) void {
@@ -207,8 +211,11 @@ pub const Fetcher = struct {
     }
 
     /// Protected resource metadata (RFC 9728): the URL of the challenge, else the
-    /// path-inserted well-known location, else the root.
+    /// path-inserted well-known location, else the root. Without `allow_http`, each URL must
+    /// use https.
     pub fn resourceMetadata(self: *Fetcher, arena: Allocator, server_url: []const u8, hinted: ?[]const u8) DiscoveryError!ResourceMetadata {
+        try requireHttps(self.allow_http, server_url);
+        if (hinted) |h| try requireHttps(self.allow_http, h);
         var candidates: std.ArrayList([]const u8) = .empty;
         if (hinted) |h| try candidates.append(arena, h);
         const parts = try splitUrl(arena, server_url);
@@ -228,8 +235,10 @@ pub const Fetcher = struct {
         return error.NoResourceMetadata;
     }
 
-    /// RFC 8414 with the MCP discovery order for issuers with and without a path.
+    /// RFC 8414 with the MCP discovery order for issuers with and without a path. Without
+    /// `allow_http`, the issuer must use https.
     pub fn authorizationServer(self: *Fetcher, arena: Allocator, issuer: []const u8) DiscoveryError!ServerMetadata {
+        try requireHttps(self.allow_http, issuer);
         const parts = try splitUrl(arena, issuer);
         var candidates: std.ArrayList([]const u8) = .empty;
         if (parts.path.len > 0) {
@@ -413,13 +422,108 @@ pub fn basicCredentials(arena: Allocator, client_id: []const u8, client_secret: 
 // -- Helpers -------------------------------------------------------------------------------------
 
 /// True when the metadata `resource` is the server URL or a parent of it. Metadata at the
-/// root well-known location names the origin (RFC 9728 section 3).
+/// root well-known location names the origin (RFC 9728 section 3). The comparison ignores the
+/// case of the scheme and the host.
 pub fn resourceCoversServer(resource: []const u8, server_url: []const u8) bool {
-    if (std.mem.eql(u8, resource, server_url)) return true;
-    const base = std.mem.trimEnd(u8, resource, "/");
-    if (base.len == 0 or !std.mem.startsWith(u8, server_url, base)) return false;
-    const rest = server_url[base.len..];
+    const r = splitUri(resource) orelse return std.mem.eql(u8, resource, server_url);
+    const s = splitUri(server_url) orelse return false;
+    if (!r.sameOrigin(s)) return false;
+    if (std.mem.eql(u8, r.rest, s.rest)) return true;
+    const base = std.mem.trimEnd(u8, r.rest, "/");
+    if (!std.mem.startsWith(u8, s.rest, base)) return false;
+    const rest = s.rest[base.len..];
     return rest.len == 0 or rest[0] == '/' or rest[0] == '?';
+}
+
+/// The parts of an absolute URI with an authority. The parts are slices of the URI.
+pub const UriSplit = struct {
+    scheme: []const u8,
+    /// The user information with its `@`, or empty.
+    userinfo: []const u8,
+    /// The host and the port.
+    host_port: []const u8,
+    /// The path, the query and the fragment.
+    rest: []const u8,
+
+    /// True when the scheme and the host are equal without regard to case, and the user
+    /// information and the port are equal.
+    pub fn sameOrigin(a: UriSplit, b: UriSplit) bool {
+        return std.ascii.eqlIgnoreCase(a.scheme, b.scheme) and std.mem.eql(u8, a.userinfo, b.userinfo) and std.ascii.eqlIgnoreCase(a.host_port, b.host_port);
+    }
+
+    /// The host without the port and without the brackets of an IPv6 address.
+    pub fn host(self: UriSplit) []const u8 {
+        const hp = self.host_port;
+        if (hp.len > 0 and hp[0] == '[') {
+            const close = std.mem.indexOfScalar(u8, hp, ']') orelse return hp;
+            return hp[1..close];
+        }
+        const colon = std.mem.lastIndexOfScalar(u8, hp, ':') orelse return hp;
+        return hp[0..colon];
+    }
+};
+
+/// Split `scheme://authority/rest`. Returns null for a text without `://`.
+pub fn splitUri(uri: []const u8) ?UriSplit {
+    const sep = std.mem.indexOf(u8, uri, "://") orelse return null;
+    if (sep == 0) return null;
+    const after = sep + 3;
+    const end = std.mem.indexOfAnyPos(u8, uri, after, "/?#") orelse uri.len;
+    const authority = uri[after..end];
+    const at = std.mem.lastIndexOfScalar(u8, authority, '@');
+    return .{
+        .scheme = uri[0..sep],
+        .userinfo = if (at) |i| authority[0 .. i + 1] else "",
+        .host_port = if (at) |i| authority[i + 1 ..] else authority,
+        .rest = uri[end..],
+    };
+}
+
+/// Compare two URIs with the rules for the canonical server URI of MCP. The scheme and the
+/// host can have a different case (RFC 3986 section 6.2.2.1). All other parts must be equal.
+/// A text without `://` must be equal byte for byte.
+pub fn uriEql(a: []const u8, b: []const u8) bool {
+    const x = splitUri(a) orelse return std.mem.eql(u8, a, b);
+    const y = splitUri(b) orelse return std.mem.eql(u8, a, b);
+    return x.sameOrigin(y) and std.mem.eql(u8, x.rest, y.rest);
+}
+
+/// Return `error.InsecureEndpoint` for a URL without https, unless `allow_http` is set.
+pub fn requireHttps(allow_http: bool, url: []const u8) error{InsecureEndpoint}!void {
+    if (allow_http) return;
+    const parts = splitUri(url) orelse return error.InsecureEndpoint;
+    if (!std.ascii.eqlIgnoreCase(parts.scheme, "https")) return error.InsecureEndpoint;
+}
+
+/// True for a redirect URI with https, or with `http` and a loopback host. A loopback host is
+/// `localhost`, an address in `127.0.0.0/8` or `[::1]`.
+pub fn validRedirectUri(uri: []const u8) bool {
+    const parts = splitUri(uri) orelse return false;
+    if (parts.userinfo.len > 0 or parts.host().len == 0) return false;
+    if (std.mem.indexOfScalar(u8, parts.rest, '#') != null) return false;
+    if (std.ascii.eqlIgnoreCase(parts.scheme, "https")) return true;
+    if (!std.ascii.eqlIgnoreCase(parts.scheme, "http")) return false;
+    const h = parts.host();
+    if (std.ascii.eqlIgnoreCase(h, "localhost") or std.mem.eql(u8, h, "::1")) return true;
+    const ip = Io.net.Ip4Address.parse(h, 0) catch return false;
+    return ip.bytes[0] == 127;
+}
+
+/// True for a URL that can be a client ID metadata document URL. The URL must have https, a
+/// host and a path other than `/`. It must not have a `.` or `..` segment, user information or
+/// a fragment.
+pub fn validClientIdUrl(url: []const u8) bool {
+    const parts = splitUri(url) orelse return false;
+    if (!std.ascii.eqlIgnoreCase(parts.scheme, "https")) return false;
+    if (parts.userinfo.len > 0 or parts.host().len == 0) return false;
+    if (std.mem.indexOfScalar(u8, parts.rest, '#') != null) return false;
+    const path = parts.rest[0 .. std.mem.indexOfScalar(u8, parts.rest, '?') orelse parts.rest.len];
+    if (path.len <= 1) return false;
+    var it = std.mem.splitScalar(u8, path[1..], '/');
+    while (it.next()) |segment| {
+        if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+    }
+    return true;
 }
 
 pub const UrlParts = struct { origin: []const u8, path: []const u8 };
@@ -551,6 +655,53 @@ test "resource coverage" {
     try std.testing.expect(!resourceCoversServer("http://h:1/mc", "http://h:1/mcp"));
     try std.testing.expect(!resourceCoversServer("https://evil.example.com/mcp", "http://h:1/mcp"));
     try std.testing.expect(!resourceCoversServer("http://h:1/mcp/x", "http://h:1/mcp"));
+    // Uppercase scheme and host are accepted. The path keeps its case.
+    try std.testing.expect(resourceCoversServer("HTTPS://MCP.Example.com/mcp", "https://mcp.example.com/mcp"));
+    try std.testing.expect(resourceCoversServer("https://MCP.example.com", "HTTPS://mcp.EXAMPLE.com/mcp"));
+    try std.testing.expect(!resourceCoversServer("https://mcp.example.com/MCP", "https://mcp.example.com/mcp"));
+    try std.testing.expect(!resourceCoversServer("https://u@mcp.example.com/mcp", "https://mcp.example.com/mcp"));
+}
+
+test "canonical URI comparison" {
+    try std.testing.expect(uriEql("https://mcp.example.com/mcp", "HTTPS://MCP.EXAMPLE.COM/mcp"));
+    try std.testing.expect(uriEql("https://mcp.example.com:8443", "https://Mcp.Example.Com:8443"));
+    try std.testing.expect(!uriEql("https://mcp.example.com/mcp", "https://mcp.example.com/MCP"));
+    try std.testing.expect(!uriEql("https://mcp.example.com/mcp", "https://mcp.example.com/mcp/"));
+    try std.testing.expect(!uriEql("https://mcp.example.com:8443", "https://mcp.example.com:8444"));
+    try std.testing.expect(uriEql("urn:example:api", "urn:example:api"));
+    try std.testing.expect(!uriEql("urn:example:api", "URN:example:api"));
+}
+
+test "redirect URI, client ID URL and https checks" {
+    try std.testing.expect(validRedirectUri("http://127.0.0.1:41893/callback"));
+    try std.testing.expect(validRedirectUri("http://localhost:3000/callback"));
+    try std.testing.expect(validRedirectUri("http://LOCALHOST/cb"));
+    try std.testing.expect(validRedirectUri("http://[::1]:8080/cb"));
+    try std.testing.expect(validRedirectUri("http://127.8.9.10/cb"));
+    try std.testing.expect(validRedirectUri("https://app.example.com/callback"));
+    try std.testing.expect(!validRedirectUri("http://app.example.com/callback"));
+    try std.testing.expect(!validRedirectUri("http://localhost.example.com/cb"));
+    try std.testing.expect(!validRedirectUri("http://128.0.0.1/cb"));
+    try std.testing.expect(!validRedirectUri("com.example.app:/callback"));
+    try std.testing.expect(!validRedirectUri("https://app.example.com/cb#x"));
+    try std.testing.expect(!validRedirectUri("https:///cb"));
+
+    try std.testing.expect(validClientIdUrl("https://example.com/client.json"));
+    try std.testing.expect(validClientIdUrl("HTTPS://example.com/a/b?v=1"));
+    try std.testing.expect(!validClientIdUrl("http://example.com/client.json"));
+    try std.testing.expect(!validClientIdUrl("https://example.com"));
+    try std.testing.expect(!validClientIdUrl("https://example.com/"));
+    try std.testing.expect(!validClientIdUrl("https://example.com/a/../client.json"));
+    try std.testing.expect(!validClientIdUrl("https://example.com/./client.json"));
+    try std.testing.expect(!validClientIdUrl("https://user@example.com/client.json"));
+    try std.testing.expect(!validClientIdUrl("https://example.com/client.json#top"));
+    try std.testing.expect(!validClientIdUrl("client.json"));
+
+    try requireHttps(false, "https://as.example.com");
+    try requireHttps(false, "HTTPS://as.example.com");
+    try requireHttps(true, "http://127.0.0.1:9");
+    try std.testing.expectError(error.InsecureEndpoint, requireHttps(false, "http://as.example.com"));
+    try std.testing.expectError(error.InsecureEndpoint, requireHttps(false, "as.example.com"));
 }
 
 test "url and form helpers" {

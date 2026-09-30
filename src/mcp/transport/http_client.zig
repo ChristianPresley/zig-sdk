@@ -211,7 +211,8 @@ pub const Client = struct {
                 return error.HttpStatus;
             };
             attempt += 1;
-            auth.handleChallenge(arena, self.url, challenge.status, challenge.www_authenticate, attempt) catch {
+            auth.handleChallenge(arena, self.url, challenge.status, challenge.www_authenticate, attempt) catch |e| {
+                log.warn("the authorization provider failed for status {d}: {t}", .{ challenge.status, e });
                 ex.http_status = challenge.status;
                 return error.HttpStatus;
             };

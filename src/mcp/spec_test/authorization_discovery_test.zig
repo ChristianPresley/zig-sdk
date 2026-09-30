@@ -29,7 +29,22 @@ const Config = struct {
     pkce_methods: ?[]const u8 = "[\"S256\"]",
     cimd_supported: bool = false,
     registration_status: http.Status = .created,
+    /// The `client_id` of a successful registration.
+    client_id: []const u8 = "dcr-client",
     state_mode: StateMode = .echo,
+    /// The `resource` of the metadata at `prm_path`.
+    prm_resource: PrmResource = .server,
+    /// Also serve metadata at the root location, with the origin as `resource`.
+    root_prm: bool = false,
+};
+
+const PrmResource = enum {
+    /// The server URL.
+    server,
+    /// The origin, as metadata at the root location names it.
+    origin,
+    /// The server URL with an uppercase scheme.
+    server_uppercase,
 };
 
 const Mock = struct {
@@ -47,6 +62,8 @@ const Mock = struct {
     register_body: ?[]u8 = null,
     authorize_query: ?[]u8 = null,
     token_body: ?[]u8 = null,
+    /// Replaces the issuer in `authorization_servers` of the protected resource metadata.
+    prm_issuer: ?[]const u8 = null,
 
     fn start(self: *Mock, config: Config) !void {
         const io = std.testing.io;
@@ -130,8 +147,22 @@ const Mock = struct {
 
         const c = self.config;
         const json_type = [_]http.Header{.{ .name = "content-type", .value = "application/json" }};
+        const as_issuer = blk: {
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+            break :blk try arena.dupe(u8, self.prm_issuer orelse self.issuer);
+        };
         if (method == .GET and std.mem.eql(u8, path, c.prm_path)) {
-            const doc = try std.fmt.allocPrint(arena, "{{\"resource\":\"{s}/mcp\",\"authorization_servers\":[\"{s}\"]}}", .{ self.base, self.issuer });
+            const resource = switch (c.prm_resource) {
+                .server => try std.fmt.allocPrint(arena, "{s}/mcp", .{self.base}),
+                .origin => self.base,
+                .server_uppercase => try std.fmt.allocPrint(arena, "HTTP{s}/mcp", .{self.base["http".len..]}),
+            };
+            const doc = try std.fmt.allocPrint(arena, "{{\"resource\":\"{s}\",\"authorization_servers\":[\"{s}\"]}}", .{ resource, as_issuer });
+            return request.respond(doc, .{ .keep_alive = false, .extra_headers = &json_type });
+        }
+        if (method == .GET and c.root_prm and std.mem.eql(u8, path, "/.well-known/oauth-protected-resource")) {
+            const doc = try std.fmt.allocPrint(arena, "{{\"resource\":\"{s}\",\"authorization_servers\":[\"{s}\"]}}", .{ self.base, as_issuer });
             return request.respond(doc, .{ .keep_alive = false, .extra_headers = &json_type });
         }
         if (method == .GET and std.mem.eql(u8, path, c.metadata_path)) {
@@ -145,7 +176,7 @@ const Mock = struct {
         }
         if (method == .POST and std.mem.eql(u8, path, "/register")) {
             const reply = if (c.registration_status == .created)
-                "{\"client_id\":\"dcr-client\"}"
+                try std.fmt.allocPrint(arena, "{{\"client_id\":\"{s}\"}}", .{c.client_id})
             else
                 "{\"error\":\"invalid_redirect_uri\",\"error_description\":\"The redirect URI is not allowed\"}";
             return request.respond(reply, .{ .status = c.registration_status, .keep_alive = false, .extra_headers = &json_type });
@@ -320,7 +351,7 @@ test "client prefers pre-registered credentials over metadata documents and regi
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var options = http_options;
-    options.registration = .{ .pre_registered = .{ .client_id = "pre-client" } };
+    options.registration = .{ .pre_registered = &.{.{ .client_id = "pre-client" }} };
     _ = try runChallenge(&mock, arena, options, true);
     mock.stop();
     try std.testing.expect(!mock.sawRequest("POST /register"));
@@ -358,6 +389,176 @@ test "client returns an error when dynamic registration fails" {
     });
 }
 
+test "client keeps the error of a rejected registration for the application" {
+    var mock: Mock = undefined;
+    try mock.start(.{ .registration_status = .bad_request });
+    defer mock.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var client: OAuthClient = .init(std.testing.io, std.testing.allocator, http_options);
+    defer client.deinit();
+    const server_url = try std.fmt.allocPrint(arena, "{s}/mcp", .{mock.base});
+    try std.testing.expectError(error.RegistrationFailed, client.handleChallenge(arena, server_url, 401, null, 1));
+    mock.stop();
+    const failure = (try client.lastFailure(arena)).?;
+    try std.testing.expectEqual(OAuthClient.Failure.Step.registration, failure.step);
+    try std.testing.expectEqual(400, failure.status);
+    try std.testing.expectEqualStrings("invalid_redirect_uri", failure.code.?);
+    try std.testing.expectEqualStrings("The redirect URI is not allowed", failure.description.?);
+}
+
+test "client registers with application_type web when the application sets it" {
+    var mock: Mock = undefined;
+    try mock.start(.{});
+    defer mock.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var options = http_options;
+    options.application_type = .web;
+    options.redirect_uri = "https://app.example.com/callback";
+    _ = try runChallenge(&mock, arena, options, true);
+    mock.stop();
+    const reg = try json.parseTree(arena, mock.register_body.?);
+    try std.testing.expectEqualStrings("web", reg.object.get("application_type").?.string);
+    try std.testing.expectEqualStrings("https://app.example.com/callback", reg.object.get("redirect_uris").?.array.items[0].string);
+}
+
+test "client refuses a metadata document URL without https or without a path" {
+    for ([_][]const u8{ "http://client.example/meta.json", "https://client.example", "https://client.example/" }) |url| {
+        var mock: Mock = undefined;
+        try mock.start(.{ .cimd_supported = true });
+        defer mock.deinit();
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+        var options = http_options;
+        options.registration = .{ .client_metadata_url = url };
+        try std.testing.expectError(error.InvalidClientMetadataUrl, runChallenge(&mock, arena_state.allocator(), options, true));
+        mock.stop();
+        try std.testing.expect(!mock.sawRequest("POST /register"));
+        try std.testing.expect(!mock.sawRequest("GET /authorize"));
+    }
+}
+
+// -- Authorization server binding ------------------------------------------------------------------
+
+/// Two authorization servers. `a` also serves the protected resource metadata. `move` points
+/// the metadata to `b`.
+const Pair = struct {
+    a: Mock,
+    b: Mock,
+
+    fn start(self: *Pair) !void {
+        try self.a.start(.{ .client_id = "dcr-a" });
+        errdefer self.a.deinit();
+        try self.b.start(.{ .client_id = "dcr-b" });
+    }
+
+    fn deinit(self: *Pair) void {
+        self.a.deinit();
+        self.b.deinit();
+    }
+
+    fn move(self: *Pair) void {
+        self.a.lock.lockUncancelable(self.a.io);
+        defer self.a.lock.unlock(self.a.io);
+        self.a.prm_issuer = self.b.issuer;
+    }
+
+    fn challenge(self: *Pair, client: *OAuthClient, arena: Allocator) OAuthClient.Error![]const u8 {
+        const server_url = try std.fmt.allocPrint(arena, "{s}/mcp", .{self.a.base});
+        return client.handleChallenge(arena, server_url, 401, null, 1);
+    }
+};
+
+test "client registers again and keeps no credentials of the old authorization server after a change" {
+    var pair: Pair = undefined;
+    try pair.start();
+    defer pair.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var client: OAuthClient = .init(std.testing.io, std.testing.allocator, http_options);
+    defer client.deinit();
+    _ = try pair.challenge(&client, arena);
+    pair.move();
+    _ = try pair.challenge(&client, arena);
+    pair.a.stop();
+    pair.b.stop();
+    try std.testing.expectEqualStrings("dcr-a", queryParam(arena, pair.a.authorize_query.?, "client_id").?);
+    // The client registers with the new server and sends only the new client_id to it.
+    try std.testing.expect(pair.b.sawRequest("POST /register"));
+    try std.testing.expectEqualStrings("dcr-b", queryParam(arena, pair.b.authorize_query.?, "client_id").?);
+    try std.testing.expectEqualStrings("dcr-b", queryParam(arena, pair.b.token_body.?, "client_id").?);
+}
+
+test "client uses the pre-registered credentials of each issuer and fails for an unknown issuer" {
+    var pair: Pair = undefined;
+    try pair.start();
+    defer pair.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // One entry for each authorization server: separate state per issuer.
+    const both = [_]OAuthClient.Credentials{
+        .{ .issuer = pair.a.issuer, .client_id = "pre-a" },
+        .{ .issuer = pair.b.issuer, .client_id = "pre-b" },
+    };
+    var options = http_options;
+    options.registration = .{ .pre_registered = &both };
+    var client: OAuthClient = .init(std.testing.io, std.testing.allocator, options);
+    defer client.deinit();
+    _ = try pair.challenge(&client, arena);
+    try std.testing.expectEqualStrings("pre-a", queryParam(arena, pair.a.authorize_query.?, "client_id").?);
+    pair.move();
+    _ = try pair.challenge(&client, arena);
+    try std.testing.expectEqualStrings("pre-b", queryParam(arena, pair.b.authorize_query.?, "client_id").?);
+
+    // Only credentials for the old server: an error, and nothing goes to the new server.
+    {
+        pair.a.lock.lockUncancelable(pair.a.io);
+        defer pair.a.lock.unlock(pair.a.io);
+        pair.a.prm_issuer = null;
+    }
+    const only_a = [_]OAuthClient.Credentials{.{ .issuer = pair.a.issuer, .client_id = "pre-a" }};
+    options.registration = .{ .pre_registered = &only_a };
+    var strict: OAuthClient = .init(std.testing.io, std.testing.allocator, options);
+    defer strict.deinit();
+    _ = try pair.challenge(&strict, arena);
+    const b_requests = pair.b.requests().len;
+    pair.move();
+    try std.testing.expectError(error.IssuerNotRegistered, pair.challenge(&strict, arena));
+    try std.testing.expect(strict.currentToken() == null);
+    pair.a.stop();
+    pair.b.stop();
+    // The new server got only the metadata request: no authorization and no token request.
+    try std.testing.expectEqual(b_requests + 1, pair.b.requests().len);
+    try std.testing.expectEqualStrings("GET /.well-known/oauth-authorization-server", pair.b.requests()[b_requests]);
+}
+
+test "client binds pre-registered credentials without an issuer to the first authorization server" {
+    var pair: Pair = undefined;
+    try pair.start();
+    defer pair.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var options = http_options;
+    options.registration = .{ .pre_registered = &.{.{ .client_id = "pre-any" }} };
+    var client: OAuthClient = .init(std.testing.io, std.testing.allocator, options);
+    defer client.deinit();
+    _ = try pair.challenge(&client, arena);
+    _ = try pair.challenge(&client, arena);
+    pair.move();
+    try std.testing.expectError(error.IssuerNotRegistered, pair.challenge(&client, arena));
+    pair.a.stop();
+    pair.b.stop();
+    try std.testing.expect(!pair.b.sawRequest("GET /authorize"));
+    try std.testing.expect(!pair.b.sawRequest("POST /token"));
+}
+
 // -- Security considerations -----------------------------------------------------------------------
 
 test "client sends the resource parameter and an S256 PKCE challenge in authorization and token requests" {
@@ -387,6 +588,50 @@ test "client sends the resource parameter and an S256 PKCE challenge in authoriz
     var encoded: [43]u8 = undefined;
     _ = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &digest);
     try std.testing.expectEqualStrings(&encoded, challenge);
+}
+
+test "client sends the most specific resource that the server declares" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    {
+        // Metadata at the path-inserted and at the root location: the client reads the
+        // path-inserted document first and sends the server URL.
+        var mock: Mock = undefined;
+        try mock.start(.{ .root_prm = true });
+        defer mock.deinit();
+        _ = try runChallenge(&mock, arena, http_options, false);
+        mock.stop();
+        try std.testing.expect(!mock.sawRequest("GET /.well-known/oauth-protected-resource"));
+        const resource = try std.fmt.allocPrint(arena, "{s}/mcp", .{mock.base});
+        try std.testing.expectEqualStrings(resource, queryParam(arena, mock.authorize_query.?, "resource").?);
+        try std.testing.expectEqualStrings(resource, queryParam(arena, mock.token_body.?, "resource").?);
+    }
+    {
+        // Metadata only at the root location: the identifier of the server is its origin
+        // (RFC 9728 section 3.3), so the client sends the origin.
+        var mock: Mock = undefined;
+        try mock.start(.{ .prm_path = "/.well-known/oauth-protected-resource", .prm_resource = .origin });
+        defer mock.deinit();
+        _ = try runChallenge(&mock, arena, http_options, false);
+        mock.stop();
+        try std.testing.expectEqualStrings(mock.base, queryParam(arena, mock.authorize_query.?, "resource").?);
+        try std.testing.expectEqualStrings(mock.base, queryParam(arena, mock.token_body.?, "resource").?);
+    }
+}
+
+test "client accepts a metadata resource with an uppercase scheme and host" {
+    var mock: Mock = undefined;
+    try mock.start(.{ .prm_resource = .server_uppercase });
+    defer mock.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    _ = try runChallenge(&mock, arena, http_options, true);
+    mock.stop();
+    const resource = queryParam(arena, mock.authorize_query.?, "resource").?;
+    try std.testing.expect(std.mem.startsWith(u8, resource, "HTTP://"));
+    try std.testing.expect(mcp.auth.common.uriEql(resource, try std.fmt.allocPrint(arena, "{s}/mcp", .{mock.base})));
 }
 
 test "client refuses to proceed when the metadata does not offer S256 PKCE" {
@@ -425,17 +670,47 @@ test "client discards an authorization response with a wrong or missing state" {
     }
 }
 
-test "client refuses plain http authorization and token endpoints by default" {
-    var mock: Mock = undefined;
-    try mock.start(.{});
-    defer mock.deinit();
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    try std.testing.expectError(error.InsecureEndpoint, runChallenge(&mock, arena_state.allocator(), .{}, true));
-    mock.stop();
-    try std.testing.expect(!mock.sawRequest("POST /register"));
-    try std.testing.expect(!mock.sawRequest("GET /authorize"));
-    try std.testing.expect(!mock.sawRequest("POST /token"));
+test "client refuses plain http metadata, registration, authorization and token endpoints by default" {
+    for ([_]bool{ true, false }) |hint| {
+        var mock: Mock = undefined;
+        try mock.start(.{});
+        defer mock.deinit();
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+        try std.testing.expectError(error.InsecureEndpoint, runChallenge(&mock, arena_state.allocator(), .{}, hint));
+        mock.stop();
+        // The client sends no request at all, not even for the metadata.
+        try expectRequests(&mock, &.{});
+    }
+}
+
+test "client refuses a redirect URI that is not https or a loopback URI" {
+    for ([_][]const u8{ "http://app.example.com/callback", "com.example.app:/callback", "http://localhost.example.com/cb" }) |uri| {
+        var mock: Mock = undefined;
+        try mock.start(.{});
+        defer mock.deinit();
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+        var options = http_options;
+        options.redirect_uri = uri;
+        try std.testing.expectError(error.InvalidRedirectUri, runChallenge(&mock, arena_state.allocator(), options, true));
+        mock.stop();
+        try expectRequests(&mock, &.{});
+    }
+    // Loopback and https redirect URIs are accepted.
+    for ([_][]const u8{ "http://localhost:3000/callback", "http://[::1]:3000/callback", "https://app.example.com/callback" }) |uri| {
+        var mock: Mock = undefined;
+        try mock.start(.{});
+        defer mock.deinit();
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var options = http_options;
+        options.redirect_uri = uri;
+        _ = try runChallenge(&mock, arena, options, true);
+        mock.stop();
+        try std.testing.expectEqualStrings(uri, queryParam(arena, mock.authorize_query.?, "redirect_uri").?);
+    }
 }
 
 // -- Resource server -------------------------------------------------------------------------------

@@ -10,6 +10,8 @@ const http = std.http;
 const json = @import("../json.zig");
 const common = @import("common.zig");
 
+const log = std.log.scoped(.mcp_auth);
+
 const formField = common.formField;
 const listContains = common.listContains;
 const appendUnique = common.appendUnique;
@@ -26,15 +28,42 @@ pub const Client = struct {
     token: ?[]u8 = null,
     /// Scopes granted with the current token (space separated list kept as a slice list).
     granted_scopes: std.ArrayList([]u8) = .empty,
+    /// The issuer of the first authorization server that used pre-registered credentials
+    /// without an issuer.
+    bound_issuer: ?[]u8 = null,
+    /// The last error that an authorization server sent.
+    failure: ?Failure = null,
     lock: Io.Mutex = .init,
 
     pub const Registration = union(enum) {
-        /// Credentials issued out of band.
-        pre_registered: struct { client_id: []const u8, client_secret: ?[]const u8 = null },
+        /// Credentials issued out of band. The client uses the entry for the issuer of the
+        /// authorization server. It never sends the entry to another authorization server.
+        pre_registered: []const Credentials,
         /// A client ID metadata document URL (used when the server supports it, else DCR).
+        /// The URL must use https and have a path.
         client_metadata_url: []const u8,
         /// Dynamic client registration only.
         dynamic,
+    };
+
+    /// Client credentials that an authorization server issued out of band.
+    pub const Credentials = struct {
+        /// The `issuer` identifier of the authorization server that issued the credentials.
+        /// Null binds the credentials to the first authorization server that the client uses.
+        /// We recommend that you set it.
+        issuer: ?[]const u8 = null,
+        client_id: []const u8,
+        client_secret: ?[]const u8 = null,
+    };
+
+    /// The `application_type` of dynamic client registration (OpenID Connect Dynamic Client
+    /// Registration 1.0).
+    pub const ApplicationType = enum {
+        /// Desktop and mobile applications, command line tools, and web applications on a
+        /// local host.
+        native,
+        /// Browser-based applications that a remote host serves.
+        web,
     };
 
     /// How the client gets the authorization code.
@@ -52,12 +81,16 @@ pub const Client = struct {
     pub const Options = struct {
         registration: Registration = .dynamic,
         client_name: []const u8 = "zig-sdk",
+        /// The redirect URI must use https or `http` with a loopback host.
         redirect_uri: []const u8 = "http://127.0.0.1:41893/callback",
+        /// Set `.web` for a browser-based application that a remote host serves.
+        application_type: ApplicationType = .native,
         authorize: Authorize = .headless_redirect,
         /// Ask for `offline_access` when the authorization server lists it.
         want_refresh_token: bool = true,
         max_step_up_attempts: u8 = 3,
-        /// Accept `http` authorization server endpoints. Tests only, production needs https.
+        /// Accept `http` metadata, registration, authorization and token endpoints. Tests
+        /// only, production needs https.
         allow_http: bool = false,
         max_document_bytes: usize = 1 << 20,
     };
@@ -69,6 +102,19 @@ pub const Client = struct {
     };
 
     pub const AuthMethod = enum { client_secret_basic, client_secret_post, none };
+
+    /// An error that an authorization server sent for a registration or a token request.
+    pub const Failure = struct {
+        step: Step,
+        /// The HTTP status, or 0 when the request did not complete.
+        status: u16,
+        /// The `error` code of the response, for example `invalid_redirect_uri`.
+        code: ?[]const u8 = null,
+        /// The `error_description` of the response. It is text from the server.
+        description: ?[]const u8 = null,
+
+        pub const Step = enum { registration, token };
+    };
 
     pub const Error = error{
         OutOfMemory,
@@ -83,28 +129,39 @@ pub const Client = struct {
         /// The metadata `issuer` is not the URL of the query.
         IssuerMismatch,
         InsecureEndpoint,
+        /// `Options.redirect_uri` does not use https or a loopback host.
+        InvalidRedirectUri,
+        /// The client ID metadata document URL does not use https or has no path.
+        InvalidClientMetadataUrl,
+        /// No pre-registered credentials are for the issuer of the authorization server. The
+        /// authorization server changed, or the configuration has no entry for it.
+        IssuerNotRegistered,
         /// The authorization server does not offer PKCE with S256.
         PkceUnsupported,
         /// No way to obtain a client id.
         RegistrationUnavailable,
+        /// The authorization server rejected the registration. `lastFailure` has the details.
         RegistrationFailed,
         AuthorizationFailed,
         StateMismatch,
         IssMissing,
         IssMismatch,
+        /// The token request failed. `lastFailure` has the details.
         TokenRequestFailed,
         HttpFailed,
         InvalidChallenge,
     };
 
     pub fn init(io: Io, gpa: Allocator, options: Options) Client {
-        return .{ .io = io, .gpa = gpa, .fetcher = .init(io, gpa, options.max_document_bytes), .options = options };
+        return .{ .io = io, .gpa = gpa, .fetcher = .init(io, gpa, options.max_document_bytes, options.allow_http), .options = options };
     }
 
     pub fn deinit(self: *Client) void {
         self.fetcher.deinit();
         self.clearCredentials();
         if (self.issuer) |i| self.gpa.free(i);
+        if (self.bound_issuer) |i| self.gpa.free(i);
+        self.clearFailure();
         self.granted_scopes.deinit(self.gpa);
     }
 
@@ -124,6 +181,40 @@ pub const Client = struct {
         }
         for (self.granted_scopes.items) |s| self.gpa.free(s);
         self.granted_scopes.clearRetainingCapacity();
+    }
+
+    fn clearFailure(self: *Client) void {
+        const f = self.failure orelse return;
+        if (f.code) |c| self.gpa.free(c);
+        if (f.description) |d| self.gpa.free(d);
+        self.failure = null;
+    }
+
+    fn recordFailure(self: *Client, step: Failure.Step, status: u16, code: ?[]const u8, description: ?[]const u8) Allocator.Error!void {
+        self.clearFailure();
+        const owned_code: ?[]u8 = if (code) |c| try self.gpa.dupe(u8, c) else null;
+        errdefer if (owned_code) |c| self.gpa.free(c);
+        self.failure = .{
+            .step = step,
+            .status = status,
+            .code = owned_code,
+            .description = if (description) |d| try self.gpa.dupe(u8, d) else null,
+        };
+        log.warn("the {t} request failed with status {d}: {f} {f}", .{ step, status, std.json.fmt(code, .{}), std.json.fmt(description, .{}) });
+    }
+
+    /// The last error that an authorization server sent for a registration or a token
+    /// request, copied into `arena`. Null when the last challenge had no such error.
+    pub fn lastFailure(self: *Client, arena: Allocator) Allocator.Error!?Failure {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        const f = self.failure orelse return null;
+        return .{
+            .step = f.step,
+            .status = f.status,
+            .code = if (f.code) |c| try arena.dupe(u8, c) else null,
+            .description = if (f.description) |d| try arena.dupe(u8, d) else null,
+        };
     }
 
     /// The bearer token to send, if any. The slice is valid until the next challenge.
@@ -164,13 +255,17 @@ pub const Client = struct {
         if (attempt > self.options.max_step_up_attempts) return error.TooManyAttempts;
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        self.clearFailure();
+        if (!common.validRedirectUri(self.options.redirect_uri)) return error.InvalidRedirectUri;
         const challenge: Challenge = if (www_authenticate) |h| try parseChallenge(arena, h) else .{};
         const step_up = challenge.isStepUp(status);
 
         // Discovery.
         const prm = try self.fetcher.resourceMetadata(arena, server_url, challenge.resource_metadata);
         if (!common.resourceCoversServer(prm.resource, server_url)) return error.ResourceMismatch;
-        // RFC 8707: the resource indicator is the canonical identifier from the metadata.
+        // RFC 8707: the resource indicator is the canonical identifier from the metadata. The
+        // discovery tries the path-inserted location first, so the value is the most specific
+        // identifier that the server declares for itself.
         const resource = prm.resource;
         if (prm.authorization_servers.len == 0) return error.NoAuthorizationServer;
         const issuer = prm.authorization_servers[0];
@@ -178,14 +273,14 @@ pub const Client = struct {
             // A new authorization server: nothing from the old one may be reused.
             self.clearCredentials();
             if (self.issuer) |i| self.gpa.free(i);
+            self.issuer = null;
             self.issuer = try self.gpa.dupe(u8, issuer);
         }
         const meta = try self.fetcher.authorizationServer(arena, issuer);
         if (!std.mem.eql(u8, meta.issuer, issuer)) return error.IssuerMismatch;
         const authorization_endpoint = meta.authorization_endpoint orelse return error.NoAuthorizationServerMetadata;
-        if (!self.options.allow_http) {
-            if (!std.mem.startsWith(u8, authorization_endpoint, "https://") or !std.mem.startsWith(u8, meta.token_endpoint, "https://")) return error.InsecureEndpoint;
-        }
+        try common.requireHttps(self.options.allow_http, authorization_endpoint);
+        try common.requireHttps(self.options.allow_http, meta.token_endpoint);
         if (!listContains(meta.code_challenge_methods_supported, "S256")) return error.PkceUnsupported;
 
         // Registration.
@@ -260,7 +355,10 @@ pub const Client = struct {
         }
         const reply = switch (try self.fetcher.tokenRequest(arena, meta.token_endpoint, body.written(), extra.items)) {
             .ok => |r| r,
-            .failed => return error.TokenRequestFailed,
+            .failed => |f| {
+                try self.recordFailure(.token, f.status, f.code, f.description);
+                return error.TokenRequestFailed;
+            },
         };
 
         // Store.
@@ -268,6 +366,7 @@ pub const Client = struct {
             std.crypto.secureZero(u8, t);
             self.gpa.free(t);
         }
+        self.token = null;
         self.token = try self.gpa.dupe(u8, reply.access_token);
         for (self.granted_scopes.items) |s| self.gpa.free(s);
         self.granted_scopes.clearRetainingCapacity();
@@ -288,44 +387,83 @@ pub const Client = struct {
         return .none;
     }
 
+    /// The pre-registered credentials for `issuer`. An entry with the issuer wins. Else the
+    /// first entry without an issuer, which the client binds to the first issuer it sees.
+    fn credentialsFor(self: *Client, list: []const Credentials, issuer: []const u8) Error!Credentials {
+        for (list) |c| if (c.issuer) |i| if (std.mem.eql(u8, i, issuer)) return c;
+        for (list) |c| if (c.issuer == null) {
+            if (self.bound_issuer) |bound| {
+                if (std.mem.eql(u8, bound, issuer)) return c;
+                break;
+            }
+            self.bound_issuer = try self.gpa.dupe(u8, issuer);
+            return c;
+        };
+        log.warn("no pre-registered credentials for the authorization server {f}", .{std.json.fmt(issuer, .{})});
+        return error.IssuerNotRegistered;
+    }
+
     fn register(self: *Client, arena: Allocator, meta: common.ServerMetadata) Error!void {
         switch (self.options.registration) {
-            .pre_registered => |p| {
+            .pre_registered => |list| {
+                const p = try self.credentialsFor(list, meta.issuer);
+                const client_id = try self.gpa.dupe(u8, p.client_id);
+                errdefer self.gpa.free(client_id);
                 self.registration = .{
-                    .client_id = try self.gpa.dupe(u8, p.client_id),
+                    .client_id = client_id,
                     .client_secret = if (p.client_secret) |s| try self.gpa.dupe(u8, s) else null,
                     .auth_method = chooseAuthMethod(meta.token_endpoint_auth_methods_supported, p.client_secret != null),
                 };
                 return;
             },
-            .client_metadata_url => |url| if (meta.client_id_metadata_document_supported) {
-                self.registration = .{ .client_id = try self.gpa.dupe(u8, url), .client_secret = null, .auth_method = .none };
-                return;
+            .client_metadata_url => |url| {
+                if (!common.validClientIdUrl(url)) return error.InvalidClientMetadataUrl;
+                if (meta.client_id_metadata_document_supported) {
+                    self.registration = .{ .client_id = try self.gpa.dupe(u8, url), .client_secret = null, .auth_method = .none };
+                    return;
+                }
             },
             .dynamic => {},
         }
         const endpoint = meta.registration_endpoint orelse return error.RegistrationUnavailable;
+        try common.requireHttps(self.options.allow_http, endpoint);
         // Ask for a public client unless only secret methods are offered.
         const wanted = chooseAuthMethod(meta.token_endpoint_auth_methods_supported, !listContains(meta.token_endpoint_auth_methods_supported, "none"));
         var body: Io.Writer.Allocating = .init(arena);
         body.writer.print(
-            "{{\"client_name\":{f},\"redirect_uris\":[{f}],\"grant_types\":[\"authorization_code\",\"refresh_token\"],\"response_types\":[\"code\"],\"token_endpoint_auth_method\":\"{s}\",\"application_type\":\"native\"}}",
-            .{ std.json.fmt(self.options.client_name, .{}), std.json.fmt(self.options.redirect_uri, .{}), @tagName(wanted) },
+            "{{\"client_name\":{f},\"redirect_uris\":[{f}],\"grant_types\":[\"authorization_code\",\"refresh_token\"],\"response_types\":[\"code\"],\"token_endpoint_auth_method\":\"{s}\",\"application_type\":\"{s}\"}}",
+            .{ std.json.fmt(self.options.client_name, .{}), std.json.fmt(self.options.redirect_uri, .{}), @tagName(wanted), @tagName(self.options.application_type) },
         ) catch return error.OutOfMemory;
-        const reply = self.fetcher.fetch(arena, .POST, endpoint, body.written(), "application/json", &.{}) catch return error.RegistrationFailed;
-        if (reply.status != 201 and reply.status != 200) return error.RegistrationFailed;
-        const tree = json.parseTree(arena, reply.body) catch return error.RegistrationFailed;
-        const client_id = json.getString(tree, "client_id") orelse return error.RegistrationFailed;
-        const secret = json.getString(tree, "client_secret");
+        const reply = self.fetcher.fetch(arena, .POST, endpoint, body.written(), "application/json", &.{}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try self.recordFailure(.registration, 0, null, null);
+                return error.RegistrationFailed;
+            },
+        };
+        const tree: ?std.json.Value = json.parseTree(arena, reply.body) catch null;
+        if (reply.status != 201 and reply.status != 200) {
+            // RFC 7591 section 3.2.2: the error response has `error` and `error_description`.
+            const doc = tree orelse .null;
+            try self.recordFailure(.registration, reply.status, json.getString(doc, "error"), json.getString(doc, "error_description"));
+            return error.RegistrationFailed;
+        }
+        const client_id = json.getString(tree orelse .null, "client_id") orelse {
+            try self.recordFailure(.registration, reply.status, null, "The registration response has no client_id");
+            return error.RegistrationFailed;
+        };
+        const secret = json.getString(tree.?, "client_secret");
         var method = wanted;
-        if (json.getString(tree, "token_endpoint_auth_method")) |m| {
+        if (json.getString(tree.?, "token_endpoint_auth_method")) |m| {
             if (std.mem.eql(u8, m, "client_secret_basic")) method = .client_secret_basic;
             if (std.mem.eql(u8, m, "client_secret_post")) method = .client_secret_post;
             if (std.mem.eql(u8, m, "none")) method = .none;
         }
         if (secret == null) method = .none;
+        const owned_id = try self.gpa.dupe(u8, client_id);
+        errdefer self.gpa.free(owned_id);
         self.registration = .{
-            .client_id = try self.gpa.dupe(u8, client_id),
+            .client_id = owned_id,
             .client_secret = if (secret) |s| try self.gpa.dupe(u8, s) else null,
             .auth_method = method,
         };
@@ -350,4 +488,43 @@ test "auth method choice" {
     try std.testing.expectEqual(Client.AuthMethod.client_secret_basic, Client.chooseAuthMethod(&.{"client_secret_basic"}, true));
     try std.testing.expectEqual(Client.AuthMethod.none, Client.chooseAuthMethod(&.{"none"}, false));
     try std.testing.expectEqual(Client.AuthMethod.client_secret_post, Client.chooseAuthMethod(&.{ "none", "client_secret_post" }, true));
+}
+
+test "pre-registered credentials are keyed by issuer" {
+    var client: Client = .init(std.testing.io, std.testing.allocator, .{});
+    defer client.deinit();
+    const list = [_]Client.Credentials{
+        .{ .issuer = "https://as1.example", .client_id = "one" },
+        .{ .issuer = "https://as2.example", .client_id = "two" },
+    };
+    try std.testing.expectEqualStrings("one", (try client.credentialsFor(&list, "https://as1.example")).client_id);
+    try std.testing.expectEqualStrings("two", (try client.credentialsFor(&list, "https://as2.example")).client_id);
+    try std.testing.expectError(error.IssuerNotRegistered, client.credentialsFor(&list, "https://as3.example"));
+    // The comparison is a simple string comparison.
+    try std.testing.expectError(error.IssuerNotRegistered, client.credentialsFor(&list, "https://AS1.example"));
+
+    // An entry without an issuer binds to the first issuer and refuses all others.
+    const unbound = [_]Client.Credentials{.{ .client_id = "any" }};
+    try std.testing.expectEqualStrings("any", (try client.credentialsFor(&unbound, "https://as1.example")).client_id);
+    try std.testing.expectEqualStrings("any", (try client.credentialsFor(&unbound, "https://as1.example")).client_id);
+    try std.testing.expectError(error.IssuerNotRegistered, client.credentialsFor(&unbound, "https://as2.example"));
+}
+
+test "registration refuses an insecure endpoint and an invalid metadata document URL" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const meta: common.ServerMetadata = .{ .issuer = "https://as.example", .token_endpoint = "https://as.example/token", .registration_endpoint = "http://as.example/register" };
+    var client: Client = .init(std.testing.io, std.testing.allocator, .{});
+    defer client.deinit();
+    try std.testing.expectError(error.InsecureEndpoint, client.register(arena, meta));
+    try std.testing.expect(client.registration == null);
+
+    for ([_][]const u8{ "http://client.example/meta.json", "https://client.example", "https://client.example/" }) |url| {
+        var cimd: Client = .init(std.testing.io, std.testing.allocator, .{ .registration = .{ .client_metadata_url = url } });
+        defer cimd.deinit();
+        var supported = meta;
+        supported.client_id_metadata_document_supported = true;
+        try std.testing.expectError(error.InvalidClientMetadataUrl, cimd.register(arena, supported));
+    }
 }

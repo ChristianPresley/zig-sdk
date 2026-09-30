@@ -42,7 +42,7 @@ pub const ClientCredentials = struct {
         /// Get a new token when the current one expires within this number of seconds.
         refresh_margin_seconds: i64 = 60,
         max_step_up_attempts: u8 = 3,
-        /// Accept an `http` token endpoint. Tests only, production needs https.
+        /// Accept `http` metadata and token endpoints. Tests only, production needs https.
         allow_http: bool = false,
         max_document_bytes: usize = 1 << 20,
         /// The clock for token lifetimes and assertions. Null uses the real clock.
@@ -74,7 +74,7 @@ pub const ClientCredentials = struct {
     };
 
     pub fn init(io: Io, gpa: Allocator, options: Options) ClientCredentials {
-        return .{ .io = io, .gpa = gpa, .fetcher = .init(io, gpa, options.max_document_bytes), .options = options };
+        return .{ .io = io, .gpa = gpa, .fetcher = .init(io, gpa, options.max_document_bytes, options.allow_http), .options = options };
     }
 
     pub fn deinit(self: *ClientCredentials) void {

@@ -144,10 +144,13 @@ pub fn main(init: std.process.Init) !u8 {
     const context: ?Value = if (init.environ_map.get("MCP_CONFORMANCE_CONTEXT")) |text| json.parseTree(arena, text) catch null else null;
 
     // Authorization: pre-registered credentials from the context when given, else a client
-    // ID metadata document where supported, else dynamic registration.
+    // ID metadata document where supported, else dynamic registration. The context does not
+    // name the issuer, so the credentials bind to the first authorization server.
     var registration: mcp.auth.OAuthClient.Registration = .{ .client_metadata_url = "https://conformance-test.local/client-metadata.json" };
+    var pre_registered: [1]mcp.auth.OAuthClient.Credentials = undefined;
     if (context) |ctx| if (json.getString(ctx, "client_id")) |client_id| {
-        registration = .{ .pre_registered = .{ .client_id = client_id, .client_secret = json.getString(ctx, "client_secret") } };
+        pre_registered[0] = .{ .client_id = client_id, .client_secret = json.getString(ctx, "client_secret") };
+        registration = .{ .pre_registered = &pre_registered };
     };
     var oauth: mcp.auth.OAuthClient = .init(io, gpa, .{ .registration = registration, .allow_http = true, .authorize = .headless_redirect });
     defer oauth.deinit();
