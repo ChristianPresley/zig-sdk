@@ -7,10 +7,15 @@
 //! peer closes its connection, the server cancels the requests of that peer.
 //!
 //! On POSIX systems the server sets the mode `0600` on the socket file after it creates the
-//! file. Before that, the umask of the process applies. We recommend a socket directory that
-//! only the owner can open. The server refuses a path that is not a socket. It removes a
-//! stale socket file at start and its own socket file at shutdown. The file mode and the
-//! directory of the socket control access, because the server does not check the peer.
+//! file. Before that, the umask of the process applies. On Windows the server gives the socket
+//! file a protected access control list that allows access only to the user of the process.
+//! Before that, the file inherits the access control list of the directory. Windows checks
+//! this list when a client connects.
+//!
+//! We recommend a socket directory that only the owner can open. The server refuses a path
+//! that is not a socket. It removes a stale socket file at start and its own socket file at
+//! shutdown. The file mode and the directory of the socket control access, because the server
+//! does not check the peer.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -29,6 +34,7 @@ const router_mod = @import("router.zig");
 const Router = router_mod.Router;
 
 const log = std.log.scoped(.mcp_unix);
+const windows_acl = if (builtin.os.tag == .windows) @import("windows_acl.zig") else struct {};
 
 /// True when the target has Unix domain sockets. Windows has them from Windows 10 version
 /// 1803. When this is false, `Server.bind` and `Client.connect` return `error.Unsupported`.
@@ -39,8 +45,10 @@ pub const Options = struct {
     /// against the current directory. The path has 108 bytes or less on Linux and 104 bytes
     /// or less on macOS.
     path: []const u8,
-    /// The permission bits of the socket file on POSIX systems. Windows ignores this value.
-    /// Then the access control list of the directory applies.
+    /// The permission bits of the socket file on POSIX systems. On Windows a value without
+    /// group and other bits (`mode & 0o077 == 0`) allows access only to the user of the
+    /// process. Another value keeps the access control list that the file inherits from the
+    /// directory.
     mode: u32 = 0o600,
 };
 
@@ -53,6 +61,9 @@ pub const BindError = error{
     AddressInUse,
     NameTooLong,
     OutOfMemory,
+    /// Windows did not set the access control list of the socket file. The log has the
+    /// Windows error code.
+    AccessControlFailed,
 } || Io.net.UnixAddress.ListenError || Io.Dir.StatFileError || Io.File.OpenError || Io.Dir.DeleteFileError || Io.Dir.SetFilePermissionsError || std.process.CurrentPathAllocError;
 
 /// Serves one MCP server on a Unix domain socket.
@@ -110,7 +121,9 @@ pub const Server = struct {
             else => |err| return err,
         };
         errdefer self.closeListener();
-        if (builtin.os.tag != .windows) {
+        if (builtin.os.tag == .windows) {
+            if (self.options.mode & 0o077 == 0) try windows_acl.restrictToCurrentUser(path);
+        } else {
             try Io.Dir.cwd().setFilePermissions(io, path, .fromMode(@intCast(self.options.mode)), .{});
         }
     }

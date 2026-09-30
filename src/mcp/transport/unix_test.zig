@@ -510,13 +510,61 @@ test "unix socket shutdown ends listen streams and cancels requests in flight" {
     try std.testing.expectError(error.FileNotFound, f.tmp.dir.statFile(io, "mcp.sock", .{ .follow_symlinks = false }));
 }
 
-test "unix socket file has mode 0600 on POSIX" {
-    if (!unix.supported or builtin.os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
-    var f: Fixture = undefined;
-    try f.start(.{});
-    defer f.stop();
-    const st = try f.tmp.dir.statFile(io, "mcp.sock", .{ .follow_symlinks = false });
-    try std.testing.expectEqual(Io.File.Kind.unix_domain_socket, st.kind);
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+// The access tests of the socket file are different on POSIX and on Windows. Each target
+// compiles only its own tests, so no target reports a skipped test.
+comptime {
+    if (unix.supported) _ = if (builtin.os.tag == .windows) windows_access_tests else posix_access_tests;
 }
+
+const posix_access_tests = struct {
+    test "unix socket file has mode 0600 on POSIX" {
+        const io = std.testing.io;
+        var f: Fixture = undefined;
+        try f.start(.{});
+        defer f.stop();
+        const st = try f.tmp.dir.statFile(io, "mcp.sock", .{ .follow_symlinks = false });
+        try std.testing.expectEqual(Io.File.Kind.unix_domain_socket, st.kind);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
+    }
+};
+
+const windows_access_tests = struct {
+    const windows_acl = @import("windows_acl.zig");
+
+    test "unix socket file allows only the owner on Windows" {
+        const io = std.testing.io;
+        var f: Fixture = undefined;
+        try f.start(.{});
+        defer f.stop();
+        const path = f.transport.path.?;
+        const report = try windows_acl.inspect(path);
+        try std.testing.expect(report.protected);
+        try std.testing.expectEqual(1, report.ace_count);
+        try std.testing.expect(report.only_current_user);
+        // Windows checks the list when a client connects: the owner connects, and after a
+        // list without entries nobody connects.
+        const address = try Io.net.UnixAddress.init(path);
+        (try address.connect(io)).close(io);
+        try windows_acl.denyAll(path);
+        if (address.connect(io)) |stream| {
+            stream.close(io);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+
+    test "unix socket file keeps the inherited list on Windows when the mode allows others" {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try socketPath(&tmp, "open.sock");
+        defer gpa.free(path);
+        var server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "unix-test", .version = "1" } });
+        defer server.deinit();
+        var transport: unix.Server = .init(io, gpa, &server, .{ .path = path, .mode = 0o666 });
+        defer transport.deinit();
+        try transport.bind();
+        const report = try windows_acl.inspect(transport.path.?);
+        try std.testing.expect(!report.protected);
+        try std.testing.expect(!report.only_current_user);
+    }
+};
