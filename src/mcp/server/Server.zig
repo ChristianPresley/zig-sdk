@@ -1,0 +1,1025 @@
+//! The MCP server engine: registries, the dispatch ladder, multi round-trip requests,
+//! subscriptions and result stamping. Transports feed it `Inbound` messages.
+const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
+const Value = std.json.Value;
+
+const types = @import("../protocol/types.zig");
+const version = @import("../protocol/version.zig");
+const errors = @import("../protocol/errors.zig");
+const meta_mod = @import("../protocol/meta.zig");
+const methods = @import("../protocol/methods.zig");
+const json = @import("../json.zig");
+const message = @import("../jsonrpc/message.zig");
+const RequestId = @import("../jsonrpc/id.zig").RequestId;
+const Transport = @import("../transport/Transport.zig");
+const Limits = @import("../Limits.zig");
+const derive = @import("../schema/derive.zig");
+const UriTemplate = @import("../uri_template/UriTemplate.zig");
+const request_state = @import("request_state.zig");
+const mrtr = @import("mrtr.zig");
+pub const RequestContext = @import("RequestContext.zig");
+pub const Outcome = mrtr.Outcome;
+pub const InputRequired = mrtr.InputRequired;
+
+const Server = @This();
+
+pub const CacheHint = struct {
+    ttl_ms: i64 = 0,
+    scope: types.CacheScope = .private,
+};
+
+pub const Options = struct {
+    info: types.Implementation,
+    instructions: ?[]const u8 = null,
+    /// Exact mirror of the advertised `ServerCapabilities`. Registering a tool, resource or
+    /// prompt declares the matching capability when it is absent.
+    capabilities: types.ServerCapabilities = .{},
+    /// Which kinds of input requests handlers may issue.
+    mrtr: struct {
+        elicitation: bool = true,
+        sampling: bool = false,
+        sampling_tools: bool = false,
+        roots: bool = false,
+    } = .{},
+    limits: Limits = .{},
+    /// How `requestState` is protected. `unprotected` is only acceptable when tampering can
+    /// cause nothing worse than request failure.
+    request_state: enum { sealed_ephemeral, unprotected } = .sealed_ephemeral,
+    /// What happens when tool arguments violate the input schema.
+    invalid_args_policy: enum { tool_error, rpc_error } = .tool_error,
+    /// Mirror `structuredContent` into a text block when the handler gave none.
+    structured_text_mirror: bool = true,
+    cache: struct {
+        discover: CacheHint = .{},
+        lists: CacheHint = .{},
+        reads: CacheHint = .{},
+    } = .{},
+};
+
+pub const ToolHandler = *const fn (ctx: *RequestContext, args: Value) anyerror!Outcome(types.CallToolResult);
+pub const ResourceHandler = *const fn (ctx: *RequestContext, uri: []const u8) anyerror!Outcome(types.ReadResourceResult);
+pub const TemplateHandler = *const fn (ctx: *RequestContext, uri: []const u8, vars: []const UriTemplate.Variable) anyerror!Outcome(types.ReadResourceResult);
+pub const TemplateLister = *const fn (ctx: *RequestContext) anyerror![]const types.Resource;
+pub const PromptHandler = *const fn (ctx: *RequestContext, args: ?std.json.ArrayHashMap([]const u8)) anyerror!Outcome(types.GetPromptResult);
+pub const CompletionHandler = *const fn (ctx: *RequestContext, params: types.CompleteRequestParams) anyerror!types.CompleteResult.Completion;
+
+pub const ToolDef = struct {
+    name: []const u8,
+    title: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    annotations: ?types.ToolAnnotations = null,
+    icons: ?[]const types.Icon = null,
+    /// Only for `addToolJson`: the input schema as JSON text.
+    input_schema: ?[]const u8 = null,
+    /// JSON text of the output schema.
+    output_schema: ?[]const u8 = null,
+    /// Client capabilities the tool needs. Checked before the handler runs (`-32021`).
+    requires_client: ?types.ClientCapabilities = null,
+    userdata: ?*anyopaque = null,
+};
+
+pub const ResourceDef = struct {
+    uri: []const u8,
+    name: []const u8,
+    title: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+    annotations: ?types.Annotations = null,
+    size: ?i64 = null,
+    userdata: ?*anyopaque = null,
+};
+
+pub const ResourceTemplateDef = struct {
+    uri_template: []const u8,
+    name: []const u8,
+    title: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    mime_type: ?[]const u8 = null,
+    annotations: ?types.Annotations = null,
+    list: ?TemplateLister = null,
+    userdata: ?*anyopaque = null,
+};
+
+pub const PromptDef = struct {
+    name: []const u8,
+    title: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    arguments: ?[]const types.PromptArgument = null,
+    userdata: ?*anyopaque = null,
+};
+
+const ToolEntry = struct {
+    def: types.Tool,
+    handler: ToolHandler,
+    requires_client: ?types.ClientCapabilities,
+    userdata: ?*anyopaque,
+    enabled: bool = true,
+};
+
+const ResourceEntry = struct {
+    def: types.Resource,
+    handler: ResourceHandler,
+    userdata: ?*anyopaque,
+    enabled: bool = true,
+};
+
+const TemplateEntry = struct {
+    def: types.ResourceTemplate,
+    template: UriTemplate,
+    handler: TemplateHandler,
+    list: ?TemplateLister,
+    userdata: ?*anyopaque,
+    enabled: bool = true,
+};
+
+const PromptEntry = struct {
+    def: types.Prompt,
+    handler: PromptHandler,
+    userdata: ?*anyopaque,
+    enabled: bool = true,
+};
+
+const Subscription = struct {
+    id: RequestId,
+    filter: types.SubscriptionFilter,
+    responder: Transport.Responder,
+    cancel: *Transport.CancelToken,
+    kind: Transport.Kind,
+    mutex: Io.Mutex = .init,
+    broken: bool = false,
+    arena: std.heap.ArenaAllocator,
+};
+
+gpa: Allocator,
+options: Options,
+/// Owns every registered definition. Never reset.
+registry_arena: std.heap.ArenaAllocator,
+registry_lock: Io.RwLock = .init,
+tools: std.ArrayList(ToolEntry) = .empty,
+resources: std.ArrayList(ResourceEntry) = .empty,
+templates: std.ArrayList(TemplateEntry) = .empty,
+prompts: std.ArrayList(PromptEntry) = .empty,
+completion_handler: ?CompletionHandler = null,
+subscriptions: std.ArrayList(*Subscription) = .empty,
+subscriptions_lock: Io.Mutex = .init,
+state_codec: ?request_state.Codec = null,
+/// Counts of protocol violations by peers, for diagnostics.
+violations: std.atomic.Value(u64) = .init(0),
+/// Set once `shutdownSubscriptions` ran; later listen requests end immediately.
+shutting_down: std.atomic.Value(bool) = .init(false),
+
+pub const InitError = error{ OutOfMemory, EntropyUnavailable };
+
+pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
+    var server: Server = .{
+        .gpa = gpa,
+        .options = options,
+        .registry_arena = .init(gpa),
+    };
+    if (options.request_state == .sealed_ephemeral) {
+        server.state_codec = try request_state.Codec.initRandom(io, options.limits.request_state_ttl);
+    }
+    return server;
+}
+
+pub fn deinit(self: *Server) void {
+    if (self.state_codec) |*c| c.deinit();
+    self.tools.deinit(self.gpa);
+    self.resources.deinit(self.gpa);
+    self.templates.deinit(self.gpa);
+    self.prompts.deinit(self.gpa);
+    for (self.subscriptions.items) |s| {
+        s.arena.deinit();
+        self.gpa.destroy(s);
+    }
+    self.subscriptions.deinit(self.gpa);
+    self.registry_arena.deinit();
+    self.* = undefined;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------------------------
+
+pub const RegisterError = error{
+    OutOfMemory,
+    InvalidToolName,
+    InvalidSchema,
+    SchemaNotObject,
+    DuplicateName,
+    InvalidUriTemplate,
+};
+
+fn validateToolName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.')) return false;
+    }
+    return true;
+}
+
+fn parseSchemaObject(self: *Server, text: []const u8, require_object_type: bool) RegisterError!Value {
+    const arena = self.registry_arena.allocator();
+    const tree = json.parseTree(arena, text) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSchema,
+    };
+    if (tree != .object) return error.SchemaNotObject;
+    if (require_object_type) {
+        const t = json.getString(tree, "type") orelse return error.SchemaNotObject;
+        if (!std.mem.eql(u8, t, "object")) return error.SchemaNotObject;
+    }
+    return tree;
+}
+
+/// Register a tool whose arguments are parsed into the handler's second parameter type. The
+/// input schema is derived from that type at compile time.
+pub fn addTool(self: *Server, def: ToolDef, comptime handler: anytype) RegisterError!void {
+    const Fn = @TypeOf(handler);
+    const params = @typeInfo(Fn).@"fn".params;
+    if (params.len != 2) @compileError("tool handler must be fn (*RequestContext, Args) anyerror!Outcome(CallToolResult)");
+    const Args = params[1].type.?;
+    if (Args == Value) return self.addToolJson(def, handler);
+    const Wrapper = struct {
+        fn call(ctx: *RequestContext, args: Value) anyerror!Outcome(types.CallToolResult) {
+            const parsed = json.parseValue(Args, ctx.arena, args) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidArguments,
+            };
+            return handler(ctx, parsed);
+        }
+    };
+    var d = def;
+    d.input_schema = derive.schemaText(Args);
+    return self.addToolJson(d, Wrapper.call);
+}
+
+/// Register a tool with an explicit JSON Schema (as text) and a raw-value handler.
+pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterError!void {
+    if (!validateToolName(def.name)) return error.InvalidToolName;
+    const arena = self.registry_arena.allocator();
+    const input_schema = try self.parseSchemaObject(def.input_schema orelse "{\"type\":\"object\"}", true);
+    const output_schema: ?Value = if (def.output_schema) |t| try self.parseSchemaObject(t, false) else null;
+    const entry: ToolEntry = .{
+        .def = .{
+            .name = try arena.dupe(u8, def.name),
+            .title = if (def.title) |t| try arena.dupe(u8, t) else null,
+            .description = if (def.description) |t| try arena.dupe(u8, t) else null,
+            .icons = def.icons,
+            .inputSchema = input_schema,
+            .outputSchema = output_schema,
+            .annotations = def.annotations,
+        },
+        .handler = handler,
+        .requires_client = def.requires_client,
+        .userdata = def.userdata,
+    };
+    self.registry_lock.lockSharedUncancelable(std.Io.Threaded.global_single_threaded.io());
+    defer self.registry_lock.unlockShared(std.Io.Threaded.global_single_threaded.io());
+    for (self.tools.items) |t| if (std.mem.eql(u8, t.def.name, def.name)) return error.DuplicateName;
+    try self.tools.append(self.gpa, entry);
+    if (self.options.capabilities.tools == null) self.options.capabilities.tools = .{ .listChanged = true };
+}
+
+pub fn addResource(self: *Server, def: ResourceDef, handler: ResourceHandler) RegisterError!void {
+    const arena = self.registry_arena.allocator();
+    for (self.resources.items) |r| if (std.mem.eql(u8, r.def.uri, def.uri)) return error.DuplicateName;
+    try self.resources.append(self.gpa, .{
+        .def = .{
+            .uri = try arena.dupe(u8, def.uri),
+            .name = try arena.dupe(u8, def.name),
+            .title = if (def.title) |t| try arena.dupe(u8, t) else null,
+            .description = if (def.description) |t| try arena.dupe(u8, t) else null,
+            .mimeType = if (def.mime_type) |t| try arena.dupe(u8, t) else null,
+            .annotations = def.annotations,
+            .size = def.size,
+        },
+        .handler = handler,
+        .userdata = def.userdata,
+    });
+    if (self.options.capabilities.resources == null) self.options.capabilities.resources = .{ .listChanged = true, .subscribe = true };
+}
+
+pub fn addResourceTemplate(self: *Server, def: ResourceTemplateDef, handler: TemplateHandler) RegisterError!void {
+    const arena = self.registry_arena.allocator();
+    const source = try arena.dupe(u8, def.uri_template);
+    const template = UriTemplate.parse(arena, source, self.options.limits.uri_template.max_expressions) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidUriTemplate,
+    };
+    try self.templates.append(self.gpa, .{
+        .def = .{
+            .uriTemplate = source,
+            .name = try arena.dupe(u8, def.name),
+            .title = if (def.title) |t| try arena.dupe(u8, t) else null,
+            .description = if (def.description) |t| try arena.dupe(u8, t) else null,
+            .mimeType = if (def.mime_type) |t| try arena.dupe(u8, t) else null,
+            .annotations = def.annotations,
+        },
+        .template = template,
+        .handler = handler,
+        .list = def.list,
+        .userdata = def.userdata,
+    });
+    if (self.options.capabilities.resources == null) self.options.capabilities.resources = .{ .listChanged = true, .subscribe = true };
+}
+
+pub fn addPrompt(self: *Server, def: PromptDef, handler: PromptHandler) RegisterError!void {
+    if (!validateToolName(def.name)) return error.InvalidToolName;
+    const arena = self.registry_arena.allocator();
+    for (self.prompts.items) |p| if (std.mem.eql(u8, p.def.name, def.name)) return error.DuplicateName;
+    try self.prompts.append(self.gpa, .{
+        .def = .{
+            .name = try arena.dupe(u8, def.name),
+            .title = if (def.title) |t| try arena.dupe(u8, t) else null,
+            .description = if (def.description) |t| try arena.dupe(u8, t) else null,
+            .arguments = def.arguments,
+        },
+        .handler = handler,
+        .userdata = def.userdata,
+    });
+    if (self.options.capabilities.prompts == null) self.options.capabilities.prompts = .{ .listChanged = true };
+}
+
+pub fn setCompletionHandler(self: *Server, handler: CompletionHandler) void {
+    self.completion_handler = handler;
+    if (self.options.capabilities.completions == null) self.options.capabilities.completions = .{ .object = .empty };
+}
+
+/// Enable or disable a registered tool. Publishes `notifications/tools/list_changed`.
+pub fn setToolEnabled(self: *Server, io: Io, name: []const u8, enabled: bool) bool {
+    var changed = false;
+    for (self.tools.items) |*t| {
+        if (std.mem.eql(u8, t.def.name, name)) {
+            changed = t.enabled != enabled;
+            t.enabled = enabled;
+        }
+    }
+    if (changed) self.publish(io, .tools_list_changed, null);
+    return changed;
+}
+
+pub fn setPromptEnabled(self: *Server, io: Io, name: []const u8, enabled: bool) bool {
+    var changed = false;
+    for (self.prompts.items) |*p| {
+        if (std.mem.eql(u8, p.def.name, name)) {
+            changed = p.enabled != enabled;
+            p.enabled = enabled;
+        }
+    }
+    if (changed) self.publish(io, .prompts_list_changed, null);
+    return changed;
+}
+
+/// Announce that a resource changed. Delivered to listeners subscribed to `uri`.
+pub fn notifyResourceUpdated(self: *Server, io: Io, uri: []const u8) void {
+    self.publish(io, .resource_updated, uri);
+}
+
+pub fn notifyToolsListChanged(self: *Server, io: Io) void {
+    self.publish(io, .tools_list_changed, null);
+}
+
+pub fn notifyPromptsListChanged(self: *Server, io: Io) void {
+    self.publish(io, .prompts_list_changed, null);
+}
+
+pub fn notifyResourcesListChanged(self: *Server, io: Io) void {
+    self.publish(io, .resources_list_changed, null);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------------------------
+
+/// Handle one inbound message. Requests always end in exactly one `finish` or `abort` on the
+/// responder. Notifications and responses are ignored here; transports handle
+/// `notifications/cancelled` themselves.
+pub fn handle(self: *Server, io: Io, inbound: Transport.Inbound) void {
+    switch (inbound.message) {
+        .request => |req| self.handleRequest(io, inbound, req),
+        .notification => {},
+        .response, .error_response => _ = self.violations.fetchAdd(1, .monotonic),
+    }
+}
+
+fn handleRequest(self: *Server, io: Io, inbound: Transport.Inbound, req: message.Message.Request) void {
+    var ctx: RequestContext = .{
+        .io = io,
+        .gpa = self.gpa,
+        .arena = inbound.arena,
+        .server = self,
+        .id = req.id,
+        .method = req.method,
+        .meta = undefined,
+        .params = req.params,
+        .cancel = inbound.cancel,
+        .responder = inbound.responder,
+        .kind = inbound.kind,
+    };
+    self.dispatch(&ctx) catch |e| switch (e) {
+        error.Rpc => {
+            const err = ctx.rpc_error orelse errors.internalError("Internal error");
+            self.sendError(&ctx, err);
+        },
+        error.Canceled => inbound.responder.abort(io),
+        error.OutOfMemory => self.sendError(&ctx, errors.internalError("Out of memory")),
+    };
+}
+
+fn sendError(self: *Server, ctx: *RequestContext, err: errors.RpcError) void {
+    _ = self;
+    std.debug.assert(errors.Code.isEmittable(err.code));
+    var aw: Io.Writer.Allocating = .init(ctx.arena);
+    message.writeErrorResponse(&aw.writer, ctx.id, err.toWire()) catch {
+        ctx.responder.abort(ctx.io);
+        return;
+    };
+    ctx.responder.finish(ctx.io, aw.written()) catch {};
+}
+
+fn finishResult(self: *Server, ctx: *RequestContext, result: anytype) RequestContext.Error!void {
+    var stamped = result;
+    const T = @TypeOf(stamped);
+    if (@hasField(T, "_meta")) {
+        const MetaT = @TypeOf(stamped._meta);
+        if (MetaT == ?types.ResultMetaObject) {
+            if (stamped._meta == null) stamped._meta = .{};
+            if (stamped._meta.?.@"io.modelcontextprotocol/serverInfo" == null) {
+                stamped._meta.?.@"io.modelcontextprotocol/serverInfo" = self.options.info;
+            }
+        } else if (MetaT == types.SubscriptionsListenResultMetaObject) {
+            if (stamped._meta.@"io.modelcontextprotocol/serverInfo" == null) {
+                stamped._meta.@"io.modelcontextprotocol/serverInfo" = self.options.info;
+            }
+        }
+    }
+    if (@hasField(T, "ttlMs")) {
+        const hint = if (T == types.DiscoverResult) self.options.cache.discover else if (T == types.ReadResourceResult) self.options.cache.reads else self.options.cache.lists;
+        if (stamped.ttlMs == null) stamped.ttlMs = @max(hint.ttl_ms, 0);
+        if (stamped.cacheScope == null) stamped.cacheScope = hint.scope;
+        if (stamped.ttlMs.? < 0) stamped.ttlMs = 0;
+    }
+    var aw: Io.Writer.Allocating = .init(ctx.arena);
+    message.writeResponse(&aw.writer, ctx.id, stamped) catch return error.OutOfMemory;
+    ctx.responder.finish(ctx.io, aw.written()) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Canceled,
+    };
+}
+
+fn dispatch(self: *Server, ctx: *RequestContext) RequestContext.Error!void {
+    // Legacy handshake from a pre-2026 client: name the supported versions.
+    if (std.mem.eql(u8, ctx.method, "initialize")) {
+        var map: std.json.ObjectMap = .empty;
+        var versions: std.json.Array = .init(ctx.arena);
+        try versions.append(.{ .string = version.version });
+        try map.put(ctx.arena, "supportedVersions", .{ .array = versions });
+        return ctx.setError(.{
+            .code = errors.Code.method_not_found.int(),
+            .message = "Method not found: initialize. This server implements MCP 2026-07-28 only; use server/discover.",
+            .data = .{ .object = map },
+        });
+    }
+
+    // Required per-request envelope.
+    ctx.meta = meta_mod.lift(ctx.arena, ctx.params) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MissingMeta => return ctx.setError(errors.invalidParams("params._meta is required")),
+        error.MissingProtocolVersion => return ctx.setError(errors.invalidParams("params._meta[\"io.modelcontextprotocol/protocolVersion\"] is required")),
+        error.MissingClientCapabilities => return ctx.setError(errors.invalidParams("params._meta[\"io.modelcontextprotocol/clientCapabilities\"] is required")),
+        error.InvalidMeta => return ctx.setError(errors.invalidParams("params._meta is malformed")),
+    };
+
+    // Version.
+    if (!std.mem.eql(u8, ctx.meta.protocol_version, version.version)) {
+        const err = try errors.unsupportedProtocolVersion(ctx.arena, &version.supported_versions, ctx.meta.protocol_version);
+        return ctx.setError(err);
+    }
+
+    // Method table and capability gate.
+    const method = methods.Method.fromName(ctx.method) orelse {
+        const msg = try std.fmt.allocPrint(ctx.arena, "Method not found: {s}", .{ctx.method});
+        return ctx.setError(errors.methodNotFound(msg));
+    };
+    if (!self.isMethodAvailable(method)) {
+        const msg = try std.fmt.allocPrint(ctx.arena, "Method not found: {s} (capability not declared)", .{ctx.method});
+        return ctx.setError(errors.methodNotFound(msg));
+    }
+
+    switch (method) {
+        inline else => |m| try self.dispatchTyped(ctx, m),
+    }
+}
+
+fn isMethodAvailable(self: *const Server, method: methods.Method) bool {
+    const caps = self.options.capabilities;
+    return switch (method.gate()) {
+        .none => true,
+        .tools => caps.tools != null,
+        .resources => caps.resources != null,
+        .prompts => caps.prompts != null,
+        .completions => caps.completions != null,
+        .subscriptions => self.supportsSubscriptions(),
+    };
+}
+
+fn supportsSubscriptions(self: *const Server) bool {
+    const caps = self.options.capabilities;
+    if (caps.tools) |t| if (t.listChanged orelse false) return true;
+    if (caps.prompts) |p| if (p.listChanged orelse false) return true;
+    if (caps.resources) |r| {
+        if (r.listChanged orelse false) return true;
+        if (r.subscribe orelse false) return true;
+    }
+    return false;
+}
+
+fn parseParams(ctx: *RequestContext, comptime T: type) RequestContext.Error!T {
+    const p = ctx.params orelse return ctx.setError(errors.invalidParams("params is required"));
+    return json.parseValue(T, ctx.arena, p) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MissingField => return ctx.setError(errors.invalidParams("params is missing a required field")),
+        else => return ctx.setError(errors.invalidParams("params has an unexpected shape")),
+    };
+}
+
+fn dispatchTyped(self: *Server, ctx: *RequestContext, comptime method: methods.Method) RequestContext.Error!void {
+    const params = try parseParams(ctx, method.Params());
+    switch (method) {
+        .@"server/discover" => {
+            const result: types.DiscoverResult = .{
+                .supportedVersions = &version.supported_versions,
+                .capabilities = self.options.capabilities,
+                .instructions = self.options.instructions,
+            };
+            try self.finishResult(ctx, result);
+        },
+        .@"tools/list" => {
+            var items: std.ArrayList(types.Tool) = .empty;
+            for (self.tools.items) |t| if (t.enabled) try items.append(ctx.arena, t.def);
+            const page = try self.paginate(ctx, types.Tool, items.items, params.cursor);
+            try self.finishResult(ctx, types.ListToolsResult{ .tools = page.items, .nextCursor = page.next_cursor });
+        },
+        .@"tools/call" => try self.callTool(ctx, params),
+        .@"resources/list" => {
+            var items: std.ArrayList(types.Resource) = .empty;
+            for (self.resources.items) |r| if (r.enabled) try items.append(ctx.arena, r.def);
+            for (self.templates.items) |t| {
+                if (!t.enabled) continue;
+                const lister = t.list orelse continue;
+                ctx.userdata = t.userdata;
+                const listed = lister(ctx) catch |e| return mapHandlerError(ctx, e);
+                try items.appendSlice(ctx.arena, listed);
+            }
+            const page = try self.paginate(ctx, types.Resource, items.items, params.cursor);
+            try self.finishResult(ctx, types.ListResourcesResult{ .resources = page.items, .nextCursor = page.next_cursor });
+        },
+        .@"resources/templates/list" => {
+            var items: std.ArrayList(types.ResourceTemplate) = .empty;
+            for (self.templates.items) |t| if (t.enabled) try items.append(ctx.arena, t.def);
+            const page = try self.paginate(ctx, types.ResourceTemplate, items.items, params.cursor);
+            try self.finishResult(ctx, types.ListResourceTemplatesResult{ .resourceTemplates = page.items, .nextCursor = page.next_cursor });
+        },
+        .@"resources/read" => try self.readResource(ctx, params),
+        .@"prompts/list" => {
+            var items: std.ArrayList(types.Prompt) = .empty;
+            for (self.prompts.items) |p| if (p.enabled) try items.append(ctx.arena, p.def);
+            const page = try self.paginate(ctx, types.Prompt, items.items, params.cursor);
+            try self.finishResult(ctx, types.ListPromptsResult{ .prompts = page.items, .nextCursor = page.next_cursor });
+        },
+        .@"prompts/get" => try self.getPrompt(ctx, params),
+        .@"completion/complete" => {
+            var completion: types.CompleteResult.Completion = .{ .values = &.{} };
+            if (self.completion_handler) |h| {
+                completion = h(ctx, params) catch |e| return mapHandlerError(ctx, e);
+            }
+            const max = self.options.limits.completion_max_values;
+            if (completion.values.len > max) {
+                completion.values = completion.values[0..max];
+                completion.hasMore = true;
+            }
+            try self.finishResult(ctx, types.CompleteResult{ .completion = completion });
+        },
+        .@"subscriptions/listen" => try self.listen(ctx, params),
+    }
+}
+
+fn mapHandlerError(ctx: *RequestContext, e: anyerror) RequestContext.Error {
+    return switch (e) {
+        error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
+        error.Rpc => error.Rpc,
+        else => {
+            const msg = std.fmt.allocPrint(ctx.arena, "Internal error: {t}", .{e}) catch return error.OutOfMemory;
+            return ctx.setError(errors.internalError(msg));
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------------------------
+
+fn Page(comptime T: type) type {
+    return struct { items: []const T, next_cursor: ?[]const u8 };
+}
+
+fn paginate(self: *Server, ctx: *RequestContext, comptime T: type, items: []const T, cursor: ?[]const u8) RequestContext.Error!Page(T) {
+    const page_size: usize = self.options.limits.page_size;
+    var offset: usize = 0;
+    if (cursor) |c| {
+        if (c.len > 0) {
+            offset = decodeCursor(c) orelse return ctx.setError(errors.invalidParams("Invalid cursor"));
+            if (offset > items.len) return ctx.setError(errors.invalidParams("Invalid cursor"));
+        }
+    }
+    const end = @min(items.len, offset + page_size);
+    var next: ?[]const u8 = null;
+    if (end < items.len) next = try encodeCursor(ctx.arena, end);
+    return .{ .items = items[offset..end], .next_cursor = next };
+}
+
+fn encodeCursor(arena: Allocator, offset: usize) Allocator.Error![]const u8 {
+    const raw = try std.fmt.allocPrint(arena, "v1:{d}", .{offset});
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const out = try arena.alloc(u8, encoder.calcSize(raw.len));
+    return encoder.encode(out, raw);
+}
+
+fn decodeCursor(cursor: []const u8) ?usize {
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    var buf: [64]u8 = undefined;
+    const len = decoder.calcSizeForSlice(cursor) catch return null;
+    if (len > buf.len) return null;
+    decoder.decode(buf[0..len], cursor) catch return null;
+    const raw = buf[0..len];
+    if (!std.mem.startsWith(u8, raw, "v1:")) return null;
+    return std.fmt.parseInt(usize, raw[3..], 10) catch null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tools, resources, prompts
+// ---------------------------------------------------------------------------------------------
+
+fn prepareInputRound(self: *Server, ctx: *RequestContext, method_name: []const u8, target: []const u8, responses: ?types.InputResponses, sealed: ?[]const u8) RequestContext.Error!void {
+    ctx.target = target;
+    ctx.input_responses = responses;
+    if (sealed) |s| {
+        if (self.state_codec) |codec| {
+            const ad = try request_state.aad(ctx.arena, method_name, target, "");
+            const now = Io.Clock.real.now(ctx.io).toSeconds();
+            ctx.request_state = codec.unseal(ctx.arena, ad, s, now) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Invalid, error.Expired => {
+                    var map: std.json.ObjectMap = .empty;
+                    try map.put(ctx.arena, "reason", .{ .string = "invalid_request_state" });
+                    return ctx.setError(.{ .code = errors.Code.invalid_params.int(), .message = "Invalid or expired requestState", .data = .{ .object = map } });
+                },
+            };
+        } else {
+            ctx.request_state = s;
+        }
+    }
+}
+
+fn finishInputRequired(self: *Server, ctx: *RequestContext, method: methods.Method, ir: InputRequired) RequestContext.Error!void {
+    if (!method.allowsInputRequired()) return ctx.setError(errors.internalError("Handler returned input_required for a method that does not allow it"));
+    if (ir.count() == 0 and ir.state == null) return ctx.setError(errors.internalError("InputRequiredResult needs inputRequests or requestState"));
+    // Every input request kind must be enabled and declared by the client.
+    var it = ir.requests.map.iterator();
+    while (it.next()) |kv| {
+        switch (kv.value_ptr.*) {
+            .@"elicitation/create" => |e| {
+                if (!self.options.mrtr.elicitation) return ctx.setError(errors.internalError("Elicitation is disabled on this server"));
+                try ctx.requireClientCapability(if (e.params.mode() == .url) .elicitation_url else .elicitation_form);
+            },
+            .@"sampling/createMessage" => |s| {
+                if (!self.options.mrtr.sampling) return ctx.setError(errors.internalError("Sampling is disabled on this server"));
+                try ctx.requireClientCapability(.sampling);
+                if (s.params.tools != null or s.params.toolChoice != null) {
+                    if (!self.options.mrtr.sampling_tools) return ctx.setError(errors.internalError("Sampling with tools is disabled on this server"));
+                    try ctx.requireClientCapability(.sampling_tools);
+                }
+            },
+            .@"roots/list" => {
+                if (!self.options.mrtr.roots) return ctx.setError(errors.internalError("Roots are disabled on this server"));
+                try ctx.requireClientCapability(.roots);
+            },
+        }
+    }
+    var result: types.InputRequiredResult = .{};
+    if (ir.count() > 0) result.inputRequests = ir.requests;
+    if (ir.state) |s| {
+        if (self.state_codec) |codec| {
+            const ad = try request_state.aad(ctx.arena, method.name(), ctx.target, "");
+            const now = Io.Clock.real.now(ctx.io).toSeconds();
+            result.requestState = codec.seal(ctx.arena, ctx.io, ad, s, now) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.EntropyUnavailable => return ctx.setError(errors.internalError("Entropy unavailable")),
+            };
+        } else {
+            result.requestState = s;
+        }
+    }
+    try self.finishResult(ctx, result);
+}
+
+fn callTool(self: *Server, ctx: *RequestContext, params: types.CallToolRequestParams) RequestContext.Error!void {
+    const entry = self.findTool(params.name) orelse {
+        const msg = try std.fmt.allocPrint(ctx.arena, "Unknown tool: {s}", .{params.name});
+        return ctx.setError(errors.invalidParams(msg));
+    };
+    if (params.arguments) |a| if (a != .object) return ctx.setError(errors.invalidParams("arguments must be an object"));
+    if (entry.requires_client) |required| try self.requireCapabilities(ctx, required);
+    try self.prepareInputRound(ctx, "tools/call", params.name, params.inputResponses, params.requestState);
+    ctx.userdata = entry.userdata;
+    const args: Value = params.arguments orelse .{ .object = .empty };
+    const outcome = entry.handler(ctx, args) catch |e| switch (e) {
+        error.InvalidArguments => switch (self.options.invalid_args_policy) {
+            .tool_error => {
+                const result = try types.CallToolResult.err(ctx.arena, "Invalid arguments for tool {s}", .{params.name});
+                return self.finishResult(ctx, result);
+            },
+            .rpc_error => {
+                const msg = try std.fmt.allocPrint(ctx.arena, "Invalid arguments for tool {s}", .{params.name});
+                return ctx.setError(errors.invalidParams(msg));
+            },
+        },
+        error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Rpc => return error.Rpc,
+        else => {
+            const result = try types.CallToolResult.err(ctx.arena, "Tool failed: {t}", .{e});
+            return self.finishResult(ctx, result);
+        },
+    };
+    switch (outcome) {
+        .complete => |r| {
+            var result = r;
+            if (self.options.structured_text_mirror and result.structuredContent != null and !hasText(result.content)) {
+                const blocks = try ctx.arena.alloc(types.ContentBlock, result.content.len + 1);
+                @memcpy(blocks[0..result.content.len], result.content);
+                blocks[result.content.len] = .{ .text = .{ .text = try json.writeAlloc(ctx.arena, result.structuredContent.?) } };
+                result.content = blocks;
+            }
+            try self.finishResult(ctx, result);
+        },
+        .input_required => |ir| try self.finishInputRequired(ctx, .@"tools/call", ir),
+    }
+}
+
+fn hasText(blocks: []const types.ContentBlock) bool {
+    for (blocks) |b| if (b == .text) return true;
+    return false;
+}
+
+fn requireCapabilities(self: *Server, ctx: *RequestContext, required: types.ClientCapabilities) RequestContext.Error!void {
+    _ = self;
+    const have = ctx.meta.client_capabilities;
+    var missing = false;
+    if (required.roots != null and have.roots == null) missing = true;
+    if (required.sampling) |s| {
+        if (have.sampling == null) missing = true else if (s.tools != null and have.sampling.?.tools == null) missing = true;
+    }
+    if (required.elicitation) |e| {
+        if (e.form != null and !have.hasElicitation(.form)) missing = true;
+        if (e.url != null and !have.hasElicitation(.url)) missing = true;
+        if (e.form == null and e.url == null and have.elicitation == null) missing = true;
+    }
+    if (!missing) return;
+    const err = try errors.missingRequiredClientCapability(ctx.arena, required, "The tool needs a client capability that the client did not declare");
+    return ctx.setError(err);
+}
+
+fn findTool(self: *Server, name: []const u8) ?*ToolEntry {
+    for (self.tools.items) |*t| if (t.enabled and std.mem.eql(u8, t.def.name, name)) return t;
+    return null;
+}
+
+fn readResource(self: *Server, ctx: *RequestContext, params: types.ReadResourceRequestParams) RequestContext.Error!void {
+    try self.prepareInputRound(ctx, "resources/read", params.uri, params.inputResponses, params.requestState);
+    for (self.resources.items) |r| {
+        if (!r.enabled or !std.mem.eql(u8, r.def.uri, params.uri)) continue;
+        ctx.userdata = r.userdata;
+        const outcome = r.handler(ctx, params.uri) catch |e| return mapHandlerError(ctx, e);
+        return self.finishRead(ctx, outcome, params.uri);
+    }
+    var vars: std.ArrayList(UriTemplate.Variable) = .empty;
+    for (self.templates.items) |t| {
+        if (!t.enabled) continue;
+        vars.clearRetainingCapacity();
+        if (!try t.template.match(params.uri, &vars, ctx.arena)) continue;
+        ctx.userdata = t.userdata;
+        const outcome = t.handler(ctx, params.uri, vars.items) catch |e| return mapHandlerError(ctx, e);
+        return self.finishRead(ctx, outcome, params.uri);
+    }
+    return ctx.setError(try errors.resourceNotFound(ctx.arena, params.uri));
+}
+
+fn finishRead(self: *Server, ctx: *RequestContext, outcome: Outcome(types.ReadResourceResult), uri: []const u8) RequestContext.Error!void {
+    switch (outcome) {
+        .complete => |r| {
+            if (r.contents.len == 0) return ctx.setError(try errors.resourceNotFound(ctx.arena, uri));
+            try self.finishResult(ctx, r);
+        },
+        .input_required => |ir| try self.finishInputRequired(ctx, .@"resources/read", ir),
+    }
+}
+
+fn getPrompt(self: *Server, ctx: *RequestContext, params: types.GetPromptRequestParams) RequestContext.Error!void {
+    for (self.prompts.items) |p| {
+        if (!p.enabled or !std.mem.eql(u8, p.def.name, params.name)) continue;
+        if (p.def.arguments) |defs| {
+            for (defs) |d| {
+                if (d.required orelse false) {
+                    const present = if (params.arguments) |a| a.map.get(d.name) != null else false;
+                    if (!present) {
+                        const msg = try std.fmt.allocPrint(ctx.arena, "Missing required argument: {s}", .{d.name});
+                        return ctx.setError(errors.invalidParams(msg));
+                    }
+                }
+            }
+        }
+        try self.prepareInputRound(ctx, "prompts/get", params.name, params.inputResponses, params.requestState);
+        ctx.userdata = p.userdata;
+        const outcome = p.handler(ctx, params.arguments) catch |e| return mapHandlerError(ctx, e);
+        switch (outcome) {
+            .complete => |r| try self.finishResult(ctx, r),
+            .input_required => |ir| try self.finishInputRequired(ctx, .@"prompts/get", ir),
+        }
+        return;
+    }
+    const msg = try std.fmt.allocPrint(ctx.arena, "Unknown prompt: {s}", .{params.name});
+    return ctx.setError(errors.invalidParams(msg));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Subscriptions
+// ---------------------------------------------------------------------------------------------
+
+pub const Event = enum { tools_list_changed, prompts_list_changed, resources_list_changed, resource_updated };
+
+fn listen(self: *Server, ctx: *RequestContext, params: types.SubscriptionsListenRequestParams) RequestContext.Error!void {
+    const caps = self.options.capabilities;
+    const filter = params.notifications;
+    if (filter.resourceSubscriptions) |uris| {
+        if (uris.len > self.options.limits.max_resource_subscription_uris) return ctx.setError(errors.internalError("Too many resource subscriptions"));
+    }
+    // Honour only what the server declared.
+    var honoured: types.SubscriptionFilter = .{};
+    if (filter.toolsListChanged orelse false) {
+        if (caps.tools) |t| if (t.listChanged orelse false) {
+            honoured.toolsListChanged = true;
+        };
+    }
+    if (filter.promptsListChanged orelse false) {
+        if (caps.prompts) |p| if (p.listChanged orelse false) {
+            honoured.promptsListChanged = true;
+        };
+    }
+    if (filter.resourcesListChanged orelse false) {
+        if (caps.resources) |r| if (r.listChanged orelse false) {
+            honoured.resourcesListChanged = true;
+        };
+    }
+    if (filter.resourceSubscriptions) |uris| {
+        if (caps.resources) |r| if (r.subscribe orelse false) {
+            honoured.resourceSubscriptions = uris;
+        };
+    }
+
+    const sub = try self.gpa.create(Subscription);
+    var owned = true;
+    errdefer if (owned) self.gpa.destroy(sub);
+    sub.* = .{
+        .id = undefined,
+        .filter = undefined,
+        .responder = ctx.responder,
+        .cancel = ctx.cancel,
+        .kind = ctx.kind,
+        .arena = .init(self.gpa),
+    };
+    errdefer if (owned) sub.arena.deinit();
+    const sub_arena = sub.arena.allocator();
+    sub.id = try ctx.id.dupe(sub_arena);
+    sub.filter = honoured;
+    if (honoured.resourceSubscriptions) |uris| {
+        const copy = try sub_arena.alloc([]const u8, uris.len);
+        for (uris, 0..) |u, i| copy[i] = try sub_arena.dupe(u8, u);
+        sub.filter.resourceSubscriptions = copy;
+    }
+
+    {
+        self.subscriptions_lock.lockUncancelable(ctx.io);
+        defer self.subscriptions_lock.unlock(ctx.io);
+        if (self.subscriptions.items.len >= self.options.limits.max_listen_subscriptions) {
+            sub.arena.deinit();
+            self.gpa.destroy(sub);
+            return ctx.setError(errors.internalError("Too many subscriptions"));
+        }
+        try self.subscriptions.append(self.gpa, sub);
+        owned = false;
+    }
+    ctx.long_lived = true;
+    if (self.shutting_down.load(.acquire)) ctx.cancel.cancel(ctx.io, shutdown_reason);
+
+    // The acknowledgement is always the first message on the stream.
+    const ack: types.SubscriptionsAcknowledgedNotificationParams = .{
+        ._meta = .{ .@"io.modelcontextprotocol/subscriptionId" = ctx.id },
+        .notifications = honoured,
+    };
+    ctx.sendNotification("notifications/subscriptions/acknowledged", ack) catch |e| {
+        _ = self.removeSubscription(ctx.io, sub);
+        return e;
+    };
+
+    // Park until the client cancels, the transport closes, or the server shuts down.
+    ctx.cancel.wait(ctx.io) catch {};
+    const by_server = self.removeSubscription(ctx.io, sub);
+    if (!by_server) return error.Canceled;
+    // Graceful teardown: a completion result, then (on stdio) a cancellation notification.
+    const result: types.SubscriptionsListenResult = .{ ._meta = .{ .@"io.modelcontextprotocol/subscriptionId" = ctx.id } };
+    try self.finishResult(ctx, result);
+}
+
+/// Remove the subscription. Returns true when the server (not the client) ended it.
+fn removeSubscription(self: *Server, io: Io, sub: *Subscription) bool {
+    self.subscriptions_lock.lockUncancelable(io);
+    defer self.subscriptions_lock.unlock(io);
+    for (self.subscriptions.items, 0..) |s, i| {
+        if (s == sub) {
+            _ = self.subscriptions.swapRemove(i);
+            break;
+        }
+    }
+    const by_server = sub.cancel.reason != null and std.mem.eql(u8, sub.cancel.reason.?, shutdown_reason);
+    sub.arena.deinit();
+    self.gpa.destroy(sub);
+    return by_server;
+}
+
+pub const shutdown_reason = "server shutdown";
+
+/// End every subscription gracefully. Call before the transport closes.
+pub fn shutdownSubscriptions(self: *Server, io: Io) void {
+    self.shutting_down.store(true, .release);
+    self.subscriptions_lock.lockUncancelable(io);
+    const subs = self.subscriptions.items;
+    // Copy the tokens: `listen` removes entries as the tasks wake.
+    var tokens: [64]*Transport.CancelToken = undefined;
+    var count: usize = 0;
+    for (subs) |s| {
+        if (count == tokens.len) break;
+        tokens[count] = s.cancel;
+        count += 1;
+    }
+    self.subscriptions_lock.unlock(io);
+    for (tokens[0..count]) |t| t.cancel(io, shutdown_reason);
+}
+
+fn publish(self: *Server, io: Io, event: Event, uri: ?[]const u8) void {
+    self.subscriptions_lock.lockUncancelable(io);
+    defer self.subscriptions_lock.unlock(io);
+    for (self.subscriptions.items) |sub| {
+        if (sub.broken) continue;
+        const wanted = switch (event) {
+            .tools_list_changed => sub.filter.toolsListChanged orelse false,
+            .prompts_list_changed => sub.filter.promptsListChanged orelse false,
+            .resources_list_changed => sub.filter.resourcesListChanged orelse false,
+            .resource_updated => blk: {
+                const uris = sub.filter.resourceSubscriptions orelse break :blk false;
+                for (uris) |u| if (std.mem.eql(u8, u, uri.?)) break :blk true;
+                break :blk false;
+            },
+        };
+        if (!wanted) continue;
+        self.deliver(io, sub, event, uri) catch {
+            sub.broken = true;
+            sub.cancel.cancel(io, "stream closed");
+        };
+    }
+}
+
+fn deliver(self: *Server, io: Io, sub: *Subscription, event: Event, uri: ?[]const u8) !void {
+    _ = self;
+    var buf: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    var aw: Io.Writer.Allocating = .init(fba.allocator());
+    const meta: types.NotificationMetaObject = .{ .@"io.modelcontextprotocol/subscriptionId" = sub.id };
+    switch (event) {
+        .tools_list_changed => try message.writeNotification(&aw.writer, "notifications/tools/list_changed", types.NotificationParams{ ._meta = meta }),
+        .prompts_list_changed => try message.writeNotification(&aw.writer, "notifications/prompts/list_changed", types.NotificationParams{ ._meta = meta }),
+        .resources_list_changed => try message.writeNotification(&aw.writer, "notifications/resources/list_changed", types.NotificationParams{ ._meta = meta }),
+        .resource_updated => try message.writeNotification(&aw.writer, "notifications/resources/updated", types.ResourceUpdatedNotificationParams{ ._meta = meta, .uri = uri.? }),
+    }
+    sub.mutex.lockUncancelable(io);
+    defer sub.mutex.unlock(io);
+    try sub.responder.notify(io, aw.written());
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}
