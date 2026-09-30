@@ -272,12 +272,13 @@ test "every cipher suite negotiates with the SDK client" {
     }
 }
 
-/// True when `openssl` runs on this machine.
+/// True when OpenSSL runs on this machine. LibreSSL is skipped: its `s_server` has no `-rev`.
 fn haveOpenssl(io: Io, gpa: std.mem.Allocator) bool {
-    var child = std.process.spawn(io, .{ .argv = &.{ "openssl", "version" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
-    const term = child.wait(io) catch return false;
-    _ = gpa;
-    return term == .exited and term.exited == 0;
+    const result = std.process.run(gpa, io, .{ .argv = &.{ "openssl", "version" }, .stdout_limit = .limited(256), .stderr_limit = .limited(256) }) catch return false;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return false;
+    return std.mem.indexOf(u8, result.stdout, "LibreSSL") == null;
 }
 
 test "interop: the SDK client talks to openssl s_server" {
