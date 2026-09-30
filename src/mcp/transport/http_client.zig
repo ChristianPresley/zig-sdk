@@ -14,6 +14,7 @@ const json = @import("../json.zig");
 const methods = @import("../protocol/methods.zig");
 const version = @import("../protocol/version.zig");
 const message = @import("../jsonrpc/message.zig");
+const OAuthClient = @import("../auth/oauth_client.zig").Client;
 
 pub const Client = struct {
     io: Io,
@@ -32,6 +33,8 @@ pub const Client = struct {
         max_response_bytes: usize = 4 << 20,
         /// How often a request checks for cancellation and its deadline.
         poll_interval: Io.Duration = .fromMilliseconds(50),
+        /// Answers 401 and 403 challenges with OAuth 2.1. Null sends no credentials.
+        auth: ?*OAuthClient = null,
     };
 
     const Binding = struct { param: []u8, header: []u8 };
@@ -151,6 +154,9 @@ pub const Client = struct {
 
     fn standardHeaders(self: *Client, arena: Allocator, headers: *std.ArrayList(http.Header), method_name: []const u8) Allocator.Error!void {
         try headers.append(arena, .{ .name = "accept", .value = "application/json, text/event-stream" });
+        if (self.options.auth) |auth| if (auth.currentToken()) |token| {
+            try headers.append(arena, .{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Bearer ", token }) });
+        };
         try headers.append(arena, .{ .name = envelope.header_protocol_version, .value = version.version });
         try headers.append(arena, .{ .name = envelope.header_method, .value = method_name });
         for (self.options.extra_headers) |h| try headers.append(arena, h);
@@ -171,7 +177,27 @@ pub const Client = struct {
         return req;
     }
 
+    const Challenge = struct { status: u16, www_authenticate: ?[]const u8 };
+
+    /// Send the request, answering authorization challenges until the attempt limit.
     fn perform(self: *Client, arena: Allocator, ex: *Transport.Exchange) Transport.ExchangeError!void {
+        var attempt: u8 = 0;
+        while (true) {
+            const challenge = (try self.performOnce(arena, ex)) orelse return;
+            const auth = self.options.auth orelse {
+                ex.http_status = challenge.status;
+                return error.HttpStatus;
+            };
+            attempt += 1;
+            _ = auth.handleChallenge(arena, self.url, challenge.status, challenge.www_authenticate, attempt) catch {
+                ex.http_status = challenge.status;
+                return error.HttpStatus;
+            };
+        }
+    }
+
+    /// One POST. Returns a challenge when the server answered 401 or 403.
+    fn performOnce(self: *Client, arena: Allocator, ex: *Transport.Exchange) Transport.ExchangeError!?Challenge {
         const io = self.io;
         var headers: std.ArrayList(http.Header) = .empty;
         try self.standardHeaders(arena, &headers, ex.method);
@@ -185,6 +211,16 @@ pub const Client = struct {
         var redirect_buf: [256]u8 = undefined;
         var response = req.receiveHead(&redirect_buf) catch return error.ReadFailed;
         ex.http_status = @intFromEnum(response.head.status);
+        if (ex.http_status == 401 or ex.http_status == 403) {
+            var www: ?[]const u8 = null;
+            var it = response.head.iterateHeaders();
+            while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate")) {
+                www = try arena.dupe(u8, h.value);
+            };
+            var transfer_buf: [1024]u8 = undefined;
+            _ = response.reader(&transfer_buf).discardRemaining() catch {};
+            return .{ .status = ex.http_status, .www_authenticate = www };
+        }
         const content_type = response.head.content_type orelse "";
         const is_json = std.ascii.startsWithIgnoreCase(content_type, "application/json");
         const is_sse = std.ascii.startsWithIgnoreCase(content_type, sse.content_type);
@@ -192,7 +228,8 @@ pub const Client = struct {
         const body = response.reader(&transfer_buf);
         if (is_json) {
             const text = body.allocRemaining(arena, .limited(self.options.max_response_bytes)) catch return error.ReadFailed;
-            return self.deliver(io, arena, ex, text);
+            try self.deliver(io, arena, ex, text);
+            return null;
         }
         if (is_sse) {
             var parser: sse.Parser = .init(self.gpa);
@@ -210,7 +247,7 @@ pub const Client = struct {
                     try self.deliver(io, arena, ex, event.data);
                 }
             }
-            return;
+            return null;
         }
         _ = body.discardRemaining() catch {};
         return error.HttpStatus;

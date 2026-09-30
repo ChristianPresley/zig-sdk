@@ -21,7 +21,8 @@ The project is in development. The table shows the parts that exist today.
 | TLS 1.3 server (HTTPS) | Done, tested against the std client, curl and openssl |
 | TLS 1.3 client | Planned |
 | Client: in-memory, stdio and Streamable HTTP transports, multi round-trip driver | Done |
-| Authorization (OAuth 2.1) | Planned |
+| Authorization: OAuth 2.1 client | Done, passes every scored `auth/*` scenario of the official suite |
+| Authorization: resource server helpers | Planned |
 | gRPC transport (JSON-RPC tunnel over HTTP/2) | Planned |
 | Tasks extension | Planned |
 

@@ -108,6 +108,13 @@ const Runner = struct {
         return error.ToolNotFound;
     }
 
+    /// The authorization scenarios list the tools and call the test tool. The transport
+    /// answers the challenges on the way.
+    fn authorized(self: *Runner) !void {
+        _ = try self.client.listTools(self.arena, null, self.opts());
+        _ = try self.client.callTool(self.arena, "test-tool", null, self.opts());
+    }
+
     fn refNoDeref(self: *Runner) !void {
         // Listing is enough: the SDK never fetches a `$ref` URI.
         _ = try self.client.listTools(self.arena, null, self.opts());
@@ -127,7 +134,15 @@ pub fn main(init: std.process.Init) !u8 {
     const scenario = init.environ_map.get("MCP_CONFORMANCE_SCENARIO") orelse "tools_call";
     const context: ?Value = if (init.environ_map.get("MCP_CONFORMANCE_CONTEXT")) |text| json.parseTree(arena, text) catch null else null;
 
-    const http = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url });
+    // Authorization: pre-registered credentials from the context when given, else a client
+    // ID metadata document where supported, else dynamic registration.
+    var registration: mcp.auth.OAuthClient.Registration = .{ .client_metadata_url = "https://conformance-test.local/client-metadata.json" };
+    if (context) |ctx| if (json.getString(ctx, "client_id")) |client_id| {
+        registration = .{ .pre_registered = .{ .client_id = client_id, .client_secret = json.getString(ctx, "client_secret") } };
+    };
+    var oauth: mcp.auth.OAuthClient = .init(io, gpa, .{ .registration = registration, .allow_http = true, .authorize = .headless_redirect });
+    defer oauth.deinit();
+    const http = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url, .auth = &oauth });
     defer http.deinit();
     var client: Client = .init(gpa, io, .{
         .info = .{ .name = "zig-sdk-conformance-client", .version = "0.1.0" },
@@ -154,6 +169,8 @@ pub fn main(init: std.process.Init) !u8 {
         runner.schemaPreservation()
     else if (std.mem.eql(u8, scenario, "json-schema-ref-no-deref"))
         runner.refNoDeref()
+    else if (std.mem.startsWith(u8, scenario, "auth/"))
+        runner.authorized()
     else {
         std.log.err("scenario {s} is not implemented", .{scenario});
         return 1;

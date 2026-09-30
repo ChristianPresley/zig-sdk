@@ -118,7 +118,9 @@ test "https discover through curl" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const probe = (try runTool(gpa, io, &.{ "curl", "--version" })) orelse return error.SkipZigTest;
-    gpa.free(probe);
+    defer gpa.free(probe);
+    // The SecureTransport backend of the macOS curl has no TLS 1.3.
+    if (std.mem.indexOf(u8, probe, "SecureTransport") != null) return error.SkipZigTest;
     var f: Fixture = undefined;
     try f.start("test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/p256.key");
     defer f.stop();
