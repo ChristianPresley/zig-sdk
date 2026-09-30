@@ -85,12 +85,14 @@ pub const Decoder = struct {
             self.evictTo(0);
             return;
         }
-        self.evictTo(self.table_size - cost);
+        // Copy before the eviction: `name` can refer to an entry that it frees (section 4.4).
         const n = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(n);
         const v = try self.gpa.dupe(u8, value);
         errdefer self.gpa.free(v);
-        try self.entries.append(self.gpa, .{ .name = n, .value = v });
+        try self.entries.ensureUnusedCapacity(self.gpa, 1);
+        self.evictTo(self.table_size - cost);
+        self.entries.appendAssumeCapacity(.{ .name = n, .value = v });
         self.size += cost;
     }
 
@@ -134,8 +136,10 @@ pub const Decoder = struct {
             } else if (first & 0x40 != 0) {
                 // Literal with incremental indexing.
                 const h = try self.literal(arena, &r, 6);
-                try self.add(h.name, h.value);
-                try self.emit(arena, out, &list_size, h.name, h.value);
+                // An indexed name refers to a dynamic entry that `add` can evict.
+                const name = try arena.dupe(u8, h.name);
+                try self.add(name, h.value);
+                try self.emit(arena, out, &list_size, name, h.value);
                 saw_header = true;
             } else if (first & 0x20 != 0) {
                 // Dynamic table size update: only at the start of a block.
@@ -387,4 +391,27 @@ test "invalid blocks" {
     try std.testing.expectError(error.Invalid, decoder.decode(arena, &.{ 0x3f, 0xe1, 0x7f }, &out)); // size update above the limit
     try std.testing.expectError(error.FieldTooLarge, decoder.decode(arena, "\x00\x11" ++ "a" ** 17 ++ "\x00", &out));
     try std.testing.expectError(error.InvalidHuffman, decoder.decode(arena, &.{ 0x00, 0x81, 0xff, 0x00 }, &out));
+}
+
+test "a literal whose indexed name the new entry evicts keeps the name" {
+    // Section 4.4: the name can refer to the entry that the insertion evicts. The fuzz job
+    // found that the decoder copied the name after it freed that entry.
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var decoder: Decoder = .init(gpa, .{ .max_table_size = 64 });
+    defer decoder.deinit();
+    var out: std.ArrayList(Header) = .empty;
+    try decoder.decode(arena, &.{ 0x40, 0x04, 'n', 'a', 'm', 'e', 0x01, 'v' }, &out); // cost 37
+    // Index 62 is "name". The new entry (cost 38) evicts it.
+    try decoder.decode(arena, &.{ 0x7e, 0x02, 'w', 'w' }, &out);
+    try std.testing.expectEqualStrings("name", out.items[1].name);
+    try std.testing.expectEqualStrings("ww", out.items[1].value);
+    try std.testing.expectEqualStrings("name", decoder.dynamicEntry(0).?.name);
+    try std.testing.expectEqual(38, decoder.dynamicSize());
+    // An entry larger than the table empties it, and the header still has its name.
+    try decoder.decode(arena, "\x7e\x28" ++ "x" ** 40, &out);
+    try std.testing.expectEqualStrings("name", out.items[2].name);
+    try std.testing.expectEqual(0, decoder.dynamicSize());
 }
