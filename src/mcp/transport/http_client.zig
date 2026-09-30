@@ -266,8 +266,14 @@ pub const Client = struct {
             var chunk: [4096]u8 = undefined;
             var total: usize = 0;
             while (true) {
-                const n = body.readSliceShort(&chunk) catch return error.ReadFailed;
-                if (n == 0) break;
+                // Take the bytes that arrived, so that each event reaches the sink at once. A
+                // read of a full chunk waits for 4096 bytes and holds back progress.
+                var bufs: [1][]u8 = .{&chunk};
+                const n = body.readVec(&bufs) catch |e| switch (e) {
+                    error.EndOfStream => break,
+                    error.ReadFailed => return error.ReadFailed,
+                };
+                if (n == 0) continue;
                 total += n;
                 if (total > self.options.max_response_bytes) return error.ReadFailed;
                 try parser.feed(chunk[0..n]);
