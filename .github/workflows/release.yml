@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: verify tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Import the maintainer key and verify the tag signature
+        run: |
+          set -euo pipefail
+          gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys ABEE3154FC637EECA5174B50E0A8E6E6A9447868 || \
+          curl -fsSL "https://github.com/ChristianPresley.gpg" | gpg --batch --import
+          git verify-tag "${GITHUB_REF_NAME}"
+      - uses: ./.github/actions/setup-zig
+      - run: zig build check-version -- "${GITHUB_REF_NAME}"
+      - run: zig build commit-policy -- HEAD
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-2025]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build fmt lint-docs census
+      - run: zig build test -Doptimize=ReleaseSafe --summary all
+      - run: zig build examples conformance-server conformance-client
+
+  publish:
+    name: publish
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-zig
+      - run: zig build changelog-section -- "${GITHUB_REF_NAME}" --out notes.md
+      - name: Create the release from the signed tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --notes-file notes.md

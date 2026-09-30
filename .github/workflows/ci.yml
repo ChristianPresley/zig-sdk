@@ -79,6 +79,17 @@ jobs:
       - uses: ./.github/actions/setup-zig
       - run: zig build examples -Dtarget=${{ matrix.target }}
 
+  consumer:
+    name: consumer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build
+        working-directory: examples/consumer
+      - run: ./zig-out/bin/consumer --check
+        working-directory: examples/consumer
+
   docs:
     name: docs
     runs-on: ubuntu-24.04

@@ -1,0 +1,59 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wiki-lint:
+    name: wiki-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki
+      - uses: ./.github/actions/setup-zig
+      - run: zig build lint-docs -- wiki
+      - name: The generated pages match the sources
+        run: |
+          set -euo pipefail
+          zig build gen-bibliography -- --check --out /tmp/Bibliography.md
+          zig build gen-dictionary -- --out /tmp/Dictionary.md
+          diff -u wiki/Bibliography.md /tmp/Bibliography.md
+          diff -u wiki/Dictionary.md /tmp/Dictionary.md
+
+  link-check:
+    name: link-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check every URL of the bibliography
+        run: |
+          set -uo pipefail
+          status=0
+          for url in $(grep -o '\.url = "[^"]*"' docs/bibliography.zon | sed 's/.url = "//; s/"$//'); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 30 -A "zig-sdk-link-check" "$url" || echo 000)
+            case "$code" in
+              2*|3*) ;;
+              *) echo "::warning::$code $url"; status=1 ;;
+            esac
+          done
+          exit $status
+
+  release-safe-matrix:
+    name: test (${{ matrix.os }}, ReleaseSafe)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-2025]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build test -Doptimize=ReleaseSafe --summary all

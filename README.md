@@ -4,6 +4,14 @@ The unofficial Zig SDK for the Model Context Protocol (MCP).
 
 This library gives you an MCP server and an MCP client in Zig 0.16.0. It has no dependency other than the Zig toolchain. It obeys MCP specification revision 2026-07-28 only.[^mcp-spec]
 
+## Consume the SDK
+
+`examples/consumer/` is a project that depends on the SDK with `b.dependency("mcp", ...)`. A released consumer fetches a tag:
+
+```bash
+zig fetch --save-exact git+https://github.com/ChristianPresley/zig-sdk#v0.1.0
+```
+
 ## Status
 
 The project is in development. The table shows the parts that exist today.

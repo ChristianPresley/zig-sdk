@@ -1,0 +1,12 @@
+.{
+    .name = .consumer,
+    .version = "0.0.1",
+    .fingerprint = 0x705b3727ce3c0059,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // A released consumer uses `zig fetch --save-exact git+https://github.com/ChristianPresley/zig-sdk#vX.Y.Z`.
+        // This example points at the repository it lives in.
+        .mcp = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

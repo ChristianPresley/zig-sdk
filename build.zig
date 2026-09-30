@@ -87,6 +87,8 @@ pub fn build(b: *std.Build) void {
     addTool(b, "commit-policy", "Check commits for a sole signed author", "tools/commit_policy.zig", &.{});
     addTool(b, "gen-bibliography", "Check the bibliography and render it", "tools/gen_bibliography.zig", &.{ "--check", "--out", "docs/generated/bibliography.md" });
     addTool(b, "gen-dictionary", "Render the project dictionary", "tools/gen_dictionary.zig", &.{ "--out", "docs/generated/dictionary.md" });
+    addTool(b, "check-version", "Check that a release tag matches the package version", "tools/check_version.zig", &.{});
+    addTool(b, "changelog-section", "Print the changelog section of a version", "tools/changelog_section.zig", &.{});
 }
 
 fn addTool(b: *std.Build, step_name: []const u8, description: []const u8, source: []const u8, default_args: []const []const u8) void {
