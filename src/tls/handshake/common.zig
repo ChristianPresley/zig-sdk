@@ -63,7 +63,7 @@ pub const CertificateMessage = struct {
         var d: Decoder = .fromTheirSlice(body);
         d.ensure(1) catch return error.DecodeError;
         const ctx_len = d.decode(u8);
-        d.ensure(ctx_len + 3) catch return error.DecodeError;
+        d.ensure(@as(usize, ctx_len) + 3) catch return error.DecodeError;
         var result: CertificateMessage = .{ .context = d.slice(ctx_len), .certs = undefined, .count = 0 };
         const list_len = d.decode(u24);
         var list = d.sub(list_len) catch return error.DecodeError;
@@ -72,7 +72,7 @@ pub const CertificateMessage = struct {
             list.ensure(3) catch return error.DecodeError;
             const cert_len = list.decode(u24);
             if (cert_len == 0) return error.DecodeError;
-            list.ensure(cert_len + 2) catch return error.DecodeError;
+            list.ensure(@as(usize, cert_len) + 2) catch return error.DecodeError;
             const cert = list.slice(cert_len);
             const ext_len = list.decode(u16);
             list.ensure(ext_len) catch return error.DecodeError;
@@ -223,4 +223,12 @@ pub fn abortParse(c: *Connection, alert_out: ?*tls.Alert, err: codec.ParseError)
         error.ProtocolVersion => abort(c, alert_out, .protocol_version, error.TlsProtocolVersion),
         error.MissingExtension => abort(c, alert_out, .missing_extension, error.TlsMissingExtension),
     };
+}
+
+test "certificate message lengths near the maximum of their type are decode errors" {
+    // The fuzz job found the same integer overflow as in the CertificateRequest.
+    var long_context = [_]u8{ 0xfd, 0x00, 0x00, 0x00 };
+    try std.testing.expectError(error.DecodeError, CertificateMessage.parse(&long_context));
+    var long_cert = [_]u8{ 0x00, 0x00, 0x00, 0x05, 0xff, 0xff, 0xff, 0x00, 0x00 };
+    try std.testing.expectError(error.DecodeError, CertificateMessage.parse(&long_cert));
 }

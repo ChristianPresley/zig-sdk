@@ -556,7 +556,7 @@ pub const CertificateRequest = struct {
         var d: Decoder = .fromTheirSlice(body);
         d.ensure(1) catch return error.DecodeError;
         const ctx_len = d.decode(u8);
-        d.ensure(ctx_len + 2) catch return error.DecodeError;
+        d.ensure(@as(usize, ctx_len) + 2) catch return error.DecodeError;
         var result: CertificateRequest = .{ .context_len = ctx_len };
         @memcpy(result.context_buf[0..ctx_len], d.slice(ctx_len));
         const ext_len = d.decode(u16);
@@ -613,6 +613,14 @@ test "server hello parsing" {
     try std.testing.expectEqual(0x0017, parsed_hrr.key_share_group.?);
     try std.testing.expect(parsed_hrr.key_share_public == null);
     try std.testing.expectError(error.DecodeError, ServerHello.parse(sh[4..20]));
+}
+
+test "certificate request with a long context is a decode error" {
+    // The fuzz job found an integer overflow for a context length of 254 or 255.
+    var body = [_]u8{ 0xff, 0x00, 0x00 };
+    try std.testing.expectError(error.DecodeError, CertificateRequest.parse(&body));
+    body[0] = 0xfe;
+    try std.testing.expectError(error.DecodeError, CertificateRequest.parse(&body));
 }
 
 test "server name eligibility" {
