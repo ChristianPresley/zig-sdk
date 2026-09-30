@@ -21,6 +21,8 @@ const tasks = @import("../server/tasks.zig");
 const skills = @import("../protocol/skills.zig");
 const apps = @import("../protocol/apps.zig");
 const cache_mod = @import("cache.zig");
+/// The client rules for icons: scheme, origin, size and format checks, selection and fetch.
+pub const icons = @import("icons.zig");
 
 const Client = @This();
 
@@ -40,6 +42,8 @@ pub const Options = struct {
     log_level: ?types.LoggingLevel = null,
     /// The result cache for results that carry a positive `ttlMs`. Off by default.
     cache: cache_mod.Options = .{},
+    /// The scheme, origin and format rules for icons. The defaults obey the specification.
+    icons: icons.Policy = .{},
 };
 
 /// The context every hook receives.
@@ -66,6 +70,10 @@ pub const Hooks = struct {
     list_roots: ?*const fn (ctx: *HookContext) anyerror![]const types.Root = null,
     /// A server notification that belongs to no request (stdio only).
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
+    /// Decode, sanitize or convert a checked icon image. The formats that need a decoder
+    /// (GIF, WebP and SVG) pass only when this hook is set and the icon policy turns them on.
+    /// The hook returns an error to reject the image.
+    icon_decoder: ?*const fn (userdata: ?*anyopaque, arena: Allocator, image: icons.Image) anyerror!icons.Image = null,
 };
 
 pub const Diagnostics = struct {
@@ -144,6 +152,36 @@ pub fn invalidateCache(self: *Client) void {
 
 pub fn connect(self: *Client, transport: Transport.ClientTransport) void {
     self.transport = transport;
+}
+
+// -- Icons --------------------------------------------------------------------------------------
+
+pub const IconOptions = struct {
+    /// The URL of the MCP endpoint. `https` icons must have its origin or a trusted origin.
+    /// Null for a server without a URL, for example on stdio.
+    server_url: ?[]const u8 = null,
+    /// The trust policy for `https` icons. Null uses the system trust store.
+    tls: ?icons.TlsSetup = null,
+};
+
+/// Get the image of an icon with the icon policy, `limits.icon`, `limits.http.max_redirect_hops`
+/// and the `icon_decoder` hook. The request carries no credentials of the MCP connection.
+/// The image bytes are in `arena`.
+pub fn fetchIcon(self: *Client, arena: Allocator, icon: types.Icon, options: IconOptions) icons.Error!icons.Image {
+    return icons.fetch(self.io, self.gpa, arena, icon, .{
+        .server_url = options.server_url,
+        .policy = self.options.icons,
+        .limits = self.options.limits.icon,
+        .max_redirect_hops = self.options.limits.http.max_redirect_hops,
+        .tls = options.tls,
+        .decoder = if (self.options.hooks.icon_decoder) |f| .{ .userdata = self.options.hooks.userdata, .decode = f } else null,
+    });
+}
+
+/// Select the icon of `list` that fits `want` best under the icon policy. Formats that need a
+/// decoder are not candidates when the `icon_decoder` hook is not set.
+pub fn selectIcon(self: *const Client, list: ?[]const types.Icon, want: icons.Want, server_url: ?[]const u8) ?types.Icon {
+    return icons.select(list, want, server_url, self.options.icons.effective(self.options.hooks.icon_decoder != null));
 }
 
 /// A result together with the raw `Value` it was parsed from.

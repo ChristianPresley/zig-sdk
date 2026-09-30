@@ -67,6 +67,8 @@ skills: struct {
     /// Maximum sum of the file sizes of one skill, in bytes.
     max_bytes: u64 = 16 << 20,
 } = .{},
+/// Limits of the client icon fetcher and the icon checks.
+icon: Icon = .{},
 
 uri_template: struct {
     max_template_bytes: usize = 64 << 10,
@@ -95,6 +97,18 @@ pub const Schema = struct {
     /// multiplies the size of its operand. The match time is linear in the input length
     /// multiplied by this size. Overflow: registration rejects the schema.
     max_regex_states: u32 = 4096,
+};
+
+/// Limits of the client icon fetcher and the icon checks.
+pub const Icon = struct {
+    /// Maximum bytes of one icon image, after the decoding of a `data:` URI. Overflow:
+    /// `error.TooLarge`, and the fetcher stops the read.
+    max_bytes: usize = 1 << 20,
+    /// Maximum width and maximum height in pixels that the image header can declare.
+    /// Overflow: `error.DimensionsTooLarge`.
+    max_dimension: u32 = 4096,
+    /// Maximum time for one fetch, redirects included. Overflow: `error.Timeout`.
+    timeout: Io.Duration = .fromSeconds(10),
 };
 
 pub const default: Limits = .{};

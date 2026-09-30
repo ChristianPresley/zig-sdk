@@ -10,6 +10,8 @@ pub const transport = @import("mcp/transport.zig");
 pub const Limits = @import("mcp/Limits.zig");
 pub const Server = @import("mcp/server/Server.zig");
 pub const Client = @import("mcp/client/Client.zig");
+/// The client rules for icons.
+pub const icons = Client.icons;
 pub const auth = @import("mcp/auth.zig");
 /// The Tasks extension: task support levels, results and the store.
 pub const tasks = @import("mcp/server/tasks.zig");
@@ -51,6 +53,8 @@ test {
     _ = @import("mcp/server/server_test.zig");
     _ = @import("mcp/client/client_test.zig");
     _ = @import("mcp/extensions_test.zig");
+    _ = @import("mcp/client/icons.zig");
+    _ = @import("mcp/client/icons_test.zig");
     _ = @import("mcp/transport/http_test.zig");
     _ = @import("mcp/transport/https_test.zig");
     _ = @import("mcp/transport/http_client_test.zig");

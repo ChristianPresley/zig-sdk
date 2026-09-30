@@ -143,9 +143,11 @@ pub const Connection = struct {
     }
 
     /// Send one request with a complete body. The connection closes after the response.
+    /// A GET request without a body has no `content-length` header.
     pub fn send(self: *Connection, method: []const u8, target: []const u8, host: []const u8, headers: []const Header, body: []const u8) Io.Writer.Error!void {
         const w = self.writer;
-        try w.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\nconnection: close\r\ncontent-length: {d}\r\n", .{ method, target, host, body.len });
+        try w.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\nconnection: close\r\n", .{ method, target, host });
+        if (body.len > 0 or !std.mem.eql(u8, method, "GET")) try w.print("content-length: {d}\r\n", .{body.len});
         for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
         try w.writeAll("\r\n");
         try w.writeAll(body);
