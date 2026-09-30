@@ -36,7 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
-      - run: zig build fmt lint-docs census
+      - run: zig build fmt census
+      - run: zig build lint-docs -- --strict --string-literals
       - run: zig build test -Doptimize=ReleaseSafe --summary all
       - run: zig build examples conformance-server conformance-client
 

@@ -22,10 +22,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
       - run: zig build fmt
-      - run: zig build lint-docs
+      - run: zig build lint-docs -- --strict --string-literals
       - run: zig build census
       - run: zig build gen-bibliography
-      - run: zig build gen-dictionary
+      - run: zig build gen-dictionary -- --check --out docs/generated/dictionary.md
 
   commit-policy:
     name: commit-policy

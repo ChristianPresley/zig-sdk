@@ -19,7 +19,7 @@ jobs:
           repository: ${{ github.repository }}.wiki
           path: wiki
       - uses: ./.github/actions/setup-zig
-      - run: zig build lint-docs -- wiki
+      - run: zig build lint-docs -- --strict --wiki-dir wiki
       - name: The generated pages match the sources
         run: |
           set -euo pipefail
