@@ -13,6 +13,7 @@ The project is in development. The table shows the parts that exist today.
 | Protocol types for the full 2026-07-28 schema | Done, tested against the official example fixtures |
 | JSON-RPC envelope, request ids, error codes | Done |
 | Server engine: tools, resources, resource templates, prompts, completion, pagination | Done |
+| JSON Schema 2020-12 validation of tool arguments and structured output | Done, subset without regular expressions |
 | Multi round-trip requests with sealed request state | Done |
 | Subscriptions (`subscriptions/listen`) | Done |
 | stdio transport (server) | Done |

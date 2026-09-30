@@ -14,6 +14,7 @@ pub const Outcome = Server.Outcome;
 pub const InputRequired = Server.InputRequired;
 pub const schema = struct {
     pub const derive = @import("mcp/schema/derive.zig");
+    pub const validator = @import("mcp/schema/validator.zig");
 };
 pub const UriTemplate = @import("mcp/uri_template/UriTemplate.zig");
 pub const util = struct {

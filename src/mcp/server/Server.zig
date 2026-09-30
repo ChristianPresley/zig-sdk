@@ -16,6 +16,8 @@ const RequestId = @import("../jsonrpc/id.zig").RequestId;
 const Transport = @import("../transport/Transport.zig");
 const Limits = @import("../Limits.zig");
 const derive = @import("../schema/derive.zig");
+const validator = @import("../schema/validator.zig");
+const envelope = @import("../transport/envelope.zig");
 const UriTemplate = @import("../uri_template/UriTemplate.zig");
 const request_state = @import("request_state.zig");
 const mrtr = @import("mrtr.zig");
@@ -51,6 +53,9 @@ pub const Options = struct {
     invalid_args_policy: enum { tool_error, rpc_error } = .tool_error,
     /// Mirror `structuredContent` into a text block when the handler gave none.
     structured_text_mirror: bool = true,
+    /// Ignore JSON Schema keywords the validator does not support instead of rejecting the
+    /// tool at registration.
+    allow_unsupported_schema_keywords: bool = false,
     cache: struct {
         discover: CacheHint = .{},
         lists: CacheHint = .{},
@@ -112,6 +117,8 @@ pub const PromptDef = struct {
 
 const ToolEntry = struct {
     def: types.Tool,
+    input: validator.Schema,
+    output: ?validator.Schema,
     handler: ToolHandler,
     requires_client: ?types.ClientCapabilities,
     userdata: ?*anyopaque,
@@ -208,9 +215,30 @@ pub const RegisterError = error{
     InvalidToolName,
     InvalidSchema,
     SchemaNotObject,
+    /// An `x-mcp-header` annotation is malformed, duplicated or on a non-scalar property.
+    InvalidHeaderAnnotation,
+    /// The schema uses a keyword the validator does not support (see `Options`).
+    UnsupportedKeyword,
+    /// The schema references a document other than itself.
+    RemoteRef,
+    /// The schema names a dialect other than JSON Schema 2020-12.
+    UnsupportedDialect,
     DuplicateName,
     InvalidUriTemplate,
 };
+
+fn compileSchema(self: *Server, root: Value) RegisterError!validator.Schema {
+    return validator.compile(self.registry_arena.allocator(), root, .{
+        .allow_unsupported_keywords = self.options.allow_unsupported_schema_keywords,
+        .limits = self.options.limits.schema,
+    }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.UnsupportedKeyword => return error.UnsupportedKeyword,
+        error.RemoteRef => return error.RemoteRef,
+        error.UnsupportedDialect => return error.UnsupportedDialect,
+        error.InvalidSchema, error.SchemaTooDeep, error.TooManySubschemas, error.DuplicateAnchor => return error.InvalidSchema,
+    };
+}
 
 fn validateToolName(name: []const u8) bool {
     if (name.len == 0 or name.len > 128) return false;
@@ -262,6 +290,9 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
     const arena = self.registry_arena.allocator();
     const input_schema = try self.parseSchemaObject(def.input_schema orelse "{\"type\":\"object\"}", true);
     const output_schema: ?Value = if (def.output_schema) |t| try self.parseSchemaObject(t, false) else null;
+    if (!envelope.schemaHeadersValid(input_schema)) return error.InvalidHeaderAnnotation;
+    const input = try self.compileSchema(input_schema);
+    const output: ?validator.Schema = if (output_schema) |o| try self.compileSchema(o) else null;
     const entry: ToolEntry = .{
         .def = .{
             .name = try arena.dupe(u8, def.name),
@@ -272,6 +303,8 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
             .outputSchema = output_schema,
             .annotations = def.annotations,
         },
+        .input = input,
+        .output = output,
         .handler = handler,
         .requires_client = def.requires_client,
         .userdata = def.userdata,
@@ -734,20 +767,12 @@ fn callTool(self: *Server, ctx: *RequestContext, params: types.CallToolRequestPa
     };
     if (params.arguments) |a| if (a != .object) return ctx.setError(errors.invalidParams("arguments must be an object"));
     if (entry.requires_client) |required| try self.requireCapabilities(ctx, required);
+    const args: Value = params.arguments orelse .{ .object = .empty };
+    if (try checkArguments(ctx, entry, args)) |detail| return self.rejectArguments(ctx, params.name, detail);
     try self.prepareInputRound(ctx, "tools/call", params.name, params.inputResponses, params.requestState);
     ctx.userdata = entry.userdata;
-    const args: Value = params.arguments orelse .{ .object = .empty };
     const outcome = entry.handler(ctx, args) catch |e| switch (e) {
-        error.InvalidArguments => switch (self.options.invalid_args_policy) {
-            .tool_error => {
-                const result = try types.CallToolResult.err(ctx.arena, "Invalid arguments for tool {s}", .{params.name});
-                return self.finishResult(ctx, result);
-            },
-            .rpc_error => {
-                const msg = try std.fmt.allocPrint(ctx.arena, "Invalid arguments for tool {s}", .{params.name});
-                return ctx.setError(errors.invalidParams(msg));
-            },
-        },
+        error.InvalidArguments => return self.rejectArguments(ctx, params.name, "the arguments do not parse"),
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
         error.Rpc => return error.Rpc,
@@ -759,6 +784,18 @@ fn callTool(self: *Server, ctx: *RequestContext, params: types.CallToolRequestPa
     switch (outcome) {
         .complete => |r| {
             var result = r;
+            if (entry.output) |*out| if (result.isError != true) {
+                const sc = result.structuredContent orelse return ctx.setError(errors.internalError("Tool declares an outputSchema but returned no structuredContent"));
+                const report = validator.validate(ctx.arena, out, sc) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return ctx.setError(errors.internalError("structuredContent could not be validated")),
+                };
+                if (!report.valid) {
+                    const f = report.first().?;
+                    const msg = try std.fmt.allocPrint(ctx.arena, "structuredContent does not match outputSchema at \"{s}\": {s}", .{ f.instance_path, f.message });
+                    return ctx.setError(errors.internalError(msg));
+                }
+            };
             if (self.options.structured_text_mirror and result.structuredContent != null and !hasText(result.content)) {
                 const blocks = try ctx.arena.alloc(types.ContentBlock, result.content.len + 1);
                 @memcpy(blocks[0..result.content.len], result.content);
@@ -768,6 +805,29 @@ fn callTool(self: *Server, ctx: *RequestContext, params: types.CallToolRequestPa
             try self.finishResult(ctx, result);
         },
         .input_required => |ir| try self.finishInputRequired(ctx, .@"tools/call", ir),
+    }
+}
+
+/// Validate tool arguments against the input schema. Returns a detail string on failure.
+fn checkArguments(ctx: *RequestContext, entry: *const ToolEntry, args: Value) RequestContext.Error!?[]const u8 {
+    const report = validator.validate(ctx.arena, &entry.input, args) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.EvalBudgetExceeded, error.TooManyRefHops, error.InstanceTooDeep => return "the arguments are too complex to validate",
+    };
+    if (report.valid) return null;
+    const f = report.first().?;
+    if (f.instance_path.len == 0) return f.message;
+    return try std.fmt.allocPrint(ctx.arena, "at \"{s}\": {s}", .{ f.instance_path, f.message });
+}
+
+fn rejectArguments(self: *Server, ctx: *RequestContext, name: []const u8, detail: []const u8) RequestContext.Error!void {
+    const msg = try std.fmt.allocPrint(ctx.arena, "Invalid arguments for tool {s}: {s}", .{ name, detail });
+    switch (self.options.invalid_args_policy) {
+        .tool_error => {
+            const result = try types.CallToolResult.err(ctx.arena, "{s}", .{msg});
+            return self.finishResult(ctx, result);
+        },
+        .rpc_error => return ctx.setError(errors.invalidParams(msg)),
     }
 }
 
