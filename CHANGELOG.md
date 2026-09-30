@@ -4,6 +4,35 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- Regular expression engine for the JSON Schema keywords `pattern` and `patternProperties` (`mcp.schema.regex`). It is a Pike VM over code points with the ECMA-262 syntax, and the match time is linear in the input length. Backreferences, lookaround and most Unicode property escapes give `error.UnsupportedRegex`. The limits are `limits.schema.max_pattern_bytes` and `limits.schema.max_regex_states`. A derived schema accepts `.pattern` on string fields.
+- RSA certificate keys in the TLS server and the TLS client: PKCS#1 and PKCS#8 keys of 2048 to 4096 bits sign with RSA-PSS (`rsa_pss_rsae_sha256`, `sha384`, `sha512`). The private operation uses the Chinese remainder theorem, and the key verifies each signature before it goes out.
+- The post-quantum hybrid key exchange group `X25519MLKEM768` (RFC 10024) in the TLS server and the TLS client. It is the first group of the default order. The client also sends an X25519 share, so a server without the hybrid group needs no HelloRetryRequest.
+- Unix socket transport (`mcp.transport.unix`) with the stdio framing: a server that accepts many peers on a socket file and a client transport. The limit is `limits.unix_socket.max_connections`. The example `unix_server` and the `client_cli unix` mode use it.
+- Client icon rules (`mcp.icons`, `Client.fetchIcon`, `Client.selectIcon`): only `https` and `data:` icons, the same origin as the server unless the policy trusts other origins, no credentials, magic byte checks, PNG and JPEG by default, other formats through the `icon_decoder` hook, and the limits `limits.icon`.
+- OAuth client credentials extension (`mcp.auth.ClientCredentials`) with client secrets and `private_key_jwt` assertions, token caching and renewal before expiry.
+- Enterprise-managed authorization extension: the client (`mcp.auth.EnterpriseClient`) exchanges an identity assertion for an ID-JAG at the enterprise identity provider and the ID-JAG for an access token. `mcp.auth.IdJagValidator` checks ID-JAGs for an application with its own authorization server.
+- `mcp.auth.Provider` for the HTTP client transport (`auth_provider`), and `Server.Options.authorization_extensions` to advertise the authorization extensions.
+- JWT signing keys (`mcp.auth.jwt.SigningKey`) for ES256, ES384, EdDSA, RS256 and PS256, JWK set parsing, and ES384 and EdDSA verification.
+- Skills extension (`io.modelcontextprotocol/skills`): the server option `skills`, `addSkill`, `addDynamicSkill`, `skills/list`, `skills/get` and `resources/directory/read`, and the client methods `listSkills`, `getSkill`, `readDirectory` and `readSkillFile` with manifest checks.
+- MCP Apps extension (`io.modelcontextprotocol/ui`): the server option `apps`, UI resources with `addUiResource`, tool UI metadata with `ToolDef.ui`, and the client accessors `toolUi` and `readUiResource`.
+- `zig build lint-docs` has the options `--strict`, `--format`, `--rule`, `--string-literals` and `--wiki-dir`, and the warning rules of the project profile. The project dictionary has all its lists.
+
+### Changed
+
+- `zig build lint-docs` runs in strict mode by default, and the CI and the nightly wiki lint use strict mode.
+- The default TLS group order is X25519MLKEM768, X25519, P-256, P-384.
+- `mcp.tls.PrivateKey.publicKeyBytes` takes a larger buffer, and `max_signature_len` is 512 for RSA keys.
+- The TLS client refuses a HelloRetryRequest cookie of more than 8 KiB.
+- `Transport.Kind` has the value `unix_socket`.
+
+### Fixed
+
+- The stdio line framer drops all of a line that is longer than the limit. Before, the rest of the line arrived as a separate frame.
+- The JSON Schema compiler compiles the target of each local `$ref`. Before, a reference into an unknown member could reach the validator unchecked and stop the process.
+- An HTTP/1.1 GET request of the SDK client has no `content-length` header.
+
 ## [0.1.0] - 2026-09-30
 
 ### Added

@@ -14,25 +14,7 @@ zig fetch --save-exact git+https://github.com/ChristianPresley/zig-sdk#v0.1.0
 
 ## Status
 
-The project is in development. The table shows the parts that exist today.
-
-| Part | State |
-| --- | --- |
-| Protocol types for the full 2026-07-28 schema | Done, tested against the official example fixtures |
-| JSON-RPC envelope, request ids, error codes | Done |
-| Server engine: tools, resources, resource templates, prompts, completion, pagination | Done |
-| JSON Schema 2020-12 validation of tool arguments and structured output | Done, subset without regular expressions |
-| Multi round-trip requests with sealed request state | Done |
-| Subscriptions (`subscriptions/listen`) | Done |
-| stdio transport (server) | Done |
-| Streamable HTTP transport (server) | Done, passes all 37 scored scenarios of the official conformance suite |
-| TLS 1.3 server (HTTPS) | Done, tested against the std client, curl and openssl |
-| TLS 1.3 client (HTTPS, client certificates) | Done, tested against the SDK server and openssl |
-| Client: in-memory, stdio and Streamable HTTP transports, multi round-trip driver | Done |
-| Authorization: OAuth 2.1 client | Done, passes every scored `auth/*` scenario of the official suite |
-| Authorization: resource server helpers (bearer checks, metadata, JWT) | Done |
-| gRPC transport (JSON-RPC tunnel over HTTP/2, module `mcp_grpc`) | Done, with its own protobuf, HPACK, HTTP/2 and gRPC layers |
-| Tasks extension (server and client) | Done, passes the functional checks of the ten unscored scenarios |
+The project is in development. The [Roadmap](https://github.com/ChristianPresley/zig-sdk/wiki/Roadmap) on the wiki shows the milestones, the state of each part and the planned work. The [Release Notes](https://github.com/ChristianPresley/zig-sdk/wiki/Release-Notes) and `CHANGELOG.md` list the changes of each release.
 
 ## Requirements
 
