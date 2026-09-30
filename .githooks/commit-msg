@@ -1,0 +1,7 @@
+#!/bin/sh
+# Reject attribution trailers. This repository has one author and one committer.
+if grep -Eiq '^(Co-Authored-By|Signed-off-by|Reviewed-by|Acked-by):' "$1"; then
+  echo "commit-msg: attribution trailers are not permitted in this repository" >&2
+  exit 1
+fi
+exit 0

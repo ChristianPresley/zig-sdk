@@ -1,0 +1,10 @@
+* text=auto eol=lf
+*.zig text eol=lf
+*.zon text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.proto text eol=lf
+test/fixtures/** linguist-vendored
+docs/generated/** linguist-generated
+*.png binary
+*.wav binary
