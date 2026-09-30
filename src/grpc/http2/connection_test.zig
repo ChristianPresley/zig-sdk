@@ -41,9 +41,15 @@ const Side = struct {
         self.stream.shutdown(self.io, .send) catch {};
     }
 
+    /// Wait for the read task to see the end of the input.
+    fn awaitRun(self: *Side) void {
+        if (self.run_future) |*f| f.await(self.io);
+        self.run_future = null;
+    }
+
     /// Wait for the read task, then close and free.
     fn finish(self: *Side) void {
-        if (self.run_future) |*f| f.await(self.io);
+        self.awaitRun();
         self.stream.close(self.io);
         self.conn.deinit();
         self.gpa.free(self.in_buf);
@@ -116,9 +122,12 @@ const Pair = struct {
         // The client stops sending; the server sees the end, finishes and closes; then the
         // client sees the end too.
         self.client.halfClose();
+        // The handlers close their streams, so they finish before the server connection
+        // frees its streams. Before, a handler could close a freed stream.
+        self.server.side.awaitRun();
+        self.server.group.await(io) catch {};
         self.server.side.finish();
         self.client.finish();
-        self.server.group.await(io) catch {};
         self.listener.deinit(io);
     }
 };
