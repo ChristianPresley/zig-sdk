@@ -14,22 +14,44 @@ const json = @import("../json.zig");
 const Value = std.json.Value;
 const Limits = @import("../Limits.zig");
 const McpServer = @import("../server/Server.zig");
+const router_mod = @import("router.zig");
+const Router = router_mod.Router;
 
 const log = std.log.scoped(.mcp_stdio);
 
-/// Serves one MCP server over a reader/writer pair (normally stdin/stdout).
+/// Serves one MCP server over a reader/writer pair (normally stdin/stdout). The Unix socket
+/// transport runs one of these for each connection.
 pub const Server = struct {
     io: Io,
     gpa: Allocator,
     server: *McpServer,
     limits: Limits,
     out: *Io.Writer,
+    /// The binding that the handlers see in `RequestContext.kind`.
+    kind: Transport.Kind = .stdio,
+    /// What `run` does with the requests in flight when the input ends.
+    on_close: OnClose = .shutdown_subscriptions,
+    /// When set, `run` reads no more frames after the flag becomes true.
+    stop: ?*const std.atomic.Value(bool) = null,
     out_lock: Io.Mutex = .init,
     in_flight: std.ArrayList(*Slot) = .empty,
     in_flight_lock: Io.Mutex = .init,
     group: Io.Group = .init,
     permits: Io.Semaphore,
     closed: bool = false,
+
+    /// The action at the end of the input.
+    pub const OnClose = enum {
+        /// End the listen streams of the whole MCP server, then wait for the other requests.
+        /// Use it when the end of the input ends the server, as on stdio.
+        shutdown_subscriptions,
+        /// Cancel the requests of this peer only, then wait for them. Use it for one
+        /// connection of a server with many peers.
+        cancel_requests,
+    };
+
+    /// The cancellation reason of the requests of a peer that closed its connection.
+    pub const connection_closed_reason = "connection closed";
 
     const Slot = struct {
         owner: *Server,
@@ -59,6 +81,7 @@ pub const Server = struct {
     pub fn run(self: *Server, in: *Io.Reader) !void {
         var line_reader: framer.Framer = .{ .reader = in, .max_line_bytes = self.limits.stdio.max_line_bytes };
         while (true) {
+            if (self.stop) |s| if (s.load(.acquire)) break;
             const slot = try self.gpa.create(Slot);
             slot.* = .{ .owner = self, .arena = .init(self.gpa) };
             const arena = slot.arena.allocator();
@@ -123,9 +146,21 @@ pub const Server = struct {
                 },
             }
         }
-        self.server.shutdownSubscriptions(self.io);
+        switch (self.on_close) {
+            .shutdown_subscriptions => self.server.shutdownSubscriptions(self.io),
+            .cancel_requests => self.cancelInFlight(connection_closed_reason),
+        }
         self.group.await(self.io) catch {};
         self.closed = true;
+    }
+
+    /// Cancel every request in flight that is not cancelled yet.
+    fn cancelInFlight(self: *Server, reason: []const u8) void {
+        self.in_flight_lock.lockUncancelable(self.io);
+        defer self.in_flight_lock.unlock(self.io);
+        for (self.in_flight.items) |slot| {
+            if (!slot.token.isCancelled()) slot.token.cancel(self.io, reason);
+        }
     }
 
     fn recoverId(arena: Allocator, line: []const u8) ?RequestId {
@@ -180,7 +215,7 @@ pub const Server = struct {
             self.destroySlot(slot);
         }
         self.server.handle(self.io, .{
-            .kind = .stdio,
+            .kind = self.kind,
             .arena = slot.arena.allocator(),
             .message = slot.message,
             .responder = .{ .ptr = slot, .vtable = &slot_vtable },
@@ -271,8 +306,7 @@ pub const Client = struct {
     stdout_reader: Io.File.Reader,
     stdin_writer: Io.File.Writer,
     out_lock: Io.Mutex = .init,
-    pending: std.ArrayList(*Pending) = .empty,
-    pending_lock: Io.Mutex = .init,
+    router: Router,
     reader_future: ?Io.Future(void) = null,
     closed: std.atomic.Value(bool) = .init(false),
     /// True once the reader task saw the end of the stream for the last time.
@@ -302,13 +336,7 @@ pub const Client = struct {
         max_restarts: u32 = 0,
     };
 
-    const Pending = struct {
-        id: RequestId,
-        generation: u32,
-        frames: std.ArrayList([]u8) = .empty,
-        lock: Io.Mutex = .init,
-        event: Io.Event = .unset,
-    };
+    const Pending = Router.Pending;
 
     /// Spawn the server process and start the reader task.
     pub fn spawn(io: Io, gpa: Allocator, options: SpawnOptions) !*Client {
@@ -329,6 +357,7 @@ pub const Client = struct {
             .out_buf = out_buf,
             .stdout_reader = undefined,
             .stdin_writer = undefined,
+            .router = .init(io, gpa),
         };
         if (builtin.os.tag == .windows and options.process_group) {
             self.job = win.createKillOnCloseJob() catch null;
@@ -410,7 +439,7 @@ pub const Client = struct {
         self.close();
         self.gpa.free(self.in_buf);
         self.gpa.free(self.out_buf);
-        self.pending.deinit(self.gpa);
+        self.router.deinit();
         self.gpa.destroy(self);
     }
 
@@ -484,12 +513,9 @@ pub const Client = struct {
     fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var pending: Pending = .{ .id = ex.id, .generation = self.generation.load(.acquire) };
-        defer {
-            for (pending.frames.items) |f| self.gpa.free(f);
-            pending.frames.deinit(self.gpa);
-        }
-        try self.register(&pending);
-        defer self.unregister(&pending);
+        defer pending.deinit(self.gpa);
+        try self.router.register(&pending);
+        defer self.router.unregister(&pending);
         self.writeFrame(ex.frame) catch |e| switch (e) {
             error.Closed => return error.Closed,
             error.OutOfMemory => return error.OutOfMemory,
@@ -503,9 +529,9 @@ pub const Client = struct {
         const deadline: ?Io.Clock.Timestamp = ex.timeout.toTimestamp(io);
         while (true) {
             // Deliver everything that arrived.
-            while (self.takeFrame(&pending)) |frame| {
+            while (self.router.takeFrame(&pending)) |frame| {
                 defer self.gpa.free(frame);
-                const is_response = frameIsResponse(frame);
+                const is_response = router_mod.frameIsResponse(frame);
                 ex.sink.deliver(io, frame) catch return error.InvalidFrame;
                 if (is_response) return;
             }
@@ -552,44 +578,6 @@ pub const Client = struct {
         self.writeFrame(aw.written()) catch {};
     }
 
-    fn register(self: *Client, p: *Pending) error{OutOfMemory}!void {
-        self.pending_lock.lockUncancelable(self.io);
-        defer self.pending_lock.unlock(self.io);
-        try self.pending.append(self.gpa, p);
-    }
-
-    fn unregister(self: *Client, p: *Pending) void {
-        self.pending_lock.lockUncancelable(self.io);
-        defer self.pending_lock.unlock(self.io);
-        for (self.pending.items, 0..) |item, i| if (item == p) {
-            _ = self.pending.swapRemove(i);
-            return;
-        };
-    }
-
-    fn takeFrame(self: *Client, p: *Pending) ?[]u8 {
-        p.lock.lockUncancelable(self.io);
-        defer p.lock.unlock(self.io);
-        if (p.frames.items.len == 0) return null;
-        return p.frames.orderedRemove(0);
-    }
-
-    fn push(self: *Client, p: *Pending, frame: []const u8) void {
-        const copy = self.gpa.dupe(u8, frame) catch return;
-        p.lock.lockUncancelable(self.io);
-        p.frames.append(self.gpa, copy) catch {
-            self.gpa.free(copy);
-        };
-        p.lock.unlock(self.io);
-        p.event.set(self.io);
-    }
-
-    fn frameIsResponse(frame: []const u8) bool {
-        // A response has "result" or "error" and no "method" at the top level. The frames
-        // come from the SDK's own parser, so a cheap check on the first key is enough.
-        return std.mem.indexOf(u8, frame, "\"result\"") != null or std.mem.indexOf(u8, frame, "\"error\"") != null;
-    }
-
     fn readerLoop(self: *Client) void {
         while (true) {
             self.readUntilEof();
@@ -601,27 +589,11 @@ pub const Client = struct {
         }
         self.closed.store(true, .release);
         self.reader_done.store(true, .release);
-        self.wakeAll();
+        self.router.wakeAll();
     }
 
     fn readUntilEof(self: *Client) void {
-        var line_reader: framer.Framer = .{ .reader = &self.stdout_reader.interface, .max_line_bytes = self.limits.stdio.max_line_bytes };
-        while (true) {
-            var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            const line = line_reader.next(arena) catch |e| switch (e) {
-                error.LineTooLong, error.InvalidUtf8, error.ControlCharacter => continue,
-                else => return,
-            };
-            const msg = jsonrpc.Message.parse(arena, line) catch continue;
-            switch (msg) {
-                .response => |r| self.route(r.id, line),
-                .error_response => |e| if (e.id) |id| self.route(id, line),
-                .notification => |n| self.routeNotification(arena, n, line),
-                .request => {}, // servers do not send requests in this revision
-            }
-        }
+        self.router.readUntilEof(&self.stdout_reader.interface, self.limits.stdio.max_line_bytes, self.on_notification, self.userdata);
     }
 
     /// Reap the old process and spawn a new one. Returns false when the spawn failed.
@@ -636,52 +608,8 @@ pub const Client = struct {
         if (self.child.id != null) _ = self.child.wait(io) catch {};
         self.spawnChild() catch return false;
         _ = self.generation.fetchAdd(1, .acq_rel);
-        self.wakeAll();
+        self.router.wakeAll();
         return true;
-    }
-
-    /// Wake every waiter so it can see the end of the stream or the new generation.
-    fn wakeAll(self: *Client) void {
-        self.pending_lock.lockUncancelable(self.io);
-        defer self.pending_lock.unlock(self.io);
-        for (self.pending.items) |p| p.event.set(self.io);
-    }
-
-    fn route(self: *Client, id: RequestId, line: []const u8) void {
-        self.pending_lock.lockUncancelable(self.io);
-        defer self.pending_lock.unlock(self.io);
-        for (self.pending.items) |p| if (p.id.eql(id)) {
-            self.push(p, line);
-            return;
-        };
-    }
-
-    fn routeNotification(self: *Client, arena: Allocator, n: jsonrpc.Message.Notification, line: []const u8) void {
-        if (n.params) |params| if (params == .object) {
-            // Request-scoped notifications carry the progress token or the subscription id,
-            // both of which equal the request id.
-            if (params.object.get("progressToken")) |token| {
-                if (RequestId.fromValue(arena, token)) |id| {
-                    self.route(id, line);
-                    return;
-                }
-            }
-            if (params.object.get("_meta")) |m| if (m == .object) {
-                if (m.object.get("io.modelcontextprotocol/subscriptionId")) |sid| {
-                    if (RequestId.fromValue(arena, sid)) |id| {
-                        self.route(id, line);
-                        return;
-                    }
-                }
-                if (m.object.get("progressToken")) |token| {
-                    if (RequestId.fromValue(arena, token)) |id| {
-                        self.route(id, line);
-                        return;
-                    }
-                }
-            };
-        };
-        if (self.on_notification) |f| f(self.userdata, n.method, n.params);
     }
 };
 
