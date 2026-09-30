@@ -25,6 +25,13 @@ const Fixture = struct {
     transport: HttpServer,
     future: Io.Future(void),
     chains: [1]*const tls.CertChain,
+    /// Set before `start` to ask for client certificates.
+    client_auth: tls.server.ClientAuth = .none,
+    client_trust: ?tls.Trust = null,
+
+    fn blank() Fixture {
+        return .{ .server = undefined, .chain = undefined, .tls_server = undefined, .transport = undefined, .future = undefined, .chains = undefined };
+    }
 
     fn start(self: *Fixture, cert: []const u8, key: []const u8) !void {
         const gpa = std.testing.allocator;
@@ -32,7 +39,7 @@ const Fixture = struct {
         self.chain = try tls.CertChain.loadFiles(gpa, io, cert, key);
         errdefer self.chain.deinit();
         self.chains = .{&self.chain};
-        self.tls_server = try tls.Server.init(.{ .chains = &self.chains, .alpn = &.{"http/1.1"} });
+        self.tls_server = try tls.Server.init(.{ .chains = &self.chains, .alpn = &.{"http/1.1"}, .client_auth = self.client_auth, .client_trust = self.client_trust });
         self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "https-test", .version = "1" } });
         errdefer self.server.deinit();
         try self.server.addTool(.{ .name = "add" }, add);
@@ -95,7 +102,7 @@ fn postWithStdClient(gpa: std.mem.Allocator, io: Io, port: u16, body: []const u8
 test "https discover through the std tls client" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var f: Fixture = undefined;
+    var f: Fixture = .blank();
     try f.start("test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/p256.key");
     defer f.stop();
     const reply = try postWithStdClient(gpa, io, f.port(), discover_body);
@@ -121,7 +128,7 @@ test "https discover through curl" {
     defer gpa.free(probe);
     // The SecureTransport backend of the macOS curl has no TLS 1.3.
     if (std.mem.indexOf(u8, probe, "SecureTransport") != null) return error.SkipZigTest;
-    var f: Fixture = undefined;
+    var f: Fixture = .blank();
     try f.start("test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/p256.key");
     defer f.stop();
     var url_buf: [64]u8 = undefined;
@@ -142,7 +149,7 @@ test "openssl s_client verifies the chain and negotiates alpn" {
     const io = std.testing.io;
     const probe = (try runTool(gpa, io, &.{ "openssl", "version" })) orelse return error.SkipZigTest;
     gpa.free(probe);
-    var f: Fixture = undefined;
+    var f: Fixture = .blank();
     try f.start("test/fixtures/tls/pem/ed25519.crt", "test/fixtures/tls/pem/ed25519.key");
     defer f.stop();
     var target_buf: [32]u8 = undefined;
@@ -171,7 +178,7 @@ test "openssl s_client with a group that needs a hello retry request" {
     const io = std.testing.io;
     const probe = (try runTool(gpa, io, &.{ "openssl", "version" })) orelse return error.SkipZigTest;
     gpa.free(probe);
-    var f: Fixture = undefined;
+    var f: Fixture = .blank();
     try f.start("test/fixtures/tls/pem/p384.crt", "test/fixtures/tls/pem/p384.key");
     defer f.stop();
     var target_buf: [32]u8 = undefined;
@@ -193,4 +200,66 @@ test "openssl s_client with a group that needs a hello retry request" {
     _ = try child.wait(io);
     try std.testing.expect(std.mem.indexOf(u8, out, "Verify return code: 0 (ok)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Cipher is TLS_") != null);
+}
+
+// -- The MCP client over HTTPS ---------------------------------------------------------------
+
+fn discoverAndAdd(gpa: std.mem.Allocator, io: Io, url: []const u8, setup: mcp.transport.HttpClient.TlsSetup) !void {
+    const http_client = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url, .tls = setup });
+    defer http_client.deinit();
+    var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(http_client.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const disc = try client.discover(arena, .{ .timeout = .fromSeconds(10) });
+    try std.testing.expect(disc.capabilities.tools != null);
+    const sum = try client.callTool(arena, "add", .{ .a = 20, .b = 22 }, .{ .timeout = .fromSeconds(10) });
+    try std.testing.expectEqualStrings("42", sum.content[0].text.text);
+}
+
+test "the MCP client over HTTPS with the SDK TLS client" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = .blank();
+    try f.start("test/fixtures/tls/pem/chain.crt", "test/fixtures/tls/pem/chain-leaf.key");
+    defer f.stop();
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/mcp", .{f.port()});
+
+    try discoverAndAdd(gpa, io, url, .{ .trust = .{ .ca_set = &set } });
+    try discoverAndAdd(gpa, io, url, .{ .trust = .{ .ca_set = &set }, .server_name = "localhost" });
+    try discoverAndAdd(gpa, io, url, .{ .trust = .{ .pinned_leaf = f.chain.certs[0] } });
+
+    // A certificate the client does not trust: no request gets through.
+    const untrusted = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url, .tls = .{ .trust = .self_signed } });
+    defer untrusted.deinit();
+    var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(untrusted.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.TransportFailed, client.discover(arena_state.allocator(), .{ .retry = .never }));
+}
+
+test "the MCP client over HTTPS with a client certificate" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
+    var f: Fixture = .blank();
+    f.client_auth = .required;
+    f.client_trust = .{ .ca_set = &set };
+    try f.start("test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/p256.key");
+    defer f.stop();
+    var identity = try tls.CertChain.loadFiles(gpa, io, "test/fixtures/tls/pem/chain-leaf.crt", "test/fixtures/tls/pem/chain-leaf.key");
+    defer identity.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/mcp", .{f.port()});
+    try discoverAndAdd(gpa, io, url, .{ .trust = .self_signed, .identity = &identity });
 }

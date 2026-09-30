@@ -339,6 +339,25 @@ pub fn messageHash(buf: []u8, hash: []const u8) []u8 {
 }
 
 pub const certificate_verify_context = " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00";
+pub const client_certificate_verify_context = " " ** 64 ++ "TLS 1.3, client CertificateVerify\x00";
+
+/// A CertificateRequest with an empty context and the accepted signature schemes.
+pub fn certificateRequest(buf: []u8, schemes: []const tls.SignatureScheme) []u8 {
+    var b: Builder = .{ .buf = buf };
+    b.byte(@intFromEnum(HandshakeType.certificate_request));
+    const msg = b.beginLen(u24);
+    b.byte(0); // certificate_request_context
+    const exts = b.beginLen(u16);
+    b.int(u16, @intFromEnum(tls.ExtensionType.signature_algorithms));
+    const ext = b.beginLen(u16);
+    const list = b.beginLen(u16);
+    for (schemes) |s| b.int(u16, @intFromEnum(s));
+    b.endLen(u16, list);
+    b.endLen(u16, ext);
+    b.endLen(u16, exts);
+    b.endLen(u24, msg);
+    return b.slice();
+}
 
 test "parse a minimal client hello" {
     var b: Builder = .{ .buf = try std.testing.allocator.alloc(u8, 512) };

@@ -13,3 +13,5 @@ pub const envelope = @import("transport/envelope.zig");
 test {
     @import("std").testing.refAllDecls(@This());
 }
+/// The HTTP/1.1 client connection the Streamable HTTP client uses.
+pub const http1 = @import("transport/http1.zig");

@@ -1,12 +1,14 @@
-//! The Streamable HTTP client transport. Every request is one POST. The response is either
-//! one JSON message or an SSE stream of messages. The transport mirrors the request into the
-//! `Mcp-*` headers, learns `x-mcp-header` annotations from `tools/list` results, and drops
-//! tools whose annotations are invalid.
+//! The Streamable HTTP client transport. Every request is one POST on its own connection.
+//! The response is either one JSON message or an SSE stream of messages. The transport
+//! mirrors the request into the `Mcp-*` headers, learns `x-mcp-header` annotations from
+//! `tools/list` results, and drops tools whose annotations are invalid. HTTPS uses the
+//! SDK TLS client.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const http = std.http;
+const http1 = @import("http1.zig");
 const Transport = @import("Transport.zig");
 const envelope = @import("envelope.zig");
 const sse = @import("sse.zig");
@@ -16,13 +18,18 @@ const version = @import("../protocol/version.zig");
 const message = @import("../jsonrpc/message.zig");
 const OAuthClient = @import("../auth/oauth_client.zig").Client;
 
+const log = std.log.scoped(.mcp_http_client);
+
 pub const Client = struct {
     io: Io,
     gpa: Allocator,
+    /// Owns `url` and the parsed target.
+    arena_state: std.heap.ArenaAllocator,
     url: []u8,
-    uri: std.Uri,
-    http_client: http.Client,
+    target: http1.Target,
     options: Options,
+    /// The system trust store, loaded for `https` URLs without an explicit `tls` option.
+    system_bundle: ?std.crypto.Certificate.Bundle = null,
     tool_headers: std.StringHashMapUnmanaged(ToolHeaders) = .empty,
     tool_headers_lock: Io.Mutex = .init,
 
@@ -35,35 +42,54 @@ pub const Client = struct {
         poll_interval: Io.Duration = .fromMilliseconds(50),
         /// Answers 401 and 403 challenges with OAuth 2.1. Null sends no credentials.
         auth: ?*OAuthClient = null,
+        /// The trust policy and identity for `https` URLs. Null uses the system trust store.
+        tls: ?http1.TlsSetup = null,
     };
+
+    pub const TlsSetup = http1.TlsSetup;
 
     const Binding = struct { param: []u8, header: []u8 };
     const ToolHeaders = struct { name: []u8, bindings: []Binding };
 
-    pub fn init(io: Io, gpa: Allocator, options: Options) error{ OutOfMemory, InvalidUrl }!*Client {
+    pub const InitError = error{ OutOfMemory, InvalidUrl, TrustStoreUnavailable };
+
+    pub fn init(io: Io, gpa: Allocator, options: Options) InitError!*Client {
         const self = try gpa.create(Client);
         errdefer gpa.destroy(self);
-        const url = try gpa.dupe(u8, options.url);
-        errdefer gpa.free(url);
-        const uri = std.Uri.parse(url) catch return error.InvalidUrl;
         self.* = .{
             .io = io,
             .gpa = gpa,
-            .url = url,
-            .uri = uri,
-            .http_client = .{ .allocator = gpa, .io = io },
+            .arena_state = .init(gpa),
+            .url = undefined,
+            .target = undefined,
             .options = options,
         };
+        errdefer self.arena_state.deinit();
+        const arena = self.arena_state.allocator();
+        self.url = try arena.dupe(u8, options.url);
+        self.target = try http1.Target.parse(arena, self.url);
+        if (self.target.secure and options.tls == null) {
+            var bundle: std.crypto.Certificate.Bundle = .empty;
+            errdefer bundle.deinit(gpa);
+            bundle.rescan(gpa, io, Io.Clock.real.now(io)) catch return error.TrustStoreUnavailable;
+            self.system_bundle = bundle;
+        }
         return self;
     }
 
     pub fn deinit(self: *Client) void {
-        self.http_client.deinit();
+        if (self.system_bundle) |*b| b.deinit(self.gpa);
         var it = self.tool_headers.valueIterator();
         while (it.next()) |th| self.freeToolHeaders(th.*);
         self.tool_headers.deinit(self.gpa);
-        self.gpa.free(self.url);
+        self.arena_state.deinit();
         self.gpa.destroy(self);
+    }
+
+    /// Open one connection to the server, with TLS for `https`.
+    fn open(self: *Client) http1.OpenError!*http1.Connection {
+        const secure: ?http1.TlsSetup = if (!self.target.secure) null else self.options.tls orelse .{ .trust = .{ .bundle = &self.system_bundle.? } };
+        return http1.Connection.open(self.io, self.gpa, self.target.host, self.target.port, secure);
     }
 
     fn freeToolHeaders(self: *Client, th: ToolHeaders) void {
@@ -143,38 +169,27 @@ pub const Client = struct {
         const method_name = msg.method() orelse return error.WriteFailed;
         var headers: std.ArrayList(http.Header) = .empty;
         try self.standardHeaders(arena, &headers, method_name);
-        var req = self.post(arena, headers.items, frame) catch return error.WriteFailed;
-        defer req.deinit();
-        var redirect_buf: [256]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch return error.WriteFailed;
+        const conn = self.open() catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.WriteFailed,
+        };
+        defer conn.close();
+        conn.send("POST", self.target.path, self.target.host_header, headers.items, frame) catch return error.WriteFailed;
+        const response = conn.receiveHead() catch return error.WriteFailed;
         if (response.head.status != .accepted) return error.WriteFailed;
-        var transfer_buf: [1024]u8 = undefined;
-        _ = response.reader(&transfer_buf).discardRemaining() catch {};
+        _ = conn.bodyReader(&response).discardRemaining() catch {};
     }
 
     fn standardHeaders(self: *Client, arena: Allocator, headers: *std.ArrayList(http.Header), method_name: []const u8) Allocator.Error!void {
         try headers.append(arena, .{ .name = "accept", .value = "application/json, text/event-stream" });
+        try headers.append(arena, .{ .name = "content-type", .value = "application/json" });
+        try headers.append(arena, .{ .name = "accept-encoding", .value = "identity" });
         if (self.options.auth) |auth| if (auth.currentToken()) |token| {
             try headers.append(arena, .{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Bearer ", token }) });
         };
         try headers.append(arena, .{ .name = envelope.header_protocol_version, .value = version.version });
         try headers.append(arena, .{ .name = envelope.header_method, .value = method_name });
         for (self.options.extra_headers) |h| try headers.append(arena, h);
-    }
-
-    fn post(self: *Client, arena: Allocator, headers: []const http.Header, frame: []const u8) !http.Client.Request {
-        var req = try self.http_client.request(.POST, self.uri, .{
-            .redirect_behavior = .unhandled,
-            .extra_headers = headers,
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .accept_encoding = .{ .override = "identity" },
-            },
-        });
-        errdefer req.deinit();
-        const body = try arena.dupe(u8, frame);
-        try req.sendBodyComplete(body);
-        return req;
     }
 
     const Challenge = struct { status: u16, www_authenticate: ?[]const u8 };
@@ -203,13 +218,18 @@ pub const Client = struct {
         try self.standardHeaders(arena, &headers, ex.method);
         try self.mirrorHeaders(arena, &headers, ex);
 
-        var req = self.post(arena, headers.items, ex.frame) catch |e| switch (e) {
+        const conn = self.open() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.WriteFailed,
+            error.Canceled => return error.Canceled,
+            error.TlsFailed => {
+                log.warn("TLS handshake with {s} failed", .{self.target.host});
+                return error.WriteFailed;
+            },
+            error.ConnectFailed => return error.WriteFailed,
         };
-        defer req.deinit();
-        var redirect_buf: [256]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch return error.ReadFailed;
+        defer conn.close();
+        conn.send("POST", self.target.path, self.target.host_header, headers.items, ex.frame) catch return error.WriteFailed;
+        const response = conn.receiveHead() catch return error.ReadFailed;
         ex.http_status = @intFromEnum(response.head.status);
         if (ex.http_status == 401 or ex.http_status == 403) {
             var www: ?[]const u8 = null;
@@ -217,15 +237,13 @@ pub const Client = struct {
             while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate")) {
                 www = try arena.dupe(u8, h.value);
             };
-            var transfer_buf: [1024]u8 = undefined;
-            _ = response.reader(&transfer_buf).discardRemaining() catch {};
+            _ = conn.bodyReader(&response).discardRemaining() catch {};
             return .{ .status = ex.http_status, .www_authenticate = www };
         }
         const content_type = response.head.content_type orelse "";
         const is_json = std.ascii.startsWithIgnoreCase(content_type, "application/json");
         const is_sse = std.ascii.startsWithIgnoreCase(content_type, sse.content_type);
-        var transfer_buf: [8 * 1024]u8 = undefined;
-        const body = response.reader(&transfer_buf);
+        const body = conn.bodyReader(&response);
         if (is_json) {
             const text = body.allocRemaining(arena, .limited(self.options.max_response_bytes)) catch return error.ReadFailed;
             try self.deliver(io, arena, ex, text);

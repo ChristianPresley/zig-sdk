@@ -27,7 +27,7 @@ The project is in development. The table shows the parts that exist today.
 | stdio transport (server) | Done |
 | Streamable HTTP transport (server) | Done, passes all 37 scored scenarios of the official conformance suite |
 | TLS 1.3 server (HTTPS) | Done, tested against the std client, curl and openssl |
-| TLS 1.3 client | Planned |
+| TLS 1.3 client (HTTPS, client certificates) | Done, tested against the SDK server and openssl |
 | Client: in-memory, stdio and Streamable HTTP transports, multi round-trip driver | Done |
 | Authorization: OAuth 2.1 client | Done, passes every scored `auth/*` scenario of the official suite |
 | Authorization: resource server helpers (bearer checks, metadata, JWT) | Done |

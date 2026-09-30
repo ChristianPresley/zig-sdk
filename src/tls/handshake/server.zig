@@ -9,10 +9,21 @@ const Writer = std.Io.Writer;
 const suites = @import("../suites.zig");
 const Suite = suites.Suite;
 const codec = @import("codec.zig");
+const common = @import("common.zig");
 const PrivateKey = @import("../PrivateKey.zig");
 const key_share = @import("key_share.zig");
 const Connection = @import("../Connection.zig");
 const CertChain = @import("../CertChain.zig");
+const verify = @import("../verify.zig");
+
+pub const ClientAuth = enum {
+    /// Never ask for a client certificate.
+    none,
+    /// Ask for one, and accept a client without one.
+    optional,
+    /// Ask for one, and refuse a client without one.
+    required,
+};
 
 pub const Config = struct {
     /// Certificate chains, at least one. The first one is the default.
@@ -28,6 +39,9 @@ pub const Config = struct {
     groups: []const key_share.Group = key_share.default_groups,
     /// What to do when the client asks for a server name no chain covers.
     server_name_mismatch: enum { ignore, alert } = .ignore,
+    client_auth: ClientAuth = .none,
+    /// How a client certificate is verified. Required when `client_auth` is not `none`.
+    client_trust: ?verify.Trust = null,
 };
 
 pub const AcceptOptions = struct {
@@ -41,33 +55,14 @@ pub const AcceptOptions = struct {
     alert: ?*tls.Alert = null,
 };
 
-pub const AcceptError = error{
-    ReadFailed,
-    WriteFailed,
-    EntropyUnavailable,
-    /// The client sent an alert.
-    TlsAlert,
-    TlsConnectionTruncated,
-    TlsRecordOverflow,
-    TlsDecodeError,
-    TlsIllegalParameter,
-    TlsUnexpectedMessage,
-    TlsProtocolVersion,
-    TlsMissingExtension,
-    TlsHandshakeFailure,
-    TlsNoApplicationProtocol,
-    TlsUnrecognizedName,
-    TlsDecryptError,
-    TlsBadRecordMac,
-    TlsSequenceOverflow,
-    TlsInternalError,
-};
+pub const AcceptError = common.Error;
 
 pub const Server = struct {
     config: Config,
 
-    pub fn init(config: Config) error{NoCertificateChain}!Server {
+    pub fn init(config: Config) error{ NoCertificateChain, NoClientTrust }!Server {
         if (config.chains.len == 0) return error.NoCertificateChain;
+        if (config.client_auth != .none and config.client_trust == null) return error.NoClientTrust;
         return .{ .config = config };
     }
 
@@ -75,8 +70,9 @@ pub const Server = struct {
     pub fn accept(self: *const Server, input: *Reader, output: *Writer, options: AcceptOptions) AcceptError!Connection {
         var c: Connection = .init(input, output, .server, options.read_buffer, options.write_buffer, options.allow_truncation_attacks);
         errdefer c.deinit();
-        var reader: MessageReader = .{};
-        const first = try reader.next(&c, options);
+        var hs_buf: [codec.max_message_len + 4]u8 = undefined;
+        var reader: common.MessageReader = .init(&hs_buf);
+        const first = try reader.next(&c, options.alert);
         if (first.kind != .client_hello) return abort(&c, options, .unexpected_message, error.TlsUnexpectedMessage);
         const hello = codec.ClientHello.parse(first.body) catch |e| return abortParse(&c, options, e);
         const suite = selectSuite(self.config, &hello) orelse return abort(&c, options, .handshake_failure, error.TlsHandshakeFailure);
@@ -131,7 +127,7 @@ fn run(
     comptime suite: Suite,
     self: *const Server,
     c: *Connection,
-    reader: *MessageReader,
+    reader: *common.MessageReader,
     hello1: *const codec.ClientHello,
     hello1_raw: []const u8,
     options: AcceptOptions,
@@ -160,7 +156,7 @@ fn run(
         if (compat_mode) c.writeChangeCipherSpec() catch return error.WriteFailed;
         c.output.flush() catch return error.WriteFailed;
 
-        const second = try reader.next(c, options);
+        const second = try reader.next(c, options.alert);
         if (second.kind != .client_hello) return abort(c, options, .unexpected_message, error.TlsUnexpectedMessage);
         hello = codec.ClientHello.parse(second.body) catch |e| return abortParse(c, options, e);
         if (selectSuite(config, &hello) != suite) return abort(c, options, .illegal_parameter, error.TlsIllegalParameter);
@@ -213,6 +209,11 @@ fn run(
     const ee = codec.encryptedExtensions(&msg_buf, alpn, c.serverName() != null);
     c.writeRecord(.handshake, ee) catch return error.WriteFailed;
     transcript.update(ee);
+    if (config.client_auth != .none) {
+        const request = codec.certificateRequest(&msg_buf, &common.signature_schemes);
+        c.writeRecord(.handshake, request) catch return error.WriteFailed;
+        transcript.update(request);
+    }
     c.writeRecord(.handshake, chain.handshake_message) catch return error.WriteFailed;
     transcript.update(chain.handshake_message);
 
@@ -240,12 +241,36 @@ fn run(
     const client_ap = K.trafficSecret(master, "c ap traffic", finished_hash);
     const server_ap = K.trafficSecret(master, "s ap traffic", finished_hash);
 
-    // Client Finished under the client handshake keys.
+    // The client flight under the client handshake keys: an optional certificate, then
+    // Finished.
     if (reader.pendingBytes() != 0) return abort(c, options, .unexpected_message, error.TlsUnexpectedMessage);
     c.read_keys = suites.DirectionKeys.init(suite, client_hs);
-    const client_fin = try reader.next(c, options);
+    var client_msg = try reader.next(c, options.alert);
+    if (config.client_auth != .none) {
+        if (client_msg.kind != .certificate) return abort(c, options, .unexpected_message, error.TlsUnexpectedMessage);
+        const certs = common.CertificateMessage.parse(client_msg.body) catch |e| return abortParse(c, options, e);
+        if (certs.context.len != 0) return abort(c, options, .illegal_parameter, error.TlsIllegalParameter);
+        transcript.update(client_msg.raw);
+        if (certs.count == 0) {
+            if (config.client_auth == .required) return abort(c, options, .certificate_required, error.TlsCertificateRequired);
+        } else {
+            const now_sec = std.Io.Clock.real.now(options.io).toSeconds();
+            const leaf = verify.verifyChain(certs.certs[0..certs.count], null, config.client_trust.?, now_sec) catch |e| return common.abortVerify(c, options.alert, e);
+            c.peer_fingerprint = common.fingerprint(certs.certs[0]);
+            const client_cv = try reader.next(c, options.alert);
+            if (client_cv.kind != .certificate_verify) return abort(c, options, .unexpected_message, error.TlsUnexpectedMessage);
+            const cv_parsed = common.CertificateVerifyMessage.parse(client_cv.body) catch |e| return abortParse(c, options, e);
+            var to_verify: [codec.client_certificate_verify_context.len + S.digest_length]u8 = undefined;
+            @memcpy(to_verify[0..codec.client_certificate_verify_context.len], codec.client_certificate_verify_context);
+            to_verify[codec.client_certificate_verify_context.len..].* = transcript.peek(S);
+            verify.verifySignature(&leaf, cv_parsed.scheme, cv_parsed.signature, &to_verify) catch |e| return common.abortSignature(c, options.alert, e);
+            transcript.update(client_cv.raw);
+        }
+        client_msg = try reader.next(c, options.alert);
+    }
+    const client_fin = client_msg;
     if (client_fin.kind != .finished) return abort(c, options, .unexpected_message, error.TlsUnexpectedMessage);
-    const expected = K.verifyData(K.finishedKey(client_hs), finished_hash);
+    const expected = K.verifyData(K.finishedKey(client_hs), transcript.peek(S));
     if (client_fin.body.len != expected.len or !crypto.timing_safe.eql([expected.len]u8, expected, client_fin.body[0..expected.len].*)) {
         return abort(c, options, .decrypt_error, error.TlsDecryptError);
     }
@@ -261,98 +286,14 @@ fn run(
     return c.*;
 }
 
-fn hrrSent(reader: *const MessageReader) bool {
+fn hrrSent(reader: *const common.MessageReader) bool {
     return reader.messages_read > 1;
 }
 
 fn abort(c: *Connection, options: AcceptOptions, description: tls.Alert.Description, err: AcceptError) AcceptError {
-    c.sendAlert(.fatal, description) catch {};
-    if (options.alert) |a| a.* = .{ .level = .fatal, .description = description };
-    return err;
+    return common.abort(c, options.alert, description, err);
 }
 
 fn abortParse(c: *Connection, options: AcceptOptions, err: codec.ParseError) AcceptError {
-    return switch (err) {
-        error.DecodeError => abort(c, options, .decode_error, error.TlsDecodeError),
-        error.IllegalParameter => abort(c, options, .illegal_parameter, error.TlsIllegalParameter),
-        error.ProtocolVersion => abort(c, options, .protocol_version, error.TlsProtocolVersion),
-        error.MissingExtension => abort(c, options, .missing_extension, error.TlsMissingExtension),
-    };
+    return common.abortParse(c, options.alert, err);
 }
-
-pub const Message = struct {
-    kind: tls.HandshakeType,
-    body: []u8,
-    /// The message with its four-byte header, for the transcript.
-    raw: []const u8,
-};
-
-/// Reassembles handshake messages from records, skipping compatibility change_cipher_spec
-/// records and surfacing alerts.
-const MessageReader = struct {
-    buf: [codec.max_message_len + 4]u8 = undefined,
-    len: usize = 0,
-    /// Start of the message returned last, so its bytes stay valid until the next call.
-    pending_consumed: usize = 0,
-    messages_read: u32 = 0,
-
-    /// Bytes of the next message that are already buffered. Must be zero when keys change.
-    fn pendingBytes(self: *const MessageReader) usize {
-        return self.len - self.pending_consumed;
-    }
-
-    fn next(self: *MessageReader, c: *Connection, options: AcceptOptions) AcceptError!Message {
-        // Drop the message returned by the previous call.
-        if (self.pending_consumed > 0) {
-            const rest = self.buf[self.pending_consumed..self.len];
-            @memmove(self.buf[0..rest.len], rest);
-            self.len = rest.len;
-            self.pending_consumed = 0;
-        }
-        while (true) {
-            if (self.len >= 4) {
-                const body_len = std.mem.readInt(u24, self.buf[1..4], .big);
-                if (body_len > codec.max_message_len) return abort(c, options, .decode_error, error.TlsDecodeError);
-                if (self.len >= 4 + body_len) {
-                    self.pending_consumed = 4 + body_len;
-                    self.messages_read += 1;
-                    return .{
-                        .kind = @enumFromInt(self.buf[0]),
-                        .body = self.buf[4 .. 4 + body_len],
-                        .raw = self.buf[0 .. 4 + body_len],
-                    };
-                }
-            }
-            const rec = c.readRecord() catch |e| switch (e) {
-                error.ReadFailed => return error.ReadFailed,
-                error.TlsConnectionTruncated => return error.TlsConnectionTruncated,
-                error.TlsBadRecordMac => return abort(c, options, .bad_record_mac, error.TlsBadRecordMac),
-                error.TlsRecordOverflow => return abort(c, options, .record_overflow, error.TlsRecordOverflow),
-                error.TlsUnexpectedMessage => return abort(c, options, .unexpected_message, error.TlsUnexpectedMessage),
-                error.TlsDecodeError => return abort(c, options, .decode_error, error.TlsDecodeError),
-                error.TlsIllegalParameter => return abort(c, options, .illegal_parameter, error.TlsIllegalParameter),
-                error.TlsSequenceOverflow => return abort(c, options, .internal_error, error.TlsSequenceOverflow),
-                error.TlsAlert => unreachable,
-            };
-            switch (rec.content_type) {
-                .handshake => {
-                    if (rec.data.len == 0) return abort(c, options, .decode_error, error.TlsDecodeError);
-                    if (self.len + rec.data.len > self.buf.len) return abort(c, options, .decode_error, error.TlsDecodeError);
-                    @memcpy(self.buf[self.len..][0..rec.data.len], rec.data);
-                    self.len += rec.data.len;
-                },
-                .change_cipher_spec => {
-                    if (rec.data.len != 1 or rec.data[0] != 1) return abort(c, options, .unexpected_message, error.TlsUnexpectedMessage);
-                },
-                .alert => {
-                    if (rec.data.len != 2) return abort(c, options, .decode_error, error.TlsDecodeError);
-                    const alert: tls.Alert = .{ .level = @enumFromInt(rec.data[0]), .description = @enumFromInt(rec.data[1]) };
-                    c.alert = alert;
-                    if (options.alert) |a| a.* = alert;
-                    return error.TlsAlert;
-                },
-                else => return abort(c, options, .unexpected_message, error.TlsUnexpectedMessage),
-            }
-        }
-    }
-};

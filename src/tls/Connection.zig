@@ -37,6 +37,8 @@ alert: ?tls.Alert = null,
 read_err: ?ReadError = null,
 suite: ?suites.Suite = null,
 group: u16 = 0,
+/// The SHA-256 fingerprint of the peer leaf certificate, when the peer presented one.
+peer_fingerprint: ?[32]u8 = null,
 alpn_buf: [255]u8 = undefined,
 alpn_len: u8 = 0,
 server_name_buf: [255]u8 = undefined,
