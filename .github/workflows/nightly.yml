@@ -57,3 +57,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
       - run: zig build test -Doptimize=ReleaseSafe --summary all
+
+  bench-smoke:
+    name: bench-smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build bench -- --smoke
+
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build test --fuzz=200000 --summary all

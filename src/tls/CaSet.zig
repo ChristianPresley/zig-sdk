@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Certificate = std.crypto.Certificate;
 const pem = @import("pem.zig");
+const x509 = @import("x509.zig");
 
 const CaSet = @This();
 
@@ -31,6 +32,7 @@ pub fn count(self: *const CaSet) usize {
 /// Add one DER certificate. The bytes are copied.
 pub fn addDer(self: *CaSet, bytes: []const u8) AddError!void {
     if (self.certs.items.len >= max_anchors) return error.TooManyAnchors;
+    x509.precheck(bytes) catch return error.InvalidCertificate;
     const cert: Certificate = .{ .buffer = bytes, .index = 0 };
     _ = cert.parse() catch return error.InvalidCertificate;
     const copy = try self.gpa.dupe(u8, bytes);

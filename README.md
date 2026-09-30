@@ -94,7 +94,7 @@ zig build test
 zig build examples
 ```
 
-Other build steps: `fmt`, `docs`, `lint-docs`, `census`, `commit-policy`.
+Other build steps: `fmt`, `docs`, `lint-docs`, `census`, `commit-policy`, `bench` (`-- --smoke` for a quick run), and `test --fuzz` for the fuzz targets.
 
 ## Documentation
 

@@ -5,6 +5,7 @@ const Certificate = std.crypto.Certificate;
 const der = @import("der.zig");
 const pem = @import("pem.zig");
 const PrivateKey = @import("PrivateKey.zig");
+const x509 = @import("x509.zig");
 
 const CertChain = @This();
 
@@ -76,7 +77,9 @@ pub fn fromDerOwned(gpa: Allocator, certs: [][]u8, key: PrivateKey) Error!CertCh
     for (certs) |c| total += c.len;
     if (total > max_chain_bytes) return error.ChainTooLarge;
 
-    // Check that the key matches the leaf.
+    // Check that the key matches the leaf. Every certificate must pass the precheck, so
+    // that the std parser never reads out of bounds later.
+    for (certs) |c| x509.precheck(c) catch return error.InvalidCertificate;
     const leaf: Certificate = .{ .buffer = certs[0], .index = 0 };
     const parsed = leaf.parse() catch return error.InvalidCertificate;
     var pk_buf: [97]u8 = undefined;

@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
 
     // Formatting check.
     const fmt_step = b.step("fmt", "Check formatting");
-    const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "build.zig.zon", "src", "examples", "tools", "conformance" }, .check = true });
+    const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "build.zig.zon", "src", "examples", "tools", "conformance", "bench" }, .check = true });
     fmt_step.dependOn(&fmt.step);
 
     // Examples.
@@ -90,6 +90,21 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "docs",
     });
     b.step("docs", "Generate API documentation").dependOn(&install_docs.step);
+
+    // Benchmarks: ReleaseFast, run with `zig build bench` or `zig build bench -- --smoke`.
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{ .{ .name = "mcp", .module = mcp }, .{ .name = "mcp_grpc", .module = mcp_grpc } },
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.setCwd(b.path("."));
+    if (b.args) |args| run_bench.addArgs(args);
+    b.step("bench", "Run the benchmarks").dependOn(&run_bench.step);
 
     // Tools written in Zig and run through `zig build <step>`.
     addTool(b, "lint-docs", "Check prose against the project STE profile", "tools/lint_docs.zig", &.{ "README.md", "docs", "src", "conformance" });

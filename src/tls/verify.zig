@@ -95,6 +95,8 @@ pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, n
 }
 
 fn parse(bytes: []const u8) !Certificate.Parsed {
+    // The std parser reads without bounds checks; the precheck rejects what would crash it.
+    try x509.precheck(bytes);
     const cert: Certificate = .{ .buffer = bytes, .index = 0 };
     return cert.parse();
 }

@@ -39,4 +39,5 @@ test {
     _ = grpc.timeout;
     _ = @import("grpc/http2/connection_test.zig");
     _ = @import("grpc/grpc_test.zig");
+    _ = @import("grpc/fuzz_test.zig");
 }

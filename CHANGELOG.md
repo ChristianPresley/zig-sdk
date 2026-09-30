@@ -27,5 +27,7 @@ All notable changes to this project are recorded in this file. The format follow
 - Conformance fixture server and a CI job that runs the official conformance suite. The fixture server serves gRPC with `--grpc-port`; the CI job `grpc-interop` calls it from a Node `http2` peer and from `curl` over HTTP/2.
 - Comptime JSON Schema derivation from Zig types.
 - JSON Schema 2020-12 subset validator. Tool arguments are checked against the input schema and structured output against the output schema.
-- Build steps `test`, `fmt`, `examples`, `docs`, `lint-docs`, `census`, `commit-policy`, `conformance-server`, `conformance-client`, `gen-bibliography`, `gen-dictionary`.
+- Build steps `test`, `fmt`, `examples`, `docs`, `lint-docs`, `census`, `commit-policy`, `conformance-server`, `conformance-client`, `gen-bibliography`, `gen-dictionary`, `bench`, `check-version`, `changelog-section`.
+- Benchmarks (`zig build bench`) for request dispatch, HPACK decoding and the TLS handshake, with the baseline in `docs/generated/bench.md` and a nightly smoke run.
+- Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.

@@ -36,6 +36,7 @@ pub const GetPromptResult = types.GetPromptResult;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("mcp/golden_test.zig");
+    _ = @import("mcp/fuzz_test.zig");
     _ = @import("mcp/server/request_state.zig");
     _ = @import("mcp/server/mrtr.zig");
     _ = @import("mcp/server/server_test.zig");
