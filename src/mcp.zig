@@ -9,6 +9,7 @@ pub const jsonrpc = @import("mcp/jsonrpc.zig");
 pub const transport = @import("mcp/transport.zig");
 pub const Limits = @import("mcp/Limits.zig");
 pub const Server = @import("mcp/server/Server.zig");
+pub const Client = @import("mcp/client/Client.zig");
 pub const RequestContext = Server.RequestContext;
 pub const Outcome = Server.Outcome;
 pub const InputRequired = Server.InputRequired;
@@ -35,6 +36,7 @@ test {
     _ = @import("mcp/server/request_state.zig");
     _ = @import("mcp/server/mrtr.zig");
     _ = @import("mcp/server/server_test.zig");
+    _ = @import("mcp/client/client_test.zig");
     _ = @import("mcp/transport/http_test.zig");
     _ = @import("mcp/transport/https_test.zig");
     _ = @import("tls/tls.zig");

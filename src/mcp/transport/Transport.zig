@@ -85,6 +85,72 @@ pub const Inbound = struct {
     context: ?*anyopaque = null,
 };
 
+/// A client transport: sends one request and streams its frames back.
+pub const ClientTransport = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        kind: Kind,
+        /// Send the request and deliver every frame of its stream to the sink. The last frame
+        /// is the response. Returns when the response was delivered, the request was
+        /// cancelled or the stream failed.
+        exchange: *const fn (ptr: *anyopaque, io: Io, ex: *Exchange) ExchangeError!void,
+        /// Send a notification. Nothing comes back.
+        notify: *const fn (ptr: *anyopaque, io: Io, frame: []const u8) SendError!void,
+    };
+
+    pub fn kind(self: ClientTransport) Kind {
+        return self.vtable.kind;
+    }
+
+    pub fn exchange(self: ClientTransport, io: Io, ex: *Exchange) ExchangeError!void {
+        return self.vtable.exchange(self.ptr, io, ex);
+    }
+
+    pub fn notify(self: ClientTransport, io: Io, frame: []const u8) SendError!void {
+        return self.vtable.notify(self.ptr, io, frame);
+    }
+};
+
+pub const ExchangeError = error{
+    Closed,
+    WriteFailed,
+    ReadFailed,
+    OutOfMemory,
+    /// The deadline passed before the response arrived.
+    Timeout,
+    /// The stream carried something that is not a JSON-RPC message for this request.
+    InvalidFrame,
+    /// The HTTP status carried no JSON-RPC body (for example 404 for a wrong path).
+    HttpStatus,
+} || Io.Cancelable;
+
+/// One request in flight on a client transport.
+pub const Exchange = struct {
+    /// The serialized request frame.
+    frame: []const u8,
+    id: jsonrpc.RequestId,
+    method: []const u8,
+    /// The request params, for transports that mirror them into headers.
+    params: ?std.json.Value,
+    sink: Sink,
+    cancel: *CancelToken,
+    /// Absolute deadline, or `.none`.
+    timeout: Io.Timeout = .none,
+    /// Set by HTTP transports: the status of the response.
+    http_status: u16 = 0,
+
+    pub const Sink = struct {
+        ptr: *anyopaque,
+        on_frame: *const fn (ptr: *anyopaque, io: Io, frame: []const u8) anyerror!void,
+
+        pub fn deliver(self: Sink, io: Io, frame: []const u8) anyerror!void {
+            return self.on_frame(self.ptr, io, frame);
+        }
+    };
+};
+
 test "cancel token" {
     var token: CancelToken = .{};
     try std.testing.expect(!token.isCancelled());

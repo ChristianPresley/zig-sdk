@@ -93,3 +93,92 @@ pub const Harness = struct {
         self.finished = true;
     }
 };
+
+/// An in-process client transport that hands frames straight to a server.
+pub const ClientLink = struct {
+    io: Io,
+    gpa: Allocator,
+    server: *Server,
+
+    pub fn init(io: Io, gpa: Allocator, server: *Server) ClientLink {
+        return .{ .io = io, .gpa = gpa, .server = server };
+    }
+
+    pub fn transport(self: *ClientLink) Transport.ClientTransport {
+        return .{ .ptr = self, .vtable = &client_vtable };
+    }
+
+    const client_vtable: Transport.ClientTransport.VTable = .{
+        .kind = .memory,
+        .exchange = exchange,
+        .notify = clientNotify,
+    };
+
+    const Forward = struct {
+        sink: Transport.Exchange.Sink,
+        failed: bool = false,
+    };
+
+    fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
+        const self: *ClientLink = @ptrCast(@alignCast(ptr));
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const msg = jsonrpc.Message.parse(arena, ex.frame) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidFrame,
+        };
+        var forward: Forward = .{ .sink = ex.sink };
+        self.server.handle(io, .{
+            .kind = .memory,
+            .arena = arena,
+            .message = msg,
+            .responder = .{ .ptr = &forward, .vtable = &forward_vtable },
+            .cancel = ex.cancel,
+        });
+        if (forward.failed) return error.ReadFailed;
+        if (ex.cancel.isCancelled()) return error.Canceled;
+    }
+
+    fn clientNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        const self: *ClientLink = @ptrCast(@alignCast(ptr));
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const msg = jsonrpc.Message.parse(arena, frame) catch return error.WriteFailed;
+        var token: Transport.CancelToken = .{};
+        var forward: Forward = .{ .sink = .{ .ptr = undefined, .on_frame = dropFrame } };
+        self.server.handle(io, .{
+            .kind = .memory,
+            .arena = arena,
+            .message = msg,
+            .responder = .{ .ptr = &forward, .vtable = &forward_vtable },
+            .cancel = &token,
+        });
+    }
+
+    fn dropFrame(_: *anyopaque, _: Io, _: []const u8) anyerror!void {}
+
+    const forward_vtable: Transport.Responder.VTable = .{
+        .notify = forwardNotify,
+        .finish = forwardFinish,
+        .abort = forwardAbort,
+    };
+
+    fn forwardNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        const f: *Forward = @ptrCast(@alignCast(ptr));
+        f.sink.deliver(io, frame) catch {
+            f.failed = true;
+            return error.Closed;
+        };
+    }
+
+    fn forwardFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        return forwardNotify(ptr, io, frame);
+    }
+
+    fn forwardAbort(ptr: *anyopaque, io: Io) void {
+        _ = ptr;
+        _ = io;
+    }
+};
