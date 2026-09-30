@@ -38,7 +38,7 @@ pub const Options = struct {
     allowed_origins: []const []const u8 = &.{},
     /// Hosts accepted in the `Host` header. Empty means loopback names plus the bound address.
     allowed_hosts: []const []const u8 = &.{},
-    /// Answer a request-scoped stream with SSE even when the handler sends no notification.
+    /// Send an SSE comment on each listen stream every `limits.http.sse_keepalive`.
     keepalive: bool = true,
     /// Serve HTTPS with this TLS 1.3 server. Null serves plaintext HTTP.
     tls: ?*const tls.Server = null,

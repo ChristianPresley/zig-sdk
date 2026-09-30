@@ -9,8 +9,8 @@ const Limits = @This();
 json_max_depth: u16 = 64,
 
 stdio: struct {
-    /// Maximum bytes of one newline-delimited message. Overflow: the transport drops the frame
-    /// and, when it can recover the request id, it returns `-32600`.
+    /// Maximum bytes of one newline-delimited message. Overflow: the transport drops the line
+    /// and logs a warning.
     max_line_bytes: usize = 16 << 20,
     /// Buffer of the line reader. For a longer line, the reader uses a buffer that grows.
     read_buffer: usize = 64 << 10,
@@ -77,8 +77,11 @@ skills: struct {
 icon: Icon = .{},
 
 uri_template: struct {
+    /// Reserved. Version 0.1.0 does not check this limit.
     max_template_bytes: usize = 64 << 10,
+    /// Maximum expressions in one template. Overflow: the registration fails.
     max_expressions: u16 = 256,
+    /// Reserved. Version 0.1.0 does not check this limit.
     max_uri_bytes: usize = 64 << 10,
 } = .{},
 
