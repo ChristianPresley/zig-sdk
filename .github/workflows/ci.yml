@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt-lint:
+    name: fmt-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build fmt
+      - run: zig build lint-docs
+      - run: zig build census
+
+  commit-policy:
+    name: commit-policy
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-zig
+      - run: zig build commit-policy -- "origin/${{ github.base_ref }}..HEAD"
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-2025]
+        optimize: [Debug, ReleaseSafe]
+        include:
+          - os: ubuntu-24.04
+            optimize: ReleaseFast
+          - os: ubuntu-24.04
+            optimize: ReleaseSmall
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/zig-global-cache
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+      - run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+      - run: zig build examples -Doptimize=${{ matrix.optimize }}
+
+  cross:
+    name: cross-compile
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: [aarch64-linux-musl, x86_64-linux-musl, x86_64-windows-gnu, aarch64-macos]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build examples -Dtarget=${{ matrix.target }}
+
+  docs:
+    name: docs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build docs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: autodocs
+          path: zig-out/docs

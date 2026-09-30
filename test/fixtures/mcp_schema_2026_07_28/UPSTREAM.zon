@@ -1,0 +1,6 @@
+.{
+    .repo = "https://github.com/modelcontextprotocol/modelcontextprotocol",
+    .commit = "046fa30efd374370afb87ef830bd788eac5f217e",
+    .path = "schema/2026-07-28",
+    .fetched = "2026-09-29",
+}

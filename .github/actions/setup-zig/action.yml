@@ -1,0 +1,84 @@
+name: Set up Zig
+description: Install the pinned Zig toolchain from ziglang.org mirrors with sha256 (and minisign) verification. Uses only GitHub-owned actions.
+inputs:
+  pin-file:
+    description: Path of the JSON file with the pinned version and hashes.
+    default: .github/zig.json
+runs:
+  using: composite
+  steps:
+    - name: Resolve target
+      id: target
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64) key=x86_64-linux ;;
+          Linux-ARM64) key=aarch64-linux ;;
+          macOS-X64) key=x86_64-macos ;;
+          macOS-ARM64) key=aarch64-macos ;;
+          Windows-X64) key=x86_64-windows ;;
+          Windows-ARM64) key=aarch64-windows ;;
+          *) echo "unsupported runner ${RUNNER_OS}-${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        version=$(jq -r .version "${{ inputs.pin-file }}")
+        tarball=$(jq -r ".targets[\"$key\"].tarball" "${{ inputs.pin-file }}")
+        shasum=$(jq -r ".targets[\"$key\"].shasum" "${{ inputs.pin-file }}")
+        {
+          echo "key=$key"; echo "version=$version"; echo "tarball=$tarball"; echo "shasum=$shasum"
+          echo "file=$(basename "$tarball")"
+          echo "dir=${RUNNER_TEMP//\//}/zig-toolchain"
+        } >> "$GITHUB_OUTPUT"
+    - name: Restore toolchain cache
+      id: cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ steps.target.outputs.dir }}
+        key: zig-${{ steps.target.outputs.version }}-${{ steps.target.outputs.key }}-${{ steps.target.outputs.shasum }}
+    - name: Download and verify
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        file="${{ steps.target.outputs.file }}"
+        expected="${{ steps.target.outputs.shasum }}"
+        url="${{ steps.target.outputs.tarball }}"
+        mirrors=$(shuf .github/community-mirrors.txt 2>/dev/null || cat .github/community-mirrors.txt)
+        ok=0
+        for m in $mirrors "$(dirname "$url")"; do
+          if curl -fsSL --retry 2 -o "$file" "$m/$file?source=zig-sdk-ci" && curl -fsSL --retry 2 -o "$file.minisig" "$m/$file.minisig?source=zig-sdk-ci"; then ok=1; echo "downloaded from $m"; break; fi
+        done
+        [ "$ok" = 1 ] || { echo "all mirrors failed" >&2; exit 1; }
+        if command -v sha256sum >/dev/null; then actual=$(sha256sum "$file" | cut -d' ' -f1); else actual=$(shasum -a 256 "$file" | cut -d' ' -f1); fi
+        [ "$actual" = "$expected" ] || { echo "sha256 mismatch: $actual != $expected" >&2; exit 1; }
+        echo "sha256 verified against the pinned value"
+        if command -v zig >/dev/null && [ -f tools/verify_minisign.zig ]; then
+          zig run tools/verify_minisign.zig -- --pubkey "$(jq -r .minisign_pubkey "${{ inputs.pin-file }}")" --file "$file" --sig "$file.minisig" --expect-file "$file"
+        else
+          echo "no cached toolchain available: minisign verification skipped, sha256 pin is the trust anchor"
+        fi
+        dir="${{ steps.target.outputs.dir }}"
+        rm -rf "$dir" && mkdir -p "$dir"
+        case "$file" in
+          *.tar.xz) tar -xJf "$file" -C "$dir" --strip-components=1 ;;
+          *.zip) python3 - "$file" "$dir" <<'PY'
+        import sys, zipfile, os, shutil
+        src, dst = sys.argv[1], sys.argv[2]
+        with zipfile.ZipFile(src) as z:
+            z.extractall(dst + "/_x")
+        root = os.path.join(dst, "_x", os.listdir(os.path.join(dst, "_x"))[0])
+        for name in os.listdir(root):
+            shutil.move(os.path.join(root, name), dst)
+        shutil.rmtree(os.path.join(dst, "_x"))
+        PY
+          ;;
+        esac
+        rm -f "$file" "$file.minisig"
+    - name: Export PATH
+      shell: bash
+      run: |
+        echo "${{ steps.target.outputs.dir }}" >> "$GITHUB_PATH"
+        echo "ZIG_GLOBAL_CACHE_DIR=${RUNNER_TEMP//\//}/zig-global-cache" >> "$GITHUB_ENV"
+    - name: Report
+      shell: bash
+      run: zig version
