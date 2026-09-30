@@ -147,6 +147,7 @@ const TlsEcho = struct {
 const TlsClient = struct {
     io: Io,
     port: u16,
+    groups: []const mcp.tls.key_share.Group,
 
     fn once(self: TlsClient) !void {
         const address = Io.net.IpAddress.parse("127.0.0.1", self.port) catch unreachable;
@@ -162,6 +163,7 @@ const TlsClient = struct {
             .io = self.io,
             .host = "localhost",
             .trust = .self_signed,
+            .groups = self.groups,
             .read_buffer = &read_buf,
             .write_buffer = &write_buf,
             .allow_truncation_attacks = true,
@@ -172,7 +174,7 @@ const TlsClient = struct {
     }
 };
 
-fn benchTls(gpa: std.mem.Allocator, io: Io, iterations: u64) !Result {
+fn benchTls(gpa: std.mem.Allocator, io: Io, iterations: u64, name: []const u8, groups: []const mcp.tls.key_share.Group) !Result {
     var chain = try mcp.tls.CertChain.loadFiles(gpa, io, "test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/p256.key");
     defer chain.deinit();
     const chains = [_]*const mcp.tls.CertChain{&chain};
@@ -185,7 +187,7 @@ fn benchTls(gpa: std.mem.Allocator, io: Io, iterations: u64) !Result {
         echo.stop.store(true, .release);
         _ = future.cancel(io);
     }
-    return measure(gpa, io, "TLS 1.3 handshake, P-256 certificate, loopback", iterations, TlsClient{ .io = io, .port = listener.socket.address.getPort() }, TlsClient.once);
+    return measure(gpa, io, name, iterations, TlsClient{ .io = io, .port = listener.socket.address.getPort(), .groups = groups }, TlsClient.once);
 }
 
 // -- Main ------------------------------------------------------------------------------------
@@ -208,6 +210,7 @@ pub fn main(init: std.process.Init) !void {
     try w.print("| Benchmark | Iterations | Per second | p50 (us) | p99 (us) |\n| --- | --- | --- | --- | --- |\n", .{});
     try (try benchDispatch(gpa, io, n_dispatch)).print(w);
     try (try benchHpack(gpa, io, n_hpack)).print(w);
-    try (try benchTls(gpa, io, n_tls)).print(w);
+    try (try benchTls(gpa, io, n_tls, "TLS 1.3 handshake, P-256 certificate, X25519, loopback", &.{.x25519})).print(w);
+    try (try benchTls(gpa, io, n_tls, "TLS 1.3 handshake, P-256 certificate, X25519MLKEM768, loopback", &.{.x25519_mlkem768})).print(w);
     try w.flush();
 }
