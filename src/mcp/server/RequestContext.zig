@@ -12,6 +12,8 @@ const Transport = @import("../transport/Transport.zig");
 const RequestId = @import("../jsonrpc/id.zig").RequestId;
 const Server = @import("Server.zig");
 
+const Principal = @import("../auth/resource_server.zig").Principal;
+
 const RequestContext = @This();
 
 io: Io,
@@ -33,6 +35,8 @@ responder: Transport.Responder,
 kind: Transport.Kind,
 /// The `userdata` given at registration of the tool, resource or prompt.
 userdata: ?*anyopaque = null,
+/// Transport data for the request. The HTTP server stores the authorization principal.
+transport_context: ?*anyopaque = null,
 /// Set by `setError`. Returned as the JSON-RPC error of the request.
 rpc_error: ?errors.RpcError = null,
 /// `params.name` or `params.uri`, used to bind sealed state to its target.
@@ -41,6 +45,13 @@ progress_sent: u32 = 0,
 long_lived: bool = false,
 
 pub const Error = error{ Canceled, Rpc, OutOfMemory };
+
+/// The authorization principal of the request, when the transport checked a bearer token.
+pub fn principal(self: *const RequestContext) ?*const Principal {
+    const p = self.transport_context orelse return null;
+    if (self.kind != .streamable_http) return null;
+    return @ptrCast(@alignCast(p));
+}
 
 /// Return `error.Canceled` when the client cancelled the request.
 pub fn checkCancel(self: *RequestContext) error{Canceled}!void {

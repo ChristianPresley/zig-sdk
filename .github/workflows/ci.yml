@@ -24,6 +24,8 @@ jobs:
       - run: zig build fmt
       - run: zig build lint-docs
       - run: zig build census
+      - run: zig build gen-bibliography
+      - run: zig build gen-dictionary
 
   commit-policy:
     name: commit-policy

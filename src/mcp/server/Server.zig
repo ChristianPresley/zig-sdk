@@ -449,6 +449,7 @@ fn handleRequest(self: *Server, io: Io, inbound: Transport.Inbound, req: message
         .meta = undefined,
         .params = req.params,
         .cancel = inbound.cancel,
+        .transport_context = inbound.context,
         .responder = inbound.responder,
         .kind = inbound.kind,
     };

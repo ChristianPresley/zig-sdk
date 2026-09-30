@@ -9,6 +9,7 @@ const http = std.http;
 const Transport = @import("Transport.zig");
 const envelope = @import("envelope.zig");
 const tls = @import("../../tls/tls.zig");
+const resource_server = @import("../auth/resource_server.zig");
 const sse = @import("sse.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const RequestId = jsonrpc.RequestId;
@@ -41,6 +42,8 @@ pub const Options = struct {
     keepalive: bool = true,
     /// Serve HTTPS with this TLS 1.3 server. Null serves plaintext HTTP.
     tls: ?*const tls.Server = null,
+    /// Require a bearer token on the endpoint and serve the protected resource metadata.
+    auth: ?*const resource_server.ResourceServer = null,
 };
 
 pub const Server = struct {
@@ -263,6 +266,7 @@ const Head = struct {
     accept: ?[]const u8 = null,
     origin: ?[]const u8 = null,
     host: ?[]const u8 = null,
+    authorization: ?[]const u8 = null,
     content_length: ?u64 = null,
     envelope_headers: envelope.Headers = .{},
 };
@@ -286,6 +290,7 @@ fn copyHead(arena: Allocator, request: *http.Server.Request) !Head {
         if (std.mem.eql(u8, name, "accept")) head.accept = value;
         if (std.mem.eql(u8, name, "origin")) head.origin = value;
         if (std.mem.eql(u8, name, "host")) head.host = value;
+        if (std.mem.eql(u8, name, "authorization")) head.authorization = value;
         if (std.mem.eql(u8, name, envelope.header_protocol_version)) head.envelope_headers.protocol_version = value;
         if (std.mem.eql(u8, name, envelope.header_method)) head.envelope_headers.method = value;
         if (std.mem.eql(u8, name, envelope.header_name)) head.envelope_headers.name = value;
@@ -318,7 +323,19 @@ fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
     const arena = arena_state.allocator();
     const head = try copyHead(arena, request);
 
-    // Router.
+    // Router. The protected resource metadata lives at the path-inserted well-known location.
+    if (self.options.auth) |auth| {
+        const prm_path = try std.mem.concat(arena, u8, &.{ "/.well-known/oauth-protected-resource", self.options.path });
+        if (std.mem.eql(u8, head.path, prm_path)) {
+            if (head.method != .GET) {
+                try request.respond("", .{ .status = .method_not_allowed, .keep_alive = request.head.keep_alive, .extra_headers = &.{.{ .name = "allow", .value = "GET" }} });
+                return true;
+            }
+            const doc = try auth.metadataJson(arena);
+            try request.respond(doc, .{ .status = .ok, .keep_alive = request.head.keep_alive, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+            return true;
+        }
+    }
     if (!std.mem.eql(u8, head.path, self.options.path)) {
         try request.respond("Not Found", .{ .status = .not_found, .keep_alive = request.head.keep_alive, .extra_headers = &.{.{ .name = "content-type", .value = "text/plain" }} });
         return true;
@@ -338,6 +355,25 @@ fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
         if (!self.hostAllowed(host)) {
             try respondErrorOptions(request, .forbidden, null, errors.invalidRequest("Host not allowed"), false);
             return false;
+        }
+    }
+    // Authorization comes before any look at the body.
+    var principal: ?*resource_server.Principal = null;
+    if (self.options.auth) |auth| {
+        switch (try auth.authorize(arena, head.authorization)) {
+            .ok => |p| {
+                const owned = try arena.create(resource_server.Principal);
+                owned.* = p;
+                principal = owned;
+            },
+            .challenge => |c| {
+                try request.respond(c.body, .{
+                    .status = @enumFromInt(c.status),
+                    .keep_alive = request.head.keep_alive,
+                    .extra_headers = &.{ .{ .name = "www-authenticate", .value = c.www_authenticate }, .{ .name = "content-type", .value = "application/json" } },
+                });
+                return true;
+            },
         }
     }
     if (head.content_type) |ct| {
@@ -395,7 +431,7 @@ fn handleRequest(self: *Server, request: *http.Server.Request) !bool {
             try respondError(request, .bad_request, null, errors.invalidRequest("Clients must not send responses"));
             return true;
         },
-        .request => |req| return handleRpcRequest(self, request, arena, head, req),
+        .request => |req| return handleRpcRequest(self, request, arena, head, req, principal),
     }
 }
 
@@ -411,7 +447,7 @@ fn respondErrorOptions(request: *http.Server.Request, status: http.Status, id: ?
     try request.respond(aw.written(), .{ .status = status, .keep_alive = keep_alive and request.head.keep_alive, .extra_headers = &json_headers });
 }
 
-fn handleRpcRequest(self: *Server, request: *http.Server.Request, arena: Allocator, head: Head, req: jsonrpc.Message.Request) !bool {
+fn handleRpcRequest(self: *Server, request: *http.Server.Request, arena: Allocator, head: Head, req: jsonrpc.Message.Request, principal: ?*resource_server.Principal) !bool {
     // Header presence, mirror validation and version support run before dispatch on HTTP.
     const schema = if (std.mem.eql(u8, req.method, "tools/call")) toolSchema(self, req.params) else null;
     if (try envelope.verify(arena, head.envelope_headers, req.method, req.params, schema)) |rejection| {
@@ -445,6 +481,7 @@ fn handleRpcRequest(self: *Server, request: *http.Server.Request, arena: Allocat
         .message = .{ .request = req },
         .responder = .{ .ptr = &exchange, .vtable = &exchange_vtable },
         .cancel = &token,
+        .context = principal,
     });
     if (exchange.keepalive_future) |*f| {
         exchange.keepalive_stop.store(true, .release);
