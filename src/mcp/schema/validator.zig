@@ -1,14 +1,18 @@
 //! JSON Schema 2020-12 subset validator over `std.json.Value`.
 //!
-//! The validator has no regular expression engine and no dynamic scope. Keywords that need
-//! one are rejected when a schema is compiled, unless `Options.allow_unsupported_keywords`
-//! is set. Then they are ignored. Remote references are always rejected. Annotation
-//! keywords such as `title`, `description`, `default`, `format` and `x-*` keys are kept but
-//! not evaluated.
+//! The validator has no dynamic scope and no annotation collection. The compiler rejects the
+//! keywords that need them. With `Options.allow_unsupported_keywords`, the compiler ignores
+//! them. The compiler always rejects remote references. The validator keeps annotation
+//! keywords such as `title`, `description`, `default`, `format` and `x-*` keys, but does not
+//! evaluate them.
+//!
+//! The keywords `pattern` and `patternProperties` use the engine in `regex.zig`. The compiler
+//! compiles each regular expression one time and keeps the program in the `Schema`.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const Limits = @import("../Limits.zig");
+const regex = @import("regex.zig");
 
 pub const dialect_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 
@@ -31,6 +35,13 @@ pub const CompileError = error{
     SchemaTooDeep,
     TooManySubschemas,
     DuplicateAnchor,
+    /// A `pattern` value or a `patternProperties` key is not an ECMA-262 regular expression.
+    InvalidRegex,
+    /// A regular expression uses a feature that `regex.zig` rejects. With
+    /// `Options.allow_unsupported_keywords` the validator ignores that expression.
+    UnsupportedRegex,
+    /// A regular expression is larger than `max_pattern_bytes` or `max_regex_states`.
+    RegexTooLarge,
 };
 
 pub const ValidateError = error{
@@ -45,6 +56,10 @@ pub const Schema = struct {
     root: Value,
     anchors: std.StringHashMapUnmanaged(Value),
     options: Options,
+    /// The compiled `pattern` values and `patternProperties` keys, by source text.
+    patterns: std.StringHashMapUnmanaged(regex.Regex) = .empty,
+    /// The largest match buffer that one of `patterns` needs, in `u32` items.
+    pattern_buffer_len: usize = 0,
 };
 
 pub const Failure = struct {
@@ -66,8 +81,6 @@ pub const Result = struct {
 };
 
 const unsupported_keywords = std.StaticStringMap(void).initComptime(.{
-    .{"pattern"},
-    .{"patternProperties"},
     .{"unevaluatedProperties"},
     .{"unevaluatedItems"},
     .{"$dynamicRef"},
@@ -90,6 +103,24 @@ const Compiler = struct {
     count: u32 = 0,
     anchors: std.StringHashMapUnmanaged(Value) = .empty,
     refs: std.ArrayList([]const u8) = .empty,
+    patterns: std.StringHashMapUnmanaged(regex.Regex) = .empty,
+    pattern_buffer_len: usize = 0,
+
+    fn pattern(self: *Compiler, source: []const u8) CompileError!void {
+        if (self.patterns.contains(source)) return;
+        const re = regex.compile(self.arena, source, .{
+            .max_pattern_bytes = self.options.limits.max_pattern_bytes,
+            .max_states = self.options.limits.max_regex_states,
+        }) catch |e| switch (e) {
+            error.UnsupportedRegex => {
+                if (self.options.allow_unsupported_keywords) return;
+                return error.UnsupportedRegex;
+            },
+            else => |other| return other,
+        };
+        try self.patterns.put(self.arena, source, re);
+        self.pattern_buffer_len = @max(self.pattern_buffer_len, re.bufferLen());
+    }
 
     fn node(self: *Compiler, value: Value, depth: u16, is_root: bool) CompileError!void {
         switch (value) {
@@ -192,6 +223,20 @@ const Compiler = struct {
             if (value != .bool) return error.InvalidSchema;
             return;
         }
+        if (std.mem.eql(u8, key, "pattern")) {
+            if (value != .string) return error.InvalidSchema;
+            try self.pattern(value.string);
+            return;
+        }
+        if (std.mem.eql(u8, key, "patternProperties")) {
+            if (value != .object) return error.InvalidSchema;
+            var it = value.object.iterator();
+            while (it.next()) |kv| {
+                try self.pattern(kv.key_ptr.*);
+                try self.node(kv.value_ptr.*, depth + 1, false);
+            }
+            return;
+        }
         // Everything else is an annotation or an unknown keyword and is ignored.
     }
 };
@@ -221,12 +266,18 @@ fn isPlainName(s: []const u8) bool {
 }
 
 /// Compile a schema: check the dialect, reject unsupported keywords and remote references,
-/// collect anchors and resolve every local reference once.
+/// compile the regular expressions, collect anchors and resolve every local reference once.
 pub fn compile(arena: Allocator, root: Value, options: Options) CompileError!Schema {
     var c: Compiler = .{ .arena = arena, .options = options };
     try c.node(root, 0, true);
     try collectAnchors(arena, root, &c.anchors);
-    var schema: Schema = .{ .root = root, .anchors = c.anchors, .options = options };
+    var schema: Schema = .{
+        .root = root,
+        .anchors = c.anchors,
+        .options = options,
+        .patterns = c.patterns,
+        .pattern_buffer_len = c.pattern_buffer_len,
+    };
     for (c.refs.items) |ref| {
         if (resolveRef(&schema, ref) == null) return error.InvalidSchema;
     }
@@ -317,6 +368,14 @@ const Evaluator = struct {
     path: std.ArrayList(Segment) = .empty,
     failures: std.ArrayList(Failure) = .empty,
     truncated: bool = false,
+    regex_buffer: []u32 = &.{},
+
+    /// Match `s` against the compiled expression for `source`. Return null when the compiler
+    /// ignored the expression.
+    fn matchPattern(self: *Evaluator, source: []const u8, s: []const u8) ?bool {
+        const re = self.schema.patterns.getPtr(source) orelse return null;
+        return re.isMatchBuffer(self.regex_buffer, s);
+    }
 
     fn fail(self: *Evaluator, collect: bool, keyword: []const u8, comptime fmt: []const u8, args: anytype) ValidateError!bool {
         if (!collect) return false;
@@ -445,9 +504,12 @@ const Evaluator = struct {
 
     fn checkString(self: *Evaluator, obj: std.json.ObjectMap, s: []const u8, collect: bool) ValidateError!bool {
         var ok = true;
+        if (obj.get("pattern")) |p| if (p == .string) if (self.matchPattern(p.string, s)) |matched| if (!matched) {
+            ok = try self.fail(collect, "pattern", "string does not match the pattern \"{s}\"", .{p.string}) and ok;
+        };
         const min = obj.get("minLength");
         const max = obj.get("maxLength");
-        if (min == null and max == null) return true;
+        if (min == null and max == null) return ok;
         const len = std.unicode.utf8CountCodepoints(s) catch s.len;
         if (min) |m| if (len < @as(usize, @intCast(m.integer))) {
             ok = try self.fail(collect, "minLength", "string is shorter than {d} characters", .{m.integer}) and ok;
@@ -489,6 +551,7 @@ const Evaluator = struct {
             }
         }
         const props = obj.get("properties");
+        const pattern_props = obj.get("patternProperties");
         const additional = obj.get("additionalProperties");
         const names_schema = obj.get("propertyNames");
         var it = members.iterator();
@@ -498,6 +561,16 @@ const Evaluator = struct {
             if (props) |p| if (p.object.get(name)) |sub| {
                 covered = true;
                 if (!try self.child(sub, kv.value_ptr.*, .{ .key = name }, depth, collect)) ok = false;
+            };
+            // A name that a `patternProperties` expression matches is not additional.
+            if (pattern_props) |pp| if (pp == .object) {
+                var pit = pp.object.iterator();
+                while (pit.next()) |entry| {
+                    const matched = self.matchPattern(entry.key_ptr.*, name) orelse continue;
+                    if (!matched) continue;
+                    covered = true;
+                    if (!try self.child(entry.value_ptr.*, kv.value_ptr.*, .{ .key = name }, depth, collect)) ok = false;
+                }
             };
             if (!covered) if (additional) |a| {
                 if (!try self.child(a, kv.value_ptr.*, .{ .key = name }, depth, collect)) ok = false;
@@ -601,6 +674,7 @@ pub fn validate(arena: Allocator, schema: *const Schema, instance: Value) Valida
         .schema = schema,
         .limits = schema.options.limits,
         .budget = schema.options.limits.eval_budget,
+        .regex_buffer = try arena.alloc(u32, schema.pattern_buffer_len),
     };
     const valid = try ev.eval(schema.root, instance, 0, true);
     return .{ .valid = valid, .failures = ev.failures.items, .truncated = ev.truncated };
@@ -830,7 +904,7 @@ test "compile rejects unsupported and remote schemas" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try std.testing.expectError(error.UnsupportedKeyword, compileText(arena, "{\"pattern\":\"^a\"}", .{}));
+    try std.testing.expectError(error.UnsupportedKeyword, compileText(arena, "{\"unevaluatedProperties\":false}", .{}));
     try std.testing.expectError(error.UnsupportedKeyword, compileText(arena, "{\"properties\":{\"a\":{\"$id\":\"x\"}}}", .{}));
     try std.testing.expectError(error.RemoteRef, compileText(arena, "{\"$ref\":\"https://example.com/s.json\"}", .{}));
     try std.testing.expectError(error.UnsupportedDialect, compileText(arena, "{\"$schema\":\"http://json-schema.org/draft-07/schema#\"}", .{}));
@@ -843,10 +917,81 @@ test "compile rejects unsupported and remote schemas" {
     try std.testing.expectError(error.DuplicateAnchor, compileText(arena, "{\"$defs\":{\"a\":{\"$anchor\":\"x\"},\"b\":{\"$anchor\":\"x\"}}}", .{}));
     try std.testing.expectError(error.Syntax, compileText(arena, "{", .{}));
     // Allowed when opted in.
-    _ = try compileText(arena, "{\"pattern\":\"^a\"}", .{ .allow_unsupported_keywords = true });
+    _ = try compileText(arena, "{\"unevaluatedProperties\":false}", .{ .allow_unsupported_keywords = true });
     // Limits.
     try std.testing.expectError(error.TooManySubschemas, compileText(arena, "{\"properties\":{\"a\":{},\"b\":{}}}", .{ .limits = .{ .max_subschemas = 2 } }));
     try std.testing.expectError(error.SchemaTooDeep, compileText(arena, "{\"properties\":{\"a\":{\"properties\":{\"b\":{}}}}}", .{ .limits = .{ .max_depth = 1 } }));
+}
+
+test "pattern, patternProperties and propertyNames" {
+    try runCases(&.{
+        .{ .schema = "{\"pattern\":\"^[a-z]+$\"}", .instance = "\"abc\"", .valid = true },
+        .{ .schema = "{\"pattern\":\"^[a-z]+$\"}", .instance = "\"abC\"", .valid = false },
+        // The search is not anchored.
+        .{ .schema = "{\"pattern\":\"b\"}", .instance = "\"abc\"", .valid = true },
+        .{ .schema = "{\"pattern\":\"^b\"}", .instance = "\"abc\"", .valid = false },
+        // Other types are ignored.
+        .{ .schema = "{\"pattern\":\"^a\"}", .instance = "1", .valid = true },
+        .{ .schema = "{\"pattern\":\"^.$\"}", .instance = "\"\\ud83d\\ude00\"", .valid = true },
+        .{ .schema = "{\"pattern\":\"\\\\p{ASCII}\",\"minLength\":2}", .instance = "\"a\"", .valid = false },
+        .{ .schema = "{\"patternProperties\":{\"^x-\":{\"type\":\"string\"}}}", .instance = "{\"x-a\":\"s\",\"b\":1}", .valid = true },
+        .{ .schema = "{\"patternProperties\":{\"^x-\":{\"type\":\"string\"}}}", .instance = "{\"x-a\":1}", .valid = false },
+        // Every matching expression applies.
+        .{ .schema = "{\"patternProperties\":{\"a\":{\"minimum\":2},\"b\":{\"maximum\":3}}}", .instance = "{\"ab\":4}", .valid = false },
+        .{ .schema = "{\"patternProperties\":{\"a\":{\"minimum\":2},\"b\":{\"maximum\":3}}}", .instance = "{\"ab\":3}", .valid = true },
+        // Names that `patternProperties` matches are not additional.
+        .{ .schema = "{\"properties\":{\"id\":{}},\"patternProperties\":{\"^x-\":{}},\"additionalProperties\":false}", .instance = "{\"id\":1,\"x-y\":2}", .valid = true },
+        .{ .schema = "{\"properties\":{\"id\":{}},\"patternProperties\":{\"^x-\":{}},\"additionalProperties\":false}", .instance = "{\"id\":1,\"y\":2}", .valid = false },
+        // `properties` and `patternProperties` both apply to one name.
+        .{ .schema = "{\"properties\":{\"xa\":{\"type\":\"integer\"}},\"patternProperties\":{\"^x\":{\"minimum\":5}}}", .instance = "{\"xa\":3}", .valid = false },
+        .{ .schema = "{\"patternProperties\":{\"^\\\\d+$\":false}}", .instance = "{\"12\":null}", .valid = false },
+        .{ .schema = "{\"propertyNames\":{\"pattern\":\"^[a-z_]+$\"}}", .instance = "{\"ok_name\":1}", .valid = true },
+        .{ .schema = "{\"propertyNames\":{\"pattern\":\"^[a-z_]+$\"}}", .instance = "{\"Bad\":1}", .valid = false },
+    });
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // With the opt-in, an unsupported `pattern` is an annotation and an unsupported
+    // `patternProperties` expression matches no name.
+    const loose: Options = .{ .allow_unsupported_keywords = true };
+    const ignored = try compileText(arena, "{\"pattern\":\"(?=a)\",\"patternProperties\":{\"(.)\\\\1\":true},\"additionalProperties\":{\"type\":\"string\"}}", loose);
+    try std.testing.expect((try validate(arena, &ignored, .{ .string = "b" })).valid);
+    const obj = try std.json.parseFromSliceLeaky(Value, arena, "{\"aa\":5}", .{});
+    try std.testing.expect(!(try validate(arena, &ignored, obj)).valid);
+    // The failure names the keyword and the pattern.
+    const s = try compileText(arena, "{\"properties\":{\"a\":{\"pattern\":\"^\\\\d+$\"}}}", .{});
+    const bad = try std.json.parseFromSliceLeaky(Value, arena, "{\"a\":\"12x\"}", .{});
+    const result = try validate(arena, &s, bad);
+    try std.testing.expect(!result.valid);
+    try std.testing.expectEqualStrings("pattern", result.failures[0].keyword);
+    try std.testing.expectEqualStrings("/a", result.failures[0].instance_path);
+    try std.testing.expectEqualStrings("string does not match the pattern \"^\\d+$\"", result.failures[0].message);
+    // One expression that occurs two times compiles one time.
+    const twice = try compileText(arena, "{\"pattern\":\"a\",\"patternProperties\":{\"a\":{\"pattern\":\"a\"}}}", .{});
+    try std.testing.expectEqual(1, twice.patterns.count());
+}
+
+test "regular expression compile errors and limits" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"pattern\":1}", .{}));
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"patternProperties\":[]}", .{}));
+    try std.testing.expectError(error.InvalidRegex, compileText(arena, "{\"pattern\":\"(\"}", .{}));
+    try std.testing.expectError(error.InvalidRegex, compileText(arena, "{\"patternProperties\":{\"[\":{}}}", .{}));
+    try std.testing.expectError(error.InvalidRegex, compileText(arena, "{\"pattern\":\"(\"}", .{ .allow_unsupported_keywords = true }));
+    try std.testing.expectError(error.UnsupportedRegex, compileText(arena, "{\"pattern\":\"(a)\\\\1\"}", .{}));
+    try std.testing.expectError(error.UnsupportedRegex, compileText(arena, "{\"properties\":{\"a\":{\"pattern\":\"(?<=a)b\"}}}", .{}));
+    try std.testing.expectError(error.UnsupportedRegex, compileText(arena, "{\"patternProperties\":{\"\\\\p{L}\":{}}}", .{}));
+    // Subschemas of `patternProperties` are compiled.
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"patternProperties\":{\"a\":{\"type\":\"int\"}}}", .{}));
+    // `max_pattern_bytes`.
+    try std.testing.expectError(error.RegexTooLarge, compileText(arena, "{\"pattern\":\"abcde\"}", .{ .limits = .{ .max_pattern_bytes = 4 } }));
+    _ = try compileText(arena, "{\"pattern\":\"abcd\"}", .{ .limits = .{ .max_pattern_bytes = 4 } });
+    // `max_regex_states`.
+    try std.testing.expectError(error.RegexTooLarge, compileText(arena, "{\"pattern\":\"^[a-z]{1,64}$\"}", .{ .limits = .{ .max_regex_states = 64 } }));
+    _ = try compileText(arena, "{\"pattern\":\"^[a-z]{1,64}$\"}", .{});
+    try std.testing.expectError(error.RegexTooLarge, compileText(arena, "{\"pattern\":\"(a{100}){100}\"}", .{}));
 }
 
 test "failure report and evaluation limits" {

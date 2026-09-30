@@ -19,6 +19,8 @@ pub const InputRequired = Server.InputRequired;
 pub const schema = struct {
     pub const derive = @import("mcp/schema/derive.zig");
     pub const validator = @import("mcp/schema/validator.zig");
+    /// The ECMA-262 regular expression engine of the `pattern` keyword.
+    pub const regex = @import("mcp/schema/regex.zig");
 };
 pub const UriTemplate = @import("mcp/uri_template/UriTemplate.zig");
 /// TLS 1.3 server and certificate handling for HTTPS.

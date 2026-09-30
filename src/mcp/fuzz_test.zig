@@ -9,6 +9,7 @@ const sse = mcp.transport.sse;
 const envelope = mcp.transport.envelope;
 const line_framer = mcp.util.line_framer;
 const validator = mcp.schema.validator;
+const regex = mcp.schema.regex;
 const jwt = mcp.auth.jwt;
 const request_state = @import("server/request_state.zig");
 const meta_mod = mcp.protocol.meta;
@@ -125,6 +126,36 @@ test "fuzz: JSON Schema compile and validate" {
         "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"a\"]}",
         "{\"$ref\":\"#/$defs/x\",\"$defs\":{\"x\":{\"$ref\":\"#\"}}}",
         "{\"allOf\":[{\"not\":{}},true,false]}",
+        "{\"patternProperties\":{\"^[a-c]\":{\"pattern\":\"x*\"}},\"propertyNames\":{\"pattern\":\"^\\\\w+$\"}}",
+    } });
+}
+
+fn regexMatch(_: void, smith: *Smith) anyerror!void {
+    var buf: [max_input]u8 = undefined;
+    const bytes = input(smith, &buf, 0x100A);
+    // The pattern ends at the first zero byte. The rest is the subject.
+    const split = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+    const pattern = bytes[0..split];
+    const subject = if (split < bytes.len) bytes[split + 1 ..] else "";
+    const gpa = std.testing.allocator;
+    const options: regex.Options = .{ .max_pattern_bytes = 512, .max_states = 1024 };
+    var re = regex.compile(gpa, pattern, options) catch return;
+    defer re.deinit(gpa);
+    const matched = try re.isMatch(gpa, subject);
+    // A non-capturing group around the pattern does not change the result.
+    var wrapped_text: [max_input + 4]u8 = undefined;
+    const wrapped = try std.fmt.bufPrint(&wrapped_text, "(?:{s})", .{pattern});
+    var re2 = regex.compile(gpa, wrapped, .{ .max_pattern_bytes = max_input + 4, .max_states = 1024 }) catch return;
+    defer re2.deinit(gpa);
+    try std.testing.expectEqual(matched, try re2.isMatch(gpa, subject));
+}
+
+test "fuzz: regular expression compile and match" {
+    try std.testing.fuzz({}, regexMatch, .{ .corpus = &.{
+        "^(a*)*b$\x00aaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+        "[\\w-.]+@[^\\s]{2,}\\.\\p{ASCII}\x00me@example.org",
+        "\\bfoo|(?:x{2,3}?)+\\u{1F600}[^\\d\\S]\x00x foo",
+        "(?<n>\\x41\\uD83D\\uDE00)\\cJ\x00A\u{1F600}\n",
     } });
 }
 

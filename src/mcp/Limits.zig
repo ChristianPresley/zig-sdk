@@ -77,6 +77,13 @@ pub const Schema = struct {
     max_errors: u16 = 32,
     /// Maximum subschema evaluations per validation. Overflow: the instance is invalid.
     eval_budget: u32 = 100_000,
+    /// Maximum bytes of one regular expression in `pattern` or in a `patternProperties` key.
+    /// Overflow: registration rejects the schema.
+    max_pattern_bytes: u32 = 4096,
+    /// Maximum instructions of one compiled regular expression. A counted repetition
+    /// multiplies the size of its operand. The match time is linear in the input length
+    /// multiplied by this size. Overflow: registration rejects the schema.
+    max_regex_states: u32 = 4096,
 };
 
 pub const default: Limits = .{};

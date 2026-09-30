@@ -237,7 +237,8 @@ pub const RegisterError = error{
     SchemaNotObject,
     /// An `x-mcp-header` annotation is malformed, duplicated or on a non-scalar property.
     InvalidHeaderAnnotation,
-    /// The schema uses a keyword the validator does not support (see `Options`).
+    /// The schema uses a keyword or a regular expression feature that the validator does
+    /// not support (see `Options`).
     UnsupportedKeyword,
     /// The schema references a document other than itself.
     RemoteRef,
@@ -253,10 +254,11 @@ fn compileSchema(self: *Server, root: Value) RegisterError!validator.Schema {
         .limits = self.options.limits.schema,
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.UnsupportedKeyword => return error.UnsupportedKeyword,
+        error.UnsupportedKeyword, error.UnsupportedRegex => return error.UnsupportedKeyword,
         error.RemoteRef => return error.RemoteRef,
         error.UnsupportedDialect => return error.UnsupportedDialect,
         error.InvalidSchema, error.SchemaTooDeep, error.TooManySubschemas, error.DuplicateAnchor => return error.InvalidSchema,
+        error.InvalidRegex, error.RegexTooLarge => return error.InvalidSchema,
     };
 }
 
