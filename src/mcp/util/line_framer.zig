@@ -55,7 +55,14 @@ pub const Framer = struct {
         var aw: Io.Writer.Allocating = .init(arena);
         const limit: Io.Limit = .limited(self.max_line_bytes + 1);
         _ = self.reader.streamDelimiterLimit(&aw.writer, '\n', limit) catch |e| switch (e) {
-            error.StreamTooLong => return error.LineTooLong,
+            error.StreamTooLong => {
+                // Skip the rest of the line. Else its tail becomes the next frame.
+                _ = self.reader.discardDelimiterInclusive('\n') catch |d| switch (d) {
+                    error.EndOfStream => {},
+                    error.ReadFailed => return error.ReadFailed,
+                };
+                return error.LineTooLong;
+            },
             error.ReadFailed => return error.ReadFailed,
             error.WriteFailed => return error.OutOfMemory,
         };
@@ -109,6 +116,22 @@ test "framer enforces the line limit on both paths" {
     var limited = fixed.limited(.unlimited, &small_buf);
     var framer: Framer = .{ .reader = &limited.interface, .max_line_bytes = 100 };
     try std.testing.expectError(error.LineTooLong, framer.next(arena));
+}
+
+test "framer skips the whole oversize line" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const long = "x" ** 300;
+    var small_buf: [16]u8 = undefined;
+    var fixed: Io.Reader = .fixed(long ++ "\nok\n" ++ long);
+    var limited = fixed.limited(.unlimited, &small_buf);
+    var framer: Framer = .{ .reader = &limited.interface, .max_line_bytes = 100 };
+    try std.testing.expectError(error.LineTooLong, framer.next(arena));
+    try std.testing.expectEqualStrings("ok", try framer.next(arena));
+    try std.testing.expectError(error.LineTooLong, framer.next(arena));
+    try std.testing.expectError(error.EndOfStream, framer.next(arena));
 }
 
 test "framer rejects invalid UTF-8" {
