@@ -38,7 +38,7 @@ jobs:
           set -uo pipefail
           status=0
           for url in $(grep -o '\.url = "[^"]*"' docs/bibliography.zon | sed 's/.url = "//; s/"$//'); do
-            code=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 30 -A "zig-sdk-link-check" "$url" || echo 000)
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 90 --retry 2 --retry-all-errors -A "zig-sdk-link-check" "$url" || echo 000)
             case "$code" in
               2*|3*) ;;
               *) echo "::warning::$code $url"; status=1 ;;
