@@ -6,13 +6,14 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const json = @import("../json.zig");
 const Certificate = std.crypto.Certificate;
-const rsa = @import("rsa.zig");
+const rsa = @import("../../tls/rsa.zig");
 const pem = @import("../../tls/pem.zig");
 const TlsPrivateKey = @import("../../tls/PrivateKey.zig");
 
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
 const Ed25519 = std.crypto.sign.Ed25519;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// The JWS algorithms. `EdDSA` is Ed25519 only.
 pub const Algorithm = enum { HS256, ES256, ES384, EdDSA, RS256, PS256 };
@@ -286,7 +287,10 @@ pub const SigningKey = union(enum) {
     es256: EcdsaP256.KeyPair,
     es384: EcdsaP384.KeyPair,
     eddsa: Ed25519.KeyPair,
+    /// An RSA key that signs with RSASSA-PKCS1-v1_5 and SHA-256.
     rs256: rsa.PrivateKey,
+    /// An RSA key that signs with RSASSA-PSS and SHA-256. `usePss` makes one from `rs256`.
+    ps256: rsa.PrivateKey,
 
     pub const LoadError = error{ OutOfMemory, NoKeyFound, InvalidEncoding, UnsupportedKey, InvalidKey };
 
@@ -297,11 +301,12 @@ pub const SigningKey = union(enum) {
             .es384 => .ES384,
             .eddsa => .EdDSA,
             .rs256 => .RS256,
+            .ps256 => .PS256,
         };
     }
 
     /// Load the first private key of a PEM text: PKCS#8 (`PRIVATE KEY`), SEC1
-    /// (`EC PRIVATE KEY`) or PKCS#1 (`RSA PRIVATE KEY`). Call `deinit` to free it.
+    /// (`EC PRIVATE KEY`) or PKCS#1 (`RSA PRIVATE KEY`). Call `deinit` to erase it.
     pub fn fromPem(gpa: Allocator, text: []const u8) LoadError!SigningKey {
         var it: pem.Iterator = .init(text);
         while (it.next()) |block| {
@@ -314,32 +319,39 @@ pub const SigningKey = union(enum) {
                 std.crypto.secureZero(u8, bytes);
                 gpa.free(bytes);
             }
-            return fromDer(gpa, bytes);
+            return fromDer(bytes);
         }
         return error.NoKeyFound;
     }
 
-    /// Load a private key from PKCS#8, SEC1 or PKCS#1 DER. Call `deinit` to free it.
-    pub fn fromDer(gpa: Allocator, bytes: []const u8) LoadError!SigningKey {
-        if (TlsPrivateKey.parseDer(bytes)) |parsed| {
-            var key = parsed;
-            defer key.deinit();
-            if (key.key == .ecdsa_p256) return .{ .es256 = key.key.ecdsa_p256 };
-            if (key.key == .ecdsa_p384) return .{ .es384 = key.key.ecdsa_p384 };
-            if (key.key == .ed25519) return .{ .eddsa = key.key.ed25519 };
-            // Another key type: the RSA parser below decides.
-        } else |err| switch (err) {
-            error.UnsupportedKey, error.InvalidEncoding => {},
-            error.InvalidKey => return error.InvalidKey,
-        }
-        return .{ .rs256 = try rsa.PrivateKey.parseDer(gpa, bytes) };
+    /// Load a private key from PKCS#8, SEC1 or PKCS#1 DER. Call `deinit` to erase it.
+    pub fn fromDer(bytes: []const u8) LoadError!SigningKey {
+        var key = TlsPrivateKey.parseDer(bytes) catch |err| return switch (err) {
+            error.UnsupportedKey => error.UnsupportedKey,
+            error.InvalidEncoding => error.InvalidEncoding,
+            error.InvalidKey => error.InvalidKey,
+        };
+        defer key.deinit();
+        return switch (key.key) {
+            .ecdsa_p256 => |kp| .{ .es256 = kp },
+            .ecdsa_p384 => |kp| .{ .es384 = kp },
+            .ed25519 => |kp| .{ .eddsa = kp },
+            .rsa => |k| .{ .rs256 = k },
+        };
     }
 
-    /// Erase the key material and free what `fromPem` or `fromDer` allocated.
-    pub fn deinit(self: *SigningKey, gpa: Allocator) void {
+    /// The same RSA key with the algorithm PS256 instead of RS256. Other keys do not change.
+    pub fn usePss(self: SigningKey) SigningKey {
+        return switch (self) {
+            .rs256 => |k| .{ .ps256 = k },
+            else => self,
+        };
+    }
+
+    /// Erase the key material. The key owns no memory.
+    pub fn deinit(self: *SigningKey) void {
         switch (self.*) {
             .hs256 => {},
-            .rs256 => |*k| k.deinit(gpa),
             else => std.crypto.secureZero(u8, std.mem.asBytes(self)),
         }
         self.* = undefined;
@@ -364,7 +376,8 @@ pub const SigningKey = union(enum) {
                 @memcpy(buf[0..p.len], &p);
                 break :blk .{ .kid = kid, .alg = .EdDSA, .material = .{ .ed25519 = buf[0..p.len] } };
             },
-            .rs256 => |*k| .{ .kid = kid, .alg = .RS256, .material = .{ .rsa = .{ .n = k.modulus, .e = k.public_exponent } } },
+            .rs256 => |*k| .{ .kid = kid, .alg = .RS256, .material = .{ .rsa = .{ .n = k.modulus(), .e = k.publicExponent() } } },
+            .ps256 => |*k| .{ .kid = kid, .alg = .PS256, .material = .{ .rsa = .{ .n = k.modulus(), .e = k.publicExponent() } } },
         };
     }
 };
@@ -406,7 +419,14 @@ pub fn sign(arena: Allocator, key: *const SigningKey, payload_json: []const u8, 
             const sig = kp.sign(input, null) catch return error.SigningFailed;
             break :blk try arena.dupe(u8, &sig.toBytes());
         },
-        .rs256 => |*k| try k.signPkcs1v15Sha256(arena, input),
+        .rs256 => |*k| blk: {
+            const out = try arena.alloc(u8, k.modulusLen());
+            break :blk k.signPkcs1v15(Sha256, input, out) catch return error.SigningFailed;
+        },
+        .ps256 => |*k| blk: {
+            const out = try arena.alloc(u8, k.modulusLen());
+            break :blk k.signPssDeterministic(Sha256, input, out) catch return error.SigningFailed;
+        },
     };
     return std.mem.concat(arena, u8, &.{ input, ".", try encodeSegment(arena, signature) });
 }
@@ -548,7 +568,7 @@ test "signatures round trip for every signing algorithm" {
         const text = try std.Io.Dir.cwd().readFileAlloc(io, f.path, gpa, .limited(1 << 16));
         defer gpa.free(text);
         var key = try SigningKey.fromPem(gpa, text);
-        defer key.deinit(gpa);
+        defer key.deinit();
         try std.testing.expectEqual(f.alg, key.algorithm());
         const token = try sign(arena, &key, payload, .{ .kid = "k1", .typ = "oauth-id-jag+jwt" });
         var buf: [97]u8 = undefined;
@@ -557,6 +577,22 @@ test "signatures round trip for every signing algorithm" {
         try std.testing.expectEqualStrings("client-1", claims.subject.?);
         try std.testing.expectEqualStrings("k1", json.getString(claims.header, "kid").?);
         try std.testing.expectError(error.TypeMismatch, verify(arena, token, .{ .keys = &keys, .token_type = "JWT" }, 1000));
+    }
+    {
+        // The RSA key signs PS256 too. An RS256 key of the same modulus does not accept it.
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, "test/fixtures/jwt/rsa2048.key", gpa, .limited(1 << 16));
+        defer gpa.free(text);
+        var rs = try SigningKey.fromPem(gpa, text);
+        defer rs.deinit();
+        var ps = rs.usePss();
+        try std.testing.expectEqual(Algorithm.PS256, ps.algorithm());
+        const token = try sign(arena, &ps, payload, .{});
+        var buf: [97]u8 = undefined;
+        const ps_keys = [_]Key{ps.verificationKey(&buf, null)};
+        _ = try verify(arena, token, .{ .keys = &ps_keys }, 1000);
+        try std.testing.expectEqualStrings(token, try sign(arena, &ps, payload, .{}));
+        const rs_keys = [_]Key{rs.verificationKey(&buf, null)};
+        try std.testing.expectError(error.UnknownKey, verify(arena, token, .{ .keys = &rs_keys }, 1000));
     }
     var hs: SigningKey = .{ .hs256 = "a-shared-secret-of-thirty-two-b!" };
     const token = try sign(arena, &hs, payload, .{ .typ = null });

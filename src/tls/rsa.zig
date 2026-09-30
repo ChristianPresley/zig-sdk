@@ -89,7 +89,54 @@ pub const PrivateKey = struct {
         defer crypto.secureZero(u8, &em);
         @memset(em[0 .. k - em_len], 0);
         emsaPssEncode(Hash, message, salt, em_bits, em[k - em_len .. k]);
-        try self.privateOp(em[0..k], out[0..k]);
+        return self.signEncoded(em[0..k], out[0..k]);
+    }
+
+    /// Sign `message` with RSASSA-PSS and a salt that an HMAC of the message under a secret of
+    /// the key gives. The signature is deterministic and others cannot know the salt. The
+    /// JWS algorithm PS256 uses it.
+    pub fn signPssDeterministic(self: *const PrivateKey, comptime Hash: type, message: []const u8, out: []u8) SignError![]const u8 {
+        const Hmac = crypto.auth.hmac.Hmac(Hash);
+        var salt: [Hash.digest_length]u8 = undefined;
+        defer crypto.secureZero(u8, &salt);
+        Hmac.create(&salt, message, self.p.slice());
+        return self.signPss(Hash, message, &salt, out);
+    }
+
+    /// Sign `message` with RSASSA-PKCS1-v1_5 (RFC 8017 section 8.2). `Hash` is SHA-256,
+    /// SHA-384 or SHA-512. TLS 1.3 does not permit this scheme in a CertificateVerify. The JWS
+    /// algorithms RS256, RS384 and RS512 use it. `out` receives `modulusLen()` bytes.
+    pub fn signPkcs1v15(self: *const PrivateKey, comptime Hash: type, message: []const u8, out: []u8) SignError![]const u8 {
+        const prefix = digestInfoPrefix(Hash);
+        const k = self.modulusLen();
+        const t_len = prefix.len + Hash.digest_length;
+        if (out.len < k or k < t_len + 11) return error.SigningFailed;
+        // EM = 0x00 || 0x01 || PS || 0x00 || DigestInfo (RFC 8017 section 9.2).
+        var em: [max_modulus_len]u8 = undefined;
+        defer crypto.secureZero(u8, &em);
+        em[0] = 0x00;
+        em[1] = 0x01;
+        @memset(em[2 .. k - t_len - 1], 0xff);
+        em[k - t_len - 1] = 0x00;
+        @memcpy(em[k - t_len ..][0..prefix.len], prefix);
+        Hash.hash(message, em[k - Hash.digest_length ..][0..Hash.digest_length], .{});
+        return self.signEncoded(em[0..k], out[0..k]);
+    }
+
+    /// The big-endian modulus without leading zero bytes.
+    pub fn modulus(self: *const PrivateKey) []const u8 {
+        return self.n.slice();
+    }
+
+    /// The big-endian public exponent without leading zero bytes.
+    pub fn publicExponent(self: *const PrivateKey) []const u8 {
+        return self.e.slice();
+    }
+
+    /// Apply the private operation to the encoded message `em`, then check the result.
+    fn signEncoded(self: *const PrivateKey, em: []const u8, out: []u8) SignError![]const u8 {
+        const k = em.len;
+        try self.privateOp(em, out[0..k]);
         // A fault in the private operation can leak the key. The public operation must give
         // the encoded message back.
         var check: [max_modulus_len]u8 = undefined;
@@ -97,7 +144,7 @@ pub const PrivateKey = struct {
             crypto.secureZero(u8, out[0..k]);
             return error.SigningFailed;
         };
-        if (!std.mem.eql(u8, check[0..k], em[0..k])) {
+        if (!std.mem.eql(u8, check[0..k], em)) {
             crypto.secureZero(u8, out[0..k]);
             return error.SigningFailed;
         }
@@ -252,6 +299,16 @@ pub fn emsaPssEncode(comptime Hash: type, message: []const u8, salt: *const [Has
     em[em_len - 1] = 0xbc;
 }
 
+/// The DER prefix of the `DigestInfo` of `Hash` (RFC 8017 section 9.2, note 1).
+fn digestInfoPrefix(comptime Hash: type) []const u8 {
+    return switch (Hash) {
+        crypto.hash.sha2.Sha256 => &.{ 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20 },
+        crypto.hash.sha2.Sha384 => &.{ 0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30 },
+        crypto.hash.sha2.Sha512 => &.{ 0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40 },
+        else => @compileError("RSASSA-PKCS1-v1_5 supports SHA-256, SHA-384 and SHA-512 only"),
+    };
+}
+
 /// XOR `out` with MGF1 (RFC 8017 appendix B.2.1) of `seed`.
 fn mgf1Xor(comptime Hash: type, seed: []const u8, out: []u8) void {
     var counter: u32 = 0;
@@ -341,6 +398,22 @@ test "RSASSA-PSS signatures verify with the std verifier" {
             try std.testing.expectError(error.InvalidSignature, verifyWithStd(Hash, &key, "another message", sig));
         }
         crypto.secureZero(u8, std.mem.asBytes(&key));
+    }
+}
+
+test "RSASSA-PKCS1-v1_5 signatures verify with the std verifier" {
+    const gpa = std.testing.allocator;
+    const Std = crypto.Certificate.rsa;
+    const bytes = try loadKeyDer(gpa, "test/fixtures/tls/pem/rsa2048-pkcs1.key", "RSA PRIVATE KEY");
+    defer gpa.free(bytes);
+    var key = try parsePkcs1(bytes);
+    defer crypto.secureZero(u8, std.mem.asBytes(&key));
+    const public_key: Std.PublicKey = try .fromBytes(key.publicExponent(), key.modulus());
+    var out: [max_modulus_len]u8 = undefined;
+    inline for (.{ crypto.hash.sha2.Sha256, crypto.hash.sha2.Sha384, crypto.hash.sha2.Sha512 }) |Hash| {
+        const sig = try key.signPkcs1v15(Hash, "header.payload", &out);
+        try Std.PKCS1v1_5Signature.verify(256, sig[0..256].*, "header.payload", public_key, Hash);
+        try std.testing.expectError(error.InvalidSignature, Std.PKCS1v1_5Signature.verify(256, sig[0..256].*, "other", public_key, Hash));
     }
 }
 

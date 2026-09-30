@@ -39,7 +39,6 @@ pub fn withExtension(arena: std.mem.Allocator, capabilities: types.ClientCapabil
 
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("auth/rsa.zig");
     _ = @import("auth/extensions_test.zig");
 }
 

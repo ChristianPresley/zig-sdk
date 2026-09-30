@@ -156,7 +156,7 @@ pub fn main(init: std.process.Init) !u8 {
     // The authorization extensions replace the interactive flow.
     var provider: mcp.auth.Provider = oauth.provider();
     var signing_key: ?mcp.auth.jwt.SigningKey = null;
-    defer if (signing_key) |*k| k.deinit(gpa);
+    defer if (signing_key) |*k| k.deinit();
     var client_credentials: ?mcp.auth.ClientCredentials = null;
     defer if (client_credentials) |*c| c.deinit();
     var enterprise: ?mcp.auth.EnterpriseClient = null;
