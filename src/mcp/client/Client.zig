@@ -21,6 +21,7 @@ const tasks = @import("../server/tasks.zig");
 const skills = @import("../protocol/skills.zig");
 const apps = @import("../protocol/apps.zig");
 const cache_mod = @import("cache.zig");
+const validator = @import("../schema/validator.zig");
 /// The client rules for icons: scheme, origin, size and format checks, selection and fetch.
 pub const icons = @import("icons.zig");
 
@@ -61,10 +62,14 @@ pub const HookContext = struct {
 pub const Hooks = struct {
     userdata: ?*anyopaque = null,
     /// Answer a form elicitation. Required when `capabilities.elicitation` allows form mode.
+    /// The client validates the accepted content against `requestedSchema` before it sends
+    /// the answer. Content that is not valid gives `error.HookFailed`.
     elicit_form: ?*const fn (ctx: *HookContext, params: types.ElicitRequestFormParams) anyerror!types.ElicitResult = null,
     /// Answer a URL elicitation. The hook shows the URL to the user and never opens it alone.
+    /// The client does not call the hook when the URL is not a valid absolute URL.
     elicit_url: ?*const fn (ctx: *HookContext, params: types.ElicitRequestURLParams) anyerror!types.ElicitResult = null,
     /// Answer a sampling request. Required when `capabilities.sampling` declares sampling.
+    /// The client does not call the hook when the messages break the tool result rules.
     sample: ?*const fn (ctx: *HookContext, params: types.CreateMessageRequestParams) anyerror!types.CreateMessageResult = null,
     /// List the roots. Required when `capabilities.roots` declares roots.
     list_roots: ?*const fn (ctx: *HookContext) anyerror![]const types.Root = null,
@@ -150,7 +155,10 @@ pub fn invalidateCache(self: *Client) void {
     self.cache.invalidate(null);
 }
 
+/// Use `transport` for the next requests. The call drops every cached result, because the
+/// new transport can reach another server or send another credential.
 pub fn connect(self: *Client, transport: Transport.ClientTransport) void {
+    self.cache.invalidate(null);
     self.transport = transport;
 }
 
@@ -538,10 +546,14 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
     const cancel = options.cancel orelse &own_token;
     const deadline: Io.Timeout = if (options.timeout) |d| .{ .deadline = Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake }) } else .none;
 
-    // The cache serves idempotent reads that a server marked with a lifetime.
-    const cacheable = self.options.cache.enabled and options.cache_mode != .bypass and known != null and known.?.isCacheable() and params.object.get("inputResponses") == null;
+    // The cache serves idempotent reads that a server marked with a lifetime. A retry of a
+    // multi round-trip request depends on inputs outside the key, so it is not cacheable.
+    const cacheable = self.options.cache.enabled and options.cache_mode != .bypass and known != null and known.?.isCacheable() and
+        params.object.get("inputResponses") == null and params.object.get("requestState") == null;
     const cache_key: ?[]u8 = if (cacheable) try cache_mod.Cache.key(arena, method_name, params) else null;
-    if (cache_key) |k| if (options.cache_mode == .default) if (self.cache.get(k)) |text| {
+    const auth_context: cache_mod.Context = if (cacheable) cache_mod.contextOf(try transport.credential(arena)) else null;
+    if (cacheable) self.cache.enterContext(auth_context);
+    if (cache_key) |k| if (options.cache_mode == .default) if (self.cache.get(k, auth_context)) |text| {
         const value = json.parseTree(arena, text) catch return error.InvalidResponse;
         return .{ .value = value };
     };
@@ -594,6 +606,10 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
                 round -|= 1;
                 continue;
             }
+            // An invalid cursor: the cached pages of the list are no longer reliable.
+            if (rpc.code == errors.Code.invalid_params.int() and known != null and known.?.isCacheable() and params.object.get("cursor") != null) {
+                self.cache.invalidate(method_name);
+            }
             if (options.diagnostics) |d| d.rpc_error = rpc;
             return error.Rpc;
         }
@@ -609,7 +625,13 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
         if (std.mem.eql(u8, result_type.?, types.result_type_complete)) {
             if (cache_key) |k| if (input_responses == null) if (result.object.get("ttlMs")) |ttl| if (ttl == .integer) {
                 const text = try json.writeAlloc(arena, result);
-                try self.cache.put(k, method_name, text, ttl.integer);
+                // A result without cacheScope counts as private.
+                const scope_text = json.getString(result, "cacheScope") orelse "private";
+                const scope: types.CacheScope = if (std.mem.eql(u8, scope_text, "public")) .public else .private;
+                // A credential change during the request, for example after a challenge, leaves
+                // the context of a private result unclear. The client does not store it then.
+                const unchanged = cache_mod.sameContext(auth_context, cache_mod.contextOf(try transport.credential(arena)));
+                if (scope == .public or unchanged) try self.cache.put(k, method_name, text, ttl.integer, scope, auth_context);
             };
             return .{ .value = result };
         }
@@ -677,10 +699,12 @@ fn answerInput(self: *Client, arena: Allocator, key: []const u8, method_name: []
                 const f = hooks.elicit_form orelse return error.HookFailed;
                 const result = f(&ctx, form) catch return error.HookFailed;
                 if (result.action != .accept and result.content != null) return error.HookFailed;
+                if (result.action == .accept and !try self.contentMatches(arena, form, result.content)) return error.HookFailed;
                 return toValue(arena, result);
             },
             .url => |url| {
                 if (!caps.hasElicitation(.url)) return error.UndeclaredInputRequest;
+                if (!types.isValidUrl(url.url)) return error.InvalidResponse;
                 const f = hooks.elicit_url orelse return error.HookFailed;
                 const result = f(&ctx, url) catch return error.HookFailed;
                 if (result.content != null) return error.HookFailed;
@@ -689,6 +713,7 @@ fn answerInput(self: *Client, arena: Allocator, key: []const u8, method_name: []
         },
         .@"sampling/createMessage" => |s| {
             if (caps.sampling == null) return error.UndeclaredInputRequest;
+            types.checkSamplingMessages(s.params.messages) catch return error.InvalidResponse;
             const f = hooks.sample orelse return error.HookFailed;
             const result = f(&ctx, s.params) catch return error.HookFailed;
             return toValue(arena, result);
@@ -701,6 +726,25 @@ fn answerInput(self: *Client, arena: Allocator, key: []const u8, method_name: []
             return toValue(arena, types.ListRootsResult{ .roots = roots });
         },
     }
+}
+
+/// True when the accepted content of a form elicitation is valid against `requestedSchema`.
+/// Content that is absent counts as an empty object. A schema that does not compile gives
+/// `error.InvalidResponse`.
+fn contentMatches(self: *Client, arena: Allocator, form: types.ElicitRequestFormParams, content: ?Value) RequestError!bool {
+    var requested = form.requestedSchema;
+    // The requested schema is a flat object of primitives in the dialect of 2020-12.
+    requested.@"$schema" = null;
+    const root = try toValue(arena, requested);
+    const schema = validator.compile(arena, root, .{ .allow_unsupported_keywords = true, .limits = self.options.limits.schema }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidResponse,
+    };
+    const report = validator.validate(arena, &schema, content orelse .{ .object = .empty }) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    return report.valid;
 }
 
 fn buildMeta(self: *Client, arena: Allocator, id: RequestId) Allocator.Error!Value {

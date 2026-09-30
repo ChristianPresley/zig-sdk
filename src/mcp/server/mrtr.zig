@@ -25,7 +25,12 @@ pub const InputRequired = struct {
         return .{ .arena = arena };
     }
 
-    pub const Error = error{ OutOfMemory, DuplicateKey };
+    pub const Error = error{
+        OutOfMemory,
+        DuplicateKey,
+        /// The URL of a URL elicitation is not a valid absolute URL.
+        InvalidUrl,
+    };
 
     fn put(self: *InputRequired, key: []const u8, request: types.InputRequest) Error!void {
         const gop = try self.requests.map.getOrPut(self.arena, key);
@@ -37,7 +42,9 @@ pub const InputRequired = struct {
         try self.put(key, .{ .@"elicitation/create" = .{ .params = .{ .form = .{ .message = message, .requestedSchema = schema } } } });
     }
 
+    /// Ask the user to open `url`. The URL must be a valid absolute URL, see `types.isValidUrl`.
     pub fn elicitUrl(self: *InputRequired, key: []const u8, message: []const u8, url: []const u8) Error!void {
+        if (!types.isValidUrl(url)) return error.InvalidUrl;
         try self.put(key, .{ .@"elicitation/create" = .{ .params = .{ .url = .{ .message = message, .url = url } } } });
     }
 
@@ -84,6 +91,10 @@ test "input required builder" {
     try ir.elicitForm("user_name", "Your name?", try InputRequired.stringSchema(arena, "name", null, true));
     try ir.listRoots("client_roots");
     try std.testing.expectError(error.DuplicateKey, ir.listRoots("client_roots"));
+    try std.testing.expectEqual(2, ir.count());
+    // A URL elicitation needs a valid absolute URL.
+    try std.testing.expectError(error.InvalidUrl, ir.elicitUrl("link", "Open it.", "example.com/connect"));
+    try std.testing.expectError(error.InvalidUrl, ir.elicitUrl("link", "Open it.", "https://"));
     try std.testing.expectEqual(2, ir.count());
     const json = @import("../json.zig");
     const out = try json.writeAlloc(gpa, ir.requests);

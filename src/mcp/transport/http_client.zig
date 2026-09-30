@@ -100,7 +100,17 @@ pub const Client = struct {
         .kind = .streamable_http,
         .exchange = exchange,
         .notify = notify,
+        .credential = credential,
     };
+
+    /// The bearer token of the auth provider, else the `authorization` header of
+    /// `extra_headers`, else null.
+    fn credential(ptr: *anyopaque, arena: Allocator) Allocator.Error!?[]const u8 {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        if (self.authProvider()) |auth| if (auth.token(arena)) |token| return token;
+        for (self.options.extra_headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "authorization")) return h.value;
+        return null;
+    }
 
     const Task = struct {
         client: *Client,

@@ -203,7 +203,16 @@ pub const Channel = struct {
         .kind = .grpc,
         .exchange = exchange,
         .notify = notify,
+        .credential = credential,
     };
+
+    /// The `authorization` value of `extra_metadata`, or null.
+    fn credential(ptr: *anyopaque, arena: Allocator) Allocator.Error!?[]const u8 {
+        _ = arena;
+        const self: *Channel = @ptrCast(@alignCast(ptr));
+        for (self.options.extra_metadata) |h| if (std.ascii.eqlIgnoreCase(h.name, "authorization")) return h.value;
+        return null;
+    }
 
     const Task = struct {
         channel: *Channel,

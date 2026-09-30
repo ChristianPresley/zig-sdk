@@ -876,6 +876,13 @@ fn dispatchTyped(self: *Server, ctx: *RequestContext, comptime method: methods.M
         },
         .@"prompts/get" => try self.getPrompt(ctx, params),
         .@"completion/complete" => {
+            if (!try self.completionTargetExists(ctx, params.ref)) {
+                const msg = switch (params.ref) {
+                    .@"ref/prompt" => |p| try std.fmt.allocPrint(ctx.arena, "Unknown prompt: {s}", .{p.name}),
+                    .@"ref/resource" => |r| try std.fmt.allocPrint(ctx.arena, "Unknown resource template: {s}", .{r.uri}),
+                };
+                return ctx.setError(errors.invalidParams(msg));
+            }
             var completion: types.CompleteResult.Completion = .{ .values = &.{} };
             if (self.completion_handler) |h| {
                 completion = h(ctx, params) catch |e| return mapHandlerError(ctx, e);
@@ -888,6 +895,29 @@ fn dispatchTyped(self: *Server, ctx: *RequestContext, comptime method: methods.M
             try self.finishResult(ctx, types.CompleteResult{ .completion = completion });
         },
         .@"subscriptions/listen" => try self.listen(ctx, params),
+    }
+}
+
+/// True when the reference of a completion names an enabled prompt or an enabled resource
+/// template. A reference names a template by its URI template or by a URI that it matches.
+/// The URI of an enabled static resource also counts.
+fn completionTargetExists(self: *Server, ctx: *RequestContext, ref: types.CompletionReference) Allocator.Error!bool {
+    switch (ref) {
+        .@"ref/prompt" => |p| {
+            for (self.prompts.items) |e| if (e.enabled and std.mem.eql(u8, e.def.name, p.name)) return true;
+            return false;
+        },
+        .@"ref/resource" => |r| {
+            var vars: std.ArrayList(UriTemplate.Variable) = .empty;
+            for (self.templates.items) |t| {
+                if (!t.enabled) continue;
+                if (std.mem.eql(u8, t.def.uriTemplate, r.uri)) return true;
+                vars.clearRetainingCapacity();
+                if (try t.template.match(r.uri, &vars, ctx.arena)) return true;
+            }
+            for (self.resources.items) |e| if (e.enabled and std.mem.eql(u8, e.def.uri, r.uri)) return true;
+            return false;
+        },
     }
 }
 
@@ -979,10 +1009,14 @@ fn finishInputRequired(self: *Server, ctx: *RequestContext, method: methods.Meth
             .@"elicitation/create" => |e| {
                 if (!self.options.mrtr.elicitation) return ctx.setError(errors.internalError("Elicitation is disabled on this server"));
                 try ctx.requireClientCapability(if (e.params.mode() == .url) .elicitation_url else .elicitation_form);
+                if (e.params == .url and !types.isValidUrl(e.params.url.url)) return ctx.setError(errors.internalError("URL elicitation needs a valid absolute URL"));
             },
             .@"sampling/createMessage" => |s| {
                 if (!self.options.mrtr.sampling) return ctx.setError(errors.internalError("Sampling is disabled on this server"));
                 try ctx.requireClientCapability(.sampling);
+                types.checkSamplingMessages(s.params.messages) catch return ctx.setError(errors.internalError("Sampling messages break the tool result rules"));
+                // The values thisServer and allServers are deprecated. They need sampling.context.
+                if (s.params.includeContext) |ic| if (ic != .none) try ctx.requireClientCapability(.sampling_context);
                 if (s.params.tools != null or s.params.toolChoice != null) {
                     if (!self.options.mrtr.sampling_tools) return ctx.setError(errors.internalError("Sampling with tools is disabled on this server"));
                     try ctx.requireClientCapability(.sampling_tools);

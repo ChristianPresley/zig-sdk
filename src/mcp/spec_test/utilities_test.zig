@@ -78,6 +78,27 @@ fn readAfterConfirm(ctx: *RequestContext, uri: []const u8) anyerror!mcp.Outcome(
     return .{ .input_required = ir };
 }
 
+fn promptHi(ctx: *RequestContext, args: ?std.json.ArrayHashMap([]const u8)) anyerror!mcp.Outcome(types.GetPromptResult) {
+    _ = args;
+    const messages = try ctx.arena.alloc(types.PromptMessage, 1);
+    messages[0] = .{ .role = .user, .content = .{ .text = .{ .text = "hi" } } };
+    return .{ .complete = .{ .messages = messages } };
+}
+
+fn readTemplated(ctx: *RequestContext, uri: []const u8, vars: []const mcp.UriTemplate.Variable) anyerror!mcp.Outcome(types.ReadResourceResult) {
+    _ = vars;
+    const contents = try ctx.arena.alloc(types.ResourceContents, 1);
+    contents[0] = .{ .text = .{ .uri = uri, .text = "templated" } };
+    return .{ .complete = .{ .contents = contents } };
+}
+
+var completion_calls: u32 = 0;
+
+fn completeCounted(ctx: *RequestContext, params: types.CompleteRequestParams) anyerror!types.CompleteResult.Completion {
+    completion_calls += 1;
+    return completeTwo(ctx, params);
+}
+
 fn completeTwo(ctx: *RequestContext, params: types.CompleteRequestParams) anyerror!types.CompleteResult.Completion {
     _ = params;
     const values = try ctx.arena.alloc([]const u8, 2);
@@ -137,13 +158,18 @@ const ServerFixture = struct {
 // -- Scripted client transport ------------------------------------------------------------------
 
 /// A client transport that answers each request with the next scripted result. It records
-/// the request frames and sends the scripted notifications before each response.
+/// the request frames and sends the scripted notifications before each response. A result
+/// that starts with `error:` is the error object of an error response.
 const Scripted = struct {
     gpa: std.mem.Allocator,
     results: []const []const u8,
     notes: []const []const u8 = &.{},
     calls: usize = 0,
     sent: std.ArrayList([]u8) = .empty,
+    /// The credential of the transport, for example a bearer token.
+    token: ?[]const u8 = null,
+    /// A new credential that the transport takes during the next request, as after a challenge.
+    rotate_to: ?[]const u8 = null,
 
     fn deinit(self: *Scripted) void {
         for (self.sent.items) |s| self.gpa.free(s);
@@ -154,7 +180,13 @@ const Scripted = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = notify };
+    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = notify, .credential = credential };
+
+    fn credential(ptr: *anyopaque, arena: std.mem.Allocator) std.mem.Allocator.Error!?[]const u8 {
+        const self: *Scripted = @ptrCast(@alignCast(ptr));
+        const t = self.token orelse return null;
+        return try arena.dupe(u8, t);
+    }
 
     fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
         const self: *Scripted = @ptrCast(@alignCast(ptr));
@@ -165,8 +197,15 @@ const Scripted = struct {
         };
         const body = self.results[@min(self.calls, self.results.len - 1)];
         self.calls += 1;
+        if (self.rotate_to) |t| {
+            self.token = t;
+            self.rotate_to = null;
+        }
         for (self.notes) |note| ex.sink.deliver(io, note) catch return error.InvalidFrame;
-        const frame = try std.fmt.allocPrint(self.gpa, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}", .{ ex.id.integer, body });
+        const is_error = std.mem.startsWith(u8, body, "error:");
+        const member: []const u8 = if (is_error) "error" else "result";
+        const payload = if (is_error) body["error:".len..] else body;
+        const frame = try std.fmt.allocPrint(self.gpa, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"{s}\":{s}}}", .{ ex.id.integer, member, payload });
         defer self.gpa.free(frame);
         ex.sink.deliver(io, frame) catch return error.InvalidFrame;
     }
@@ -410,6 +449,123 @@ test "client caches are not shared between client instances" {
     try std.testing.expectEqual(2, reads);
 }
 
+test "client does not cache a caller request that carries requestState" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var script: Scripted = .{ .gpa = gpa, .results = &.{
+        "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"public\",\"contents\":[{\"uri\":\"test://a\",\"text\":\"a\"}]}",
+    } };
+    defer script.deinit();
+    var client: Client = .init(gpa, std.testing.io, .{ .info = client_info, .cache = .{ .enabled = true } });
+    defer client.deinit();
+    client.connect(script.transport());
+
+    // The caller drives the multi round-trip retry and sends only requestState.
+    const params = try json.parseTree(arena, "{\"uri\":\"test://a\",\"requestState\":\"opaque-state\"}");
+    _ = try client.request(arena, .@"resources/read", params, .{});
+    _ = try client.request(arena, .@"resources/read", params, .{});
+    try std.testing.expectEqual(2, script.calls);
+    try std.testing.expectEqual(0, client.cache.count());
+    try std.testing.expectEqualStrings("opaque-state", (try script.sentParams(arena, 1)).object.get("requestState").?.string);
+    // The same request without requestState is cacheable.
+    _ = try client.readResource(arena, "test://a", .{});
+    _ = try client.readResource(arena, "test://a", .{});
+    try std.testing.expectEqual(3, script.calls);
+    try std.testing.expectEqual(1, client.cache.count());
+}
+
+test "client keeps private cache entries apart by authorization context" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const private_a = "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"private\",\"contents\":[{\"uri\":\"test://a\",\"text\":\"a\"}]}";
+    const unscoped_b = "{\"resultType\":\"complete\",\"ttlMs\":60000,\"contents\":[{\"uri\":\"test://b\",\"text\":\"b\"}]}";
+    var script: Scripted = .{ .gpa = gpa, .token = "token-alice", .results = &.{
+        private_a,
+        "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"public\",\"tools\":[]}",
+        private_a,
+        private_a,
+        unscoped_b,
+        unscoped_b,
+    } };
+    defer script.deinit();
+    var client: Client = .init(gpa, std.testing.io, .{ .info = client_info, .cache = .{ .enabled = true } });
+    defer client.deinit();
+    client.connect(script.transport());
+
+    // Alice: the private read and the public list are cached.
+    _ = try client.readResource(arena, "test://a", .{});
+    _ = try client.readResource(arena, "test://a", .{});
+    _ = try client.listTools(arena, null, .{});
+    try std.testing.expectEqual(2, script.calls);
+    // Bob: the private read of Alice is not shared. The public list is shared.
+    script.token = "token-bob";
+    _ = try client.readResource(arena, "test://a", .{});
+    try std.testing.expectEqual(3, script.calls);
+    _ = try client.listTools(arena, null, .{});
+    try std.testing.expectEqual(3, script.calls);
+    // Alice again: the token change dropped her private entry.
+    script.token = "token-alice";
+    _ = try client.readResource(arena, "test://a", .{});
+    try std.testing.expectEqual(4, script.calls);
+    // A result without cacheScope counts as private.
+    _ = try client.readResource(arena, "test://b", .{});
+    script.token = null;
+    _ = try client.readResource(arena, "test://b", .{});
+    try std.testing.expectEqual(6, script.calls);
+    // A token change during the request: the private result is not stored.
+    script.rotate_to = "token-carol";
+    _ = try client.readResource(arena, "test://c", .{});
+    _ = try client.readResource(arena, "test://c", .{});
+    try std.testing.expectEqual(8, script.calls);
+    try std.testing.expect(client.cache.count() > 0);
+    // A new connection drops every cached result.
+    client.connect(script.transport());
+    try std.testing.expectEqual(0, client.cache.count());
+
+    // The HTTP transport gives the authorization header as the credential.
+    const http = try mcp.transport.HttpClient.init(std.testing.io, gpa, .{
+        .url = "http://127.0.0.1:9/mcp",
+        .extra_headers = &.{.{ .name = "Authorization", .value = "Bearer t1" }},
+    });
+    defer http.deinit();
+    try std.testing.expectEqualStrings("Bearer t1", (try http.transport().credential(arena)).?);
+}
+
+test "client drops the cached pages of a list after an invalid cursor error" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var script: Scripted = .{ .gpa = gpa, .results = &.{
+        "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"public\",\"tools\":[],\"nextCursor\":\"c1\"}",
+        "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"public\",\"tools\":[]}",
+        "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"public\",\"prompts\":[]}",
+        "error:{\"code\":-32602,\"message\":\"Invalid cursor\"}",
+        "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"public\",\"tools\":[]}",
+    } };
+    defer script.deinit();
+    var client: Client = .init(gpa, std.testing.io, .{ .info = client_info, .cache = .{ .enabled = true } });
+    defer client.deinit();
+    client.connect(script.transport());
+
+    _ = try client.listTools(arena, null, .{});
+    _ = try client.listTools(arena, "c1", .{});
+    _ = try client.listPrompts(arena, null, .{});
+    try std.testing.expectEqual(3, client.cache.count());
+    // The server now rejects the cursor.
+    var diag: Client.Diagnostics = .{};
+    try std.testing.expectError(error.Rpc, client.listTools(arena, "c1", .{ .cache_mode = .refresh, .diagnostics = &diag }));
+    try std.testing.expectEqual(@as(i64, -32602), diag.rpc_error.?.code);
+    // Both pages of tools/list are gone. The prompts page stays.
+    try std.testing.expectEqual(1, client.cache.count());
+    _ = try client.listTools(arena, null, .{});
+    try std.testing.expectEqual(5, script.calls);
+}
+
 // -- Completion ---------------------------------------------------------------------------------
 
 test "completion needs the completions capability" {
@@ -417,6 +573,7 @@ test "completion needs the completions capability" {
     try f.init(.{ .info = .{ .name = "t", .version = "1" } });
     defer f.deinit();
     try f.server.addToolJson(.{ .name = "noop" }, noop);
+    try f.server.addPrompt(.{ .name = "p" }, promptHi);
     const params = "\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"x\"}";
 
     // Without a completion handler the capability is absent and the method is not found.
@@ -452,9 +609,48 @@ test "completion handler failure is an internal error" {
     var f: ServerFixture = undefined;
     try f.init(.{ .info = .{ .name = "t", .version = "1" } });
     defer f.deinit();
+    try f.server.addPrompt(.{ .name = "p" }, promptHi);
     f.server.setCompletionHandler(completeFails);
     const v = try f.call(1, "completion/complete", meta_none, "\"ref\":{\"type\":\"ref/prompt\",\"name\":\"p\"},\"argument\":{\"name\":\"a\",\"value\":\"x\"}");
     try std.testing.expectEqual(@as(i64, -32603), errorCode(v).?);
+}
+
+test "completion rejects an unknown prompt or resource template with invalid params" {
+    var f: ServerFixture = undefined;
+    try f.init(.{ .info = .{ .name = "t", .version = "1" } });
+    defer f.deinit();
+    try f.server.addPrompt(.{ .name = "p" }, promptHi);
+    try f.server.addPrompt(.{ .name = "off" }, promptHi);
+    _ = f.server.setPromptEnabled(std.testing.io, "off", false);
+    try f.server.addResourceTemplate(.{ .uri_template = "test://items/{id}", .name = "items" }, readTemplated);
+    try f.server.addResource(.{ .uri = "test://static", .name = "static" }, readNegative);
+    f.server.setCompletionHandler(completeCounted);
+    completion_calls = 0;
+
+    const Case = struct { ref: []const u8, code: ?i64 };
+    const cases = [_]Case{
+        .{ .ref = "{\"type\":\"ref/prompt\",\"name\":\"p\"}", .code = null },
+        .{ .ref = "{\"type\":\"ref/prompt\",\"name\":\"missing\"}", .code = -32602 },
+        // A disabled prompt is unknown to the client.
+        .{ .ref = "{\"type\":\"ref/prompt\",\"name\":\"off\"}", .code = -32602 },
+        .{ .ref = "{\"type\":\"ref/resource\",\"uri\":\"test://items/{id}\"}", .code = null },
+        .{ .ref = "{\"type\":\"ref/resource\",\"uri\":\"test://items/7\"}", .code = null },
+        .{ .ref = "{\"type\":\"ref/resource\",\"uri\":\"test://static\"}", .code = null },
+        .{ .ref = "{\"type\":\"ref/resource\",\"uri\":\"test://other/{x}\"}", .code = -32602 },
+    };
+    var expected_calls: u32 = 0;
+    for (cases, 0..) |c, i| {
+        const extra = try std.fmt.allocPrint(f.arena(), "\"ref\":{s},\"argument\":{{\"name\":\"a\",\"value\":\"x\"}}", .{c.ref});
+        const v = try f.call(@intCast(i + 1), "completion/complete", meta_none, extra);
+        if (c.code) |code| {
+            try std.testing.expectEqual(code, errorCode(v).?);
+        } else {
+            try std.testing.expect(errorCode(v) == null);
+            expected_calls += 1;
+        }
+    }
+    // The server rejects an unknown target before it calls the handler.
+    try std.testing.expectEqual(expected_calls, completion_calls);
 }
 
 // -- Logging ------------------------------------------------------------------------------------

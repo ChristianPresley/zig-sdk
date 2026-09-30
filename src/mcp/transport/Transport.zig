@@ -97,10 +97,20 @@ pub const ClientTransport = struct {
         exchange: *const fn (ptr: *anyopaque, io: Io, ex: *Exchange) ExchangeError!void,
         /// Send a notification. The peer sends nothing back.
         notify: *const fn (ptr: *anyopaque, io: Io, frame: []const u8) SendError!void,
+        /// The credential that the next request carries, for example the bearer token, in
+        /// `arena`. Null when the transport sends no credential. The client uses it to keep
+        /// the private cache entries of each authorization context apart.
+        credential: ?*const fn (ptr: *anyopaque, arena: std.mem.Allocator) std.mem.Allocator.Error!?[]const u8 = null,
     };
 
     pub fn kind(self: ClientTransport) Kind {
         return self.vtable.kind;
+    }
+
+    /// The credential that the next request carries, or null. See `VTable.credential`.
+    pub fn credential(self: ClientTransport, arena: std.mem.Allocator) std.mem.Allocator.Error!?[]const u8 {
+        const f = self.vtable.credential orelse return null;
+        return f(self.ptr, arena);
     }
 
     pub fn exchange(self: ClientTransport, io: Io, ex: *Exchange) ExchangeError!void {

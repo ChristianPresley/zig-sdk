@@ -603,7 +603,55 @@ pub const SamplingContent = union(enum) {
             inline else => |payload| try jws.write(payload),
         }
     }
+
+    /// The content blocks as one slice.
+    pub fn blocks(self: *const SamplingContent) []const SamplingMessageContentBlock {
+        return switch (self.*) {
+            .single => |*b| b[0..1],
+            .list => |l| l,
+        };
+    }
 };
+
+pub const SamplingMessagesError = error{
+    /// A user message has tool results and other content.
+    MixedToolResults,
+    /// A tool use has no tool result in the next message, or that message is not a user
+    /// message with only tool results.
+    UnmatchedToolUse,
+};
+
+/// Check the tool rules of the sampling messages. A user message with a tool result has
+/// only tool results. The message after an assistant message with tool uses is a user
+/// message with only tool results. It has a tool result for each tool use.
+pub fn checkSamplingMessages(messages: []const SamplingMessage) SamplingMessagesError!void {
+    for (messages, 0..) |*m, i| {
+        const own = m.content.blocks();
+        if (m.role == .user) {
+            var results: usize = 0;
+            for (own) |b| {
+                if (b == .tool_result) results += 1;
+            }
+            if (results > 0 and results != own.len) return error.MixedToolResults;
+            continue;
+        }
+        var uses: usize = 0;
+        for (own) |b| {
+            if (b == .tool_use) uses += 1;
+        }
+        if (uses == 0) continue;
+        if (i + 1 >= messages.len or messages[i + 1].role != .user) return error.UnmatchedToolUse;
+        const next = messages[i + 1].content.blocks();
+        for (next) |b| if (b != .tool_result) return error.UnmatchedToolUse;
+        for (own) |b| {
+            if (b != .tool_use) continue;
+            const found = for (next) |r| {
+                if (std.mem.eql(u8, r.tool_result.toolUseId, b.tool_use.id)) break true;
+            } else false;
+            if (!found) return error.UnmatchedToolUse;
+        }
+    }
+}
 
 pub const SamplingMessageContentBlock = union(enum) {
     text: TextContent,
@@ -781,6 +829,15 @@ pub const ElicitRequestURLParams = struct {
     message: []const u8,
     url: []const u8,
 };
+
+/// True when `text` is a valid absolute URL. The URL has a scheme and a host that is not
+/// empty. It has no space and no ASCII control character.
+pub fn isValidUrl(text: []const u8) bool {
+    for (text) |c| if (c <= 0x20 or c == 0x7f) return false;
+    const uri = std.Uri.parse(text) catch return false;
+    const host = uri.host orelse return false;
+    return !host.isEmpty();
+}
 
 pub const ElicitRequestParams = union(enum) {
     form: ElicitRequestFormParams,
@@ -1001,4 +1058,38 @@ test "elicitation form params default mode" {
     try std.testing.expect(props.get("c").? == .@"enum");
     try std.testing.expect(props.get("c").?.@"enum" == .single_select);
     try std.testing.expect(props.get("m").?.@"enum" == .multi_select);
+}
+
+test "valid URLs for URL elicitation" {
+    const good = [_][]const u8{ "https://example.com/connect", "http://localhost:8080/a?b=c#d", "https://xn--bcher-kva.example/", "custom-app://host/path" };
+    for (good) |u| try std.testing.expect(isValidUrl(u));
+    const bad = [_][]const u8{ "", "example.com/connect", "/relative/path", "https://", "https:///path", "mailto:user@example.com", "https://exa mple.com/", "https://example.com/\n", "1http://example.com/" };
+    for (bad) |u| try std.testing.expect(!isValidUrl(u));
+}
+
+test "sampling message tool rules" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Case = struct { text: []const u8, err: ?SamplingMessagesError };
+    const cases = [_]Case{
+        .{ .text = "[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"hi\"}}]", .err = null },
+        // Two tool uses, both answered in the next user message.
+        .{ .text = "[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"w?\"}},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"w\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"w\",\"input\":{}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"toolUseId\":\"b\",\"content\":[]},{\"type\":\"tool_result\",\"toolUseId\":\"a\",\"content\":[]}]},{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"ok\"}}]", .err = null },
+        // A tool result together with text.
+        .{ .text = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"here\"},{\"type\":\"tool_result\",\"toolUseId\":\"a\",\"content\":[]}]}]", .err = error.MixedToolResults },
+        // The result for "b" is missing.
+        .{ .text = "[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"w\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"w\",\"input\":{}}]},{\"role\":\"user\",\"content\":{\"type\":\"tool_result\",\"toolUseId\":\"a\",\"content\":[]}}]", .err = error.UnmatchedToolUse },
+        // Another message comes before the tool result.
+        .{ .text = "[{\"role\":\"assistant\",\"content\":{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"w\",\"input\":{}}},{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"x\"}},{\"role\":\"user\",\"content\":{\"type\":\"tool_result\",\"toolUseId\":\"a\",\"content\":[]}}]", .err = error.UnmatchedToolUse },
+        // The tool use is the last message.
+        .{ .text = "[{\"role\":\"assistant\",\"content\":{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"w\",\"input\":{}}}]", .err = error.UnmatchedToolUse },
+    };
+    for (cases) |c| {
+        const messages = try json.parseValue([]const SamplingMessage, arena, try json.parseTree(arena, c.text));
+        if (c.err) |e| {
+            try std.testing.expectError(e, checkSamplingMessages(messages));
+        } else try checkSamplingMessages(messages);
+    }
 }

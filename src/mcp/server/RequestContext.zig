@@ -120,7 +120,7 @@ pub fn sendNotification(self: *RequestContext, method_name: []const u8, params: 
     };
 }
 
-pub const CapabilityPath = enum { roots, sampling, sampling_tools, elicitation_form, elicitation_url };
+pub const CapabilityPath = enum { roots, sampling, sampling_tools, sampling_context, elicitation_form, elicitation_url };
 
 /// True when the client declared the capability for this request.
 pub fn hasClientCapability(self: *const RequestContext, path: CapabilityPath) bool {
@@ -129,6 +129,7 @@ pub fn hasClientCapability(self: *const RequestContext, path: CapabilityPath) bo
         .roots => caps.roots != null,
         .sampling => caps.sampling != null,
         .sampling_tools => caps.sampling != null and caps.sampling.?.tools != null,
+        .sampling_context => caps.sampling != null and caps.sampling.?.context != null,
         .elicitation_form => caps.hasElicitation(.form),
         .elicitation_url => caps.hasElicitation(.url),
     };
@@ -141,6 +142,7 @@ pub fn requireClientCapability(self: *RequestContext, path: CapabilityPath) Erro
         .roots => .{ .roots = .{} },
         .sampling => .{ .sampling = .{} },
         .sampling_tools => .{ .sampling = .{ .tools = .{ .object = .empty } } },
+        .sampling_context => .{ .sampling = .{ .context = .{ .object = .empty } } },
         .elicitation_form => .{ .elicitation = .{ .form = .{ .object = .empty } } },
         .elicitation_url => .{ .elicitation = .{ .url = .{ .object = .empty } } },
     };

@@ -62,6 +62,43 @@ fn askRoots(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallTo
     return .{ .input_required = ir };
 }
 
+/// Puts a URL elicitation with a URL that is not valid straight into the requests.
+fn askBadUrl(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.requests.map.put(ctx.arena, "link", .{ .@"elicitation/create" = .{ .params = .{ .url = .{ .message = "Open it.", .url = "not a url" } } } });
+    return .{ .input_required = ir };
+}
+
+/// Asks for sampling with the deprecated includeContext value thisServer.
+fn askSampleContext(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    if (try ctx.sampleResponse("reply")) |resp| return .{ .complete = try types.CallToolResult.text(ctx.arena, "model {s}", .{resp.model}) };
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.sample("reply", .{ .messages = try userMessage(ctx, "hi"), .maxTokens = 10, .includeContext = .thisServer });
+    return .{ .input_required = ir };
+}
+
+/// Asks for sampling with a user message that mixes text and a tool result.
+fn askSampleMixed(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    const text = "[{\"role\":\"assistant\",\"content\":{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"w\",\"input\":{}}},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"here\"},{\"type\":\"tool_result\",\"toolUseId\":\"a\",\"content\":[]}]}]";
+    const messages = try json.parseValue([]const types.SamplingMessage, ctx.arena, try json.parseTree(ctx.arena, text));
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.sample("reply", .{ .messages = messages, .maxTokens = 10 });
+    return .{ .input_required = ir };
+}
+
+/// Asks for sampling with a tool use that has no tool result.
+fn askSampleUnmatched(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    const text = "[{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"a\",\"name\":\"w\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"b\",\"name\":\"w\",\"input\":{}}]},{\"role\":\"user\",\"content\":{\"type\":\"tool_result\",\"toolUseId\":\"a\",\"content\":[]}}]";
+    const messages = try json.parseValue([]const types.SamplingMessage, ctx.arena, try json.parseTree(ctx.arena, text));
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.sample("reply", .{ .messages = messages, .maxTokens = 10 });
+    return .{ .input_required = ir };
+}
+
 var loop_calls: u32 = 0;
 
 /// Asks for input on every round and never completes.
@@ -85,6 +122,10 @@ fn initServer(server: *Server) !void {
     try server.addToolJson(.{ .name = "ask_sample_tools" }, askSampleTools);
     try server.addToolJson(.{ .name = "ask_roots" }, askRoots);
     try server.addToolJson(.{ .name = "endless" }, endless);
+    try server.addToolJson(.{ .name = "ask_bad_url" }, askBadUrl);
+    try server.addToolJson(.{ .name = "ask_sample_context" }, askSampleContext);
+    try server.addToolJson(.{ .name = "ask_sample_mixed" }, askSampleMixed);
+    try server.addToolJson(.{ .name = "ask_sample_unmatched" }, askSampleUnmatched);
 }
 
 // -- Raw server calls through the harness -------------------------------------------------------
@@ -584,4 +625,197 @@ test "client stops a multi round-trip request after the round limit" {
     try std.testing.expectError(error.TooManyRounds, client.callTool(arena, "endless", null, .{}));
     try std.testing.expectEqual(3, loop_calls);
     try std.testing.expectEqual(3, c.form);
+}
+
+test "URL elicitation needs a valid absolute URL on the server and on the client" {
+    var server: Server = undefined;
+    try initServer(&server);
+    defer server.deinit();
+    var h: Harness = .init(std.testing.io, std.testing.allocator, &server);
+    defer h.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The builder refuses the URL.
+    var ir: mcp.InputRequired = .init(arena);
+    try std.testing.expectError(error.InvalidUrl, ir.elicitUrl("link", "Open it.", "/connect"));
+    // The server does not send a URL request that a handler built without the builder.
+    const bad = try rawCall(&h, arena, 1, "{\"elicitation\":{\"url\":{}}}", "\"name\":\"ask_bad_url\"");
+    try std.testing.expectEqual(@as(i64, -32603), errorCode(bad).?);
+
+    // The client refuses a URL request with a URL that is not valid and does not call the hook.
+    const gpa = std.testing.allocator;
+    const url_only = try json.parseValue(types.ClientCapabilities, arena, try json.parseTree(arena, "{\"elicitation\":{\"url\":{}}}"));
+    const bodies = [_][]const u8{
+        \\{"resultType":"input_required","inputRequests":{"link":{"method":"elicitation/create","params":{"mode":"url","message":"Connect","url":"example.com/connect"}}}}
+        ,
+        \\{"resultType":"input_required","inputRequests":{"link":{"method":"elicitation/create","params":{"mode":"url","message":"Connect","url":"https://"}}}}
+        ,
+    };
+    for (bodies) |body| {
+        var script: Scripted = .{ .results = &.{ body, complete_text } };
+        var c: Calls = .{};
+        var hooks = all_hooks;
+        hooks.userdata = &c;
+        var client: Client = .init(gpa, std.testing.io, .{ .info = .{ .name = "cli", .version = "1" }, .capabilities = url_only, .hooks = hooks });
+        defer client.deinit();
+        client.connect(script.transport());
+        try std.testing.expectError(error.InvalidResponse, client.callTool(arena, "t", null, .{}));
+        try std.testing.expectEqual(0, c.url);
+    }
+}
+
+fn formAnswer(ctx: *Client.HookContext, params: types.ElicitRequestFormParams) anyerror!types.ElicitResult {
+    _ = params;
+    const text: *const []const u8 = @ptrCast(@alignCast(ctx.userdata.?));
+    if (text.len == 0) return .{ .action = .accept };
+    return .{ .action = .accept, .content = try json.parseTree(ctx.arena, text.*) };
+}
+
+test "client validates the form answer against the requested schema" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ask =
+        \\{"resultType":"input_required","inputRequests":{"q":{"method":"elicitation/create","params":{"message":"About you?","requestedSchema":{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"name":{"type":"string","minLength":2},"age":{"type":"integer","minimum":0},"color":{"type":"string","enum":["red","blue"]}},"required":["name"]}}}}}
+    ;
+    const Case = struct { answer: []const u8, ok: bool };
+    const cases = [_]Case{
+        .{ .answer = "{\"name\":\"Al\",\"age\":30,\"color\":\"red\"}", .ok = true },
+        .{ .answer = "{\"name\":\"Al\"}", .ok = true },
+        // The required name is missing.
+        .{ .answer = "{\"age\":30}", .ok = false },
+        // Accepted without content: the required name is missing.
+        .{ .answer = "", .ok = false },
+        .{ .answer = "{\"name\":\"A\"}", .ok = false },
+        .{ .answer = "{\"name\":\"Al\",\"age\":-1}", .ok = false },
+        .{ .answer = "{\"name\":\"Al\",\"age\":\"30\"}", .ok = false },
+        .{ .answer = "{\"name\":\"Al\",\"color\":\"green\"}", .ok = false },
+        .{ .answer = "[\"Al\"]", .ok = false },
+    };
+    for (cases) |c| {
+        var script: Scripted = .{ .results = &.{ ask, complete_text } };
+        var answer: []const u8 = c.answer;
+        var client: Client = .init(gpa, io, .{
+            .info = .{ .name = "cli", .version = "1" },
+            .capabilities = .{ .elicitation = .{} },
+            .hooks = .{ .elicit_form = formAnswer, .userdata = @ptrCast(&answer) },
+        });
+        defer client.deinit();
+        client.connect(script.transport());
+        if (c.ok) {
+            _ = try client.callTool(arena, "t", null, .{});
+            try std.testing.expectEqual(2, script.exchanges);
+        } else {
+            // The client does not send an answer that is not valid.
+            try std.testing.expectError(error.HookFailed, client.callTool(arena, "t", null, .{}));
+            try std.testing.expectEqual(1, script.exchanges);
+        }
+    }
+}
+
+test "server uses includeContext values only when the client declared sampling.context" {
+    var server: Server = undefined;
+    try initServer(&server);
+    defer server.deinit();
+    var h: Harness = .init(std.testing.io, std.testing.allocator, &server);
+    defer h.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const no_context = try rawCall(&h, arena, 1, "{\"sampling\":{}}", "\"name\":\"ask_sample_context\"");
+    try std.testing.expectEqual(@as(i64, -32021), errorCode(no_context).?);
+    try std.testing.expect(requiredCaps(no_context).object.get("sampling").?.object.get("context") != null);
+
+    const with_context = result(try rawCall(&h, arena, 2, "{\"sampling\":{\"context\":{}}}", "\"name\":\"ask_sample_context\""));
+    const params = with_context.object.get("inputRequests").?.object.get("reply").?.object.get("params").?;
+    try std.testing.expectEqualStrings("thisServer", params.object.get("includeContext").?.string);
+    // Without includeContext the plain sampling capability is enough.
+    const plain = result(try rawCall(&h, arena, 3, "{\"sampling\":{}}", "\"name\":\"ask_sample\""));
+    try std.testing.expectEqualStrings("input_required", plain.object.get("resultType").?.string);
+}
+
+test "sampling messages with tool results hold only tool results on the server and on the client" {
+    var server: Server = undefined;
+    try initServer(&server);
+    defer server.deinit();
+    var h: Harness = .init(std.testing.io, std.testing.allocator, &server);
+    defer h.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The server does not send the request.
+    const bad = try rawCall(&h, arena, 1, "{\"sampling\":{\"tools\":{}}}", "\"name\":\"ask_sample_mixed\"");
+    try std.testing.expectEqual(@as(i64, -32603), errorCode(bad).?);
+
+    // The client refuses the request and does not call the hook.
+    var script: Scripted = .{ .results = &.{
+        \\{"resultType":"input_required","inputRequests":{"s":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":[{"type":"text","text":"here"},{"type":"tool_result","toolUseId":"a","content":[]}]}],"maxTokens":10}}}}
+        ,
+        complete_text,
+    } };
+    var c: Calls = .{};
+    var hooks = all_hooks;
+    hooks.userdata = &c;
+    var client: Client = .init(std.testing.allocator, std.testing.io, .{ .info = .{ .name = "cli", .version = "1" }, .capabilities = .{ .sampling = .{} }, .hooks = hooks });
+    defer client.deinit();
+    client.connect(script.transport());
+    try std.testing.expectError(error.InvalidResponse, client.callTool(arena, "t", null, .{}));
+    try std.testing.expectEqual(0, c.sample);
+}
+
+test "each sampling tool use has a tool result in the next user message on the server and on the client" {
+    var server: Server = undefined;
+    try initServer(&server);
+    defer server.deinit();
+    var h: Harness = .init(std.testing.io, std.testing.allocator, &server);
+    defer h.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The server does not send the request.
+    const bad = try rawCall(&h, arena, 1, "{\"sampling\":{\"tools\":{}}}", "\"name\":\"ask_sample_unmatched\"");
+    try std.testing.expectEqual(@as(i64, -32603), errorCode(bad).?);
+
+    // The client refuses a request with an unmatched tool use and does not call the hook.
+    const bodies = [_][]const u8{
+        // The result for "b" is missing.
+        \\{"resultType":"input_required","inputRequests":{"s":{"method":"sampling/createMessage","params":{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"w","input":{}},{"type":"tool_use","id":"b","name":"w","input":{}}]},{"role":"user","content":{"type":"tool_result","toolUseId":"a","content":[]}}],"maxTokens":10}}}}
+        ,
+        // Another message comes before the tool result.
+        \\{"resultType":"input_required","inputRequests":{"s":{"method":"sampling/createMessage","params":{"messages":[{"role":"assistant","content":{"type":"tool_use","id":"a","name":"w","input":{}}},{"role":"assistant","content":{"type":"text","text":"x"}},{"role":"user","content":{"type":"tool_result","toolUseId":"a","content":[]}}],"maxTokens":10}}}}
+        ,
+    };
+    for (bodies) |body| {
+        var script: Scripted = .{ .results = &.{ body, complete_text } };
+        var c: Calls = .{};
+        var hooks = all_hooks;
+        hooks.userdata = &c;
+        var client: Client = .init(std.testing.allocator, std.testing.io, .{ .info = .{ .name = "cli", .version = "1" }, .capabilities = .{ .sampling = .{} }, .hooks = hooks });
+        defer client.deinit();
+        client.connect(script.transport());
+        try std.testing.expectError(error.InvalidResponse, client.callTool(arena, "t", null, .{}));
+        try std.testing.expectEqual(0, c.sample);
+    }
+
+    // A balanced conversation passes on both sides.
+    var script: Scripted = .{ .results = &.{
+        \\{"resultType":"input_required","inputRequests":{"s":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"w?"}},{"role":"assistant","content":{"type":"tool_use","id":"a","name":"w","input":{}}},{"role":"user","content":{"type":"tool_result","toolUseId":"a","content":[]}}],"maxTokens":10}}}}
+        ,
+        complete_text,
+    } };
+    var c: Calls = .{};
+    var hooks = all_hooks;
+    hooks.userdata = &c;
+    var client: Client = .init(std.testing.allocator, std.testing.io, .{ .info = .{ .name = "cli", .version = "1" }, .capabilities = .{ .sampling = .{} }, .hooks = hooks });
+    defer client.deinit();
+    client.connect(script.transport());
+    _ = try client.callTool(arena, "t", null, .{});
+    try std.testing.expectEqual(1, c.sample);
 }
