@@ -20,7 +20,7 @@ The project is in development. The table shows the parts that exist today.
 | Streamable HTTP transport (server) | Done, passes all 37 scored scenarios of the official conformance suite |
 | TLS 1.3 server (HTTPS) | Done, tested against the std client, curl and openssl |
 | TLS 1.3 client | Planned |
-| Client | Planned |
+| Client: in-memory, stdio and Streamable HTTP transports, multi round-trip driver | Done |
 | Authorization (OAuth 2.1) | Planned |
 | gRPC transport (JSON-RPC tunnel over HTTP/2) | Planned |
 | Tasks extension | Planned |

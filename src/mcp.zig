@@ -39,5 +39,6 @@ test {
     _ = @import("mcp/client/client_test.zig");
     _ = @import("mcp/transport/http_test.zig");
     _ = @import("mcp/transport/https_test.zig");
+    _ = @import("mcp/transport/http_client_test.zig");
     _ = @import("tls/tls.zig");
 }

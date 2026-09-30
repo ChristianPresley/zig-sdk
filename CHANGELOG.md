@@ -11,6 +11,7 @@ All notable changes to this project are recorded in this file. The format follow
 - Server engine with tools, resources, resource templates, prompts, completion, pagination, multi round-trip requests and subscriptions.
 - stdio transport for servers.
 - Streamable HTTP transport for servers with SSE responses and header mirroring.
+- Client (`mcp.Client`) with typed requests, progress and log callbacks, the multi round-trip driver over application hooks, and three client transports: in-memory, stdio with process management, and Streamable HTTP with header mirroring.
 - In-tree TLS 1.3 server (`mcp.tls`) with ECDSA P-256, P-384 and Ed25519 certificates, X25519, P-256 and P-384 key exchange, HelloRetryRequest, ALPN and server name indication. The HTTP transport serves HTTPS with the `tls` option.
 - Conformance fixture server and a CI job that runs the official conformance suite.
 - Comptime JSON Schema derivation from Zig types.

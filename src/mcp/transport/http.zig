@@ -487,7 +487,7 @@ const Exchange = struct {
 
     fn startSse(self: *Exchange) Transport.SendError!void {
         if (self.body_writer != null) return;
-        self.body_writer = self.request.respondStreaming(&.{}, .{ .respond_options = .{ .status = .ok, .keep_alive = self.request.head.keep_alive, .extra_headers = &sse_headers } }) catch return error.WriteFailed;
+        self.body_writer = self.request.respondStreaming(&.{}, .{ .respond_options = .{ .status = .ok, .keep_alive = false, .extra_headers = &sse_headers } }) catch return error.WriteFailed;
         self.reusable = false;
         if (self.long_lived and self.owner.options.keepalive) {
             self.keepalive_future = self.owner.io.concurrent(keepaliveLoop, .{self}) catch null;

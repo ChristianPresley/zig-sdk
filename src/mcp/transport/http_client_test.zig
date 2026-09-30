@@ -1,0 +1,147 @@
+//! The MCP client over the Streamable HTTP client transport against the loopback server.
+const std = @import("std");
+const Io = std.Io;
+const Value = std.json.Value;
+const mcp = @import("../../mcp.zig");
+const json = mcp.json;
+const types = mcp.types;
+const Client = mcp.Client;
+const HttpServer = mcp.transport.http.Server;
+const HttpClient = mcp.transport.HttpClient;
+
+const AddArgs = struct { a: i64, b: i64 };
+
+fn add(ctx: *mcp.RequestContext, args: AddArgs) anyerror!mcp.Outcome(types.CallToolResult) {
+    try ctx.progress(0, 100, null);
+    try ctx.progress(50, 100, null);
+    try ctx.progress(100, 100, null);
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "{d}", .{args.a + args.b}) };
+}
+
+const HeaderArgs = struct {
+    region: []const u8,
+    priority: i64,
+    pub const json_schema = .{ .fields = .{ .region = .{ .header = "Region" }, .priority = .{ .header = "Priority" } } };
+};
+
+fn echoHeaders(ctx: *mcp.RequestContext, args: HeaderArgs) anyerror!mcp.Outcome(types.CallToolResult) {
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "{s}/{d}", .{ args.region, args.priority }) };
+}
+
+fn askName(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    if (try ctx.elicitResponse("user_name")) |resp| {
+        const name = json.getString(resp.content.?, "name") orelse "?";
+        return .{ .complete = try types.CallToolResult.text(ctx.arena, "hello {s}", .{name}) };
+    }
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.elicitForm("user_name", "Name?", try mcp.InputRequired.stringSchema(ctx.arena, "name", null, true));
+    return .{ .input_required = ir };
+}
+
+fn slow(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    try ctx.io.sleep(.fromMilliseconds(1500), .awake);
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "late", .{}) };
+}
+
+fn answerForm(ctx: *Client.HookContext, params: types.ElicitRequestFormParams) anyerror!types.ElicitResult {
+    _ = params;
+    return .{ .action = .accept, .content = try json.parseTree(ctx.arena, "{\"name\":\"Bob\"}") };
+}
+
+const Fixture = struct {
+    server: mcp.Server,
+    transport: HttpServer,
+    future: Io.Future(void),
+    http: *HttpClient,
+    client: Client,
+
+    fn start(self: *Fixture, path: []const u8) !void {
+        const gpa = std.testing.allocator;
+        const io = std.testing.io;
+        self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "http-test", .version = "1" }, .mrtr = .{ .elicitation = true } });
+        try self.server.addTool(.{ .name = "add" }, add);
+        try self.server.addTool(.{ .name = "test_headers" }, echoHeaders);
+        try self.server.addToolJson(.{ .name = "ask_name" }, askName);
+        try self.server.addToolJson(.{ .name = "slow" }, slow);
+        self.transport = .init(io, gpa, &self.server, .{ .port = 0 });
+        try self.transport.bind();
+        self.future = try io.concurrent(serveIgnoringErrors, .{&self.transport});
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ self.transport.bound_port, path });
+        self.http = try HttpClient.init(io, gpa, .{ .url = url });
+        self.client = .init(gpa, io, .{
+            .info = .{ .name = "cli", .version = "1" },
+            .capabilities = .{ .elicitation = .{} },
+            .hooks = .{ .elicit_form = answerForm },
+        });
+        self.client.connect(self.http.transport());
+    }
+
+    fn serveIgnoringErrors(t: *HttpServer) void {
+        t.serve() catch {};
+    }
+
+    fn stop(self: *Fixture) void {
+        const io = std.testing.io;
+        self.client.deinit();
+        self.http.deinit();
+        self.transport.shutdown();
+        self.future.await(io);
+        self.transport.deinit();
+        self.server.deinit();
+    }
+};
+
+const Recorder = struct {
+    progress: u32 = 0,
+    fn onProgress(userdata: ?*anyopaque, params: types.ProgressNotificationParams) void {
+        const self: *Recorder = @ptrCast(@alignCast(userdata.?));
+        _ = params;
+        self.progress += 1;
+    }
+};
+
+test "http client: json, sse, header mirroring and mrtr" {
+    var f: Fixture = undefined;
+    try f.start("/mcp");
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const disc = try f.client.discover(arena, .{});
+    try std.testing.expectEqualStrings("2026-07-28", disc.supportedVersions[0]);
+
+    var rec: Recorder = .{};
+    const sum = try f.client.callTool(arena, "add", .{ .a = 2, .b = 3 }, .{ .on_progress = Recorder.onProgress, .userdata = &rec });
+    try std.testing.expectEqualStrings("5", sum.content[0].text.text);
+    try std.testing.expectEqual(3, rec.progress);
+
+    // Without the annotations learned from tools/list the server rejects the call.
+    var diag: Client.Diagnostics = .{};
+    try std.testing.expectError(error.Rpc, f.client.callTool(arena, "test_headers", .{ .region = "us west", .priority = 7 }, .{ .diagnostics = &diag }));
+    try std.testing.expectEqual(@as(i64, -32020), diag.rpc_error.?.code);
+    // After tools/list the headers are mirrored, including the base64 sentinel for the space.
+    const tools = try f.client.listTools(arena, null, .{});
+    try std.testing.expectEqual(4, tools.tools.len);
+    const echoed = try f.client.callTool(arena, "test_headers", .{ .region = "us west", .priority = 7 }, .{});
+    try std.testing.expectEqualStrings("us west/7", echoed.content[0].text.text);
+
+    // Multi round-trip over HTTP.
+    const hello = try f.client.callTool(arena, "ask_name", null, .{});
+    try std.testing.expectEqualStrings("hello Bob", hello.content[0].text.text);
+
+    // A timeout cancels the request.
+    try std.testing.expectError(error.Timeout, f.client.callTool(arena, "slow", null, .{ .timeout = .fromMilliseconds(200) }));
+}
+
+test "http client: a wrong path is an http status without a message" {
+    var f: Fixture = undefined;
+    try f.start("/nope");
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.InvalidResponse, f.client.discover(arena_state.allocator(), .{}));
+}
