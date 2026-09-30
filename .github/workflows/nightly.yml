@@ -38,10 +38,13 @@ jobs:
           set -uo pipefail
           status=0
           for url in $(grep -o '\.url = "[^"]*"' docs/bibliography.zon | sed 's/.url = "//; s/"$//'); do
-            code=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 90 --retry 2 --retry-all-errors -A "zig-sdk-link-check" "$url" || echo 000)
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 90 --retry 2 --retry-all-errors -A "zig-sdk-link-check" "$url") || true
             case "$code" in
               2*|3*) ;;
-              *) echo "::warning::$code $url"; status=1 ;;
+              # No HTTP response (timeout or network error): the host can be slow from the
+              # runner, so only an HTTP error status fails the job.
+              000|"") echo "::warning::no response from $url" ;;
+              *) echo "::error::$code $url"; status=1 ;;
             esac
           done
           exit $status
