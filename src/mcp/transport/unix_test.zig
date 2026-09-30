@@ -248,6 +248,35 @@ test "unix socket server drops an oversize line and keeps the connection" {
     try std.testing.expect(msg.response.id.eql(.{ .integer = 2 }));
 }
 
+test "unix socket server answers valid JSON that is not a message with the recovered id" {
+    if (!unix.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(.{});
+    defer f.stop();
+    const stream = try f.rawConnect();
+    defer stream.close(io);
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("{\"jsonrpc\":\"2.0\",\"id\":8}\n");
+    try writer.interface.writeAll("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/list\",\"params\":{" ++ meta_none ++ "}}\n");
+    try writer.interface.flush();
+    var read_buf: [16 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const first = try mcp.jsonrpc.Message.parse(arena, try arena.dupe(u8, try reader.interface.takeDelimiterExclusive('\n')));
+    reader.interface.toss(1);
+    try std.testing.expect(first == .error_response);
+    try std.testing.expect(first.error_response.id.?.eql(.{ .integer = 8 }));
+    try std.testing.expectEqual(@as(i64, -32600), first.error_response.code);
+    // The connection stays usable.
+    const second = try mcp.jsonrpc.Message.parse(arena, try arena.dupe(u8, try reader.interface.takeDelimiterExclusive('\n')));
+    try std.testing.expect(second == .response);
+    try std.testing.expect(second.response.id.eql(.{ .integer = 9 }));
+}
+
 test "unix socket limit on connections closes the extra connection" {
     if (!unix.supported) return error.SkipZigTest;
     var limits: mcp.Limits = .{};

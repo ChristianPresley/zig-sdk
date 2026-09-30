@@ -114,7 +114,9 @@ pub const Server = struct {
                     continue;
                 },
                 error.Invalid => {
-                    self.destroySlot(slot);
+                    // The line and the recovered id are in the arena of the slot. Free the
+                    // slot only after the error response is out.
+                    defer self.destroySlot(slot);
                     try self.writeFrameError(recoverId(arena, line), errors.invalidRequest("Invalid Request"));
                     continue;
                 },

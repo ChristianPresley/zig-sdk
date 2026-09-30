@@ -231,6 +231,35 @@ test "stdio server writes one valid JSON-RPC message per line and never a reques
     try std.testing.expectEqualStrings("input_required", ask.object.get("result").?.object.get("resultType").?.string);
 }
 
+test "stdio server answers valid JSON that is not a message with Invalid Request and the id" {
+    const gpa = std.testing.allocator;
+    var server: mcp.Server = undefined;
+    try initServer(&server);
+    defer server.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Each line is valid JSON but not a JSON-RPC message. The server recovers the id.
+    const input = "{\"jsonrpc\":\"2.0\",\"id\":8}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":\"s-9\",\"params\":{}}\n" ++
+        "[1,2]\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"server/discover\",\"params\":{" ++ meta_none ++ "}}\n";
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try runStdio(&server, input, &out);
+
+    const messages = try parseLines(arena, out.written());
+    try std.testing.expectEqual(4, messages.len);
+    try std.testing.expectEqual(@as(i64, 8), messages[0].error_response.id.?.integer);
+    try std.testing.expectEqual(@as(i64, -32600), messages[0].error_response.code);
+    try std.testing.expectEqualStrings("s-9", messages[1].error_response.id.?.string);
+    try std.testing.expectEqual(@as(i64, -32600), messages[1].error_response.code);
+    try std.testing.expect(messages[2].error_response.id == null);
+    // The server still serves the next request.
+    try std.testing.expectEqual(@as(i64, 10), messages[3].response.id.integer);
+}
+
 test "stdio server sends nothing more for a request that the client cancelled" {
     const gpa = std.testing.allocator;
     var server: mcp.Server = undefined;
