@@ -278,6 +278,7 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
     const deadline: Io.Timeout = if (options.timeout) |d| .{ .deadline = Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake }) } else .none;
 
     var round: u32 = 0;
+    var version_retried = false;
     var input_responses: ?std.json.ObjectMap = null;
     var request_state: ?[]const u8 = null;
     while (round < self.options.limits.mrtr_max_rounds_client) : (round += 1) {
@@ -311,6 +312,12 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             error.WriteFailed, error.ReadFailed => return error.TransportFailed,
         };
         if (collector.rpc_error) |rpc| {
+            // One retry when the server rejects the version but supports ours (-32022).
+            if (rpc.code == errors.Code.unsupported_protocol_version.int() and !version_retried and supportsOurVersion(rpc.data)) {
+                version_retried = true;
+                round -|= 1;
+                continue;
+            }
             if (options.diagnostics) |d| d.rpc_error = rpc;
             return error.Rpc;
         }
@@ -342,6 +349,16 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
         request_state = ir.requestState;
     }
     return error.TooManyRounds;
+}
+
+/// True when `data.supported` of a -32022 error lists the revision this SDK speaks.
+fn supportsOurVersion(data: ?Value) bool {
+    const d = data orelse return false;
+    if (d != .object) return false;
+    const supported = d.object.get("supported") orelse return false;
+    if (supported != .array) return false;
+    for (supported.array.items) |v| if (v == .string and std.mem.eql(u8, v.string, version.version)) return true;
+    return false;
 }
 
 fn answerInput(self: *Client, arena: Allocator, key: []const u8, method_name: []const u8, req: types.InputRequest) RequestError!Value {

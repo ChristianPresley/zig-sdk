@@ -54,6 +54,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("conformance-server", "Build the conformance everything server").dependOn(&b.addInstallArtifact(conformance_server, .{}).step);
+    const conformance_client = b.addExecutable(.{
+        .name = "mcp-conformance-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("conformance/everything_client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mcp", .module = mcp }},
+        }),
+    });
+    b.step("conformance-client", "Build the conformance everything client").dependOn(&b.addInstallArtifact(conformance_client, .{}).step);
 
     // Autodocs.
     const docs_obj = b.addObject(.{

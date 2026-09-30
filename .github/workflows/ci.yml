@@ -118,6 +118,15 @@ jobs:
       - name: Stop the everything server
         if: always()
         run: kill "$(cat server.pid)" || true
+      - run: zig build conformance-client -Doptimize=ReleaseSafe
+      - name: Run the official conformance suite against the client
+        run: >
+          npx --yes @modelcontextprotocol/conformance@0.2.0-alpha.11 client
+          --command ./zig-out/bin/mcp-conformance-client
+          --requirements 2026-07-28
+          --timeout 60000
+          --expected-failures conformance/expected-failures-client.yml
+          --output-dir conformance-results/client
       - uses: actions/upload-artifact@v7
         if: always()
         with:
