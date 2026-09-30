@@ -98,9 +98,14 @@ Other build steps: `fmt`, `docs`, `lint-docs`, `census`, `commit-policy`, `bench
 
 ## Documentation
 
-The wiki holds the guides, the style guide and the bibliography.[^wiki] The API reference comes from `zig build docs`.
+The wiki holds the guides, the style guide and the bibliography.[^wiki] The API reference comes from `zig build docs`. Start with these pages:
 
-All prose in this repository uses ASD-STE100 Simplified Technical English, customized for this project.[^ste]
+- [Getting Started](https://github.com/ChristianPresley/zig-sdk/wiki/Getting-Started)
+- [Server Guide](https://github.com/ChristianPresley/zig-sdk/wiki/Server-Guide) and [Client Guide](https://github.com/ChristianPresley/zig-sdk/wiki/Client-Guide)
+- [Transports](https://github.com/ChristianPresley/zig-sdk/wiki/Transports)
+- [Release Notes](https://github.com/ChristianPresley/zig-sdk/wiki/Release-Notes)
+
+All prose in this repository uses ASD-STE100 Simplified Technical English, customized for this project.[^ste] The profile is in `docs/style/ste-profile.md`. `zig build lint-docs` checks the prose.
 
 ## License
 

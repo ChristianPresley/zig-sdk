@@ -49,7 +49,8 @@ pub fn stripInline(arena: Allocator, text: []const u8) ![]u8 {
                     i = @min(after, text.len);
                     continue;
                 }
-                if (isWikiPageTarget(target) and (sameName(inner, pageOf(target)) or sameName(inner, anchorOf(target)))) {
+                const wiki_target = wikiTarget(target);
+                if (isWikiPageTarget(wiki_target) and (sameName(inner, pageOf(wiki_target)) or sameName(inner, anchorOf(wiki_target)))) {
                     try out.appendSlice(arena, name_token);
                 } else {
                     try out.appendSlice(arena, try stripInline(arena, inner));
@@ -119,6 +120,15 @@ pub fn isWikiPageTarget(target: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) return false;
     }
     return true;
+}
+
+/// Returns the page part of a URL of a GitHub wiki, such as `Home` of
+/// `https://github.com/owner/repo/wiki/Home`. Other targets stay as they are.
+pub fn wikiTarget(target: []const u8) []const u8 {
+    if (std.mem.find(u8, target, "://") == null) return target;
+    const marker = "/wiki/";
+    const i = std.mem.findLast(u8, target, marker) orelse return target;
+    return target[i + marker.len ..];
 }
 
 /// Returns the part of a link target before `#`.
@@ -335,6 +345,7 @@ test "inline pre-pass" {
     try std.testing.expectEqualStrings("See the guide.", try stripInline(arena, "See the [guide](https://example.com)."));
     try std.testing.expectEqualStrings("See {name}.", try stripInline(arena, "See [Getting Started](Getting-Started)."));
     try std.testing.expectEqualStrings("{name}: a key.", try stripInline(arena, "[RFC-2119](Bibliography#rfc-2119): a key."));
+    try std.testing.expectEqualStrings("Read {name}.", try stripInline(arena, "Read [Getting Started](https://github.com/o/r/wiki/Getting-Started)."));
     try std.testing.expectEqualStrings("The SDK obeys MCP.", try stripInline(arena, "The SDK obeys **MCP**<sup>[1](#ref-1)</sup>."));
     try std.testing.expectEqualStrings("Set max_restarts.", try stripInline(arena, "Set max_restarts."));
     try std.testing.expectEqualStrings("A {code} span.", try stripInline(arena, "A ``a ` b`` span."));
