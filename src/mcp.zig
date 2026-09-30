@@ -32,4 +32,5 @@ test {
     _ = @import("mcp/server/request_state.zig");
     _ = @import("mcp/server/mrtr.zig");
     _ = @import("mcp/server/server_test.zig");
+    _ = @import("mcp/transport/http_test.zig");
 }
