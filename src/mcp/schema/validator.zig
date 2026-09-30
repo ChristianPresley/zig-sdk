@@ -278,9 +278,19 @@ pub fn compile(arena: Allocator, root: Value, options: Options) CompileError!Sch
         .patterns = c.patterns,
         .pattern_buffer_len = c.pattern_buffer_len,
     };
-    for (c.refs.items) |ref| {
-        if (resolveRef(&schema, ref) == null) return error.InvalidSchema;
+    // A reference can point into a member that the walk above does not visit, such as an
+    // unknown keyword. Compile each target too, so that validation never meets an unchecked
+    // operand. The list grows while the loop runs, because a target can hold references.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var i: usize = 0;
+    while (i < c.refs.items.len) : (i += 1) {
+        const ref = c.refs.items[i];
+        const target = resolveRef(&schema, ref) orelse return error.InvalidSchema;
+        if ((try seen.getOrPut(arena, ref)).found_existing) continue;
+        try c.node(target, 0, false);
     }
+    schema.patterns = c.patterns;
+    schema.pattern_buffer_len = c.pattern_buffer_len;
     return schema;
 }
 
@@ -909,6 +919,9 @@ test "compile rejects unsupported and remote schemas" {
     try std.testing.expectError(error.RemoteRef, compileText(arena, "{\"$ref\":\"https://example.com/s.json\"}", .{}));
     try std.testing.expectError(error.UnsupportedDialect, compileText(arena, "{\"$schema\":\"http://json-schema.org/draft-07/schema#\"}", .{}));
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$ref\":\"#/$defs/missing\"}", .{}));
+    // A reference into an unknown member is compiled too.
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$ref\":\"#/x\",\"x\":{\"minimum\":\"a\"}}", .{}));
+    try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"$ref\":\"#/x\",\"x\":5}", .{}));
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"items\":[{}]}", .{}));
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"type\":\"int\"}", .{}));
     try std.testing.expectError(error.InvalidSchema, compileText(arena, "{\"multipleOf\":0}", .{}));
