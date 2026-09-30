@@ -87,6 +87,9 @@ pub const Task = struct {
     /// The `tools/call` params that created the task, copied into the task arena.
     params: Value,
     kind: Transport.Kind,
+    /// The principal part of the associated data of sealed state. It comes from the request
+    /// that created the task, in the task arena.
+    principal_tag: []const u8 = "",
     created_ms: i64,
     updated_ms: i64,
     ttl_ms: i64,

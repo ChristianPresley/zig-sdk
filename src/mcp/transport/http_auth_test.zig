@@ -25,6 +25,19 @@ fn whoami(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.Call
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "{s}", .{p.subject orelse "?"}) };
 }
 
+/// Asks for a name in the first round and greets in the second round.
+fn askName(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    if (try ctx.elicitResponse("user_name")) |resp| {
+        const name = json.getString(resp.content orelse .null, "name") orelse "?";
+        return .{ .complete = try types.CallToolResult.text(ctx.arena, "hello {s} from {s}", .{ name, ctx.request_state orelse "-" }) };
+    }
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.elicitForm("user_name", "What is your name?", try mcp.InputRequired.stringSchema(ctx.arena, "name", null, true));
+    try ir.setStateFmt("{{\"asked\":{f}}}", .{std.json.fmt(ctx.principal().?.subject orelse "", .{})});
+    return .{ .input_required = ir };
+}
+
 const Fixture = struct {
     server: mcp.Server,
     keys: [1]jwt.Key,
@@ -40,6 +53,7 @@ const Fixture = struct {
         const io = std.testing.io;
         self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "auth-test", .version = "1" } });
         try self.server.addToolJson(.{ .name = "whoami" }, whoami);
+        try self.server.addToolJson(.{ .name = "ask" }, askName);
         self.keys = .{.{ .alg = .HS256, .material = .{ .secret = secret } }};
         self.jv = .{ .options = .{ .keys = &self.keys, .audience = "http://127.0.0.1/mcp" }, .clock = .{ .fixed = fixedNow } };
         self.rs = .{
@@ -141,4 +155,64 @@ test "resource server: metadata, challenges and the principal" {
     const stale = try f.send(arena, .POST, "/mcp", call_whoami, &(std_headers ++ [_]http.Header{.{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Bearer ", expired }) }}));
     try std.testing.expectEqual(http.Status.unauthorized, stale.status);
     try std.testing.expect(std.mem.indexOf(u8, stale.www_authenticate.?, "invalid_token") != null);
+}
+
+const meta_elicit =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}
+;
+const ask_headers = [_]http.Header{
+    .{ .name = "accept", .value = "application/json, text/event-stream" },
+    .{ .name = "mcp-protocol-version", .value = "2026-07-28" },
+    .{ .name = "mcp-method", .value = "tools/call" },
+    .{ .name = "mcp-name", .value = "ask" },
+};
+
+/// Call the tool `ask` with the token for `claims`. `state` is the sealed state of the round
+/// before, or null for the first round. Checks the HTTP status and returns the parsed response.
+fn callAsk(f: *Fixture, arena: std.mem.Allocator, claims: []const u8, state: ?[]const u8, status: http.Status) !Value {
+    const token = try jwt.signHs256(arena, claims, secret, null);
+    const retry = if (state) |s|
+        try std.fmt.allocPrint(arena, ",\"inputResponses\":{{\"user_name\":{{\"action\":\"accept\",\"content\":{{\"name\":\"Ann\"}}}}}},\"requestState\":\"{s}\"", .{s})
+    else
+        "";
+    const body = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{{s},\"name\":\"ask\",\"arguments\":{{}}{s}}}}}", .{ meta_elicit, retry });
+    const reply = try f.send(arena, .POST, "/mcp", body, &(ask_headers ++ [_]http.Header{.{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Bearer ", token }) }}));
+    try std.testing.expectEqual(status, reply.status);
+    return json.parseTree(arena, reply.body);
+}
+
+test "resource server: sealed request state opens only for the principal that it was sealed for" {
+    var f: Fixture = undefined;
+    try f.start();
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const alice = "{\"iss\":\"https://as.example\",\"sub\":\"alice\",\"client_id\":\"app\",\"aud\":\"http://127.0.0.1/mcp\",\"exp\":2000,\"scope\":\"mcp:read\"}";
+    const first = try callAsk(&f, arena, alice, null, .ok);
+    const result = first.object.get("result").?;
+    try std.testing.expectEqualStrings("input_required", result.object.get("resultType").?.string);
+    const state = result.object.get("requestState").?.string;
+
+    // Another subject, another issuer or another client cannot use the state. The HTTP
+    // server sends the invalid params error with status 400.
+    const others = [_][]const u8{
+        "{\"iss\":\"https://as.example\",\"sub\":\"bob\",\"client_id\":\"app\",\"aud\":\"http://127.0.0.1/mcp\",\"exp\":2000,\"scope\":\"mcp:read\"}",
+        "{\"iss\":\"https://other.example\",\"sub\":\"alice\",\"client_id\":\"app\",\"aud\":\"http://127.0.0.1/mcp\",\"exp\":2000,\"scope\":\"mcp:read\"}",
+        "{\"iss\":\"https://as.example\",\"sub\":\"alice\",\"client_id\":\"other-app\",\"aud\":\"http://127.0.0.1/mcp\",\"exp\":2000,\"scope\":\"mcp:read\"}",
+    };
+    for (others) |claims| {
+        const reply = try callAsk(&f, arena, claims, state, .bad_request);
+        try std.testing.expect(reply.object.get("result") == null);
+        const err = reply.object.get("error").?;
+        try std.testing.expectEqual(@as(i64, -32602), err.object.get("code").?.integer);
+        try std.testing.expectEqualStrings("invalid_request_state", err.object.get("data").?.object.get("reason").?.string);
+    }
+
+    // The same principal, with a new token, completes the request.
+    const again = "{\"iss\":\"https://as.example\",\"sub\":\"alice\",\"client_id\":\"app\",\"aud\":\"http://127.0.0.1/mcp\",\"exp\":1900,\"scope\":\"mcp:read\"}";
+    const done = try callAsk(&f, arena, again, state, .ok);
+    const text = done.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string;
+    try std.testing.expectEqualStrings("hello Ann from {\"asked\":\"alice\"}", text);
 }

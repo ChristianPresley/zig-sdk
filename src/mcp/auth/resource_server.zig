@@ -7,6 +7,8 @@ const json = @import("../json.zig");
 
 /// Who the token stands for. Handlers read it through the request context.
 pub const Principal = struct {
+    /// The issuer of the token, the `iss` claim of a JWT.
+    issuer: ?[]const u8 = null,
     subject: ?[]const u8 = null,
     client_id: ?[]const u8 = null,
     scopes: []const []const u8 = &.{},
@@ -26,6 +28,29 @@ pub const TokenVerifier = struct {
         return self.verify(self.ptr, arena, token);
     }
 };
+
+/// A broader scope and the narrower scopes that it implies.
+pub const ScopeRule = struct {
+    scope: []const u8,
+    implies: []const []const u8,
+};
+
+/// True when `held` has `needed`, or a scope that implies `needed` through the rules of
+/// `hierarchy`. An implication can use more than one rule.
+pub fn scopeSatisfied(hierarchy: []const ScopeRule, held: []const []const u8, needed: []const u8) bool {
+    return scopeFound(hierarchy, held, needed, hierarchy.len);
+}
+
+fn scopeFound(hierarchy: []const ScopeRule, held: []const []const u8, needed: []const u8, depth: usize) bool {
+    for (held) |have| if (std.mem.eql(u8, have, needed)) return true;
+    if (depth == 0) return false;
+    for (hierarchy) |rule| {
+        for (rule.implies) |narrow| if (std.mem.eql(u8, narrow, needed)) {
+            if (scopeFound(hierarchy, held, rule.scope, depth - 1)) return true;
+        };
+    }
+    return false;
+}
 
 /// The answer to a rejected request.
 pub const Challenge = struct {
@@ -48,7 +73,16 @@ pub const ResourceServer = struct {
     scopes_supported: []const []const u8 = &.{},
     /// Scopes every request needs.
     required_scopes: []const []const u8 = &.{},
+    /// Broader scopes and the narrower scopes that they imply. A token with a broader scope
+    /// satisfies a need for each scope that it implies.
+    scope_hierarchy: []const ScopeRule = &.{},
     verifier: TokenVerifier,
+
+    /// True when the principal has the scope `needed`, or a broader scope that implies it.
+    /// Handlers can call it for the scopes of one operation.
+    pub fn hasScope(self: *const ResourceServer, principal: *const Principal, needed: []const u8) bool {
+        return scopeSatisfied(self.scope_hierarchy, principal.scopes, needed);
+    }
 
     /// The metadata document (RFC 9728).
     pub fn metadataJson(self: *const ResourceServer, arena: Allocator) Allocator.Error![]u8 {
@@ -85,11 +119,7 @@ pub const ResourceServer = struct {
             error.InvalidToken => return .{ .challenge = try self.challenge(arena, 401, "invalid_token", "The access token is not valid") },
         };
         for (self.required_scopes) |needed| {
-            var found = false;
-            for (principal.scopes) |have| if (std.mem.eql(u8, have, needed)) {
-                found = true;
-            };
-            if (!found) return .{ .challenge = try self.challenge(arena, 403, "insufficient_scope", "The token lacks a required scope") };
+            if (!self.hasScope(&principal, needed)) return .{ .challenge = try self.challenge(arena, 403, "insufficient_scope", "The token lacks a required scope") };
         }
         return .{ .ok = principal };
     }
@@ -151,6 +181,7 @@ pub const JwtVerifier = struct {
             else => return error.InvalidToken,
         };
         return .{
+            .issuer = claims.issuer,
             .subject = claims.subject,
             .client_id = claims.client_id,
             .scopes = claims.scopes,
@@ -197,6 +228,53 @@ test "challenges and decisions" {
     const wrong_aud = try jwt.signHs256(arena, "{\"sub\":\"alice\",\"aud\":\"https://other\",\"exp\":2000,\"scope\":\"mcp:read\"}", secret, null);
     const rejected = try rs.authorize(arena, try std.mem.concat(arena, u8, &.{ "Bearer ", wrong_aud }));
     try std.testing.expectEqual(401, rejected.challenge.status);
+    // The audience check accepts an uppercase scheme and host.
+    const upper_aud = try jwt.signHs256(arena, "{\"iss\":\"https://as.example\",\"sub\":\"alice\",\"aud\":\"HTTPS://RS.EXAMPLE/mcp\",\"exp\":2000,\"scope\":\"mcp:read\"}", secret, null);
+    const upper = try rs.authorize(arena, try std.mem.concat(arena, u8, &.{ "Bearer ", upper_aud }));
+    try std.testing.expectEqualStrings("alice", upper.ok.subject.?);
+    try std.testing.expectEqualStrings("https://as.example", upper.ok.issuer.?);
+}
+
+test "scope hierarchy" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const jwt = @import("jwt.zig");
+    const secret = "resource-server-test-secret-32b!";
+    const keys = [_]jwt.Key{.{ .alg = .HS256, .material = .{ .secret = secret } }};
+    var jv: JwtVerifier = .{ .options = .{ .keys = &keys, .audience = "https://rs.example/mcp" }, .clock = .{ .fixed = fixedNow } };
+    const hierarchy = [_]ScopeRule{
+        .{ .scope = "mcp:admin", .implies = &.{"mcp:write"} },
+        .{ .scope = "mcp:write", .implies = &.{"mcp:read"} },
+    };
+    const rs: ResourceServer = .{
+        .resource = "https://rs.example/mcp",
+        .resource_metadata_url = "https://rs.example/.well-known/oauth-protected-resource/mcp",
+        .authorization_servers = &.{"https://as.example"},
+        .required_scopes = &.{"mcp:read"},
+        .scope_hierarchy = &hierarchy,
+        .verifier = jv.verifier(),
+    };
+    // A broader scope satisfies the required narrower scope, also through two rules.
+    for ([_][]const u8{ "mcp:read", "mcp:write", "mcp:admin" }) |scope| {
+        const payload = try std.fmt.allocPrint(arena, "{{\"sub\":\"alice\",\"aud\":\"https://rs.example/mcp\",\"exp\":2000,\"scope\":\"{s}\"}}", .{scope});
+        const token = try jwt.signHs256(arena, payload, secret, null);
+        const decision = try rs.authorize(arena, try std.mem.concat(arena, u8, &.{ "Bearer ", token }));
+        try std.testing.expectEqualStrings("alice", decision.ok.subject.?);
+    }
+    // A narrower scope does not satisfy a broader one, and unrelated scopes do not count.
+    const other = try jwt.signHs256(arena, "{\"sub\":\"eve\",\"aud\":\"https://rs.example/mcp\",\"exp\":2000,\"scope\":\"files:read\"}", secret, null);
+    try std.testing.expectEqual(403, (try rs.authorize(arena, try std.mem.concat(arena, u8, &.{ "Bearer ", other }))).challenge.status);
+    const reader: Principal = .{ .scopes = &.{"mcp:read"} };
+    try std.testing.expect(rs.hasScope(&reader, "mcp:read"));
+    try std.testing.expect(!rs.hasScope(&reader, "mcp:write"));
+    const admin: Principal = .{ .scopes = &.{"mcp:admin"} };
+    try std.testing.expect(rs.hasScope(&admin, "mcp:read"));
+    try std.testing.expect(!rs.hasScope(&admin, "mcp:delete"));
+    // A cycle in the rules ends.
+    const cycle = [_]ScopeRule{ .{ .scope = "a", .implies = &.{"b"} }, .{ .scope = "b", .implies = &.{"a"} } };
+    try std.testing.expect(!scopeSatisfied(&cycle, &.{"c"}, "a"));
+    try std.testing.expect(scopeSatisfied(&cycle, &.{"b"}, "a"));
 }
 
 fn fixedNow() i64 {

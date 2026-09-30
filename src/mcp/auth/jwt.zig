@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const json = @import("../json.zig");
+const common = @import("common.zig");
 const Certificate = std.crypto.Certificate;
 const rsa = @import("../../tls/rsa.zig");
 const pem = @import("../../tls/pem.zig");
@@ -71,7 +72,8 @@ pub const Options = struct {
     keys: []const Key,
     /// The `iss` the token must carry. Null skips the check.
     issuer: ?[]const u8 = null,
-    /// A value that `aud` must contain. Null skips the check.
+    /// A value that `aud` must contain. Null skips the check. The comparison accepts an
+    /// uppercase scheme and host (RFC 3986 section 6.2.2.1).
     audience: ?[]const u8 = null,
     /// The `typ` header the token must carry, for example `oauth-id-jag+jwt`. The comparison
     /// ignores case and an `application/` prefix (RFC 7515 section 4.1.9). Null skips the check.
@@ -136,7 +138,7 @@ pub fn verify(arena: Allocator, token: []const u8, options: Options, now: i64) V
     }
     if (options.audience) |want| {
         var found = false;
-        for (claims.audience) |a| if (std.mem.eql(u8, a, want)) {
+        for (claims.audience) |a| if (common.uriEql(a, want)) {
             found = true;
         };
         if (!found) return error.AudienceMismatch;
@@ -518,6 +520,9 @@ test "hs256 round trip and claims" {
     try std.testing.expectError(error.Expired, verify(arena, token, .{ .keys = &keys }, 1100));
     try std.testing.expectError(error.NotYetValid, verify(arena, token, .{ .keys = &keys }, 800));
     try std.testing.expectError(error.AudienceMismatch, verify(arena, token, .{ .keys = &keys, .audience = "https://other" }, 950));
+    // The audience comparison accepts an uppercase scheme and host, but not another path.
+    _ = try verify(arena, token, .{ .keys = &keys, .audience = "HTTPS://RS.Example/mcp" }, 950);
+    try std.testing.expectError(error.AudienceMismatch, verify(arena, token, .{ .keys = &keys, .audience = "https://rs.example/MCP" }, 950));
     try std.testing.expectError(error.IssuerMismatch, verify(arena, token, .{ .keys = &keys, .issuer = "https://evil" }, 950));
     const wrong = [_]Key{.{ .kid = "k1", .alg = .HS256, .material = .{ .secret = "other" } }};
     try std.testing.expectError(error.BadSignature, verify(arena, token, .{ .keys = &wrong }, 950));

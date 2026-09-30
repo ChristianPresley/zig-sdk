@@ -2,7 +2,8 @@
 //!
 //! Format: `v1.` + base64url(nonce ‖ ciphertext ‖ tag). The plaintext is
 //! `{"exp":<unix seconds>,"s":<caller state>}` and the associated data binds the state to
-//! the method, the target name or URI, and a principal tag.
+//! the method, the target name or URI, and the authenticated principal. State that a server
+//! sealed for one principal does not open for another principal.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -67,9 +68,24 @@ pub const Codec = struct {
     }
 };
 
-/// Build the associated data for a request: method, target and principal.
+/// Build the associated data for a request: method, target and principal. Each part has a
+/// length prefix, so no two different requests have the same associated data.
 pub fn aad(arena: Allocator, method: []const u8, target: []const u8, principal: []const u8) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(arena, "{s}\x00{s}\x00{s}", .{ method, target, principal });
+    return std.fmt.allocPrint(arena, "{d}:{s}{d}:{s}{d}:{s}", .{ method.len, method, target.len, target, principal.len, principal });
+}
+
+/// The principal part of the associated data: the issuer, the subject and the client of the
+/// token. A part that the token does not have is a `-`.
+pub fn principalTag(arena: Allocator, issuer: ?[]const u8, subject: ?[]const u8, client_id: ?[]const u8) Allocator.Error![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    for ([_]?[]const u8{ issuer, subject, client_id }) |part| {
+        if (part) |p| {
+            aw.writer.print("{d}:{s}", .{ p.len, p }) catch return error.OutOfMemory;
+        } else {
+            aw.writer.writeByte('-') catch return error.OutOfMemory;
+        }
+    }
+    return aw.toOwnedSlice();
 }
 
 test "seal and unseal" {
@@ -89,4 +105,31 @@ test "seal and unseal" {
     const tampered = try std.fmt.allocPrint(arena, "{s}-TAMPERED", .{sealed});
     try std.testing.expectError(error.Invalid, codec.unseal(arena, ad, tampered, 1_100));
     try std.testing.expectError(error.Invalid, codec.unseal(arena, ad, "garbage", 1_100));
+}
+
+test "sealed state is bound to the principal" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var codec: Codec = .{ .key = [_]u8{9} ** key_length, .ttl_seconds = 600 };
+    const alice = try principalTag(arena, "https://as.example", "alice", "app");
+    const ad = try aad(arena, "tools/call", "echo", alice);
+    const sealed = try codec.seal(arena, std.testing.io, ad, "{}", 1_000);
+    try std.testing.expectEqualStrings("{}", try codec.unseal(arena, ad, sealed, 1_000));
+    const others = [_][]const u8{
+        try principalTag(arena, "https://as.example", "bob", "app"),
+        try principalTag(arena, "https://other.example", "alice", "app"),
+        try principalTag(arena, "https://as.example", "alice", "other-app"),
+        try principalTag(arena, "https://as.example", "alice", null),
+        try principalTag(arena, null, null, null),
+        "",
+    };
+    for (others) |tag| {
+        const other_ad = try aad(arena, "tools/call", "echo", tag);
+        try std.testing.expectError(error.Invalid, codec.unseal(arena, other_ad, sealed, 1_000));
+    }
+    // The length prefixes keep the parts apart.
+    try std.testing.expect(!std.mem.eql(u8, try principalTag(arena, "ab", "c", null), try principalTag(arena, "a", "bc", null)));
+    try std.testing.expect(!std.mem.eql(u8, try aad(arena, "a", "bc", ""), try aad(arena, "ab", "c", "")));
 }

@@ -982,12 +982,19 @@ fn decodeCursor(cursor: []const u8) ?usize {
 // Tools, resources, prompts
 // ---------------------------------------------------------------------------------------------
 
+/// The principal part of the associated data of sealed state: empty without a principal. A
+/// task uses the principal of the request that created it.
+fn principalTag(ctx: *RequestContext) Allocator.Error![]const u8 {
+    const p = ctx.principal() orelse return if (ctx.task) |t| t.principal_tag else "";
+    return request_state.principalTag(ctx.arena, p.issuer, p.subject, p.client_id);
+}
+
 fn prepareInputRound(self: *Server, ctx: *RequestContext, method_name: []const u8, target: []const u8, responses: ?types.InputResponses, sealed: ?[]const u8) RequestContext.Error!void {
     ctx.target = target;
     ctx.input_responses = responses;
     if (sealed) |s| {
         if (self.state_codec) |codec| {
-            const ad = try request_state.aad(ctx.arena, method_name, target, "");
+            const ad = try request_state.aad(ctx.arena, method_name, target, try principalTag(ctx));
             const now = Io.Clock.real.now(ctx.io).toSeconds();
             ctx.request_state = codec.unseal(ctx.arena, ad, s, now) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1036,7 +1043,7 @@ fn finishInputRequired(self: *Server, ctx: *RequestContext, method: methods.Meth
     if (ir.count() > 0) result.inputRequests = ir.requests;
     if (ir.state) |s| {
         if (self.state_codec) |codec| {
-            const ad = try request_state.aad(ctx.arena, method.name(), ctx.target, "");
+            const ad = try request_state.aad(ctx.arena, method.name(), ctx.target, try principalTag(ctx));
             const now = Io.Clock.real.now(ctx.io).toSeconds();
             result.requestState = codec.seal(ctx.arena, ctx.io, ad, s, now) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1414,12 +1421,15 @@ test {
 /// Create the task, start its runner, and answer with `CreateTaskResult`.
 fn startTask(self: *Server, ctx: *RequestContext, entry: *ToolEntry, params: types.CallToolRequestParams) RequestContext.Error!void {
     const store = &self.task_store.?;
+    const tag = try principalTag(ctx);
     const task = store.create(params.name, ctx.params orelse .null, ctx.kind) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.TooManyTasks => return ctx.setError(errors.internalError("Too many tasks")),
         error.EntropyUnavailable => return ctx.setError(errors.internalError("No entropy for the task id")),
     };
     _ = entry;
+    // The task runs without the transport data: it keeps the principal for sealed state.
+    task.principal_tag = try task.arena().dupe(u8, tag);
     // The task is in the store: a `tasks/get` resolves from now on.
     task.future = ctx.io.concurrent(runTask, .{ self, ctx.io, task }) catch null;
     if (task.future == null) runTask(self, ctx.io, task);

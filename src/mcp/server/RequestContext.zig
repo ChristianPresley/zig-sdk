@@ -36,7 +36,7 @@ responder: Transport.Responder,
 kind: Transport.Kind,
 /// The `userdata` given at registration of the tool, resource or prompt.
 userdata: ?*anyopaque = null,
-/// Transport data for the request. The HTTP server stores the authorization principal.
+/// Transport data for the request. The HTTP and gRPC servers store the authorization principal.
 transport_context: ?*anyopaque = null,
 /// Set while a handler runs inside a task of the Tasks extension.
 task: ?*tasks.Task = null,
@@ -58,7 +58,7 @@ pub fn inTask(self: *const RequestContext) bool {
 /// The authorization principal of the request, when the transport checked a bearer token.
 pub fn principal(self: *const RequestContext) ?*const Principal {
     const p = self.transport_context orelse return null;
-    if (self.kind != .streamable_http) return null;
+    if (self.kind != .streamable_http and self.kind != .grpc) return null;
     return @ptrCast(@alignCast(p));
 }
 
