@@ -10,10 +10,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Unit tests. `-Dfuzz` replaces the test runner for `zig build test -Dfuzz --fuzz`.
-    const fuzz = b.option(bool, "fuzz", "Use a test runner whose fuzz path compiles on Zig 0.16.0 (for --fuzz)") orelse false;
+    // Unit tests. `-Dfuzz` prepares them for `zig build test -Dfuzz --fuzz` on Zig 0.16.0: a test
+    // runner whose fuzz path compiles, and the LLVM backend, because the self-hosted backend of
+    // Debug builds emits no `__sancov_pcs1` table and the fuzzer then sees no coverage.
+    const fuzz = b.option(bool, "fuzz", "Prepare the unit tests for --fuzz on Zig 0.16.0") orelse false;
     const test_runner: ?std.Build.Step.Compile.TestRunner = if (fuzz) fuzzTestRunner(b) else null;
-    const mod_tests = b.addTest(.{ .root_module = mcp, .test_runner = test_runner });
+    const use_llvm: ?bool = if (fuzz) true else null;
+    const mod_tests = b.addTest(.{ .root_module = mcp, .test_runner = test_runner, .use_llvm = use_llvm });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
@@ -25,7 +28,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "mcp", .module = mcp }},
     });
-    const grpc_tests = b.addTest(.{ .root_module = mcp_grpc, .test_runner = test_runner });
+    const grpc_tests = b.addTest(.{ .root_module = mcp_grpc, .test_runner = test_runner, .use_llvm = use_llvm });
     test_step.dependOn(&b.addRunArtifact(grpc_tests).step);
 
     // The tests of the documentation tools.

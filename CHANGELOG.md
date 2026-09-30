@@ -47,7 +47,7 @@ All notable changes to this project are recorded in this file. The format follow
 
 ### Fixed
 
-- `zig build test --fuzz` did not compile on Zig 0.16.0, because the fuzz path of the test runner of the toolchain gives a `builtin.StackTrace` to `std.debug.writeStackTrace`. The option `-Dfuzz` makes a copy of the runner with `std.debug.writeErrorReturnTrace` in that call, and the nightly `fuzz` job uses it.
+- `zig build test --fuzz` did not compile on Zig 0.16.0, because the fuzz path of the test runner of the toolchain gives a `builtin.StackTrace` to `std.debug.writeStackTrace`. The option `-Dfuzz` makes a copy of the runner with `std.debug.writeErrorReturnTrace` in that call. It also builds the tests with the LLVM backend, because the self-hosted backend of Debug builds emits no coverage table for the fuzzer. The nightly `fuzz` job uses the option.
 - The HPACK decoder read freed memory when a literal with incremental indexing had the name of a dynamic entry that the new entry evicts. RFC 7541 section 4.4 permits this case. The decoder now copies the name before the eviction. The fuzz job found this defect.
 - The TLS parsers of the CertificateRequest and Certificate messages had an integer overflow for a context length of 253 to 255 or a certificate length near 16 MiB. In Debug and ReleaseSafe a peer could stop the process. The parsers now give `decode_error`. The fuzz job found this defect.
 - The stdio line framer drops all of a line that is longer than the limit. Before, the rest of the line arrived as a separate frame.
