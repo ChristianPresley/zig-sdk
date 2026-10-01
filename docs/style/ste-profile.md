@@ -31,7 +31,7 @@ lint-docs [--format text|github|json] [--strict] [--string-literals]
 | `--dictionary DIR` | The directory of the word lists. The default is `docs/dictionary`. |
 | `--rule ID=off` | Disable a rule, or change its severity with `warn` or `error`. Use it only on your computer. CI does not disable rules. |
 
-Without a path and without `--wiki-dir`, the linter checks the Markdown files of the repository and `docs/`. It also checks the Zig files in `src/`, `tools/`, `conformance/`, `examples/` and `bench/`.
+Without a path and without `--wiki-dir`, the linter checks `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `VERSIONING.md`, the pull request template and the Markdown files in `docs/`. It also checks the Zig files in `src/`, `tools/`, `conformance/`, `examples/` and `bench/`.
 
 To check the wiki, run `zig build lint-docs -- --strict --wiki-dir ../zig-sdk.wiki`.
 
@@ -39,7 +39,7 @@ To check the wiki, run `zig build lint-docs -- --strict --wiki-dir ../zig-sdk.wi
 
 | Rule | What the linter checks |
 | --- | --- |
-| STE-1.1 | Only approved words. `project_word_list.txt` names the words that we do not use, with the replacement. |
+| STE-1.1 | Only approved words. The linter finds the words of `project_word_list.txt`. This file names the words that we do not use, with the replacement. |
 | STE-4.2 | No contractions. |
 | STE-5.1 | A procedural sentence has 20 words or less. |
 | STE-6.3 | A descriptive sentence has 25 words or less. |
@@ -125,4 +125,17 @@ The files in `docs/dictionary/` are the project dictionary:
 | `participles.txt` | Past participles that tell a state (STE-3.6). |
 | `ing_allowlist.txt` | Approved words that end in "-ing" (STE-3.5). |
 
-`zig build gen-dictionary` writes the lists as one page to `docs/generated/dictionary.md`. The wiki page Dictionary is a copy of this page.
+`zig build gen-dictionary` writes the lists as one page to `docs/generated/dictionary.md`. The Dictionary page of the wiki is a copy of that page.
+
+## Page template
+
+Every wiki page has this shape:
+
+1. A level-one title.
+2. An HTML comment with the mode (`descriptive` or `procedural`), the review date and the versions it applies to.
+3. A summary of six sentences or less.
+4. An **Applies to** line.
+5. Sections. A citation is a superscript number that links to the References section.
+6. A References section. Each item has an anchor and links to a key of the Bibliography page of the wiki.
+
+The linter checks the marker, the **Applies to** line, the citations and the references (PRJ-8). A page with a name that starts with `_`, for example the sidebar `_Sidebar.md` and the footer `_Footer.md`, does not have the template.
