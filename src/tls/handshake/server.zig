@@ -48,6 +48,9 @@ pub const Config = struct {
     client_auth: ClientAuth = .none,
     /// How the server verifies a client certificate. Required when `client_auth` is not `none`.
     client_trust: ?verify.Trust = null,
+    /// The padding of the encrypted records that the server sends (RFC 8446 section 5.4).
+    /// It starts with EncryptedExtensions.
+    padding: Connection.Padding = .none,
 };
 
 pub const AcceptOptions = struct {
@@ -76,6 +79,7 @@ pub const Server = struct {
     pub fn accept(self: *const Server, input: *Reader, output: *Writer, options: AcceptOptions) AcceptError!Connection {
         var c: Connection = .init(input, output, .server, options.read_buffer, options.write_buffer, options.allow_truncation_attacks);
         errdefer c.deinit();
+        try c.setPadding(options.io, self.config.padding);
         var hs_buf: [codec.max_message_len + 4]u8 = undefined;
         var reader: common.MessageReader = .init(&hs_buf);
         const first = try reader.next(&c, options.alert);

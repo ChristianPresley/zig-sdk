@@ -11,6 +11,8 @@ const Echo = struct {
     alpn: ?[]const u8 = null,
     /// Run the handshake only, then wait for the client to close.
     handshake_only: bool = false,
+    /// After the handshake, send this text and close.
+    greeting: ?[]const u8 = null,
     /// The group the server negotiated.
     group: u16 = 0,
     result: anyerror!void = {},
@@ -38,6 +40,12 @@ const Echo = struct {
         });
         defer conn.deinit();
         self.group = conn.group;
+        if (self.greeting) |text| {
+            try conn.writer.writeAll(text);
+            try conn.writer.flush();
+            try conn.end();
+            return;
+        }
         if (self.handshake_only) {
             _ = conn.reader.discardRemaining() catch {};
             conn.end() catch {};
@@ -208,6 +216,21 @@ test "AEGIS is off by default and on with the option" {
     try std.testing.expectEqualStrings(@tagName(tls.suites.default_suites_with_aegis[0]), with_aegis);
 }
 
+test "the std client removes the padding of the SDK server" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer chain.deinit();
+    const chains = [_]*const tls.CertChain{&chain};
+    // The padding covers the encrypted handshake messages and the application data.
+    // The std client refuses an encrypted handshake record with 2^14 + 1 bytes of inner
+    // plaintext. Padding stops at 2^14 bytes, so the largest block size works too.
+    for ([_]tls.Padding{ .{ .block = 512 }, .{ .block = 4096 }, .{ .block = tls.Connection.max_inner_plaintext_len }, .{ .random = 1024 }, .{ .random = 65535 } }) |policy| {
+        _ = try stdClientEcho(io, .{ .chains = &chains, .padding = policy }, "padded");
+        _ = try stdClientEcho(io, .{ .chains = &chains, .padding = policy, .cipher_suites = &.{.AEGIS_256_SHA512} }, "padded aegis");
+    }
+}
+
 test "a TLS 1.2 client hello is refused with protocol_version" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -271,12 +294,19 @@ fn opensslVersion(io: Io, gpa: std.mem.Allocator) ?[2]u32 {
 /// Run `openssl s_client` with `extra` arguments against the SDK server and return its
 /// output. The server result and group are in `echo`.
 fn opensslClient(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, groups: []const tls.key_share.Group, extra: []const []const u8, echo: *Echo) ![]u8 {
+    return opensslClientPadded(gpa, io, chain, groups, extra, echo, .none, null);
+}
+
+/// Like `opensslClient`, with record padding on the server. With a `greeting`, the server sends
+/// it after the handshake and closes.
+fn opensslClientPadded(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, groups: []const tls.key_share.Group, extra: []const []const u8, echo: *Echo, padding: tls.Padding, greeting: ?[]const u8) ![]u8 {
     const chains = [_]*const tls.CertChain{chain};
     echo.* = .{
-        .server = try tls.Server.init(.{ .chains = &chains, .groups = groups }),
+        .server = try tls.Server.init(.{ .chains = &chains, .groups = groups, .padding = padding }),
         .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
         .io = io,
         .handshake_only = true,
+        .greeting = greeting,
     };
     defer echo.listener.deinit(io);
     const port = echo.listener.socket.address.getPort();
@@ -361,5 +391,22 @@ test "interop: openssl s_client with RSA-PSS and X25519MLKEM768" {
         defer gpa.free(out);
         try echo.result;
         try std.testing.expectEqual(tls.key_share.Group.x25519_mlkem768.wire(), echo.group);
+    }
+}
+
+test "interop: openssl s_client removes the padding of the SDK server" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (opensslVersion(io, gpa) == null) return error.SkipZigTest;
+    var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer chain.deinit();
+    var echo: Echo = undefined;
+    // The padding covers the encrypted handshake messages, the greeting and close_notify.
+    for ([_]tls.Padding{ .{ .block = 4096 }, .{ .block = tls.Connection.max_inner_plaintext_len }, .{ .random = 1024 } }) |policy| {
+        const out = try opensslClientPadded(gpa, io, &chain, tls.key_share.default_groups, &.{ "-CAfile", "test/fixtures/tls/pem/p256.crt", "-verify_return_error", "-ign_eof" }, &echo, policy, "padded greeting\n");
+        defer gpa.free(out);
+        try echo.result;
+        try expectContains(out, "Verify return code: 0 (ok)");
+        try expectContains(out, "padded greeting");
     }
 }

@@ -11,6 +11,8 @@ pub const PrivateKey = @import("PrivateKey.zig");
 pub const rsa = @import("rsa.zig");
 pub const CertChain = @import("CertChain.zig");
 pub const Connection = @import("Connection.zig");
+/// The record padding policy of the client and the server (RFC 8446 section 5.4).
+pub const Padding = Connection.Padding;
 pub const key_share = @import("handshake/key_share.zig");
 pub const codec = @import("handshake/codec.zig");
 pub const server = @import("handshake/server.zig");

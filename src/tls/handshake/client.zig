@@ -41,6 +41,9 @@ pub const Options = struct {
     /// The certificate chain to present when the server asks for one. Without it the
     /// client answers a request with an empty certificate list.
     identity: ?*const CertChain = null,
+    /// The padding of the encrypted records that the client sends (RFC 8446 section 5.4).
+    /// It starts with the first encrypted handshake record.
+    padding: Connection.Padding = .none,
     /// Plaintext buffer for the application. At least `Connection.min_read_buffer_len`.
     read_buffer: []u8,
     /// Plaintext buffer for the application.
@@ -102,6 +105,7 @@ pub fn connect(input: *Reader, output: *Writer, options: Options) ConnectError!C
     if (options.cipher_suites.len == 0 or options.groups.len == 0) return error.TlsInternalError;
     var c: Connection = .init(input, output, .client, options.read_buffer, options.write_buffer, options.allow_truncation_attacks);
     errdefer c.deinit();
+    try c.setPadding(options.io, options.padding);
     var hs_buf: [max_handshake_bytes]u8 = undefined;
     var reader: common.MessageReader = .init(&hs_buf);
 

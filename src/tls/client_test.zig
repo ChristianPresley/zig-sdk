@@ -15,6 +15,8 @@ const Echo = struct {
     group: u16 = 0,
     /// The suite the server negotiated.
     suite: ?tls.Suite = null,
+    /// The padding policy of the server connection.
+    padding: tls.Padding = .none,
     /// Echo a second line after a key update in each direction.
     key_update: bool = false,
     result: anyerror!void = {},
@@ -46,6 +48,7 @@ const Echo = struct {
         defer conn.deinit();
         self.group = conn.group;
         self.suite = conn.suite;
+        self.padding = conn.padding;
         if (conn.alpn()) |a| {
             @memcpy(self.alpn_buf[0..a.len], a);
             self.alpn_len = @intCast(a.len);
@@ -105,12 +108,14 @@ const ClientSetup = struct {
     expect_suite: ?tls.Suite = null,
     /// Send a second line after a key update. The server answers with a key update too.
     key_update: bool = false,
+    padding: tls.Padding = .none,
 };
 
 const ServerSetup = struct {
     alpn: []const []const u8 = &.{},
     groups: []const tls.key_share.Group = tls.key_share.default_groups,
     cipher_suites: []const tls.Suite = tls.suites.default_suites,
+    padding: tls.Padding = .none,
     client_auth: tls.server.ClientAuth = .none,
     client_trust: ?tls.Trust = null,
 };
@@ -125,6 +130,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
             .alpn = server_setup.alpn,
             .groups = server_setup.groups,
             .cipher_suites = server_setup.cipher_suites,
+            .padding = server_setup.padding,
             .client_auth = server_setup.client_auth,
             .client_trust = server_setup.client_trust,
         }),
@@ -154,6 +160,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
         .alpn = client_setup.alpn,
         .groups = client_setup.groups,
         .cipher_suites = client_setup.cipher_suites,
+        .padding = client_setup.padding,
         .identity = client_setup.identity,
         .read_buffer = &read_buf,
         .write_buffer = &write_buf,
@@ -184,6 +191,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
     }
     if (client_setup.expect_group) |g| try std.testing.expectEqual(g.wire(), conn.group);
     if (client_setup.expect_suite) |s| try std.testing.expectEqual(s, conn.suite.?);
+    try std.testing.expectEqual(client_setup.padding, conn.padding);
     if (expect_alpn) |want| {
         try std.testing.expectEqualStrings(want, conn.alpn() orelse "");
     } else {
@@ -195,6 +203,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
     try echo_out.result;
     if (client_setup.expect_group) |g| try std.testing.expectEqual(g.wire(), echo_out.group);
     if (client_setup.expect_suite) |s| try std.testing.expectEqual(s, echo_out.suite.?);
+    try std.testing.expectEqual(server_setup.padding, echo_out.padding);
 }
 
 test "handshake with every self-signed key type" {
@@ -381,6 +390,44 @@ test "AEGIS is off by default in the client and the server" {
     try std.testing.expectError(error.TlsHandshakeFailure, echo.result);
 }
 
+test "record padding in both directions between the SDK client and server" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer chain.deinit();
+    var echo: Echo = undefined;
+    const policies = [_]tls.Padding{ .none, .{ .block = 256 }, .{ .block = tls.Connection.max_inner_plaintext_len }, .{ .random = 1024 } };
+    for (policies) |policy| {
+        // The same policy on both sides, with a key update in each direction.
+        try roundTrip(io, &chain, .{ .padding = policy }, .{ .trust = .self_signed, .padding = policy, .key_update = true }, &echo, null);
+        // A different policy on each side.
+        try roundTrip(io, &chain, .{ .padding = policy }, .{ .trust = .self_signed, .padding = .{ .random = 64 } }, &echo, null);
+        try roundTrip(io, &chain, .{}, .{ .trust = .self_signed, .padding = policy }, &echo, null);
+    }
+    // Padding on the client certificate flight, after a HelloRetryRequest, with AEGIS-256.
+    var identity = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
+    defer identity.deinit();
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
+    try roundTrip(io, &chain, .{
+        .padding = .{ .block = 512 },
+        .cipher_suites = &.{.AEGIS_256_SHA512},
+        .groups = &.{.secp384r1},
+        .client_auth = .required,
+        .client_trust = .{ .ca_set = &set },
+    }, .{
+        .trust = .self_signed,
+        .identity = &identity,
+        .padding = .{ .random = 255 },
+        .cipher_suites = tls.suites.default_suites_with_aegis,
+        .groups = &.{ .x25519, .secp384r1 },
+        .expect_suite = .AEGIS_256_SHA512,
+        .expect_group = .secp384r1,
+        .key_update = true,
+    }, &echo, null);
+}
+
 /// True when OpenSSL runs on this machine. The tests skip LibreSSL: its `s_server` has no `-rev`.
 fn haveOpenssl(io: Io, gpa: std.mem.Allocator) bool {
     return opensslVersion(io, gpa) != null;
@@ -413,7 +460,7 @@ test "interop: the SDK client talks to openssl s_server" {
     var set: tls.CaSet = .init(gpa);
     defer set.deinit();
     try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
-    try opensslServerRoundTrip(io, &.{ "-cert", "test/fixtures/tls/pem/chain.crt", "-key", "test/fixtures/tls/pem/chain-leaf.key" }, .{ .ca_set = &set }, tls.key_share.default_groups, null);
+    try opensslServerRoundTrip(io, &.{ "-cert", "test/fixtures/tls/pem/chain.crt", "-key", "test/fixtures/tls/pem/chain-leaf.key" }, .{ .ca_set = &set }, tls.key_share.default_groups, null, .none);
 }
 
 test "interop: the SDK client and openssl s_server with RSA and X25519MLKEM768" {
@@ -422,17 +469,28 @@ test "interop: the SDK client and openssl s_server with RSA and X25519MLKEM768" 
     if (!opensslHasMlkem(io, gpa)) return error.SkipZigTest;
     const rsa_cert = [_][]const u8{ "-cert", "test/fixtures/tls/pem/rsa3072.crt", "-key", "test/fixtures/tls/pem/rsa3072.key" };
     // The hybrid group in the first flight.
-    try opensslServerRoundTrip(io, &(rsa_cert ++ [_][]const u8{ "-groups", "X25519MLKEM768" }), .self_signed, tls.key_share.default_groups, .x25519_mlkem768);
+    try opensslServerRoundTrip(io, &(rsa_cert ++ [_][]const u8{ "-groups", "X25519MLKEM768" }), .self_signed, tls.key_share.default_groups, .x25519_mlkem768, .none);
     // A HelloRetryRequest from X25519 to the hybrid group.
-    try opensslServerRoundTrip(io, &(rsa_cert ++ [_][]const u8{ "-groups", "X25519MLKEM768" }), .self_signed, &.{ .x25519, .x25519_mlkem768 }, .x25519_mlkem768);
+    try opensslServerRoundTrip(io, &(rsa_cert ++ [_][]const u8{ "-groups", "X25519MLKEM768" }), .self_signed, &.{ .x25519, .x25519_mlkem768 }, .x25519_mlkem768, .none);
     // Each RSA-PSS hash.
     for ([_][]const u8{ "rsa_pss_rsae_sha384", "rsa_pss_rsae_sha512" }) |sigalg| {
-        try opensslServerRoundTrip(io, &(rsa_cert ++ [_][]const u8{ "-sigalgs", sigalg }), .self_signed, tls.key_share.default_groups, null);
+        try opensslServerRoundTrip(io, &(rsa_cert ++ [_][]const u8{ "-sigalgs", sigalg }), .self_signed, tls.key_share.default_groups, null, .none);
+    }
+}
+
+test "interop: openssl s_server removes the padding of the SDK client" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!haveOpenssl(io, gpa)) return error.SkipZigTest;
+    const cert = [_][]const u8{ "-cert", "test/fixtures/tls/pem/p256.crt", "-key", "test/fixtures/tls/pem/p256.key" };
+    // The padding covers the Finished message of the client and its application data.
+    for ([_]tls.Padding{ .{ .block = 4096 }, .{ .block = tls.Connection.max_inner_plaintext_len }, .{ .random = 1024 } }) |policy| {
+        try opensslServerRoundTrip(io, &cert, .self_signed, tls.key_share.default_groups, null, policy);
     }
 }
 
 /// Run `openssl s_server` with `extra` arguments, connect the SDK client and check an echo.
-fn opensslServerRoundTrip(io: Io, extra: []const []const u8, trust: tls.Trust, groups: []const tls.key_share.Group, expect_group: ?tls.key_share.Group) !void {
+fn opensslServerRoundTrip(io: Io, extra: []const []const u8, trust: tls.Trust, groups: []const tls.key_share.Group, expect_group: ?tls.key_share.Group, padding: tls.Padding) !void {
     // Pick a free port by binding and releasing it.
     const port = blk: {
         var probe = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{});
@@ -481,6 +539,7 @@ fn opensslServerRoundTrip(io: Io, extra: []const []const u8, trust: tls.Trust, g
         .trust = trust,
         .alpn = &.{"http/1.1"},
         .groups = groups,
+        .padding = padding,
         .read_buffer = &read_buf,
         .write_buffer = &write_buf,
         .allow_truncation_attacks = true,

@@ -48,12 +48,38 @@ plaintext_ccs_seen: u8 = 0,
 /// Decrypted application data that did not fit into the `reader` buffer. It points into the
 /// buffer of `input`. The connection reads no record from `input` while this data remains.
 pending: []u8 = &.{},
+/// The padding of the encrypted records that this connection sends. Use `setPadding`.
+padding: Padding = .none,
+/// The random source of the `random` padding policy.
+padding_rng: std.Random.ChaCha = .{ .state = @splat(0), .offset = 0 },
 
 pub const Role = enum { server, client };
+
+/// How the record layer pads the encrypted records that it sends (RFC 8446 section 5.4).
+/// Padding adds zero bytes after the content type of the inner plaintext. It hides the length
+/// of the content from an observer of the network, and costs bandwidth. The padding of all
+/// encrypted records is the same: application data, handshake messages, key updates and
+/// alerts. Padding stops at `max_padded_inner_len` bytes of inner plaintext.
+pub const Padding = union(enum) {
+    /// No padding. This is the default.
+    none,
+    /// Pad each inner plaintext to a multiple of this number of bytes. The inner plaintext
+    /// is the content, the content type byte and the padding. The values 0 and 1 add no
+    /// padding.
+    block: u16,
+    /// Add a random number of zero bytes to each record, from 0 to this number.
+    random: u16,
+};
 
 /// The largest inner plaintext of an encrypted record: 2^14 bytes of content and the content
 /// type byte (RFC 8446 section 5.4). Padding does not change this limit.
 pub const max_inner_plaintext_len = tls.max_ciphertext_inner_record_len + 1;
+
+/// Padding stops at an inner plaintext of 2^14 bytes, 1 byte below the limit. Only a record
+/// with 2^14 bytes of content gets to the limit, and it has no padding. Some peers keep a
+/// handshake record in a buffer of 2^14 bytes, such as the TLS client of the Zig standard
+/// library. They accept every padded record.
+pub const max_padded_inner_len = tls.max_ciphertext_inner_record_len;
 
 pub const min_input_buffer_len = tls.max_ciphertext_record_len;
 pub const min_output_buffer_len = tls.max_ciphertext_record_len;
@@ -125,6 +151,32 @@ pub fn setServerName(self: *Connection, name: []const u8) void {
 pub fn deinit(self: *Connection) void {
     self.read_keys.wipe();
     self.write_keys.wipe();
+    crypto.secureZero(u8, &self.padding_rng.state);
+}
+
+/// Set the padding of the encrypted records that this connection sends from now on. The
+/// `random` policy gets its seed from the secure random source of `io`.
+pub fn setPadding(self: *Connection, io: std.Io, padding: Padding) error{EntropyUnavailable}!void {
+    if (padding == .random) {
+        var seed: [std.Random.ChaCha.secret_seed_length]u8 = undefined;
+        defer crypto.secureZero(u8, &seed);
+        io.randomSecure(&seed) catch return error.EntropyUnavailable;
+        self.padding_rng = .init(seed);
+    }
+    self.padding = padding;
+}
+
+/// The number of zero bytes to add to an inner plaintext of `inner_len` bytes. The padded
+/// inner plaintext stays at `max_padded_inner_len` bytes or less.
+fn paddingLength(self: *Connection, inner_len: usize) usize {
+    std.debug.assert(inner_len <= max_inner_plaintext_len);
+    const room = max_padded_inner_len -| inner_len;
+    const wanted: usize = switch (self.padding) {
+        .none => 0,
+        .block => |size| if (size <= 1) 0 else (size - inner_len % size) % size,
+        .random => |most| self.padding_rng.random().uintAtMost(u16, most),
+    };
+    return @min(wanted, room);
 }
 
 pub fn eof(self: *const Connection) bool {
@@ -362,14 +414,25 @@ fn encryptInto(c: *Connection, out: []u8, bytes: []const u8, content_type: tls.C
         inline else => |*keys| {
             const S = @TypeOf(keys.*).Suite;
             const overhead = tls.record_header_len + S.AEAD.tag_length + 1;
-            var cleartext: [tls.max_ciphertext_inner_record_len + 1]u8 = undefined;
+            var cleartext: [max_inner_plaintext_len]u8 = undefined;
             while (true) {
-                const n: usize = @min(bytes.len - consumed, tls.max_ciphertext_inner_record_len, out.len -| (overhead + written));
+                // The content bytes that fit into `out` without padding.
+                const space = out.len -| (overhead + written);
+                const n: usize = @min(bytes.len - consumed, tls.max_ciphertext_inner_record_len, space);
                 if (n == 0) return .{ .written = written, .consumed = consumed };
+                var pad = c.paddingLength(n + 1);
+                if (n + pad > space) {
+                    // The padded record does not fit after the records before it. The caller
+                    // gives a new buffer. An empty buffer of `min_output_buffer_len` bytes
+                    // holds the largest record.
+                    if (written > 0) return .{ .written = written, .consumed = consumed };
+                    pad = space - n;
+                }
                 @memcpy(cleartext[0..n], bytes[consumed..][0..n]);
                 cleartext[n] = @intFromEnum(content_type);
+                @memset(cleartext[n + 1 ..][0..pad], 0);
                 consumed += n;
-                const inner_len = n + 1;
+                const inner_len = n + 1 + pad;
                 const header = out[written..][0..tls.record_header_len];
                 header[0] = @intFromEnum(tls.ContentType.application_data);
                 std.mem.writeInt(u16, header[1..3], @intFromEnum(tls.ProtocolVersion.tls_1_2), .big);
@@ -674,4 +737,157 @@ test "the receive path removes padding and refuses bad inner plaintexts" {
             try std.testing.expectError(want_err, p.readRecord());
         }
     }
+}
+
+test "padding lengths of each policy" {
+    var unused_in: Reader = .fixed("");
+    var unused_out: Writer = .failing;
+    var read_buf: [min_read_buffer_len]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+    var c: Connection = .init(&unused_in, &unused_out, .client, &read_buf, &write_buf, false);
+    defer c.deinit();
+    try std.testing.expectEqual(0, c.paddingLength(15));
+    for ([_]u16{ 0, 1 }) |size| {
+        c.padding = .{ .block = size };
+        try std.testing.expectEqual(0, c.paddingLength(15));
+    }
+    c.padding = .{ .block = 64 };
+    try std.testing.expectEqual(49, c.paddingLength(15));
+    try std.testing.expectEqual(0, c.paddingLength(64));
+    try std.testing.expectEqual(63, c.paddingLength(65));
+    try std.testing.expectEqual(4, c.paddingLength(16380));
+    // A full record has no room for padding.
+    try std.testing.expectEqual(0, c.paddingLength(max_inner_plaintext_len));
+    // The limit cuts the padding short.
+    c.padding = .{ .block = 1000 };
+    try std.testing.expectEqual(max_padded_inner_len - 16001, c.paddingLength(16001));
+    c.padding = .{ .block = max_inner_plaintext_len };
+    try std.testing.expectEqual(max_padded_inner_len - 15, c.paddingLength(15));
+    try std.testing.expectEqual(0, c.paddingLength(max_padded_inner_len));
+    try c.setPadding(std.testing.io, .{ .random = 0 });
+    try std.testing.expectEqual(0, c.paddingLength(15));
+    try c.setPadding(std.testing.io, .{ .random = 10 });
+    var seen: [11]bool = @splat(false);
+    for (0..2000) |_| {
+        const n = c.paddingLength(15);
+        try std.testing.expect(n <= 10);
+        seen[n] = true;
+    }
+    for (seen) |s| try std.testing.expect(s);
+    try std.testing.expectEqual(0, c.paddingLength(max_inner_plaintext_len));
+}
+
+test "padded records decrypt to their content and stay in the size limit" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const policies = [_]Padding{
+        .{ .block = 64 },
+        .{ .block = 4096 },
+        .{ .block = max_inner_plaintext_len },
+        .{ .block = 65535 },
+        .{ .random = 300 },
+        .{ .random = 65535 },
+    };
+    const message = try gpa.alloc(u8, 40000);
+    defer gpa.free(message);
+    // Zero bytes in the content stay: only the bytes after the content type are padding.
+    for (message, 0..) |*b, i| b.* = @truncate(i % 251);
+    inline for (.{ suites.Suite.AES_128_GCM_SHA256, suites.Suite.AEGIS_128L_SHA256, suites.Suite.AEGIS_256_SHA512 }) |suite| {
+        const S = suites.Suite.Type(suite);
+        const secret = [_]u8{4} ** S.digest_length;
+        for (policies) |policy| {
+            var unused_in: Reader = .fixed("");
+            var sink: Writer.Allocating = .init(gpa);
+            defer sink.deinit();
+            var read_buf: [min_read_buffer_len]u8 = undefined;
+            var write_buf: [1024]u8 = undefined;
+            var c: Connection = .init(&unused_in, &sink.writer, .server, &read_buf, &write_buf, false);
+            defer c.deinit();
+            c.write_keys = suites.DirectionKeys.init(suite, secret);
+            c.handshake_complete = true;
+            try c.setPadding(io, policy);
+            try c.writer.writeAll("hello over tls");
+            try c.writer.flush();
+            try c.writer.writeAll(message);
+            try c.writer.flush();
+            try c.end();
+
+            // Read the records one at a time and check the padding of each.
+            var peer_in: Reader = .fixed(sink.written());
+            var peer_sink: Writer.Allocating = .init(gpa);
+            defer peer_sink.deinit();
+            var peer_read: [min_read_buffer_len]u8 = undefined;
+            var peer_write: [64]u8 = undefined;
+            var p: Connection = .init(&peer_in, &peer_sink.writer, .client, &peer_read, &peer_write, false);
+            defer p.deinit();
+            p.read_keys = suites.DirectionKeys.init(suite, secret);
+            p.handshake_complete = true;
+            var got: std.ArrayList(u8) = .empty;
+            defer got.deinit(gpa);
+            var total_padding: usize = 0;
+            while (true) {
+                const header = peer_in.buffered()[0..tls.record_header_len];
+                const record_len = std.mem.readInt(u16, header[3..5], .big);
+                try std.testing.expect(record_len <= tls.max_ciphertext_len);
+                const inner_len = record_len - S.AEAD.tag_length;
+                try std.testing.expect(inner_len <= max_inner_plaintext_len);
+                const rec = try p.readRecord();
+                const padding = inner_len - rec.data.len - 1;
+                total_padding += padding;
+                if (padding > 0) try std.testing.expect(inner_len <= max_padded_inner_len);
+                switch (policy) {
+                    .none => unreachable,
+                    .block => |size| try std.testing.expect(inner_len % size == 0 or inner_len >= max_padded_inner_len),
+                    .random => |most| try std.testing.expect(padding <= most),
+                }
+                if (rec.content_type == .alert) {
+                    try std.testing.expectEqualSlices(u8, &tls.close_notify_alert, rec.data);
+                    break;
+                }
+                try std.testing.expectEqual(tls.ContentType.application_data, rec.content_type);
+                try got.appendSlice(gpa, rec.data);
+            }
+            try std.testing.expect(total_padding > 0);
+            try std.testing.expectEqual(0, peer_in.buffered().len);
+            try std.testing.expectEqualStrings("hello over tls", got.items[0..14]);
+            try std.testing.expect(std.mem.eql(u8, message, got.items[14..]));
+        }
+    }
+}
+
+test "a padded record that does not fit waits for a new buffer" {
+    const gpa = std.testing.allocator;
+    const S = suites.Suite.Type(.AES_128_GCM_SHA256);
+    const secret = [_]u8{8} ** S.digest_length;
+    var unused_in: Reader = .fixed("");
+    var unused_out: Writer = .failing;
+    var read_buf: [min_read_buffer_len]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+    var c: Connection = .init(&unused_in, &unused_out, .client, &read_buf, &write_buf, false);
+    defer c.deinit();
+    c.write_keys = suites.DirectionKeys.init(.AES_128_GCM_SHA256, secret);
+    c.padding = .{ .block = max_inner_plaintext_len };
+    // A full record has no padding. A short record gets padding up to 2^14 bytes.
+    const full_len = tls.record_header_len + max_inner_plaintext_len + S.AEAD.tag_length;
+    const padded_len = tls.record_header_len + max_padded_inner_len + S.AEAD.tag_length;
+    const bytes = try gpa.alloc(u8, tls.max_ciphertext_inner_record_len + 10);
+    defer gpa.free(bytes);
+    @memset(bytes, 'q');
+    const wire = try gpa.alloc(u8, full_len + padded_len + min_output_buffer_len);
+    defer gpa.free(wire);
+    // The second record fits without padding, but not with it. It waits for the next buffer.
+    const first = c.encryptInto(wire[0 .. full_len + padded_len - 1], bytes, .application_data);
+    try std.testing.expectEqual(full_len, first.written);
+    try std.testing.expectEqual(tls.max_ciphertext_inner_record_len, first.consumed);
+    const second = c.encryptInto(wire[first.written..], bytes[first.consumed..], .application_data);
+    try std.testing.expectEqual(padded_len, second.written);
+    try std.testing.expectEqual(10, second.consumed);
+
+    var peer_in: Reader = .fixed(wire[0 .. first.written + second.written]);
+    var p: Connection = .init(&peer_in, &unused_out, .server, &read_buf, &write_buf, false);
+    defer p.deinit();
+    p.read_keys = suites.DirectionKeys.init(.AES_128_GCM_SHA256, secret);
+    p.handshake_complete = true;
+    try std.testing.expectEqual(tls.max_ciphertext_inner_record_len, (try p.readRecord()).data.len);
+    try std.testing.expectEqualStrings("q" ** 10, (try p.readRecord()).data);
 }
