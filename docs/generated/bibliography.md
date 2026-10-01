@@ -1066,6 +1066,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-30
 - Note: The example of section 3.1 is a test vector of the SDK.
 
+### RFC8252
+
+- Title: OAuth 2.0 for Native Apps
+- Author: W. Denniss, J. Bradley
+- Publisher: IETF / RFC Editor (Best Current Practice)
+- Date: October 2017
+- URL: <https://www.rfc-editor.org/rfc/rfc8252.html>
+- Accessed: 2026-10-01
+- Note: A loopback redirect URI can use any port (section 7.3).
+
 ### RFC8414
 
 - Title: OAuth 2.0 Authorization Server Metadata
@@ -1092,6 +1102,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Date: February 2020
 - URL: <https://www.rfc-editor.org/rfc/rfc8707.html>
 - Accessed: 2026-09-29
+
+### RFC9068
+
+- Title: JSON Web Token (JWT) Profile for OAuth 2.0 Access Tokens
+- Author: V. Bertocci
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: October 2021
+- URL: <https://www.rfc-editor.org/rfc/rfc9068.html>
+- Accessed: 2026-10-01
+- Note: The at+jwt type header and the claims of JWT access tokens.
 
 ### RFC9207
 
