@@ -230,3 +230,59 @@ test "concurrent streams interleave" {
     try group.await(io);
     for (jobs) |job| try job.result;
 }
+
+fn acceptServer(side: *Side, listener: *Io.net.Server, io: Io, gpa: std.mem.Allocator) anyerror!void {
+    const stream = try listener.accept(io);
+    try side.init(io, gpa, stream, .{ .role = .server });
+    try side.start();
+}
+
+/// Send the preface, an empty `SETTINGS` frame and `bytes` from a raw socket to a server
+/// connection. Return the error code of the `GOAWAY` frame that the server sends.
+fn goawayCodeFor(bytes: []const u8) !frame.ErrorCode {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{});
+    defer listener.deinit(io);
+    var server: Side = undefined;
+    var accept_future = try io.concurrent(acceptServer, .{ &server, &listener, io, gpa });
+    const address = Io.net.IpAddress.parse("127.0.0.1", listener.socket.address.getPort()) catch unreachable;
+    const stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var in_buf: [1024]u8 = undefined;
+    var out_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+    var writer = stream.writer(io, &out_buf);
+    const settings: frame.Header = .{ .length = 0, .type = .settings, .flags = 0, .stream_id = 0 };
+    try writer.interface.writeAll(frame.preface);
+    try writer.interface.writeAll(&settings.encode());
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+    try accept_future.await(io);
+    defer server.finish();
+    while (true) {
+        const header = frame.Header.parse(try reader.interface.takeArray(frame.header_len));
+        if (header.type != .goaway) {
+            try reader.interface.discardAll(header.length);
+            continue;
+        }
+        const payload = try reader.interface.takeArray(8);
+        return @enumFromInt(std.mem.readInt(u32, payload[4..8], .big));
+    }
+}
+
+test "a frame larger than the maximum frame size gives GOAWAY with FRAME_SIZE_ERROR" {
+    // The server reads the header and stops. It does not wait for the payload.
+    const oversize: frame.Header = .{ .length = frame.default_max_frame_size + 1, .type = .data, .flags = 0, .stream_id = 1 };
+    try std.testing.expectEqual(frame.ErrorCode.frame_size_error, try goawayCodeFor(&oversize.encode()));
+}
+
+test "a control frame with a wrong length gives GOAWAY with FRAME_SIZE_ERROR" {
+    const ping: frame.Header = .{ .length = 4, .type = .ping, .flags = 0, .stream_id = 0 };
+    try std.testing.expectEqual(frame.ErrorCode.frame_size_error, try goawayCodeFor(&(ping.encode() ++ [_]u8{0} ** 4)));
+}
+
+test "a PING frame on a stream gives GOAWAY with PROTOCOL_ERROR" {
+    const ping: frame.Header = .{ .length = 8, .type = .ping, .flags = 0, .stream_id = 1 };
+    try std.testing.expectEqual(frame.ErrorCode.protocol_error, try goawayCodeFor(&(ping.encode() ++ [_]u8{0} ** 8)));
+}

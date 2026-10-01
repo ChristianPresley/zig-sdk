@@ -44,6 +44,10 @@ pub const Error = error{
     ProtocolError,
 } || Io.Cancelable;
 
+/// The errors of the read task. A frame with a wrong length gives `FrameSizeError`
+/// (RFC 9113 sections 4.2 and 6).
+const ReadError = Error || error{FrameSizeError};
+
 io: Io,
 gpa: Allocator,
 reader: *Io.Reader,
@@ -142,6 +146,7 @@ pub fn run(self: *Connection) void {
         self.readFrame() catch |e| {
             switch (e) {
                 error.ProtocolError => self.sendGoaway(.protocol_error),
+                error.FrameSizeError => self.sendGoaway(.frame_size_error),
                 error.OutOfMemory => self.sendGoaway(.internal_error),
                 else => {},
             }
@@ -221,13 +226,13 @@ pub fn ping(self: *Connection, data: [8]u8) Error!void {
 
 // -- Reading ---------------------------------------------------------------------------------
 
-fn readFrame(self: *Connection) Error!void {
+fn readFrame(self: *Connection) ReadError!void {
     const header_bytes = self.reader.takeArray(frame.header_len) catch |e| switch (e) {
         error.EndOfStream => return error.Closed,
         error.ReadFailed => return error.ReadFailed,
     };
     const header = frame.Header.parse(header_bytes);
-    if (header.length > self.options.max_frame_size) return error.ProtocolError;
+    if (header.length > self.options.max_frame_size) return error.FrameSizeError;
     const payload = self.frame_buf[0..header.length];
     self.reader.readSliceAll(payload) catch |e| switch (e) {
         error.EndOfStream => return error.Closed,
@@ -240,13 +245,15 @@ fn readFrame(self: *Connection) Error!void {
         .headers => try self.onHeaders(header, payload),
         .continuation => try self.onContinuation(header, payload),
         .priority => {
-            if (header.stream_id == 0 or header.length != 5) return error.ProtocolError;
+            if (header.stream_id == 0) return error.ProtocolError;
+            if (header.length != 5) return error.FrameSizeError;
         },
         .rst_stream => try self.onRstStream(header, payload),
         .settings => try self.onSettings(header, payload),
         .push_promise => return error.ProtocolError,
         .ping => {
-            if (header.stream_id != 0 or header.length != 8) return error.ProtocolError;
+            if (header.stream_id != 0) return error.ProtocolError;
+            if (header.length != 8) return error.FrameSizeError;
             if (!header.has(frame.Flags.ack)) try self.writeFrame(.ping, frame.Flags.ack, 0, payload);
         },
         .goaway => try self.onGoaway(header, payload),
@@ -466,8 +473,9 @@ fn validHeaders(headers: []const Header, trailers: bool, role: Role) bool {
     };
 }
 
-fn onRstStream(self: *Connection, header: frame.Header, payload: []const u8) Error!void {
-    if (header.stream_id == 0 or header.length != 4) return error.ProtocolError;
+fn onRstStream(self: *Connection, header: frame.Header, payload: []const u8) ReadError!void {
+    if (header.stream_id == 0) return error.ProtocolError;
+    if (header.length != 4) return error.FrameSizeError;
     const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
     self.lock.lockUncancelable(self.io);
     defer self.lock.unlock(self.io);
@@ -479,13 +487,13 @@ fn onRstStream(self: *Connection, header: frame.Header, payload: []const u8) Err
     }
 }
 
-fn onSettings(self: *Connection, header: frame.Header, payload: []const u8) Error!void {
+fn onSettings(self: *Connection, header: frame.Header, payload: []const u8) ReadError!void {
     if (header.stream_id != 0) return error.ProtocolError;
     if (header.has(frame.Flags.ack)) {
-        if (header.length != 0) return error.ProtocolError;
+        if (header.length != 0) return error.FrameSizeError;
         return;
     }
-    if (header.length % 6 != 0) return error.ProtocolError;
+    if (header.length % 6 != 0) return error.FrameSizeError;
     {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
@@ -525,8 +533,8 @@ fn onGoaway(self: *Connection, header: frame.Header, payload: []const u8) Error!
     self.cond.broadcast(self.io);
 }
 
-fn onWindowUpdate(self: *Connection, header: frame.Header, payload: []const u8) Error!void {
-    if (header.length != 4) return error.ProtocolError;
+fn onWindowUpdate(self: *Connection, header: frame.Header, payload: []const u8) ReadError!void {
+    if (header.length != 4) return error.FrameSizeError;
     const increment = std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff;
     if (increment == 0) {
         if (header.stream_id == 0) return error.ProtocolError;

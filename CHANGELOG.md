@@ -4,6 +4,10 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Fixed
+
+- The HTTP/2 connection of the gRPC transport answers a frame larger than the maximum frame size with `GOAWAY` and `FRAME_SIZE_ERROR` (RFC 9113 section 4.2). Before, it sent `PROTOCOL_ERROR`. A `PING`, `PRIORITY`, `RST_STREAM`, `SETTINGS` or `WINDOW_UPDATE` frame with a wrong length also gives `FRAME_SIZE_ERROR`.
+
 ## [0.2.0] - 2026-09-30
 
 ### Added
