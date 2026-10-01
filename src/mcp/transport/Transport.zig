@@ -123,7 +123,7 @@ pub const Peer = union(enum) {
     /// The connection of the request, on stdio and on a Unix socket. `nextConnectionId`
     /// gives the value.
     connection: u64,
-    /// The IP address of the client, on HTTP and gRPC. The port does not count.
+    /// The IP address of the client, on HTTP, gRPC and WebSocket. The port does not count.
     address: Io.net.IpAddress,
 };
 

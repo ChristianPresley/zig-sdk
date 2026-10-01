@@ -805,6 +805,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-30
 - Note: Origin of an https icon and of each redirect.
 
+### RFC6455
+
+- Title: The WebSocket Protocol
+- Author: I. Fette, A. Melnikov
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: December 2011
+- URL: <https://www.rfc-editor.org/rfc/rfc6455.html>
+- Accessed: 2026-09-30
+- Note: The opening handshake (section 4), the framing and masking (section 5) and the close codes (section 7.4).
+
 ### RFC6570
 
 - Title: URI Template

@@ -156,9 +156,9 @@ pub const Rate = struct {
 ///
 /// The caller of a request is the authorization principal: the issuer, the subject and the
 /// client of the token. A request without a principal has the IP address of the client as its
-/// caller on HTTP and gRPC. The server counts all IPv6 addresses of one /64 network as one
-/// caller. On stdio and on a Unix socket, the caller is the connection. Requests from a
-/// transport without this data share one caller.
+/// caller on HTTP, gRPC and WebSocket. The server counts all IPv6 addresses of one /64
+/// network as one caller. On stdio and on a Unix socket, the caller is the connection.
+/// Requests from a transport without this data share one caller.
 pub const RateLimits = struct {
     /// `tools/call` requests of one caller. `ToolDef.rate_limit` replaces this rate for one
     /// tool. Each round of a multi round-trip call counts. Overflow: `-31429` with

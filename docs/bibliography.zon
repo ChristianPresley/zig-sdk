@@ -968,6 +968,17 @@
         .note = "The client does not use the common name when the certificate has no subject alternative name of the right type (section 6.3).",
     },
     .{
+        .id = "RFC6455",
+        .title = "The WebSocket Protocol",
+        .author = "I. Fette, A. Melnikov",
+        .publisher = "IETF / RFC Editor (Proposed Standard)",
+        .date = "December 2011",
+        .url = "https://www.rfc-editor.org/rfc/rfc6455.html",
+        .accessed = "2026-09-30",
+        .category = "http",
+        .note = "The opening handshake (section 4), the framing and masking (section 5) and the close codes (section 7.4).",
+    },
+    .{
         .id = "RFC7301",
         .title = "TLS Application-Layer Protocol Negotiation Extension (ALPN)",
         .author = "S. Friedl, A. Popov, A. Langley, E. Stephan",
