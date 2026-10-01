@@ -105,14 +105,14 @@ pub fn verifyChain(certs: []const []const u8, trust: Trust, options: ChainOption
             while (true) {
                 if (findAnchor(trust, current.issuer())) |anchor| {
                     pss.verifyCertificate(current, anchor, now_sec) catch |e| return mapVerify(e);
-                    try requireCa(anchor.certificate.buffer[anchor.certificate.index..], index);
+                    try requireCa(anchor.certificate.buffer[anchor.certificate.index..], index, .anchor);
                     return leaf;
                 }
                 index += 1;
                 if (index >= certs.len) return error.TlsCertificateIssuerNotFound;
                 const next = parse(certs[index]) catch return error.TlsCertificateInvalid;
                 pss.verifyCertificate(current, next, now_sec) catch |e| return mapVerify(e);
-                try requireCa(certs[index], index - 1);
+                try requireCa(certs[index], index - 1, .intermediate);
                 try requirePurpose(certs[index], options.purpose);
                 current = next;
             }
@@ -139,14 +139,18 @@ fn findAnchor(trust: Trust, issuer_name: []const u8) ?Certificate.Parsed {
     }
 }
 
+const IssuerRole = enum { intermediate, anchor };
+
 /// An issuer must be a certificate authority. `below` counts the intermediates it signs,
-/// directly or indirectly, for the path length constraint.
-fn requireCa(cert: []const u8, below: usize) Error!void {
+/// directly or indirectly, for the path length constraint. An intermediate must have
+/// basic constraints with `cA` set (RFC 5280 section 6.1.4). An anchor without basic
+/// constraints is good, because old version 1 roots have no extensions.
+fn requireCa(cert: []const u8, below: usize, role: IssuerRole) Error!void {
     const bc = x509.basicConstraints(cert) catch return error.TlsCertificateInvalid;
     if (bc) |constraints| {
         if (!constraints.ca) return error.TlsCertificateNotCa;
         if (constraints.path_len) |limit| if (below > limit) return error.TlsCertificateNotCa;
-    }
+    } else if (role == .intermediate) return error.TlsCertificateNotCa;
     const ku = x509.keyUsage(cert) catch return error.TlsCertificateInvalid;
     if (ku) |usage| if (!usage.key_cert_sign) return error.TlsCertificateNotCa;
 }
@@ -418,4 +422,35 @@ test "the extended key usage of the leaf and the intermediates must permit the p
     try std.testing.expectError(error.TlsCertificateWrongPurpose, serverChain(&.{ eku_leaf, eku_ca }, "localhost", trust, test_now));
     // The self-signed policy checks the leaf as well.
     try std.testing.expectError(error.TlsCertificateWrongPurpose, verifyChain(&.{client_leaf}, .self_signed, .{ .purpose = .server, .now_sec = test_now }));
+}
+
+test "an intermediate needs basic constraints with cA, an anchor can lack them" {
+    const gpa = std.testing.allocator;
+    const ca = try loadDer(gpa, "test/fixtures/tls/pem/ca.crt");
+    defer gpa.free(ca);
+    // no-bc-ca.crt has neither basic constraints nor key usage.
+    const no_bc_ca = try loadDer(gpa, "test/fixtures/tls/pem/no-bc-ca.crt");
+    defer gpa.free(no_bc_ca);
+    const no_bc_leaf = try loadDer(gpa, "test/fixtures/tls/pem/no-bc-leaf.crt");
+    defer gpa.free(no_bc_leaf);
+    var set: CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addDer(ca);
+    try std.testing.expectError(error.TlsCertificateNotCa, serverChain(&.{ no_bc_leaf, no_bc_ca }, "localhost", .{ .ca_set = &set }, test_now));
+
+    // As a trust anchor, the same certificate is good.
+    var anchors: CaSet = .init(gpa);
+    defer anchors.deinit();
+    try anchors.addDer(no_bc_ca);
+    _ = try serverChain(&.{no_bc_leaf}, "localhost", .{ .ca_set = &anchors }, test_now);
+
+    // An anchor with basic constraints and cA not set is not a CA.
+    const leaf = try loadDer(gpa, "test/fixtures/tls/pem/chain-leaf.crt");
+    defer gpa.free(leaf);
+    const bad = try loadDer(gpa, "test/fixtures/tls/pem/bad-chain-leaf.crt");
+    defer gpa.free(bad);
+    var leaf_anchor: CaSet = .init(gpa);
+    defer leaf_anchor.deinit();
+    try leaf_anchor.addDer(leaf);
+    try std.testing.expectError(error.TlsCertificateNotCa, serverChain(&.{bad}, "localhost", .{ .ca_set = &leaf_anchor }, test_now));
 }
