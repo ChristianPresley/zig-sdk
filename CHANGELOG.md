@@ -39,11 +39,16 @@ All notable changes to this project are recorded in this file. The format follow
 - Rate limits for each caller (`limits.rate_limits`): a token bucket for the tool calls of each caller, one for all tool calls together, one for the log messages of each caller, and `ToolDef.rate_limit` for one tool. The caller is the principal, else the IP address (an IPv6 /64 network), else the connection. A refused tool call gets error `-31429` with `data.retryAfterMs`, and on HTTP with a JSON response also status 429 with `Retry-After`. The server drops log messages over the limit and later sends one summary with the count. The limits are off by default. The table of callers has at most `max_callers` entries. `Server.rateLimitStats` gives the counters.
 - The TLS cipher suites `TLS_AEGIS_128L_SHA256` and `TLS_AEGIS_256_SHA512` as an option of the TLS client and server (`tls.suites.default_suites_with_aegis`). They are off by default. `HttpClient.TlsSetup.cipher_suites` selects them for the HTTP client.
 - Record padding in the TLS client and server (RFC 8446 section 5.4): the option `padding` with the policies `none`, `block` and `random`, and `Connection.setPadding`. Padding stops at an inner plaintext of 2^14 bytes. `HttpClient.TlsSetup.padding` sets it for the HTTP client.
+- The certificate_authorities extension (RFC 8446 section 4.2.4) in the TLS client and server. The server sends the names of its `client_trust` anchors in the CertificateRequest (`send_client_ca_names`, on by default) and prefers a chain that leads to a name of the client. The client can send the names of its anchors in the ClientHello (`send_ca_names`, off by default). With `identities`, the client chooses the chain that leads to a name of the server, and `identity_fallback` decides when no chain does.
+- RSA-PSS keys (`id-RSASSA-PSS`, RFC 4055) in the TLS server and client. The key signs only with the `rsa_pss_pss` schemes and respects the hash of its parameters. Chain validation verifies certificates with RSASSA-PSS signatures. `mcp.auth.jwt` gives PS256 for such a key.
+- Name constraints (RFC 5280 section 4.2.1.10) in chain validation for DNS names, IP addresses, directory names, mailboxes and URIs. The constraints of each CA and of the anchor apply to the certificates below it and to the host name. A critical constraint of a form that the SDK cannot check ends the handshake with `bad_certificate`.
+- Revocation checks without network access (`tls.Revocation`): CRLs from the application (`tls.Crl`) and stapled OCSP responses (RFC 6960). The client asks for a staple with `ocsp_stapling = .request` or `.require`, and the server staples the response of the selected chain (`ocsp_staples`). The policy has the scope `leaf` or `chain` and the modes `soft_fail` and `hard_fail` for an unknown status. A revoked certificate always ends the handshake with `certificate_revoked`. The server checks client certificates with `client_revocation`, and `HttpClient.TlsSetup.revocation` sets the policy of the HTTP client.
 
 ### Changed
 
 - `zig build lint-docs` runs in strict mode by default, and the CI and the nightly wiki lint use strict mode.
 - The default TLS group order is X25519MLKEM768, X25519, P-256, P-384.
+- Breaking: `tls.verify.verifyChain` takes `(certs, trust, ChainOptions)`. `ChainOptions` has the purpose of the peer (`server` or `client`), the host, the time, the revocation policy and the staples.
 - `mcp.tls.PrivateKey.publicKeyBytes` takes a larger buffer, and `max_signature_len` is 512 for RSA keys.
 - The TLS client refuses a HelloRetryRequest cookie of more than 8 KiB.
 - `Transport.Kind` has the value `unix_socket`.
@@ -75,6 +80,11 @@ All notable changes to this project are recorded in this file. The format follow
 - The HTTP, Unix socket and gRPC servers connect to their own listener at shutdown. On Windows a cancel did not always wake a blocked accept, and `serve` could wait without end.
 - The Unix socket transport refuses a path that is longer than the `sockaddr_un` of the target, 104 bytes on macOS.
 - The server rejects control characters and bytes that are not ASCII in `Mcp-Param`, `Mcp-Name` and `Mcp-Method` values.
+- The TLS chain validation did not check the extended key usage. A client certificate could authenticate a server, and a server certificate could authenticate a client. The leaf and each intermediate must now permit the purpose, or have no extended key usage. A wrong purpose ends the handshake with `unsupported_certificate`.
+- The TLS chain validation accepted an intermediate without basic constraints when it had no key usage. Each intermediate must now have basic constraints with `cA` set. Version 1 anchors stay valid.
+- The TLS client compared the host name with the common name of a certificate without a subject alternative name. It now uses only the `dNSName` and `iPAddress` entries (RFC 9525), and it refuses partial wildcards.
+- The TLS chain validation tried only the first anchor with the name of the issuer. It now tries each anchor with that name, so a root with a new key works.
+- The TLS ClientHello parser found duplicate extensions only among the first 32 types and duplicate key shares only among the first 16 groups. It now finds each duplicate, refuses bytes after the structure of an extension, and refuses a key share for a group that `supported_groups` does not have. The client refuses the same defects in ServerHello, EncryptedExtensions and CertificateRequest.
 
 ## [0.1.0] - 2026-09-30
 

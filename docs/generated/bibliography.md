@@ -755,6 +755,46 @@ This page lists every source that the wiki, the README and the design documents 
 - URL: <https://www.rfc-editor.org/rfc/rfc3986.html>
 - Accessed: 2026-09-29
 
+### RFC4055
+
+- Title: Additional Algorithms and Identifiers for RSA Cryptography for use in the Internet X.509 Public Key Infrastructure Certificate and Certificate Revocation List (CRL) Profile
+- Author: J. Schaad, B. Kaliski, R. Housley
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: June 2005
+- URL: <https://www.rfc-editor.org/rfc/rfc4055.html>
+- Accessed: 2026-09-30
+- Note: The id-RSASSA-PSS key and signature identifiers and the RSASSA-PSS-params structure (section 3).
+
+### RFC5280
+
+- Title: Internet X.509 Public Key Infrastructure Certificate and Certificate Revocation List (CRL) Profile
+- Author: D. Cooper, S. Santesson, S. Farrell, S. Boeyen, R. Housley, W. Polk
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: May 2008
+- URL: <https://www.rfc-editor.org/rfc/rfc5280.html>
+- Accessed: 2026-09-30
+- Note: Path validation (section 6), basic constraints (4.2.1.9), name constraints (4.2.1.10), extended key usage (4.2.1.12), CRL profile (section 5).
+
+### RFC6066
+
+- Title: Transport Layer Security (TLS) Extensions: Extension Definitions
+- Author: D. Eastlake 3rd
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: January 2011
+- URL: <https://www.rfc-editor.org/rfc/rfc6066.html>
+- Accessed: 2026-09-30
+- Note: The status_request extension (section 8).
+
+### RFC6125
+
+- Title: Representation and Verification of Domain-Based Application Service Identity within Internet Public Key Infrastructure Using X.509 (PKIX) Certificates in the Context of Transport Layer Security (TLS)
+- Author: P. Saint-Andre, J. Hodges
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: March 2011
+- URL: <https://www.rfc-editor.org/rfc/rfc6125.html>
+- Accessed: 2026-09-30
+- Note: Replaced by RFC 9525.
+
 ### RFC6454
 
 - Title: The Web Origin Concept
@@ -774,6 +814,16 @@ This page lists every source that the wiki, the README and the design documents 
 - URL: <https://www.rfc-editor.org/rfc/rfc6570.html>
 - Accessed: 2026-09-29
 - Note: MCP resource templates.
+
+### RFC6960
+
+- Title: X.509 Internet Public Key Infrastructure Online Certificate Status Protocol - OCSP
+- Author: S. Santesson, M. Myers, R. Ankney, A. Malpani, S. Galperin, C. Adams
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: June 2013
+- URL: <https://www.rfc-editor.org/rfc/rfc6960.html>
+- Accessed: 2026-09-30
+- Note: The OCSP response, the responder delegation and the id-pkix-ocsp-nocheck extension.
 
 ### RFC7301
 
@@ -821,6 +871,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Date: June 2022
 - URL: <https://www.rfc-editor.org/rfc/rfc9112.html>
 - Accessed: 2026-09-29
+
+### RFC9525
+
+- Title: Service Identity in TLS
+- Author: P. Saint-Andre, R. Salz
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: November 2023
+- URL: <https://www.rfc-editor.org/rfc/rfc9525.html>
+- Accessed: 2026-09-30
+- Note: The client does not use the common name when the certificate has no subject alternative name of the right type (section 6.3).
 
 ### RFC9562
 
