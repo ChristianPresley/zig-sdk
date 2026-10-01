@@ -10,6 +10,7 @@ const suites = @import("../suites.zig");
 const Suite = suites.Suite;
 const codec = @import("codec.zig");
 const common = @import("common.zig");
+const ca_names = @import("ca_names.zig");
 const PrivateKey = @import("../PrivateKey.zig");
 const key_share = @import("key_share.zig");
 const Connection = @import("../Connection.zig");
@@ -26,10 +27,14 @@ pub const ClientAuth = enum {
 };
 
 pub const Config = struct {
-    /// Certificate chains, at least one. The first one is the default.
+    /// Certificate chains in preference order, at least one. The first one is the default.
     chains: []const *const CertChain,
-    /// Choose a chain for a server name. The default picks the first chain whose leaf
-    /// names the host, else the first chain.
+    /// Choose a chain for a server name. A custom function does not see the names of the
+    /// certificate_authorities extension of the client.
+    ///
+    /// The default rule has three steps. First, it picks the first chain that leads to a name
+    /// of the client. With a server name, the leaf of this chain must also name the host.
+    /// Then it picks the first chain whose leaf names the host. Else it picks the first chain.
     select_chain: ?*const fn (server_name: ?[]const u8, chains: []const *const CertChain) ?*const CertChain = null,
     /// Application protocols in preference order. Empty disables ALPN.
     alpn: []const []const u8 = &.{},
@@ -51,6 +56,12 @@ pub const Config = struct {
     /// The padding of the encrypted records that the server sends (RFC 8446 section 5.4).
     /// It starts with EncryptedExtensions.
     padding: Connection.Padding = .none,
+    /// Send the subject names of the `client_trust` anchors in the certificate_authorities
+    /// extension of the CertificateRequest (RFC 8446 section 4.2.4). A client with more than
+    /// one certificate can then choose a chain that the server trusts. Only the `ca_set` and
+    /// `bundle` policies have anchors. When the names do not fit in
+    /// `ca_names.max_request_list_len` bytes, the server sends no names.
+    send_client_ca_names: bool = true,
 };
 
 pub const AcceptOptions = struct {
@@ -119,8 +130,15 @@ fn selectGroup(config: Config, hello: *const codec.ClientHello) ?GroupChoice {
     return null;
 }
 
-fn selectChain(config: Config, server_name: ?[]const u8) ?*const CertChain {
+fn selectChain(config: Config, server_name: ?[]const u8, authorities: ?[]const u8) ?*const CertChain {
     if (config.select_chain) |f| return f(server_name, config.chains);
+    // With one chain, the names of the client change nothing.
+    if (authorities != null and config.chains.len > 1) {
+        for (config.chains) |chain| {
+            if (server_name) |name| if (!chain.matchesHost(name)) continue;
+            if (ca_names.chainMatches(chain, authorities.?)) return chain;
+        }
+    }
     if (server_name) |name| {
         for (config.chains) |chain| if (chain.matchesHost(name)) return chain;
         if (config.server_name_mismatch == .alert) return null;
@@ -187,7 +205,7 @@ fn run(
 
     // Decisions that depend on the final ClientHello.
     if (hello.server_name) |name| c.setServerName(name);
-    const chain = selectChain(config, c.serverName()) orelse return abort(c, options, .unrecognized_name, error.TlsUnrecognizedName);
+    const chain = selectChain(config, c.serverName(), hello.certificate_authorities) orelse return abort(c, options, .unrecognized_name, error.TlsUnrecognizedName);
     const scheme = for (chain.key.schemes()) |s| {
         if (hello.offersScheme(@intFromEnum(s))) break s;
     } else return abort(c, options, .handshake_failure, error.TlsHandshakeFailure);
@@ -228,7 +246,10 @@ fn run(
     c.writeRecord(.handshake, ee) catch return error.WriteFailed;
     transcript.update(ee);
     if (config.client_auth != .none) {
-        const request = codec.certificateRequest(&msg_buf, &common.signature_schemes);
+        // The names of the trusted authorities can need much more room than `msg_buf`.
+        var request_buf: [ca_names.max_request_message_len]u8 = undefined;
+        const names = if (config.send_client_ca_names) config.client_trust else null;
+        const request = ca_names.certificateRequest(&request_buf, &common.signature_schemes, names);
         c.writeRecord(.handshake, request) catch return error.WriteFailed;
         transcript.update(request);
     }

@@ -417,6 +417,108 @@ test "interop: openssl s_client removes the padding of the SDK server" {
     }
 }
 
+test "a malformed certificate_authorities extension is refused with decode_error" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer chain.deinit();
+    const chains = [_]*const tls.CertChain{&chain};
+    var echo: Echo = .{
+        .server = try tls.Server.init(.{ .chains = &chains }),
+        .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
+        .io = io,
+    };
+    defer echo.listener.deinit(io);
+    const port = echo.listener.socket.address.getPort();
+    var future = try io.concurrent(Echo.serve, .{&echo});
+    defer _ = future.cancel(io);
+    const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    // A ClientHello with an X25519 share and a name list that holds an empty Name.
+    var hello_buf: [256]u8 = undefined;
+    var b: tls.codec.Builder = .{ .buf = &hello_buf };
+    b.bytes(&.{ 0x16, 0x03, 0x01 });
+    const record = b.beginLen(u16);
+    b.byte(0x01);
+    const msg = b.beginLen(u24);
+    b.bytes(&.{ 0x03, 0x03 });
+    b.bytes(&([_]u8{0x11} ** 32));
+    b.bytes(&.{ 0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00 });
+    const exts = b.beginLen(u16);
+    b.bytes(&.{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 });
+    b.bytes(&.{ 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d });
+    b.bytes(&.{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x04, 0x03 });
+    b.bytes(&.{ 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 });
+    b.bytes(&([_]u8{0x09} ** 32));
+    b.bytes(&.{ 0x00, 0x2f, 0x00, 0x06, 0x00, 0x04, 0x00, 0x02, 0x30, 0x00 });
+    b.endLen(u16, exts);
+    b.endLen(u24, msg);
+    b.endLen(u16, record);
+    var out_buf: [512]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    try writer.interface.writeAll(b.slice());
+    try writer.interface.flush();
+    var in_buf: [512]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+    const alert = try reader.interface.takeArray(7);
+    try std.testing.expectEqual(0x15, alert[0]); // alert record
+    try std.testing.expectEqual(2, alert[5]); // fatal
+    try std.testing.expectEqual(@intFromEnum(std.crypto.tls.Alert.Description.decode_error), alert[6]);
+    future.await(io);
+    try std.testing.expectError(error.TlsDecodeError, echo.result);
+}
+
+test "interop: openssl s_client sees the CA names and selects a chain with them" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    _ = opensslVersion(io, gpa) orelse return error.SkipZigTest;
+    var self_signed = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer self_signed.deinit();
+    var ca_signed = try loadChain(gpa, io, "chain.crt", "chain-leaf.key");
+    defer ca_signed.deinit();
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
+    var echo: Echo = undefined;
+    const one = [_]*const tls.CertChain{&self_signed};
+    const config: tls.server.Config = .{ .chains = &one, .client_auth = .optional, .client_trust = .{ .ca_set = &set } };
+
+    // The CertificateRequest names the test CA.
+    {
+        const out = try opensslClientConfig(gpa, io, config, &.{}, &echo, null);
+        defer gpa.free(out);
+        try echo.result;
+        try expectContains(out, "Acceptable client certificate CA names");
+        try expectContains(out, "CN=zig-sdk test CA");
+    }
+    // The option turns the names off.
+    {
+        var quiet = config;
+        quiet.send_client_ca_names = false;
+        const out = try opensslClientConfig(gpa, io, quiet, &.{}, &echo, null);
+        defer gpa.free(out);
+        try echo.result;
+        try expectContains(out, "No client certificate CA names sent");
+    }
+    // The client sends the test CA with -requestCAfile. The server takes the chain that the
+    // test CA signs, not the default chain.
+    const both = [_]*const tls.CertChain{ &self_signed, &ca_signed };
+    const verify_args = [_][]const u8{ "-CAfile", "test/fixtures/tls/pem/ca.crt", "-verify_return_error" };
+    {
+        const out = try opensslClientConfig(gpa, io, .{ .chains = &both }, &(verify_args ++ [_][]const u8{ "-requestCAfile", "test/fixtures/tls/pem/ca.crt" }), &echo, null);
+        defer gpa.free(out);
+        try echo.result;
+        try expectContains(out, "Verify return code: 0 (ok)");
+        try expectContains(out, "i:CN=zig-sdk test CA");
+    }
+    {
+        const out = try opensslClientConfig(gpa, io, .{ .chains = &both }, &verify_args, &echo, null);
+        defer gpa.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "Verify return code: 0 (ok)") == null);
+    }
+}
+
 test "interop: openssl s_client with an RSA-PSS server key" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

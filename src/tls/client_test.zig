@@ -102,6 +102,9 @@ const ClientSetup = struct {
     groups: []const tls.key_share.Group = tls.key_share.default_groups,
     identity: ?*const tls.CertChain = null,
     cipher_suites: []const tls.Suite = tls.suites.default_suites,
+    identities: []const *const tls.CertChain = &.{},
+    identity_fallback: @FieldType(tls.ClientOptions, "identity_fallback") = .first,
+    send_ca_names: bool = false,
     /// The group both sides must negotiate.
     expect_group: ?tls.key_share.Group = null,
     /// The suite both sides must negotiate.
@@ -118,21 +121,25 @@ const ServerSetup = struct {
     padding: tls.Padding = .none,
     client_auth: tls.server.ClientAuth = .none,
     client_trust: ?tls.Trust = null,
+    send_client_ca_names: bool = true,
+    /// The chains of the server. Null takes the one chain argument of `roundTrip`.
+    chains: ?[]const *const tls.CertChain = null,
 };
 
 /// One handshake and echo between the SDK client and the SDK server. Returns the client
 /// error, if any. The server result is in `echo`. The client checks `expect_alpn`.
 fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, client_setup: ClientSetup, echo_out: *Echo, expect_alpn: ?[]const u8) !void {
-    const chains = [_]*const tls.CertChain{chain};
+    const one = [_]*const tls.CertChain{chain};
     echo_out.* = .{
         .server = try tls.Server.init(.{
-            .chains = &chains,
+            .chains = server_setup.chains orelse &one,
             .alpn = server_setup.alpn,
             .groups = server_setup.groups,
             .cipher_suites = server_setup.cipher_suites,
             .padding = server_setup.padding,
             .client_auth = server_setup.client_auth,
             .client_trust = server_setup.client_trust,
+            .send_client_ca_names = server_setup.send_client_ca_names,
         }),
         .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
         .io = io,
@@ -162,6 +169,9 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
         .cipher_suites = client_setup.cipher_suites,
         .padding = client_setup.padding,
         .identity = client_setup.identity,
+        .identities = client_setup.identities,
+        .identity_fallback = client_setup.identity_fallback,
+        .send_ca_names = client_setup.send_ca_names,
         .read_buffer = &read_buf,
         .write_buffer = &write_buf,
         .alert = &alert,
@@ -374,6 +384,117 @@ test "RSA-PSS certificates on the server and on the client" {
     try std.testing.expectError(error.TlsCertificateNotVerified, echo.result);
 }
 
+test "the server names its trusted authorities and the client chooses a chain" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var server_chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer server_chain.deinit();
+    var self_signed = try loadChain(gpa, io, "ed25519.crt", "ed25519.key");
+    defer self_signed.deinit();
+    var ca_signed = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
+    defer ca_signed.deinit();
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
+    var echo: Echo = undefined;
+    const required: ServerSetup = .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } };
+
+    // The server names the test CA. The client takes the second chain, which leads to it.
+    try roundTrip(io, &server_chain, required, .{ .trust = .self_signed, .identities = &.{ &self_signed, &ca_signed } }, &echo, null);
+    // `identity` comes first, then `identities`.
+    try roundTrip(io, &server_chain, required, .{ .trust = .self_signed, .identity = &self_signed, .identities = &.{&ca_signed} }, &echo, null);
+    try roundTrip(io, &server_chain, required, .{ .trust = .self_signed, .identity = &ca_signed, .identities = &.{&self_signed} }, &echo, null);
+    // Without names the client takes the first chain, which the server does not trust.
+    var no_names = required;
+    no_names.send_client_ca_names = false;
+    const refused = roundTrip(io, &server_chain, no_names, .{ .trust = .self_signed, .identities = &.{ &self_signed, &ca_signed } }, &echo, null);
+    try std.testing.expect(std.meta.isError(refused));
+    try std.testing.expectError(error.TlsCertificateIssuerNotFound, echo.result);
+
+    // The server trusts only the RSA-PSS CA: no chain of the client leads to it.
+    var pss_set: tls.CaSet = .init(gpa);
+    defer pss_set.deinit();
+    try pss_set.addFile(io, "test/fixtures/tls/pem/rsa-pss.crt");
+    const pss_required: ServerSetup = .{ .client_auth = .required, .client_trust = .{ .ca_set = &pss_set } };
+    // The fallback `first` sends the first chain anyway.
+    const first = roundTrip(io, &server_chain, pss_required, .{ .trust = .self_signed, .identities = &.{ &self_signed, &ca_signed } }, &echo, null);
+    try std.testing.expect(std.meta.isError(first));
+    try std.testing.expectError(error.TlsCertificateIssuerNotFound, echo.result);
+    // The fallback `none` sends an empty certificate list.
+    const none = roundTrip(io, &server_chain, pss_required, .{ .trust = .self_signed, .identities = &.{ &self_signed, &ca_signed }, .identity_fallback = .none }, &echo, null);
+    try std.testing.expect(std.meta.isError(none));
+    try std.testing.expectError(error.TlsCertificateRequired, echo.result);
+    var optional = pss_required;
+    optional.client_auth = .optional;
+    try roundTrip(io, &server_chain, optional, .{ .trust = .self_signed, .identities = &.{ &self_signed, &ca_signed }, .identity_fallback = .none }, &echo, null);
+}
+
+test "a certificate request with many authority names" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var server_chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer server_chain.deinit();
+    var self_signed = try loadChain(gpa, io, "ed25519.crt", "ed25519.key");
+    defer self_signed.deinit();
+    var ca_signed = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
+    defer ca_signed.deinit();
+    var ca_buf: [128]u8 = undefined;
+    const ca_text = try std.Io.Dir.cwd().readFileAlloc(io, fixture(&ca_buf, "ca.crt"), gpa, .limited(1 << 16));
+    defer gpa.free(ca_text);
+    var it: tls.pem.Iterator = .init(ca_text);
+    const ca = try it.nextLabeled("CERTIFICATE").?.decode(gpa);
+    defer gpa.free(ca);
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    var echo: Echo = undefined;
+    const setup: ServerSetup = .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } };
+    const client: ClientSetup = .{ .trust = .self_signed, .identities = &.{ &self_signed, &ca_signed } };
+
+    // 500 names of 30 bytes: a CertificateRequest of nearly 15 KiB, far more than the other
+    // handshake messages of the server.
+    for (0..500) |_| try set.addDer(ca);
+    try roundTrip(io, &server_chain, setup, client, &echo, null);
+    // 600 names do not fit: the server sends none, and the client takes the first chain.
+    for (0..100) |_| try set.addDer(ca);
+    const refused = roundTrip(io, &server_chain, setup, client, &echo, null);
+    try std.testing.expect(std.meta.isError(refused));
+    try std.testing.expectError(error.TlsCertificateIssuerNotFound, echo.result);
+}
+
+test "the client names its trusted authorities and the server chooses a chain" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var self_signed = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer self_signed.deinit();
+    var ca_signed = try loadChain(gpa, io, "chain.crt", "chain-leaf.key");
+    defer ca_signed.deinit();
+    var pss_signed = try loadChain(gpa, io, "rsa-pss-sha256.crt", "rsa-pss-sha256.key");
+    defer pss_signed.deinit();
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
+    var pss_set: tls.CaSet = .init(gpa);
+    defer pss_set.deinit();
+    try pss_set.addFile(io, "test/fixtures/tls/pem/rsa-pss.crt");
+    var echo: Echo = undefined;
+    const chains = [_]*const tls.CertChain{ &self_signed, &ca_signed, &pss_signed };
+    const server: ServerSetup = .{ .chains = &chains };
+
+    // The default chain is self-signed. The names of the client select the other chains.
+    try roundTrip(io, undefined, server, .{ .trust = .{ .ca_set = &set }, .send_ca_names = true }, &echo, null);
+    try roundTrip(io, undefined, server, .{ .trust = .{ .ca_set = &pss_set }, .send_ca_names = true }, &echo, null);
+    // Without names the server takes the default chain, which the client does not trust.
+    try std.testing.expectError(error.TlsCertificateIssuerNotFound, roundTrip(io, undefined, server, .{ .trust = .{ .ca_set = &set } }, &echo, null));
+    // A policy without anchors sends no names.
+    try roundTrip(io, undefined, server, .{ .trust = .self_signed, .send_ca_names = true }, &echo, null);
+    // The names also go in the second ClientHello after a HelloRetryRequest.
+    var retry = server;
+    retry.groups = &.{.secp384r1};
+    try roundTrip(io, undefined, retry, .{ .trust = .{ .ca_set = &set }, .send_ca_names = true, .groups = &.{ .x25519, .secp384r1 }, .expect_group = .secp384r1 }, &echo, null);
+    // The server name comes first: a chain for another host does not count.
+    try std.testing.expectError(error.TlsCertificateHostMismatch, roundTrip(io, undefined, server, .{ .trust = .{ .ca_set = &set }, .send_ca_names = true, .host = "example.com" }, &echo, null));
+}
+
 test "every cipher suite negotiates with the SDK client, with a key update" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -519,6 +640,23 @@ test "interop: openssl s_server removes the padding of the SDK client" {
     }
 }
 
+test "interop: the SDK client chooses the chain for the CA names of openssl s_server" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!haveOpenssl(io, gpa)) return error.SkipZigTest;
+    var self_signed = try loadChain(gpa, io, "ed25519.crt", "ed25519.key");
+    defer self_signed.deinit();
+    var ca_signed = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
+    defer ca_signed.deinit();
+    // The leaf of the RSA-PSS CA has no extended key usage, so OpenSSL accepts it as a client
+    // certificate. The leaf of the test CA permits server authentication only.
+    var pss_signed = try loadChain(gpa, io, "rsa-pss-sha256.crt", "rsa-pss-sha256.key");
+    defer pss_signed.deinit();
+    // s_server sends the names of its CA file. It requires and verifies the client
+    // certificate, so the handshake fails with another chain.
+    try opensslServer(io, &.{ "-cert", "test/fixtures/tls/pem/p256.crt", "-key", "test/fixtures/tls/pem/p256.key", "-Verify", "1", "-CAfile", "test/fixtures/tls/pem/rsa-pss.crt", "-verify_return_error" }, .{ .trust = .self_signed, .identities = &.{ &self_signed, &ca_signed, &pss_signed } });
+}
+
 test "interop: the SDK client and openssl s_server with RSA-PSS keys" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -598,6 +736,9 @@ fn opensslServer(io: Io, extra: []const []const u8, setup: ClientSetup) !void {
         .groups = setup.groups,
         .identity = setup.identity,
         .padding = setup.padding,
+        .identities = setup.identities,
+        .identity_fallback = setup.identity_fallback,
+        .send_ca_names = setup.send_ca_names,
         .read_buffer = &read_buf,
         .write_buffer = &write_buf,
         .allow_truncation_attacks = true,

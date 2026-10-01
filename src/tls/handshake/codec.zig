@@ -2,6 +2,7 @@
 const std = @import("std");
 const tls = std.crypto.tls;
 const Decoder = tls.Decoder;
+const ca_names = @import("ca_names.zig");
 
 pub const max_message_len = 16 << 10;
 
@@ -36,6 +37,9 @@ pub const ClientHello = struct {
     server_name: ?[]const u8 = null,
     /// Raw `ProtocolNameList`.
     alpn: []const u8 = &.{},
+    /// The checked name list of the certificate_authorities extension (RFC 8446 section
+    /// 4.2.4). Iterate it with `ca_names.Iterator`.
+    certificate_authorities: ?[]const u8 = null,
     offers_tls_1_3: bool = false,
     has_key_share: bool = false,
     has_groups: bool = false,
@@ -147,6 +151,10 @@ pub const ClientHello = struct {
                         list.ensure(plen) catch return error.DecodeError;
                         _ = list.slice(plen);
                     }
+                },
+                .certificate_authorities => {
+                    hello.certificate_authorities = try ca_names.parse(ext.buf);
+                    continue;
                 },
                 // The parser does not read the body of these extensions and of unknown ones.
                 .pre_shared_key => {
@@ -363,24 +371,6 @@ pub fn messageHash(buf: []u8, hash: []const u8) []u8 {
 pub const certificate_verify_context = " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00";
 pub const client_certificate_verify_context = " " ** 64 ++ "TLS 1.3, client CertificateVerify\x00";
 
-/// A CertificateRequest with an empty context and the accepted signature schemes.
-pub fn certificateRequest(buf: []u8, schemes: []const tls.SignatureScheme) []u8 {
-    var b: Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(HandshakeType.certificate_request));
-    const msg = b.beginLen(u24);
-    b.byte(0); // certificate_request_context
-    const exts = b.beginLen(u16);
-    b.int(u16, @intFromEnum(tls.ExtensionType.signature_algorithms));
-    const ext = b.beginLen(u16);
-    const list = b.beginLen(u16);
-    for (schemes) |s| b.int(u16, @intFromEnum(s));
-    b.endLen(u16, list);
-    b.endLen(u16, ext);
-    b.endLen(u16, exts);
-    b.endLen(u24, msg);
-    return b.slice();
-}
-
 test "parse a minimal client hello" {
     var b: Builder = .{ .buf = try std.testing.allocator.alloc(u8, 512) };
     defer std.testing.allocator.free(b.buf);
@@ -545,6 +535,22 @@ test "trailing bytes in a known client hello extension are a decode error" {
         list[n] = e;
         try std.testing.expectError(error.DecodeError, ClientHello.parse(testHello(&buf, list[0 .. n + 1])));
     }
+}
+
+test "the certificate_authorities extension of a client hello" {
+    var buf: [4096]u8 = undefined;
+    const name = "\x30\x1a\x31\x18\x30\x16\x06\x03\x55\x04\x03\x0c\x0fzig-sdk test CA";
+    const names: TestExtension = .{ .type = 47, .body = "\x00\x1e\x00\x1c" ++ name };
+    const hello = try ClientHello.parse(testHello(&buf, &.{ test_versions, test_groups, names, test_schemes, test_share }));
+    try std.testing.expect(ca_names.contains(hello.certificate_authorities.?, name));
+    const plain = try ClientHello.parse(testHello(&buf, &.{ test_versions, test_groups, test_schemes, test_share }));
+    try std.testing.expect(plain.certificate_authorities == null);
+    // A malformed list, an empty list and a second extension.
+    const bad: TestExtension = .{ .type = 47, .body = "\x00\x1e\x00\x1c\x31" ++ name[1..] };
+    try std.testing.expectError(error.DecodeError, ClientHello.parse(testHello(&buf, &.{ test_versions, test_groups, bad, test_schemes, test_share })));
+    const empty: TestExtension = .{ .type = 47, .body = "\x00\x00" };
+    try std.testing.expectError(error.DecodeError, ClientHello.parse(testHello(&buf, &.{ test_versions, test_groups, empty, test_schemes, test_share })));
+    try std.testing.expectError(error.IllegalParameter, ClientHello.parse(testHello(&buf, &.{ test_versions, names, test_groups, names, test_schemes, test_share })));
 }
 
 test "server hello builder" {

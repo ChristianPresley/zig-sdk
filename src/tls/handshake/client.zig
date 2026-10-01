@@ -11,6 +11,7 @@ const suites = @import("../suites.zig");
 const Suite = suites.Suite;
 const codec = @import("codec.zig");
 const common = @import("common.zig");
+const ca_names = @import("ca_names.zig");
 const key_share = @import("key_share.zig");
 const Connection = @import("../Connection.zig");
 const CertChain = @import("../CertChain.zig");
@@ -38,12 +39,27 @@ pub const Options = struct {
     /// group without a post-quantum part. A server without the hybrid group then needs no
     /// HelloRetryRequest.
     groups: []const key_share.Group = key_share.default_groups,
-    /// The certificate chain to present when the server asks for one. Without it the
-    /// client answers a request with an empty certificate list.
+    /// The certificate chain to present when the server asks for one. Without it and without
+    /// `identities`, the client answers a request with an empty certificate list.
     identity: ?*const CertChain = null,
     /// The padding of the encrypted records that the client sends (RFC 8446 section 5.4).
     /// It starts with the first encrypted handshake record.
     padding: Connection.Padding = .none,
+    /// More certificate chains, after `identity` in preference order. When the request of the
+    /// server has the certificate_authorities extension (RFC 8446 section 4.2.4), the client
+    /// takes the first chain that leads to one of the names. Without a match,
+    /// `identity_fallback` decides. Without names, the client takes the first chain.
+    identities: []const *const CertChain = &.{},
+    /// The answer when the server names certificate authorities and no chain leads to one of
+    /// them. `first` sends the first chain, and `none` sends an empty certificate list.
+    identity_fallback: enum { first, none } = .first,
+    /// Send the subject names of the `trust` anchors in the certificate_authorities extension
+    /// of the ClientHello. A server with more than one chain can then choose a chain that the
+    /// client trusts. Only the `ca_set` and `bundle` policies have anchors. The list can be
+    /// large, so the default is off. When the names do not fit in
+    /// `ca_names.max_hello_list_len` bytes or in a ClientHello of 16 KiB, the client sends no
+    /// names.
+    send_ca_names: bool = false,
     /// Plaintext buffer for the application. At least `Connection.min_read_buffer_len`.
     read_buffer: []u8,
     /// Plaintext buffer for the application.
@@ -64,8 +80,9 @@ const client_verify_context = codec.client_certificate_verify_context;
 /// The largest HelloRetryRequest cookie the client echoes. A larger cookie ends the
 /// handshake with `illegal_parameter`.
 pub const max_cookie_len = 8 << 10;
-/// The ClientHello buffer: two key shares, the cookie and the other extensions.
-const client_hello_buffer_len = max_cookie_len + 2 * (4 + key_share.max_public_len) + 2048;
+/// The ClientHello buffer: two key shares, the cookie, the names of the certificate
+/// authorities and the other extensions.
+const client_hello_buffer_len = max_cookie_len + 2 * (4 + key_share.max_public_len) + (6 + ca_names.max_hello_list_len) + 2048;
 
 /// The key shares of a ClientHello: one, or a hybrid share and a fallback share.
 const Shares = struct {
@@ -118,7 +135,8 @@ pub fn connect(input: *Reader, output: *Writer, options: Options) ConnectError!C
     shares.generate(options.io, options.groups) catch return error.EntropyUnavailable;
 
     var ch_buf: [client_hello_buffer_len]u8 = undefined;
-    const hello1 = clientHello(&ch_buf, random, &session_id, options, shares.slice(), null);
+    const first_hello = clientHello(&ch_buf, random, &session_id, options, shares.slice(), null, options.send_ca_names);
+    const hello1 = first_hello.bytes;
     c.writeRecord(.handshake, hello1) catch return error.WriteFailed;
     c.output.flush() catch return error.WriteFailed;
 
@@ -127,7 +145,7 @@ pub fn connect(input: *Reader, output: *Writer, options: Options) ConnectError!C
     const sh = ServerHello.parse(first.body) catch |e| return common.abortParse(&c, options.alert, e);
     const suite = offeredSuite(options, sh.cipher_suite) orelse return common.abort(&c, options.alert, .illegal_parameter, error.TlsIllegalParameter);
     switch (suite) {
-        inline else => |s| return run(Suite.Type(s), s, &c, &reader, options, &shares, random, &session_id, &ch_buf, hello1, first, sh),
+        inline else => |s| return run(Suite.Type(s), s, &c, &reader, options, &shares, random, &session_id, &ch_buf, first_hello, first, sh),
     }
 }
 
@@ -141,10 +159,11 @@ fn run(
     random: [32]u8,
     session_id: *const [32]u8,
     ch_buf: *[client_hello_buffer_len]u8,
-    hello1: []const u8,
+    first_hello: Hello,
     first: common.Message,
     first_sh: ServerHello,
 ) ConnectError!Connection {
+    const hello1 = first_hello.bytes;
     const K = suites.Schedule(S);
     const alert_out = options.alert;
     var transcript: suites.Transcript = .init(S);
@@ -169,8 +188,9 @@ fn run(
         shares.wipe();
         shares.items[0] = key_share.KeyShare.generate(options.io, group) catch return common.abort(c, alert_out, .internal_error, error.EntropyUnavailable);
         shares.len = 1;
-        // The first ClientHello is in the transcript, so its buffer is free again.
-        const hello2 = clientHello(ch_buf, random, session_id, options, shares.slice(), sh.cookie);
+        // The first ClientHello is in the transcript, so its buffer is free again. The second
+        // ClientHello has the names of the first one (RFC 8446 section 4.1.2).
+        const hello2 = clientHello(ch_buf, random, session_id, options, shares.slice(), sh.cookie, first_hello.names_sent).bytes;
         c.writeChangeCipherSpec() catch return error.WriteFailed;
         ccs_sent = true;
         c.writeRecord(.handshake, hello2) catch return error.WriteFailed;
@@ -225,8 +245,13 @@ fn run(
     // Optional CertificateRequest, then Certificate.
     var msg = try reader.next(c, alert_out);
     var cert_request: ?CertificateRequest = null;
+    var identity: ?*const CertChain = null;
     if (msg.kind == .certificate_request) {
-        cert_request = CertificateRequest.parse(msg.body) catch |e| return common.abortParse(c, alert_out, e);
+        var req = CertificateRequest.parse(msg.body) catch |e| return common.abortParse(c, alert_out, e);
+        // The names point into the message buffer, which the next message overwrites.
+        identity = chooseIdentity(options, req.authorities);
+        req.authorities = null;
+        cert_request = req;
         transcript.update(msg.raw);
         msg = try reader.next(c, alert_out);
     }
@@ -271,7 +296,7 @@ fn run(
     if (!ccs_sent) c.writeChangeCipherSpec() catch return error.WriteFailed;
     c.write_keys = suites.DirectionKeys.init(suite, client_hs);
     if (cert_request) |req| {
-        try sendClientCertificate(S, c, &transcript, options, req, alert_out);
+        try sendClientCertificate(S, c, &transcript, options, req, identity, alert_out);
     }
     const client_verify = K.verifyData(K.finishedKey(client_hs), transcript.peek(S));
     const client_fin = codec.finished(&msg_buf, &client_verify);
@@ -287,15 +312,29 @@ fn run(
     return c.*;
 }
 
+/// The chain for a CertificateRequest with the name list `authorities`. The candidates are
+/// `identity`, then `identities`.
+fn chooseIdentity(options: Options, authorities: ?[]const u8) ?*const CertChain {
+    const first: *const CertChain = options.identity orelse
+        (if (options.identities.len > 0) options.identities[0] else return null);
+    const list = authorities orelse return first;
+    if (options.identity) |chain| if (ca_names.chainMatches(chain, list)) return chain;
+    for (options.identities) |chain| if (ca_names.chainMatches(chain, list)) return chain;
+    return switch (options.identity_fallback) {
+        .first => first,
+        .none => null,
+    };
+}
+
 /// Send the Certificate and, with an identity, the CertificateVerify.
-fn sendClientCertificate(comptime S: type, c: *Connection, transcript: *suites.Transcript, options: Options, req: CertificateRequest, alert_out: ?*tls.Alert) ConnectError!void {
+fn sendClientCertificate(comptime S: type, c: *Connection, transcript: *suites.Transcript, options: Options, req: CertificateRequest, identity: ?*const CertChain, alert_out: ?*tls.Alert) ConnectError!void {
     var cert_buf: [CertChain.max_chain_bytes + 512]u8 = undefined;
     var b: codec.Builder = .{ .buf = &cert_buf };
     b.byte(@intFromEnum(tls.HandshakeType.certificate));
     const msg = b.beginLen(u24);
     b.byte(req.context_len);
     b.bytes(req.context());
-    if (options.identity) |chain| {
+    if (identity) |chain| {
         // The chain message of the identity carries the list after its empty context.
         b.bytes(chain.handshake_message[5..]);
     } else {
@@ -306,7 +345,7 @@ fn sendClientCertificate(comptime S: type, c: *Connection, transcript: *suites.T
     c.writeRecord(.handshake, cert_msg) catch return error.WriteFailed;
     transcript.update(cert_msg);
 
-    const chain = options.identity orelse return;
+    const chain = identity orelse return;
     const scheme = for (chain.key.schemes()) |s| {
         if (req.offersScheme(@intFromEnum(s))) break s;
     } else return common.abort(c, alert_out, .handshake_failure, error.TlsHandshakeFailure);
@@ -333,7 +372,12 @@ fn isServerName(host: []const u8) bool {
     return true;
 }
 
-fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Options, shares: []const key_share.KeyShare, cookie: ?[]const u8) []u8 {
+/// A ClientHello message, and whether it has the certificate_authorities extension.
+const Hello = struct { bytes: []u8, names_sent: bool };
+
+/// Build a ClientHello. With `send_names`, it has the names of the `trust` anchors when they
+/// fit. In the first ClientHello they must also keep the message at 16 KiB or less.
+fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Options, shares: []const key_share.KeyShare, cookie: ?[]const u8, send_names: bool) Hello {
     var b: codec.Builder = .{ .buf = buf };
     b.byte(@intFromEnum(tls.HandshakeType.client_hello));
     const msg = b.beginLen(u24);
@@ -405,6 +449,14 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
         b.endLen(u16, list);
         b.endLen(u16, ext);
     }
+    var names_sent = false;
+    if (send_names) {
+        // The message body of the first ClientHello stays at `codec.max_message_len` or less.
+        // The extension header has 6 bytes.
+        const room = (codec.max_message_len + 4) -| (b.len + 6);
+        const limit = if (cookie == null) @min(ca_names.max_hello_list_len, room) else ca_names.max_hello_list_len;
+        names_sent = ca_names.write(&b, options.trust, limit);
+    }
     if (cookie) |value| {
         b.int(u16, @intFromEnum(tls.ExtensionType.cookie));
         const ext = b.beginLen(u16);
@@ -414,7 +466,7 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
     }
     b.endLen(u16, exts);
     b.endLen(u24, msg);
-    return b.slice();
+    return .{ .bytes = b.slice(), .names_sent = names_sent };
 }
 
 fn offeredSuite(options: Options, wire: u16) ?Suite {
@@ -555,13 +607,16 @@ pub const EncryptedExtensions = struct {
     }
 };
 
-/// A parsed CertificateRequest. The fields are copies: the next message overwrites the
-/// reader buffer.
+/// A parsed CertificateRequest. The fields other than `authorities` are copies: the next
+/// message overwrites the reader buffer.
 pub const CertificateRequest = struct {
     context_buf: [255]u8 = undefined,
     context_len: u8 = 0,
     schemes: [64]u16 = undefined,
     scheme_count: u8 = 0,
+    /// The checked name list of the certificate_authorities extension. It points into the
+    /// message buffer and is valid until the next message.
+    authorities: ?[]const u8 = null,
 
     pub fn parse(body: []u8) codec.ParseError!CertificateRequest {
         var d: Decoder = .fromTheirSlice(body);
@@ -581,6 +636,7 @@ pub const CertificateRequest = struct {
             var ext = exts.sub(len) catch return error.DecodeError;
             if (seen.isSet(et)) return error.IllegalParameter;
             seen.set(et);
+            if (et == ca_names.extension_type) result.authorities = try ca_names.parse(ext.buf);
             if (@as(tls.ExtensionType, @enumFromInt(et)) == .signature_algorithms) {
                 ext.ensure(2) catch return error.DecodeError;
                 const list_len = ext.decode(u16);
@@ -646,7 +702,7 @@ test "the default client hello offers no AEGIS suite" {
     var buf: [client_hello_buffer_len]u8 = undefined;
     const session_id = [_]u8{0} ** 32;
     {
-        const hello = try codec.ClientHello.parse(clientHello(&buf, [_]u8{1} ** 32, &session_id, options, shares.slice(), null)[4..]);
+        const hello = try codec.ClientHello.parse(clientHello(&buf, [_]u8{1} ** 32, &session_id, options, shares.slice(), null, false).bytes[4..]);
         for (suites.default_suites) |s| try std.testing.expect(hello.offersSuite(s.wire()));
         try std.testing.expect(!hello.offersSuite(Suite.AEGIS_128L_SHA256.wire()));
         try std.testing.expect(!hello.offersSuite(Suite.AEGIS_256_SHA512.wire()));
@@ -654,7 +710,7 @@ test "the default client hello offers no AEGIS suite" {
     // The option adds both AEGIS suites.
     options.cipher_suites = suites.default_suites_with_aegis;
     {
-        const hello = try codec.ClientHello.parse(clientHello(&buf, [_]u8{1} ** 32, &session_id, options, shares.slice(), null)[4..]);
+        const hello = try codec.ClientHello.parse(clientHello(&buf, [_]u8{1} ** 32, &session_id, options, shares.slice(), null, false).bytes[4..]);
         for (suites.default_suites) |s| try std.testing.expect(hello.offersSuite(s.wire()));
         try std.testing.expect(hello.offersSuite(Suite.AEGIS_128L_SHA256.wire()));
         try std.testing.expect(hello.offersSuite(Suite.AEGIS_256_SHA512.wire()));
@@ -702,6 +758,19 @@ test "trailing bytes and duplicates in server extensions are refused" {
     try std.testing.expectError(error.DecodeError, CertificateRequest.parse(&cr_trailing));
     var cr_dup = [_]u8{ 0, 0, 16, 0x7a, 0x7a, 0, 0, 0, 13, 0, 4, 0, 2, 0x04, 0x03, 0x7a, 0x7a, 0, 0 };
     try std.testing.expectError(error.IllegalParameter, CertificateRequest.parse(&cr_dup));
+}
+
+test "the certificate_authorities extension of a certificate request" {
+    const name = "\x30\x1a\x31\x18\x30\x16\x06\x03\x55\x04\x03\x0c\x0fzig-sdk test CA";
+    var good = [_]u8{ 0, 0, 44, 0, 13, 0, 4, 0, 2, 0x04, 0x03, 0, 47, 0, 32, 0, 30, 0, 28 } ++ name.*;
+    const req = try CertificateRequest.parse(&good);
+    try std.testing.expect(ca_names.contains(req.authorities.?, name));
+    // A wrong name length, and an extension without names.
+    var bad = good;
+    bad[18] = 27;
+    try std.testing.expectError(error.DecodeError, CertificateRequest.parse(&bad));
+    var empty = [_]u8{ 0, 0, 14, 0, 13, 0, 4, 0, 2, 0x04, 0x03, 0, 47, 0, 2, 0, 0 };
+    try std.testing.expectError(error.DecodeError, CertificateRequest.parse(&empty));
 }
 
 test "server name eligibility" {

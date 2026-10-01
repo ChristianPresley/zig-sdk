@@ -16,6 +16,7 @@ pub const Connection = @import("Connection.zig");
 pub const Padding = Connection.Padding;
 pub const key_share = @import("handshake/key_share.zig");
 pub const codec = @import("handshake/codec.zig");
+pub const ca_names = @import("handshake/ca_names.zig");
 pub const server = @import("handshake/server.zig");
 pub const Server = server.Server;
 pub const client = @import("handshake/client.zig");
