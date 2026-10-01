@@ -36,7 +36,7 @@ pub const Message = union(enum) {
     };
 
     pub const ParseError = error{
-        /// The text is not valid JSON.
+        /// The text is not valid JSON, or it nests deeper than the depth limit.
         Syntax,
         /// The text is valid JSON but not a JSON-RPC 2.0 message.
         Invalid,
@@ -45,9 +45,16 @@ pub const Message = union(enum) {
         OutOfMemory,
     };
 
-    /// Parse one message. `text` must be a single JSON value (no batches).
+    /// Parse one message. `text` must be a single JSON value (no batches). The depth limit is
+    /// `json.max_message_depth`.
     pub fn parse(arena: Allocator, text: []const u8) ParseError!Message {
-        const tree = json.parseTree(arena, text) catch |e| switch (e) {
+        return parseMaxDepth(arena, text, json.max_message_depth);
+    }
+
+    /// Parse one message with a depth limit, for example `Limits.json_max_depth`. A text that
+    /// nests deeper than `max_depth` or than `json.max_message_depth` gives `error.Syntax`.
+    pub fn parseMaxDepth(arena: Allocator, text: []const u8, max_depth: u16) ParseError!Message {
+        const tree = json.parseTreeMaxDepth(arena, text, @min(max_depth, json.max_message_depth)) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Syntax,
         };
@@ -198,6 +205,14 @@ test "parse request, notification, response, error" {
     try std.testing.expectError(error.Invalid, Message.parse(arena, "{\"jsonrpc\":\"1.0\",\"method\":\"x\"}"));
     try std.testing.expectError(error.InvalidId, Message.parse(arena, "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"x\"}"));
     try std.testing.expectError(error.InvalidId, Message.parse(arena, "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"x\"}"));
+
+    // The depth limit counts the message object. A deeper message is a parse error.
+    const nested = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\",\"params\":{\"a\":[[]]}}";
+    _ = try Message.parseMaxDepth(arena, nested, 4);
+    try std.testing.expectError(error.Syntax, Message.parseMaxDepth(arena, nested, 3));
+    // A larger limit than `json.max_message_depth` counts as that value.
+    const deep = try json.nestedArrays(arena, json.max_message_depth + 1);
+    try std.testing.expectError(error.Syntax, Message.parseMaxDepth(arena, deep, std.math.maxInt(u16)));
 }
 
 test "write error response with null id" {

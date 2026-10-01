@@ -364,7 +364,7 @@ pub const Client = struct {
             .out_buf = out_buf,
             .stream_reader = stream.reader(io, in_buf),
             .stream_writer = stream.writer(io, out_buf),
-            .router = .init(io, gpa),
+            .router = .init(io, gpa, options.limits.json_max_depth),
         };
         self.reader_future = try io.concurrent(readerLoop, .{self});
         return self;
@@ -445,24 +445,21 @@ pub const Client = struct {
             error.WriteFailed => return error.WriteFailed,
             error.Closed => return error.Closed,
         };
-        const deadline: ?Io.Clock.Timestamp = ex.timeout.toTimestamp(io);
         while (true) {
             // Deliver everything that arrived.
             while (self.router.takeFrame(&pending)) |frame| {
                 defer self.gpa.free(frame);
                 const is_response = router_mod.frameIsResponse(frame);
-                ex.sink.deliver(io, frame) catch return error.InvalidFrame;
+                ex.deliver(io, frame) catch return error.InvalidFrame;
                 if (is_response) return;
             }
             if (ex.cancel.isCancelled()) {
                 self.sendCancelled(ex.id, ex.cancel.reason);
                 return error.Canceled;
             }
-            if (deadline) |d| {
-                if (Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw.nanoseconds <= 0) {
-                    self.sendCancelled(ex.id, "timeout");
-                    return error.Timeout;
-                }
+            if (ex.expired(io)) {
+                self.sendCancelled(ex.id, "timeout");
+                return error.Timeout;
             }
             if (self.closed.load(.acquire)) return error.Closed;
             pending.event.waitTimeout(io, .{ .duration = .{ .raw = self.options.poll_interval, .clock = .awake } }) catch |e| switch (e) {

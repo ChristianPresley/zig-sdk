@@ -213,8 +213,33 @@ pub const Exchange = struct {
     cancel: *CancelToken,
     /// Absolute deadline, or `.none`.
     timeout: Io.Timeout = .none,
+    /// Absolute deadline of the first frame, or `.none`. The client sets it for a
+    /// `subscriptions/listen` stream, because the acknowledgment is the first message of the
+    /// stream. After the first frame, only `timeout` applies.
+    first_frame_timeout: Io.Timeout = .none,
+    /// Set by `deliver` at the first frame.
+    got_frame: std.atomic.Value(bool) = .init(false),
     /// Set by HTTP transports: the status of the response.
     http_status: u16 = 0,
+
+    /// Give one frame to the sink. Transports call this function, not `Sink.deliver`, so that
+    /// the first frame stops `first_frame_timeout`.
+    pub fn deliver(ex: *Exchange, io: Io, frame: []const u8) anyerror!void {
+        ex.got_frame.store(true, .release);
+        return ex.sink.deliver(io, frame);
+    }
+
+    /// True when `timeout` passed, or when `first_frame_timeout` passed before the first
+    /// frame. The transport then ends the exchange with `error.Timeout`.
+    pub fn expired(ex: *const Exchange, io: Io) bool {
+        if (passed(io, ex.timeout)) return true;
+        return !ex.got_frame.load(.acquire) and passed(io, ex.first_frame_timeout);
+    }
+
+    fn passed(io: Io, timeout: Io.Timeout) bool {
+        const d = timeout.toTimestamp(io) orelse return false;
+        return Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw.nanoseconds <= 0;
+    }
 
     pub const Sink = struct {
         ptr: *anyopaque,

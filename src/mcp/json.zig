@@ -38,12 +38,60 @@ pub fn parseValue(comptime T: type, arena: Allocator, value: Value) ParseValueEr
 
 pub const ParseValueError = std.json.ParseFromValueError;
 
-/// Parse a complete JSON text into a `Value` tree. All memory comes from `arena`.
+/// The maximum nesting depth that `std.json.Stringify` can write in a safe build mode.
+/// `parseTree` rejects a deeper text, thus the SDK can serialize each tree that it parses.
+pub const max_tree_depth: u16 = 256;
+
+/// The maximum nesting depth of a JSON-RPC message, also when `Limits.json_max_depth` is
+/// larger. The margin to `max_tree_depth` is for the objects that the SDK puts around a
+/// value from a message, for example a response around a result.
+pub const max_message_depth: u16 = 200;
+
+/// Parse a complete JSON text into a `Value` tree. All memory comes from `arena`. A text
+/// that nests deeper than `max_tree_depth` gives `error.TooDeep`.
 pub fn parseTree(arena: Allocator, text: []const u8) ParseTreeError!Value {
+    return parseTreeMaxDepth(arena, text, max_tree_depth);
+}
+
+/// Parse a complete JSON text into a `Value` tree. A text that nests deeper than
+/// `max_depth` gives `error.TooDeep`. All memory comes from `arena`.
+pub fn parseTreeMaxDepth(arena: Allocator, text: []const u8, max_depth: u16) ParseTreeError!Value {
+    try checkDepth(text, @min(max_depth, max_tree_depth));
     return std.json.parseFromSliceLeaky(Value, arena, text, .{ .allocate = .alloc_always });
 }
 
-pub const ParseTreeError = std.json.ParseError(std.json.Scanner);
+pub const ParseTreeError = std.json.ParseError(std.json.Scanner) || error{TooDeep};
+
+/// Give `error.TooDeep` when the arrays and objects of `text` nest deeper than `max_depth`.
+/// The depth of a scalar is 0, and the depth of `[]` and of `{}` is 1. The function does
+/// not check the syntax. It ignores the brackets in strings. It uses no recursion and no
+/// memory, thus it is safe on all input.
+pub fn checkDepth(text: []const u8, max_depth: u16) error{TooDeep}!void {
+    var depth: usize = 0;
+    var in_string = false;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_string) {
+            switch (c) {
+                // The escaped character cannot end the string.
+                '\\' => i += 1,
+                '"' => in_string = false,
+                else => {},
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '[', '{' => {
+                depth += 1;
+                if (depth > max_depth) return error.TooDeep;
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
+    }
+}
 
 /// Hooks for a `union(enum)` whose field names are the values of the discriminator `key`.
 ///
@@ -140,6 +188,43 @@ pub const Raw = struct {
         try jws.print("{s}", .{self.text});
     }
 };
+
+/// A text of `depth` nested arrays, for the tests of the depth limits.
+pub fn nestedArrays(gpa: Allocator, depth: usize) Allocator.Error![]u8 {
+    const text = try gpa.alloc(u8, 2 * depth);
+    @memset(text[0..depth], '[');
+    @memset(text[depth..], ']');
+    return text;
+}
+
+test "the depth check counts brackets outside strings" {
+    try checkDepth("1", 0);
+    try checkDepth("{\"a\":[1]}", 2);
+    try std.testing.expectError(error.TooDeep, checkDepth("{\"a\":[1]}", 1));
+    try std.testing.expectError(error.TooDeep, checkDepth("[]", 0));
+    // Brackets in strings and after an escaped quote do not count.
+    try checkDepth("[\"[[[{{{\"]", 1);
+    try checkDepth("[\"\\\"[[\"]", 1);
+    try checkDepth("[\"\\\\\",[1]]", 2);
+    try std.testing.expectError(error.TooDeep, checkDepth("[\"\\\\\",[1]]", 1));
+    // Closed containers give their depth back.
+    try checkDepth("[[],[],[[]]]", 3);
+}
+
+test "parseTree rejects a text that std.json.Stringify cannot write" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ok = try nestedArrays(arena, max_tree_depth);
+    const tree = try parseTree(arena, ok);
+    // The serializer accepts each tree that the parser gives.
+    try std.testing.expectEqualStrings(ok, try writeAlloc(arena, tree));
+    try std.testing.expectError(error.TooDeep, parseTree(arena, try nestedArrays(arena, max_tree_depth + 1)));
+    // A deep text does not exhaust the stack.
+    try std.testing.expectError(error.TooDeep, parseTree(arena, try nestedArrays(arena, 1 << 20)));
+    try std.testing.expectError(error.TooDeep, parseTreeMaxDepth(arena, "[[1]]", 1));
+}
 
 test "Raw round trip" {
     const gpa = std.testing.allocator;

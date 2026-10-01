@@ -847,7 +847,7 @@ pub const ClientOptions = struct {
     auth_provider: ?AuthProvider = null,
     /// The trust policy and identity for `wss` URLs. Null uses the system trust store.
     tls: ?http1.TlsSetup = null,
-    /// The client obeys `limits.websocket` and `limits.shutdown_grace`.
+    /// The client obeys `limits.websocket`, `limits.json_max_depth` and `limits.shutdown_grace`.
     limits: Limits = .{},
     /// How often a request that waits checks for cancellation and its deadline.
     poll_interval: Io.Duration = .fromMilliseconds(50),
@@ -906,7 +906,7 @@ pub const Client = struct {
             .options = options,
             .arena_state = .init(gpa),
             .target = undefined,
-            .router = .init(io, gpa),
+            .router = .init(io, gpa, options.limits.json_max_depth),
         };
         errdefer self.arena_state.deinit();
         self.target = try Target.parse(self.arena_state.allocator(), options.url);
@@ -1008,18 +1008,15 @@ pub const Client = struct {
             error.Closed => error.Closed,
             error.WriteFailed => error.WriteFailed,
         };
-        const deadline: ?Io.Clock.Timestamp = ex.timeout.toTimestamp(io);
         while (true) {
             if (try self.drain(io, &pending, ex)) return;
             if (ex.cancel.isCancelled()) {
                 self.sendCancelled(gen, ex.id, ex.cancel.reason);
                 return error.Canceled;
             }
-            if (deadline) |d| {
-                if (Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw.nanoseconds <= 0) {
-                    self.sendCancelled(gen, ex.id, "timeout");
-                    return error.Timeout;
-                }
+            if (ex.expired(io)) {
+                self.sendCancelled(gen, ex.id, "timeout");
+                return error.Timeout;
             }
             if (self.live.load(.acquire) != gen) {
                 // A response that arrived before the end of the connection still counts.
@@ -1039,7 +1036,7 @@ pub const Client = struct {
         while (self.router.takeFrame(pending)) |f| {
             defer self.gpa.free(f);
             const is_response = router_mod.frameIsResponse(f);
-            ex.sink.deliver(io, f) catch return error.InvalidFrame;
+            ex.deliver(io, f) catch return error.InvalidFrame;
             if (is_response) return true;
         }
         return false;
@@ -1127,7 +1124,6 @@ pub const Client = struct {
         if (live != 0) return live;
         var task: ConnectTask = .{ .client = self };
         var future = io.concurrent(ConnectTask.run, .{&task}) catch return self.mapConnect(self.ensureLink(), ex);
-        const deadline = ex.timeout.toTimestamp(io);
         while (!task.done.isSet()) {
             task.done.waitTimeout(io, .{ .duration = .{ .raw = self.options.poll_interval, .clock = .awake } }) catch |e| switch (e) {
                 error.Timeout => {},
@@ -1141,10 +1137,10 @@ pub const Client = struct {
                 future.cancel(io);
                 return error.Canceled;
             }
-            if (deadline) |d| if (Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw.nanoseconds <= 0) {
+            if (ex.expired(io)) {
                 future.cancel(io);
                 return error.Timeout;
-            };
+            }
         }
         future.await(io);
         return self.mapConnect(task.result, ex);

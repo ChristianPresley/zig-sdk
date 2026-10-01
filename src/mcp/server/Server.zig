@@ -1321,6 +1321,7 @@ fn listen(self: *Server, ctx: *RequestContext, params: types.SubscriptionsListen
     if (filter.resourceSubscriptions) |uris| {
         if (uris.len > self.options.limits.max_resource_subscription_uris) return ctx.setError(errors.internalError("Too many resource subscriptions"));
     }
+    if (filterBytes(filter) > self.options.limits.max_filter_bytes) return ctx.setError(errors.internalError("Subscription filter too large"));
     // Honour only what the server declared.
     var honoured: types.SubscriptionFilter = .{};
     if (filter.toolsListChanged orelse false) {
@@ -1398,6 +1399,14 @@ fn listen(self: *Server, ctx: *RequestContext, params: types.SubscriptionsListen
     try self.finishResult(ctx, result);
 }
 
+/// The bytes of `filter` as compact JSON, for `Limits.max_filter_bytes`.
+fn filterBytes(filter: types.SubscriptionFilter) u64 {
+    var buf: [256]u8 = undefined;
+    var counter: Io.Writer.Discarding = .init(&buf);
+    json.write(filter, &counter.writer) catch unreachable; // the discarding writer does not fail
+    return counter.fullCount();
+}
+
 /// Remove the subscription. Returns true when the server (not the client) ended it.
 fn removeSubscription(self: *Server, io: Io, sub: *Subscription) bool {
     self.subscriptions_lock.lockUncancelable(io);
@@ -1469,6 +1478,15 @@ fn deliver(self: *Server, io: Io, sub: *Subscription, event: Event, uri: ?[]cons
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "the size of a filter is its compact JSON, also above the buffer of the counter" {
+    try std.testing.expectEqual(2, filterBytes(.{}));
+    try std.testing.expectEqual("{\"toolsListChanged\":true}".len, filterBytes(.{ .toolsListChanged = true }));
+    const uri = "file:///" ++ "x" ** 300;
+    const uris = [_][]const u8{ uri, uri };
+    const expected = "{\"resourceSubscriptions\":[\"\",\"\"]}".len + 2 * uri.len;
+    try std.testing.expectEqual(expected, filterBytes(.{ .resourceSubscriptions = &uris }));
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -134,7 +134,6 @@ pub const Client = struct {
         defer arena_state.deinit();
         var task: Task = .{ .client = self, .ex = ex, .arena = arena_state.allocator() };
         var future = io.concurrent(Task.run, .{&task}) catch return self.perform(task.arena, ex);
-        const deadline = ex.timeout.toTimestamp(io);
         var stop: ?Transport.ExchangeError = null;
         while (true) {
             task.done.waitTimeout(io, .{ .duration = .{ .raw = self.options.poll_interval, .clock = .awake } }) catch |e| switch (e) {
@@ -149,10 +148,10 @@ pub const Client = struct {
                 stop = error.Canceled;
                 break;
             }
-            if (deadline) |d| if (Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw.nanoseconds <= 0) {
+            if (ex.expired(io)) {
                 stop = error.Timeout;
                 break;
-            };
+            }
         }
         if (stop) |err| {
             _ = future.cancel(io);
@@ -291,20 +290,20 @@ pub const Client = struct {
         if (is_sse) {
             var parser: sse.Parser = .init(self.gpa);
             defer parser.deinit();
-            var chunk: [4096]u8 = undefined;
             var total: usize = 0;
             while (true) {
-                // Take the bytes that arrived, so that each event reaches the sink at once. A
-                // read of a full chunk waits for 4096 bytes and holds back progress.
-                var bufs: [1][]u8 = .{&chunk};
-                const n = body.readVec(&bufs) catch |e| switch (e) {
+                // Take the bytes that arrived, so that each event reaches the sink at once.
+                // `readVec` copies the buffered bytes and then waits to fill the rest of its
+                // buffer. That holds back an event until more bytes come.
+                if (body.bufferedLen() == 0) body.fillMore() catch |e| switch (e) {
                     error.EndOfStream => break,
                     error.ReadFailed => return error.ReadFailed,
                 };
-                if (n == 0) continue;
-                total += n;
+                const bytes = body.buffered();
+                body.tossBuffered();
+                total += bytes.len;
                 if (total > self.options.max_response_bytes) return error.ReadFailed;
-                try parser.feed(chunk[0..n]);
+                try parser.feed(bytes);
                 while (parser.next()) |event| {
                     defer parser.release(event);
                     try self.deliver(io, arena, ex, event.data);
@@ -348,6 +347,6 @@ pub const Client = struct {
         if (std.mem.eql(u8, ex.method, "tools/list")) {
             if (self.tool_headers.learn(arena, frame) catch null) |rewritten| out = rewritten;
         }
-        ex.sink.deliver(io, out) catch return error.InvalidFrame;
+        ex.deliver(io, out) catch return error.InvalidFrame;
     }
 };

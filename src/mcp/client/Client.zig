@@ -510,8 +510,9 @@ pub fn complete(self: *Client, arena: Allocator, params: types.CompleteRequestPa
 }
 
 /// Open a `subscriptions/listen` stream. `options.on_notification` receives every event
-/// notification. The call returns when the server closes the stream gracefully, or with `error.Canceled` when
-/// the cancel token fires.
+/// notification. The call returns when the server closes the stream gracefully, or with
+/// `error.Canceled` when the cancel token fires. A stream without its acknowledgment in
+/// `limits.listen_ack_timeout` ends with `error.Timeout`.
 pub fn listen(self: *Client, arena: Allocator, filter: types.SubscriptionsListenRequestParams, options: RequestOptions) RequestError!types.SubscriptionsListenResult {
     return (try self.request(arena, .@"subscriptions/listen", try toValue(arena, filter), options)).result;
 }
@@ -569,7 +570,7 @@ const Collector = struct {
     fn onFrame(ptr: *anyopaque, io: Io, frame: []const u8) anyerror!void {
         const self: *Collector = @ptrCast(@alignCast(ptr));
         self.frames += 1;
-        const msg = message.Message.parse(self.arena, frame) catch {
+        const msg = message.Message.parseMaxDepth(self.arena, frame, self.client.options.limits.json_max_depth) catch {
             self.invalid = true;
             return error.InvalidFrame;
         };
@@ -673,6 +674,7 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             .sink = .{ .ptr = &collector, .on_frame = Collector.onFrame },
             .cancel = cancel,
             .timeout = deadline,
+            .first_frame_timeout = if (is_listen) self.listenAckTimeout() else .none,
         };
         transport.exchange(self.io, &ex) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -763,6 +765,14 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
         request_state = ir.requestState;
     }
     return error.TooManyRounds;
+}
+
+/// The deadline of the acknowledgment of a listen stream, from now. `.none` when
+/// `limits.listen_ack_timeout` is zero.
+fn listenAckTimeout(self: *const Client) Io.Timeout {
+    const d = self.options.limits.listen_ack_timeout;
+    if (d.nanoseconds <= 0) return .none;
+    return .{ .deadline = Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake }) };
 }
 
 /// The timeout of a request: `options.timeout`, or `limits.request_timeout` when the caller

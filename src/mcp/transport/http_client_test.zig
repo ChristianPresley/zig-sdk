@@ -147,3 +147,49 @@ test "http client: a wrong path is an http status without a message" {
     defer arena_state.deinit();
     try std.testing.expectError(error.InvalidResponse, f.client.discover(arena_state.allocator(), .{}));
 }
+
+const listen_filter = "{\"notifications\":{\"toolsListChanged\":true}}";
+
+test "http client: a listen stream without its acknowledgment in listen_ack_timeout ends with error.Timeout" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // The kernel completes the connection, but nobody answers the request.
+    var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var silent = try address.listen(io, .{});
+    defer silent.deinit(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/mcp", .{silent.socket.address.getPort()});
+    const http = try HttpClient.init(io, gpa, .{ .url = url });
+    defer http.deinit();
+    var limits: mcp.Limits = .{};
+    limits.listen_ack_timeout = .fromMilliseconds(200);
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" }, .limits = limits });
+    defer client.deinit();
+    client.connect(http.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const filter = try json.parseTree(arena, listen_filter);
+    try std.testing.expectError(error.Timeout, client.request(arena, .@"subscriptions/listen", filter, .{}));
+}
+
+fn listenUntilCanceled(client: *Client, arena: std.mem.Allocator, token: *mcp.transport.CancelToken) Client.RequestError!void {
+    const filter = json.parseTree(arena, listen_filter) catch return error.OutOfMemory;
+    _ = try client.request(arena, .@"subscriptions/listen", filter, .{ .cancel = token });
+}
+
+test "http client: the acknowledgment stops listen_ack_timeout, and the stream stays open" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start("/mcp");
+    defer f.stop();
+    f.client.options.limits.listen_ack_timeout = .fromMilliseconds(200);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var token: mcp.transport.CancelToken = .{};
+    var future = try io.concurrent(listenUntilCanceled, .{ &f.client, arena_state.allocator(), &token });
+    try io.sleep(.fromMilliseconds(600), .awake);
+    token.cancel(io, "test done");
+    try std.testing.expectError(error.Canceled, future.await(io));
+}

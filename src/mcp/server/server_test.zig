@@ -415,6 +415,21 @@ test "subscriptions listen stream" {
     try std.testing.expectEqual(@as(i64, 9), result(last).object.get("_meta").?.object.get("io.modelcontextprotocol/subscriptionId").?.integer);
 }
 
+test "a listen filter above limits.max_filter_bytes gets -32603 and no stream" {
+    var f: Fixture = undefined;
+    var options: Server.Options = .{ .info = .{ .name = "test", .version = "0.1.0" } };
+    options.limits.max_filter_bytes = 64;
+    try f.init(options);
+    defer f.deinit();
+    // The filter has 79 bytes as compact JSON.
+    const big = "\"notifications\":{\"resourceSubscriptions\":[\"file:///a/long/path/one\",\"file:///a/long/path/two\"]}";
+    const reply = try f.call(11, "subscriptions/listen", meta_none, big);
+    try std.testing.expectEqual(@as(i64, -32603), errorCode(reply).?);
+    try std.testing.expectEqualStrings("Subscription filter too large", reply.object.get("error").?.object.get("message").?.string);
+    // The error is the only frame: there is no acknowledgment.
+    try std.testing.expectEqual(1, f.harness.out.items.len);
+}
+
 test "client-cancelled listen stream gets no response" {
     var f: Fixture = undefined;
     try f.init(.{ .info = .{ .name = "test", .version = "0.1.0" } });

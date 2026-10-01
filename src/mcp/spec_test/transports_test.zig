@@ -252,6 +252,43 @@ test "stdio server writes one valid JSON-RPC message per line and never a reques
     try std.testing.expectEqualStrings("input_required", ask.object.get("result").?.object.get("resultType").?.string);
 }
 
+test "stdio server answers a message deeper than limits.json_max_depth with a parse error" {
+    const gpa = std.testing.allocator;
+    var server: mcp.Server = undefined;
+    try initServer(&server);
+    defer server.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const max_depth = server.options.limits.json_max_depth;
+
+    // The message object, `params` and `arguments` are three levels of the depth.
+    const ok_args = try std.fmt.allocPrint(arena, "\"name\":\"multiline\",\"arguments\":{{\"a\":{s}}}", .{try json.nestedArrays(arena, max_depth - 3)});
+    const deep_args = try std.fmt.allocPrint(arena, "\"name\":\"multiline\",\"arguments\":{{\"a\":{s}}}", .{try json.nestedArrays(arena, max_depth - 2)});
+    // Far too deep for the stack of a recursive parser or serializer.
+    const huge = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"x\":{s}}}}}", .{try json.nestedArrays(arena, 1 << 20)});
+    const input = try std.mem.concat(arena, u8, &.{
+        try request(arena, 1, "tools/call", meta_none, ok_args),   "\n",
+        try request(arena, 2, "tools/call", meta_none, deep_args), "\n",
+        huge,                                                      "\n",
+    });
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try runStdio(&server, input, &out);
+
+    // The message at the limit gets an answer with its id.
+    try std.testing.expect(try responseFor(arena, out.written(), 1) != null);
+    var parse_errors: usize = 0;
+    for (try parseLines(arena, out.written())) |m| switch (m) {
+        .error_response => |e| if (e.code == -32700) {
+            try std.testing.expect(e.id == null);
+            parse_errors += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(2, parse_errors);
+}
+
 test "stdio server answers valid JSON that is not a message with Invalid Request and the id" {
     const gpa = std.testing.allocator;
     var server: mcp.Server = undefined;

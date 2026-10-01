@@ -6,6 +6,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const framer = @import("../util/line_framer.zig");
+const json = @import("../json.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const RequestId = jsonrpc.RequestId;
 const Transport = @import("Transport.zig");
@@ -16,6 +17,9 @@ pub const NotificationFn = *const fn (userdata: ?*anyopaque, method: []const u8,
 pub const Router = struct {
     io: Io,
     gpa: Allocator,
+    /// `Limits.json_max_depth` of the client. The router drops a deeper notification that
+    /// belongs to no request.
+    max_depth: u16,
     pending: std.ArrayList(*Pending) = .empty,
     lock: Io.Mutex = .init,
 
@@ -35,8 +39,8 @@ pub const Router = struct {
         }
     };
 
-    pub fn init(io: Io, gpa: Allocator) Router {
-        return .{ .io = io, .gpa = gpa };
+    pub fn init(io: Io, gpa: Allocator, max_depth: u16) Router {
+        return .{ .io = io, .gpa = gpa, .max_depth = max_depth };
     }
 
     pub fn deinit(self: *Router) void {
@@ -118,6 +122,8 @@ pub const Router = struct {
                 }
             };
         };
+        // The request of a routed frame checks its depth. Here the router does.
+        json.checkDepth(line, self.max_depth) catch return;
         if (on_notification) |f| f(userdata, n.method, n.params);
     }
 
@@ -201,7 +207,7 @@ test "only top-level keys make a frame a response" {
 test "router routes responses by id and progress by token" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var router: Router = .init(io, gpa);
+    var router: Router = .init(io, gpa, 64);
     defer router.deinit();
     var p: Router.Pending = .{ .id = .{ .integer = 7 } };
     defer p.deinit(gpa);
@@ -226,7 +232,7 @@ test "router routes responses by id and progress by token" {
 test "router routes the progress of two concurrent requests by their tokens" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var router: Router = .init(io, gpa);
+    var router: Router = .init(io, gpa, 64);
     defer router.deinit();
     var a: Router.Pending = .{ .id = .{ .integer = 1 } };
     defer a.deinit(gpa);

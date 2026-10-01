@@ -210,7 +210,7 @@ pub const Server = struct {
     /// Parse one message in the arena of `slot` and process it. The function owns `slot`.
     fn dispatch(self: *Server, slot: *Slot, line: []const u8) !void {
         const arena = slot.arena.allocator();
-        slot.message = jsonrpc.Message.parse(arena, line) catch |e| switch (e) {
+        slot.message = jsonrpc.Message.parseMaxDepth(arena, line, self.limits.json_max_depth) catch |e| switch (e) {
             error.OutOfMemory => {
                 self.destroySlot(slot);
                 return error.OutOfMemory;
@@ -502,7 +502,7 @@ pub const Client = struct {
             .out_buf = out_buf,
             .stdout_reader = undefined,
             .stdin_writer = undefined,
-            .router = .init(io, gpa),
+            .router = .init(io, gpa, options.limits.json_max_depth),
         };
         if (builtin.os.tag == .windows and options.process_group) {
             self.job = win.createKillOnCloseJob() catch null;
@@ -671,24 +671,21 @@ pub const Client = struct {
                 return error.Closed;
             },
         };
-        const deadline: ?Io.Clock.Timestamp = ex.timeout.toTimestamp(io);
         while (true) {
             // Deliver everything that arrived.
             while (self.router.takeFrame(&pending)) |frame| {
                 defer self.gpa.free(frame);
                 const is_response = router_mod.frameIsResponse(frame);
-                ex.sink.deliver(io, frame) catch return error.InvalidFrame;
+                ex.deliver(io, frame) catch return error.InvalidFrame;
                 if (is_response) return;
             }
             if (ex.cancel.isCancelled()) {
                 self.sendCancelled(ex.id, ex.cancel.reason);
                 return error.Canceled;
             }
-            if (deadline) |d| {
-                if (Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw.nanoseconds <= 0) {
-                    self.sendCancelled(ex.id, "timeout");
-                    return error.Timeout;
-                }
+            if (ex.expired(io)) {
+                self.sendCancelled(ex.id, "timeout");
+                return error.Timeout;
             }
             if (self.closed.load(.acquire)) return error.Closed;
             // The process was restarted: this request went with the old one.

@@ -38,9 +38,13 @@ const Fixture = struct {
     base: []u8,
 
     fn start(self: *Fixture, mode: mcp.transport.http.ResponseMode) !void {
+        try self.startWith(mode, .{});
+    }
+
+    fn startWith(self: *Fixture, mode: mcp.transport.http.ResponseMode, limits: mcp.Limits) !void {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
-        self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "http-test", .version = "1" } });
+        self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "http-test", .version = "1" }, .limits = limits });
         try self.server.addTool(.{ .name = "add" }, add);
         try self.server.addTool(.{ .name = "test_headers" }, echoHeaders);
         self.transport = .init(io, gpa, &self.server, .{ .port = 0, .response_mode = mode });
@@ -228,4 +232,210 @@ test "http sse response with progress notifications" {
     }
     try std.testing.expectEqual(4, events);
     try std.testing.expect(got_result);
+}
+
+// -- Limits -------------------------------------------------------------------------------------
+
+/// A raw TCP peer that writes bytes and reads all bytes until the server closes.
+const Raw = struct {
+    stream: Io.net.Stream,
+    read_buf: [4096]u8 = undefined,
+    write_buf: [4096]u8 = undefined,
+    reader: Io.net.Stream.Reader = undefined,
+    writer: Io.net.Stream.Writer = undefined,
+
+    fn open(gpa: std.mem.Allocator, port: u16) !*Raw {
+        const io = std.testing.io;
+        const raw = try gpa.create(Raw);
+        errdefer gpa.destroy(raw);
+        const address = try Io.net.IpAddress.parse("127.0.0.1", port);
+        raw.* = .{ .stream = try address.connect(io, .{ .mode = .stream }) };
+        raw.reader = raw.stream.reader(io, &raw.read_buf);
+        raw.writer = raw.stream.writer(io, &raw.write_buf);
+        return raw;
+    }
+
+    fn close(raw: *Raw, gpa: std.mem.Allocator) void {
+        raw.stream.close(std.testing.io);
+        gpa.destroy(raw);
+    }
+
+    fn send(raw: *Raw, bytes: []const u8) !void {
+        try raw.writer.interface.writeAll(bytes);
+        try raw.writer.interface.flush();
+    }
+
+    /// All bytes until the end of the connection. A reset also ends the read.
+    fn readToEnd(raw: *Raw, arena: std.mem.Allocator) ![]u8 {
+        var all: std.ArrayList(u8) = .empty;
+        const r = &raw.reader.interface;
+        while (true) {
+            r.fillMore() catch break;
+            try all.appendSlice(arena, r.buffered());
+            r.tossBuffered();
+        }
+        try all.appendSlice(arena, r.buffered());
+        r.tossBuffered();
+        return all.items;
+    }
+};
+
+const discover_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{" ++ meta_none ++ "}}";
+
+fn discoverRequest(arena: std.mem.Allocator) ![]u8 {
+    return std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\nmcp-protocol-version: 2026-07-28\r\nmcp-method: server/discover\r\ncontent-length: {d}\r\n\r\n{s}", .{ discover_body.len, discover_body });
+}
+
+fn countResponses(bytes: []const u8) usize {
+    return std.mem.count(u8, bytes, "HTTP/1.1 ");
+}
+
+test "http limits: a request head that does not arrive in head_timeout gets 408" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    limits.http.head_timeout = .fromMilliseconds(200);
+    var f: Fixture = undefined;
+    try f.startWith(.auto, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A slow client sends a part of the head and then nothing.
+    {
+        const raw = try Raw.open(gpa, f.transport.bound_port);
+        defer raw.close(gpa);
+        try raw.send("POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\n");
+        const reply = try raw.readToEnd(arena);
+        try std.testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 408 "));
+        try std.testing.expectEqual(1, countResponses(reply));
+    }
+    // A client that sends no byte also gets 408 after the time limit.
+    {
+        const raw = try Raw.open(gpa, f.transport.bound_port);
+        defer raw.close(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, try raw.readToEnd(arena), "HTTP/1.1 408 "));
+    }
+    // A complete request in time gets its response.
+    const reply = try f.post(arena, discover_body, &(std_headers ++ [_]http.Header{.{ .name = "mcp-method", .value = "server/discover" }}));
+    try std.testing.expectEqual(http.Status.ok, reply.status);
+}
+
+test "http limits: the server closes a keep-alive connection after idle_timeout without a response" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    limits.http.idle_timeout = .fromMilliseconds(300);
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // After a request, the connection waits for the next request.
+    {
+        const raw = try Raw.open(gpa, f.transport.bound_port);
+        defer raw.close(gpa);
+        try raw.send(try discoverRequest(arena));
+        const bytes = try raw.readToEnd(arena);
+        try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 200 "));
+        // The end of the connection is the only sign of the idle timeout.
+        try std.testing.expectEqual(1, countResponses(bytes));
+    }
+    // A notification gets 202 and takes another path to the next request.
+    {
+        const raw = try Raw.open(gpa, f.transport.bound_port);
+        defer raw.close(gpa);
+        const note = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}";
+        try raw.send(try std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\ncontent-length: {d}\r\n\r\n{s}", .{ note.len, note }));
+        const bytes = try raw.readToEnd(arena);
+        try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 202 "));
+        try std.testing.expectEqual(1, countResponses(bytes));
+    }
+    // A second request before the limit uses the same connection.
+    {
+        const raw = try Raw.open(gpa, f.transport.bound_port);
+        defer raw.close(gpa);
+        const request_bytes = try discoverRequest(arena);
+        try raw.send(request_bytes);
+        try std.testing.io.sleep(.fromMilliseconds(100), .awake);
+        try raw.send(request_bytes);
+        try std.testing.expectEqual(2, countResponses(try raw.readToEnd(arena)));
+    }
+}
+
+test "http limits: a request body that does not arrive in idle_timeout gets 408" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    limits.http.idle_timeout = .fromMilliseconds(300);
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    try raw.send("POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\ncontent-length: 100\r\n\r\n{\"jsonrpc\"");
+    const bytes = try raw.readToEnd(arena);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 408 "));
+    try std.testing.expectEqual(1, countResponses(bytes));
+}
+
+test "http shutdown ends a connection that sends nothing, also without time limits" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var limits: mcp.Limits = .{};
+    limits.http.head_timeout = .zero;
+    limits.http.idle_timeout = .zero;
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // One silent connection, and one that waits for its next request.
+    const silent = try Raw.open(gpa, f.transport.bound_port);
+    defer silent.close(gpa);
+    const idle = try Raw.open(gpa, f.transport.bound_port);
+    defer idle.close(gpa);
+    try idle.send(try discoverRequest(arena));
+    var head: [12]u8 = undefined;
+    try idle.reader.interface.readSliceAll(&head);
+    try std.testing.expectEqualStrings("HTTP/1.1 200", &head);
+    // Without time limits, the connections stay open.
+    try io.sleep(.fromMilliseconds(200), .awake);
+
+    // The peers do not close their side. The shutdown must not wait for them.
+    const started = Io.Timestamp.now(io, .awake);
+    f.stop();
+    const took = started.durationTo(Io.Timestamp.now(io, .awake));
+    try std.testing.expect(took.nanoseconds < 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(0, countResponses(try silent.readToEnd(arena)));
+}
+
+test "http limits: a message deeper than json_max_depth gets -32700" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    limits.json_max_depth = 8;
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const headers = std_headers ++ [_]http.Header{ .{ .name = "mcp-method", .value = "tools/call" }, .{ .name = "mcp-name", .value = "add" } };
+    // The message object, `params`, `arguments` and six arrays: nine levels.
+    const deep = try request(arena, 1, "tools/call", "\"name\":\"add\",\"arguments\":{\"a\":[[[[[[1]]]]]],\"b\":1}");
+    const reply = try f.post(arena, deep, &headers);
+    try std.testing.expectEqual(http.Status.bad_request, reply.status);
+    const tree = try json.parseTree(arena, reply.body);
+    try std.testing.expectEqual(@as(i64, -32700), tree.object.get("error").?.object.get("code").?.integer);
+    try std.testing.expect(tree.object.get("id").? == .null);
+    // The message object, `params` and `_meta` with the client capabilities: four levels.
+    const ok = try request(arena, 2, "tools/call", "\"name\":\"add\",\"arguments\":{\"a\":1,\"b\":2}");
+    const answer = try f.post(arena, ok, &headers);
+    try std.testing.expectEqual(http.Status.ok, answer.status);
 }

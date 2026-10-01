@@ -46,7 +46,7 @@ pub const Harness = struct {
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const msg = try jsonrpc.Message.parse(arena, text);
+        const msg = try jsonrpc.Message.parseMaxDepth(arena, text, self.server.options.limits.json_max_depth);
         self.server.handle(self.io, .{
             .kind = if (self.principal != null) .streamable_http else .memory,
             .arena = arena,
@@ -132,7 +132,7 @@ pub const ClientLink = struct {
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const msg = jsonrpc.Message.parse(arena, ex.frame) catch |e| switch (e) {
+        const msg = jsonrpc.Message.parseMaxDepth(arena, ex.frame, self.server.options.limits.json_max_depth) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidFrame,
         };

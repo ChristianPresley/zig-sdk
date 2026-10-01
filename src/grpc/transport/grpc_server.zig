@@ -317,7 +317,7 @@ fn handleStreamInner(conn: *Conn, stream: *Stream) !void {
     } orelse return trailersOnly(stream, arena, .invalid_argument, "The call carried no message", null, null);
     defer self.gpa.free(payload);
     const text = messages.decodeJsonRpcMessage(payload) catch return trailersOnly(stream, arena, .invalid_argument, "The message is not a JsonRpcMessage", null, null);
-    const msg = jsonrpc.Message.parse(arena, text) catch |e| switch (e) {
+    const msg = jsonrpc.Message.parseMaxDepth(arena, text, self.server.options.limits.json_max_depth) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Syntax => return rpcErrorOnly(stream, arena, errors.parseError("Parse error"), null),
         error.Invalid, error.InvalidId => return rpcErrorOnly(stream, arena, errors.invalidRequest("Invalid Request"), null),

@@ -152,10 +152,11 @@ pub const Server = struct {
         self.closing.store(true, .release);
         self.stop_event.set(self.io);
         self.server.shutdownSubscriptions(self.io);
-        // Unblock connection tasks that wait for the next request.
+        // The connection tasks stop the connections that wait for the next request at once,
+        // and the busy connections after `limits.shutdown_grace`.
         self.connections_lock.lockUncancelable(self.io);
         defer self.connections_lock.unlock(self.io);
-        for (self.connections.items) |c| c.stream.shutdown(self.io, .both) catch {};
+        for (self.connections.items) |c| c.wake.set(self.io);
     }
 
     fn originAllowed(self: *Server, origin: []const u8) bool {
@@ -207,9 +208,52 @@ fn isLoopbackOrigin(origin: []const u8) bool {
     return isLoopbackName(stripPort(rest));
 }
 
+/// The awake clock in nanoseconds.
+fn nowNanoseconds(io: Io) i64 {
+    return @intCast(Io.Timestamp.now(io, .awake).nanoseconds);
+}
+
+/// A duration in nanoseconds, from 0 to the maximum of `i64`.
+fn nanoseconds(d: Io.Duration) i64 {
+    if (d.nanoseconds <= 0) return 0;
+    return @intCast(@min(d.nanoseconds, std.math.maxInt(i64)));
+}
+
+/// The response to a request that did not arrive in its time limit (RFC 9110 section 15.5.9).
+const request_timeout_response = "HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+/// One connection. The connection task supervises the time limits. A worker task does the
+/// TLS handshake, reads the requests and runs the handlers. On a timeout, the connection
+/// task cancels the worker task: on Windows, a shutdown of the socket does not stop a read.
 const Connection = struct {
     owner: *Server,
     stream: Io.net.Stream,
+    /// The time limit of the read that the worker does now: an awake time in nanoseconds,
+    /// `busy`, `unlimited` or `expired`. Only the worker changes a value other than
+    /// `expired`. Only the connection task sets `expired`.
+    deadline: std.atomic.Value(i64) = .init(busy),
+    /// What the worker waits for. Only the worker uses it.
+    phase: Phase = .busy,
+    worker_done: std.atomic.Value(bool) = .init(false),
+    /// Wakes the connection task for a new deadline, the end of the worker or the shutdown.
+    wake: Io.Event = .unset,
+
+    const Phase = enum {
+        /// The TLS handshake or a request head.
+        head,
+        /// The first byte of the next request.
+        idle,
+        /// The rest of a request body.
+        body,
+        busy,
+    };
+
+    /// The worker runs a handler or writes a response. No time limit applies.
+    const busy: i64 = 0;
+    /// The worker waits for bytes from the client, without a time limit.
+    const unlimited: i64 = std.math.maxInt(i64);
+    /// The time limit passed, or the server stops. The worker must stop.
+    const expired: i64 = -1;
 
     fn run(conn: *Connection) Io.Cancelable!void {
         const self = conn.owner;
@@ -219,6 +263,121 @@ const Connection = struct {
             self.permits.post(self.io);
             self.gpa.destroy(conn);
         }
+        var worker = self.io.concurrent(work, .{conn}) catch return;
+        conn.supervise(&worker);
+    }
+
+    /// Watch the time limit of the worker until the worker ends. Cancel the worker when the
+    /// limit passes. At the shutdown, cancel a worker that waits for bytes at once, and a
+    /// busy worker after `limits.shutdown_grace`.
+    fn supervise(conn: *Connection, worker: *Io.Future(void)) void {
+        const self = conn.owner;
+        const io = self.io;
+        var shutdown_end: ?i64 = null;
+        while (!conn.worker_done.load(.acquire)) {
+            const now = nowNanoseconds(io);
+            var wait: i64 = 60 * std.time.ns_per_s;
+            const d = conn.deadline.load(.acquire);
+            if (d == expired) break;
+            if (self.closing.load(.acquire)) {
+                if (d != busy) {
+                    if (conn.expire(d)) break;
+                    continue;
+                }
+                const end = shutdown_end orelse now +| nanoseconds(self.limits.shutdown_grace);
+                shutdown_end = end;
+                if (now >= end) {
+                    conn.deadline.store(expired, .release);
+                    break;
+                }
+                wait = @min(wait, end - now);
+            } else if (d != busy and d != unlimited) {
+                if (now >= d) {
+                    if (conn.expire(d)) break;
+                    continue;
+                }
+                wait = @min(wait, d - now);
+            }
+            conn.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(@max(wait, 1)), .clock = .awake } }) catch |e| switch (e) {
+                error.Timeout => {},
+                error.Canceled => {
+                    conn.deadline.store(expired, .release);
+                    break;
+                },
+            };
+            conn.wake.reset();
+        }
+        if (conn.deadline.load(.acquire) == expired) worker.cancel(io) else worker.await(io);
+    }
+
+    /// Mark the deadline `d` as passed. False when the worker changed the deadline first.
+    fn expire(conn: *Connection, d: i64) bool {
+        return conn.deadline.cmpxchgStrong(d, expired, .acq_rel, .acquire) == null;
+    }
+
+    /// Set the time limit of the next read to `limit` from now. Zero means no limit. False
+    /// when the connection expired: the worker must stop.
+    fn startTimer(conn: *Connection, phase: Phase, limit: Io.Duration) bool {
+        conn.phase = phase;
+        const ns = nanoseconds(limit);
+        const io = conn.owner.io;
+        const value = if (ns == 0) unlimited else @max(nowNanoseconds(io) +| ns, 1);
+        if (!conn.setDeadline(value)) return false;
+        if (value != unlimited) conn.wake.set(io);
+        return true;
+    }
+
+    /// As `startTimer`, but keep a time limit that runs already.
+    fn continueTimer(conn: *Connection, phase: Phase, limit: Io.Duration) bool {
+        const d = conn.deadline.load(.acquire);
+        if (d == expired) return false;
+        if (d != busy) return true;
+        return conn.startTimer(phase, limit);
+    }
+
+    /// Remove the time limit while the worker is busy. False when the connection expired.
+    fn stopTimer(conn: *Connection) bool {
+        conn.phase = .busy;
+        return conn.setDeadline(busy);
+    }
+
+    fn setDeadline(conn: *Connection, value: i64) bool {
+        var cur = conn.deadline.load(.acquire);
+        while (cur != expired) {
+            cur = conn.deadline.cmpxchgWeak(cur, value, .acq_rel, .acquire) orelse return true;
+        }
+        return false;
+    }
+
+    fn timedOut(conn: *Connection) bool {
+        return conn.deadline.load(.acquire) == expired;
+    }
+
+    /// Tell the client about a request head or body that did not arrive in time. The server
+    /// closes an idle connection without a response (RFC 9112 section 9.6), and sends nothing
+    /// at the shutdown.
+    fn sendTimeout(conn: *Connection, out: *Io.Writer) void {
+        if (conn.phase != .head and conn.phase != .body) return;
+        if (conn.owner.closing.load(.acquire)) return;
+        out.writeAll(request_timeout_response) catch return;
+        out.flush() catch {};
+    }
+
+    fn work(conn: *Connection) void {
+        const io = conn.owner.io;
+        defer {
+            conn.worker_done.store(true, .release);
+            conn.wake.set(io);
+        }
+        conn.serve() catch {};
+    }
+
+    /// Read and handle requests until the connection ends. The TLS handshake and the head of
+    /// the first request obey `limits.http.head_timeout`. The wait for the next request obeys
+    /// `limits.http.idle_timeout`, and its head obeys `head_timeout` from its first byte.
+    fn serve(conn: *Connection) Io.Cancelable!void {
+        const self = conn.owner;
+        if (!conn.startTimer(.head, self.limits.http.head_timeout)) return;
         const read_buf = self.gpa.alloc(u8, @max(self.limits.http.max_head_bytes + 4096, tls.Connection.min_input_buffer_len)) catch return;
         defer self.gpa.free(read_buf);
         const write_buf = self.gpa.alloc(u8, tls.Connection.min_output_buffer_len) catch return;
@@ -258,7 +417,16 @@ const Connection = struct {
         const in: *Io.Reader = if (tls_active) &tls_conn.reader else &reader.interface;
         const out: *Io.Writer = if (tls_active) &tls_conn.writer else &writer.interface;
         var http_server: http.Server = .init(in, out);
+        var first = true;
         while (!self.closing.load(.acquire)) {
+            if (!first) {
+                // Wait for the first byte of the next request. A time limit that runs already
+                // (from the end of the last handler) continues.
+                if (!conn.continueTimer(.idle, self.limits.http.idle_timeout)) return;
+                _ = in.peekByte() catch return;
+                if (!conn.startTimer(.head, self.limits.http.head_timeout)) return;
+            }
+            first = false;
             var request = http_server.receiveHead() catch |e| switch (e) {
                 error.HttpConnectionClosing => return,
                 error.HttpHeadersOversize => {
@@ -266,12 +434,20 @@ const Connection = struct {
                     out.flush() catch {};
                     return;
                 },
-                else => return,
+                else => {
+                    if (conn.timedOut()) conn.sendTimeout(out);
+                    return;
+                },
             };
-            const keep_alive = handleRequest(self, &request, &reader) catch |err| switch (err) {
+            if (!conn.stopTimer()) return;
+            const keep_alive = handleRequest(conn, &request, &reader) catch |err| switch (err) {
                 error.OutOfMemory => false,
                 else => false,
             };
+            if (conn.timedOut()) {
+                conn.sendTimeout(out);
+                return;
+            }
             if (!keep_alive or !request.head.keep_alive) return;
         }
     }
@@ -354,7 +530,8 @@ fn retryAfterSeconds(err: Value) ?u64 {
 
 /// Handle one request on a connection. Returns whether the connection can carry one more request.
 /// `socket` is the reader of the socket. It detects a disconnect while a handler runs.
-fn handleRequest(self: *Server, request: *http.Server.Request, socket: *Io.net.Stream.Reader) !bool {
+fn handleRequest(conn: *Connection, request: *http.Server.Request, socket: *Io.net.Stream.Reader) !bool {
+    const self = conn.owner;
     var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -442,6 +619,8 @@ fn handleRequest(self: *Server, request: *http.Server.Request, socket: *Io.net.S
     if (request.head.transfer_encoding == .none and request.head.content_length == null) {
         request.head.content_length = 0;
     }
+    // The body obeys `limits.http.idle_timeout` from the end of the head.
+    if (!conn.startTimer(.body, self.limits.http.idle_timeout)) return false;
     var body_buf: [4096]u8 = undefined;
     const body_reader = request.readerExpectNone(&body_buf);
     const body = body_reader.allocRemaining(arena, .limited(self.limits.http.max_body_bytes)) catch |e| switch (e) {
@@ -452,7 +631,8 @@ fn handleRequest(self: *Server, request: *http.Server.Request, socket: *Io.net.S
         error.OutOfMemory => return error.OutOfMemory,
         error.ReadFailed => return false,
     };
-    const msg = jsonrpc.Message.parse(arena, body) catch |e| switch (e) {
+    if (!conn.stopTimer()) return false;
+    const msg = jsonrpc.Message.parseMaxDepth(arena, body, self.limits.json_max_depth) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Syntax => {
             try respondError(request, .bad_request, null, errors.parseError("Parse error"));
@@ -472,7 +652,7 @@ fn handleRequest(self: *Server, request: *http.Server.Request, socket: *Io.net.S
             try respondError(request, .bad_request, null, errors.invalidRequest("Clients must not send responses"));
             return true;
         },
-        .request => |req| return handleRpcRequest(self, request, socket, arena, head, req, principal),
+        .request => |req| return handleRpcRequest(conn, request, socket, arena, head, req, principal),
     }
 }
 
@@ -488,7 +668,8 @@ fn respondErrorOptions(request: *http.Server.Request, status: http.Status, id: ?
     try request.respond(aw.written(), .{ .status = status, .keep_alive = keep_alive and request.head.keep_alive, .extra_headers = &json_headers });
 }
 
-fn handleRpcRequest(self: *Server, request: *http.Server.Request, socket: *Io.net.Stream.Reader, arena: Allocator, head: Head, req: jsonrpc.Message.Request, principal: ?*resource_server.Principal) !bool {
+fn handleRpcRequest(conn: *Connection, request: *http.Server.Request, socket: *Io.net.Stream.Reader, arena: Allocator, head: Head, req: jsonrpc.Message.Request, principal: ?*resource_server.Principal) !bool {
+    const self = conn.owner;
     // Header presence, mirror validation and version support run before dispatch on HTTP.
     const schema = if (std.mem.eql(u8, req.method, "tools/call")) toolSchema(self, req.params) else null;
     if (try envelope.verify(arena, head.envelope_headers, req.method, req.params, schema)) |rejection| {
@@ -539,7 +720,9 @@ fn handleRpcRequest(self: *Server, request: *http.Server.Request, socket: *Io.ne
     }
     // The connection of a canceled request does not carry one more request.
     const reuse = exchange.reusable and !token.isCancelled() and request.head.keep_alive;
-    if (watcher) |*w| watch.stop(self.io, w, reuse);
+    // The watch can wait for the next request, thus the idle time limit starts now.
+    const idle = reuse and conn.startTimer(.idle, self.limits.http.idle_timeout);
+    if (watcher) |*w| watch.stop(self.io, w, idle);
     return reuse;
 }
 

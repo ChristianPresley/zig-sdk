@@ -1,11 +1,16 @@
-//! Size, count and time limits with their defaults. Every field has one documented overflow
-//! behavior and one test.
+//! Size, count and time limits with their defaults. The doc comment of each limit gives the
+//! behavior at overflow, and a test examines that behavior.
 const std = @import("std");
 const Io = std.Io;
 
 const Limits = @This();
 
-/// Maximum JSON nesting depth of an inbound message. Overflow: `-32700`.
+/// Maximum JSON nesting depth of an inbound message. The message object is level 1, thus
+/// `params` is level 2. The servers of all transports and the client check the depth before
+/// they parse a message, without recursion. A value above `json.max_message_depth` (200)
+/// counts as that value. Overflow: the server answers with `-32700` and a null id. On the
+/// client, the request of the message fails with `error.InvalidResponse`, and the client
+/// drops a notification that belongs to no request.
 json_max_depth: u16 = 64,
 
 stdio: struct {
@@ -55,11 +60,19 @@ http: struct {
     max_head_bytes: usize = 16 << 10,
     /// Maximum open connections. Overflow: the accept loop waits.
     max_connections: u32 = 256,
+    /// Set `SO_REUSEADDR` on the listen socket of the HTTP and WebSocket servers.
     reuse_address: bool = false,
+    /// The time that the server waits for the next request on a keep-alive connection. It is
+    /// also the time for the body of a request after its head. Zero disables the limit. Overflow: the server closes an idle connection without a
+    /// response, and answers a late body with HTTP 408.
     idle_timeout: Io.Duration = .fromSeconds(60),
+    /// The time for the head of a request, from its first byte. For the first request of a
+    /// connection, the time starts at the accept and includes the TLS handshake. Zero
+    /// disables the limit. Overflow: HTTP 408, and the server closes the connection.
     head_timeout: Io.Duration = .fromSeconds(10),
+    /// The interval of the SSE comments that keep a listen stream open.
     sse_keepalive: Io.Duration = .fromSeconds(15),
-    listen_ack_timeout: Io.Duration = .fromSeconds(10),
+    /// Maximum redirects of one icon fetch. Overflow: `error.TooManyRedirects`.
     max_redirect_hops: u8 = 3,
 } = .{},
 
@@ -69,7 +82,8 @@ max_in_flight_requests: u32 = 256,
 max_listen_subscriptions: u32 = 1024,
 /// Maximum URIs in one `resourceSubscriptions` filter. Overflow: `-32603`.
 max_resource_subscription_uris: u32 = 1024,
-/// Maximum serialized bytes of a subscription filter. Overflow: `-32603`.
+/// Maximum bytes of the `notifications` filter of `subscriptions/listen` as compact JSON.
+/// Overflow: `-32603`.
 max_filter_bytes: usize = 64 << 10,
 /// Maximum progress notifications per second per request, on the server and on the client.
 /// Overflow: the server does not send the notification, and the client does not give it to
@@ -82,19 +96,30 @@ request_timeout: Io.Duration = .fromSeconds(60),
 /// `RequestOptions.max_total_timeout`. Progress notifications do not extend a timeout.
 /// Overflow: the client cancels the request and returns `error.Timeout`.
 max_total_timeout: Io.Duration = .fromSeconds(600),
+/// The time that the requests in flight get to end at a shutdown or at the end of a
+/// connection. Overflow: the transport cancels them.
 shutdown_grace: Io.Duration = .fromSeconds(2),
 /// How often the client re-issues a request after it lost the stream before any response
 /// byte. The client retries only idempotent methods, unless the caller forces it.
 max_lost_stream_retries: u32 = 3,
-cancel_notify_timeout: Io.Duration = .fromSeconds(5),
+/// The time that the client waits for `notifications/subscriptions/acknowledged`, the first
+/// message of a `subscriptions/listen` stream, from the start of the request. Zero disables
+/// the limit. Overflow: the client cancels the stream and returns `error.Timeout`.
+listen_ack_timeout: Io.Duration = .fromSeconds(10),
+/// The lifetime of a `requestState` that the server seals. Overflow: `-32602` with the
+/// reason `invalid_request_state`.
 request_state_ttl: Io.Duration = .fromSeconds(600),
+/// Maximum entries in one page of a list result. Overflow: the result has a `nextCursor`.
 page_size: u32 = 100,
 /// Maximum pages that the client reads in one automatic list refresh, for example the
 /// `tools/list` refresh after a `-32020` error. Overflow: the client stops the refresh.
 max_auto_pages: u32 = 64,
+/// Maximum values of one completion result. Overflow: the server sends the first values
+/// and sets `hasMore`.
 completion_max_values: u32 = 100,
+/// Maximum multi round-trip rounds of one client request. Overflow:
+/// `error.TooManyRounds`.
 mrtr_max_rounds_client: u8 = 10,
-max_step_up_attempts: u8 = 3,
 
 /// Rate limits of the server for each caller. All limits are off by default.
 rate_limits: RateLimits = .{},

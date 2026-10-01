@@ -138,7 +138,6 @@ pub const TypedChannel = struct {
         defer arena_state.deinit();
         var task: Task = .{ .self = self, .ex = ex, .rpc = rpc, .arena = arena_state.allocator() };
         var future = io.concurrent(Task.run, .{&task}) catch return self.perform(task.arena, ex, rpc);
-        const deadline = ex.timeout.toTimestamp(io);
         var stop: ?Transport.ExchangeError = null;
         while (true) {
             task.done.waitTimeout(io, .{ .duration = .{ .raw = self.options.channel.poll_interval, .clock = .awake } }) catch |e| switch (e) {
@@ -153,10 +152,10 @@ pub const TypedChannel = struct {
                 stop = error.Canceled;
                 break;
             }
-            if (deadline) |d| if (Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw.nanoseconds <= 0) {
+            if (ex.expired(io)) {
                 stop = error.Timeout;
                 break;
-            };
+            }
         }
         if (stop) |err| {
             _ = future.cancel(io);
@@ -238,7 +237,7 @@ pub const TypedChannel = struct {
         };
         var aw: Io.Writer.Allocating = .init(arena);
         jsonrpc.message.writeResponse(&aw.writer, ex.id, result) catch return error.OutOfMemory;
-        ex.sink.deliver(io, aw.written()) catch return error.InvalidFrame;
+        ex.deliver(io, aw.written()) catch return error.InvalidFrame;
     }
 
     /// The pseudo-headers and the metadata of one call.
@@ -290,7 +289,7 @@ fn finishError(io: Io, arena: Allocator, ex: *Transport.Exchange, trailers: []co
     if (err) |e| {
         var aw: Io.Writer.Allocating = .init(arena);
         jsonrpc.message.writeErrorResponse(&aw.writer, ex.id, e) catch return error.OutOfMemory;
-        ex.sink.deliver(io, aw.written()) catch return error.InvalidFrame;
+        ex.deliver(io, aw.written()) catch return error.InvalidFrame;
         return;
     }
     return switch (code) {

@@ -234,7 +234,6 @@ pub const Channel = struct {
         defer arena_state.deinit();
         var task: Task = .{ .channel = self, .ex = ex, .arena = arena_state.allocator() };
         var future = io.concurrent(Task.run, .{&task}) catch return self.perform(task.arena, ex);
-        const deadline = ex.timeout.toTimestamp(io);
         var stop: ?Transport.ExchangeError = null;
         while (true) {
             task.done.waitTimeout(io, .{ .duration = .{ .raw = self.options.poll_interval, .clock = .awake } }) catch |e| switch (e) {
@@ -249,10 +248,10 @@ pub const Channel = struct {
                 stop = error.Canceled;
                 break;
             }
-            if (deadline) |d| if (Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw.nanoseconds <= 0) {
+            if (ex.expired(io)) {
                 stop = error.Timeout;
                 break;
-            };
+            }
         }
         if (stop) |err| {
             _ = future.cancel(io);
@@ -372,7 +371,7 @@ pub const Channel = struct {
             if (std.mem.eql(u8, ex.method, "tools/list")) {
                 if (self.tool_headers.learn(arena, text) catch null) |rewritten| frame = rewritten;
             }
-            ex.sink.deliver(io, frame) catch return error.InvalidFrame;
+            ex.deliver(io, frame) catch return error.InvalidFrame;
             delivered = true;
         }
         const trailers = stream.waitEnd() catch |e| return mapStream(e);
@@ -396,7 +395,7 @@ pub const Channel = struct {
             const len = decoder.calcSizeForSlice(bin) catch return error.InvalidFrame;
             const frame = try arena.alloc(u8, len);
             decoder.decode(frame, bin) catch return error.InvalidFrame;
-            ex.sink.deliver(io, frame) catch return error.InvalidFrame;
+            ex.deliver(io, frame) catch return error.InvalidFrame;
             return;
         };
         return switch (code) {
