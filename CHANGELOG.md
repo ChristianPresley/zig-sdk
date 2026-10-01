@@ -4,6 +4,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-30
+
 ### Added
 
 - Regular expression engine for the JSON Schema keywords `pattern` and `patternProperties` (`mcp.schema.regex`). It is a Pike VM over code points with the ECMA-262 syntax, and the match time is linear in the input length. Backreferences, lookaround and most Unicode property escapes give `error.UnsupportedRegex`. The limits are `limits.schema.max_pattern_bytes` and `limits.schema.max_regex_states`. A derived schema accepts `.pattern` on string fields.
