@@ -62,6 +62,8 @@ pub const Config = struct {
     /// `bundle` policies have anchors. When the names do not fit in
     /// `ca_names.max_request_list_len` bytes, the server sends no names.
     send_client_ca_names: bool = true,
+    /// The revocation checks of a client certificate. The default makes none.
+    client_revocation: verify.Revocation = .{},
 };
 
 pub const AcceptOptions = struct {
@@ -73,6 +75,9 @@ pub const AcceptOptions = struct {
     allow_truncation_attacks: bool = false,
     /// Receives the alert that ended a failed handshake, sent or received.
     alert: ?*tls.Alert = null,
+    /// The current time in seconds since the epoch for the checks of a client
+    /// certificate. Null reads the real clock of `io`.
+    now_sec: ?i64 = null,
 };
 
 pub const AcceptError = common.Error;
@@ -293,10 +298,11 @@ fn run(
         if (certs.count == 0) {
             if (config.client_auth == .required) return abort(c, options, .certificate_required, error.TlsCertificateRequired);
         } else {
-            const now_sec = std.Io.Clock.real.now(options.io).toSeconds();
+            const now_sec = options.now_sec orelse std.Io.Clock.real.now(options.io).toSeconds();
             const leaf = verify.verifyChain(certs.certs[0..certs.count], config.client_trust.?, .{
                 .purpose = .client,
                 .now_sec = now_sec,
+                .revocation = config.client_revocation,
             }) catch |e| return common.abortVerify(c, options.alert, e);
             c.peer_fingerprint = common.fingerprint(certs.certs[0]);
             const client_cv = try reader.next(c, options.alert);

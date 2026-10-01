@@ -70,6 +70,8 @@ pub const Options = struct {
     /// The current time in seconds since the epoch for the certificate validity. Null
     /// reads the real clock of `io`.
     now_sec: ?i64 = null,
+    /// The revocation checks of the server chain. The default makes none.
+    revocation: verify.Revocation = .{},
 };
 
 pub const ConnectError = common.Error;
@@ -263,6 +265,7 @@ fn run(
         .purpose = .server,
         .host = options.host,
         .now_sec = now_sec,
+        .revocation = options.revocation,
     }) catch |e| return common.abortVerify(c, alert_out, e);
     c.peer_fingerprint = common.fingerprint(chain.certs[0]);
     transcript.update(msg.raw);

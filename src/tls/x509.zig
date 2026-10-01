@@ -2,6 +2,7 @@
 //! expose: basic constraints, key usage and the subject alternative name (RFC 5280
 //! section 4.2.1).
 const std = @import("std");
+const Certificate = std.crypto.Certificate;
 const der = @import("der.zig");
 
 const oid_basic_constraints = "\x55\x1d\x13";
@@ -111,6 +112,7 @@ pub const BasicConstraints = struct {
 pub const KeyUsage = struct {
     key_cert_sign: bool,
     digital_signature: bool,
+    crl_sign: bool = false,
 };
 
 /// The purposes of the extended key usage extension that the SDK knows (RFC 5280
@@ -234,7 +236,88 @@ pub fn keyUsage(cert: []const u8) der.Error!?KeyUsage {
     return .{
         .digital_signature = first & 0x80 != 0,
         .key_cert_sign = first & 0x04 != 0,
+        .crl_sign = first & 0x02 != 0,
     };
+}
+
+pub const SignatureError = error{
+    /// The algorithm or the key size is not one that the SDK verifies.
+    UnsupportedAlgorithm,
+    /// The signature does not verify with the key.
+    BadSignature,
+};
+
+const oid_sha256_rsa = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b";
+const oid_sha384_rsa = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0c";
+const oid_sha512_rsa = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d";
+const oid_ecdsa_sha256 = "\x2a\x86\x48\xce\x3d\x04\x03\x02";
+const oid_ecdsa_sha384 = "\x2a\x86\x48\xce\x3d\x04\x03\x03";
+const oid_ecdsa_sha512 = "\x2a\x86\x48\xce\x3d\x04\x03\x04";
+const oid_ed25519 = "\x2b\x65\x70";
+
+/// Verify the signature of a signed object, such as a CRL or an OCSP response, with the
+/// public key of a certificate. `algorithm` is the `AlgorithmIdentifier` element. The SDK
+/// verifies RSASSA-PKCS1-v1_5 with SHA-256, SHA-384 or SHA-512, ECDSA on P-256 or P-384,
+/// and Ed25519.
+pub fn verifySignature(algorithm: der.Element, message: []const u8, signature: []const u8, signer: Certificate.Parsed) SignatureError!void {
+    if (algorithm.tag != der.tag_sequence) return error.UnsupportedAlgorithm;
+    var parts = algorithm.children();
+    const oid = parts.require() catch return error.UnsupportedAlgorithm;
+    const params = parts.next() catch return error.UnsupportedAlgorithm;
+    if ((parts.next() catch return error.UnsupportedAlgorithm) != null) return error.UnsupportedAlgorithm;
+    const key = signer.pubKey();
+    const sha2 = std.crypto.hash.sha2;
+    if (oid.isOid(oid_sha256_rsa) or oid.isOid(oid_sha384_rsa) or oid.isOid(oid_sha512_rsa)) {
+        // The parameters are NULL or absent (RFC 4055 section 5).
+        if (params) |p| if (p.tag != der.tag_null or p.content.len != 0) return error.UnsupportedAlgorithm;
+        if (oid.isOid(oid_sha256_rsa)) return verifyRsaPkcs1(sha2.Sha256, message, signature, signer.pub_key_algo, key);
+        if (oid.isOid(oid_sha384_rsa)) return verifyRsaPkcs1(sha2.Sha384, message, signature, signer.pub_key_algo, key);
+        return verifyRsaPkcs1(sha2.Sha512, message, signature, signer.pub_key_algo, key);
+    }
+    if (params != null) return error.UnsupportedAlgorithm;
+    if (oid.isOid(oid_ecdsa_sha256)) return verifyEcdsa(sha2.Sha256, message, signature, signer.pub_key_algo, key);
+    if (oid.isOid(oid_ecdsa_sha384)) return verifyEcdsa(sha2.Sha384, message, signature, signer.pub_key_algo, key);
+    if (oid.isOid(oid_ecdsa_sha512)) return verifyEcdsa(sha2.Sha512, message, signature, signer.pub_key_algo, key);
+    if (oid.isOid(oid_ed25519)) {
+        if (signer.pub_key_algo != .curveEd25519) return error.BadSignature;
+        const Ed25519 = std.crypto.sign.Ed25519;
+        if (signature.len != Ed25519.Signature.encoded_length or key.len != Ed25519.PublicKey.encoded_length) return error.BadSignature;
+        const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
+        const public = Ed25519.PublicKey.fromBytes(key[0..Ed25519.PublicKey.encoded_length].*) catch return error.BadSignature;
+        sig.verify(message, public) catch return error.BadSignature;
+        return;
+    }
+    return error.UnsupportedAlgorithm;
+}
+
+fn verifyRsaPkcs1(comptime Hash: type, message: []const u8, signature: []const u8, algo: Certificate.Parsed.PubKeyAlgo, key: []const u8) SignatureError!void {
+    if (algo != .rsaEncryption) return error.BadSignature;
+    const rsa = Certificate.rsa;
+    const components = rsa.PublicKey.parseDer(key) catch return error.BadSignature;
+    switch (components.modulus.len) {
+        inline 256, 384, 512 => |modulus_len| {
+            if (signature.len != modulus_len) return error.BadSignature;
+            const public = rsa.PublicKey.fromBytes(components.exponent, components.modulus) catch return error.BadSignature;
+            rsa.PKCS1v1_5Signature.verify(modulus_len, signature[0..modulus_len].*, message, public, Hash) catch return error.BadSignature;
+        },
+        else => return error.UnsupportedAlgorithm,
+    }
+}
+
+fn verifyEcdsa(comptime Hash: type, message: []const u8, signature: []const u8, algo: Certificate.Parsed.PubKeyAlgo, key: []const u8) SignatureError!void {
+    const curve = switch (algo) {
+        .X9_62_id_ecPublicKey => |c| c,
+        else => return error.BadSignature,
+    };
+    switch (curve) {
+        inline .X9_62_prime256v1, .secp384r1 => |c| {
+            const Ecdsa = std.crypto.sign.ecdsa.Ecdsa(c.Curve(), Hash);
+            const sig = Ecdsa.Signature.fromDer(signature) catch return error.BadSignature;
+            const public = Ecdsa.PublicKey.fromSec1(key) catch return error.BadSignature;
+            sig.verify(message, public) catch return error.BadSignature;
+        },
+        .secp521r1 => return error.UnsupportedAlgorithm,
+    }
 }
 
 /// The extended key usage of a certificate, or null when the extension is absent.

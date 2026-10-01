@@ -214,6 +214,13 @@ fn tlsParsers(_: void, smith: *Smith) anyerror!void {
         nc.checkName(.{ .form = .rfc822_name, .value = bytes }) catch {};
     } else |_| {}
     tls.name_constraints.checkPath(&.{bytes}, bytes, "localhost") catch {};
+    if (tls.Crl.fromDer(std.testing.allocator, bytes)) |crl_value| {
+        var crl = crl_value;
+        defer crl.deinit();
+        _ = crl.find(bytes);
+        _ = crl.isCurrent(0, 0);
+    } else |_| {}
+    if (tls.der.parse(bytes)) |element| _ = element.time() catch {} else |_| {}
     _ = tls.verify.verifyChain(&.{bytes}, .self_signed, .{ .purpose = .server, .host = "localhost", .now_sec = 0 }) catch {};
     var it: tls.pem.Iterator = .init(bytes);
     while (it.next()) |block| {

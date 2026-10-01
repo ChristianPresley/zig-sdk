@@ -20,6 +20,8 @@ pub const TlsSetup = struct {
     cipher_suites: []const tls.Suite = tls.suites.default_suites,
     /// The padding of the encrypted records that the client sends.
     padding: tls.Padding = .none,
+    /// The revocation checks of the server certificate. The default makes none.
+    revocation: tls.Revocation = .{},
 };
 
 pub const OpenError = error{
@@ -97,6 +99,7 @@ pub const Connection = struct {
                 .identity = setup.identity,
                 .cipher_suites = setup.cipher_suites,
                 .padding = setup.padding,
+                .revocation = setup.revocation,
                 .read_buffer = self.tls_read_buf,
                 .write_buffer = self.tls_write_buf,
                 .alert = &alert,

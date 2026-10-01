@@ -21,6 +21,8 @@ const Echo = struct {
     key_update: bool = false,
     result: anyerror!void = {},
     alert: std.crypto.tls.Alert = undefined,
+    /// The verification time of client certificates. Null reads the clock.
+    now_sec: ?i64 = null,
 
     fn alpn(self: *const Echo) ?[]const u8 {
         return if (self.alpn_len == 0) null else self.alpn_buf[0..self.alpn_len];
@@ -44,6 +46,7 @@ const Echo = struct {
             .read_buffer = &read_buf,
             .write_buffer = &write_buf,
             .alert = &self.alert,
+            .now_sec = self.now_sec,
         });
         defer conn.deinit();
         self.group = conn.group;
@@ -114,6 +117,7 @@ const ClientSetup = struct {
     padding: tls.Padding = .none,
     /// The verification time. Null reads the clock.
     now_sec: ?i64 = null,
+    revocation: tls.Revocation = .{},
 };
 
 /// The fixed verification time of the newer fixtures: 2027-01-15.
@@ -129,6 +133,9 @@ const ServerSetup = struct {
     send_client_ca_names: bool = true,
     /// The chains of the server. Null takes the one chain argument of `roundTrip`.
     chains: ?[]const *const tls.CertChain = null,
+    client_revocation: tls.Revocation = .{},
+    /// The verification time of client certificates. Null reads the clock.
+    now_sec: ?i64 = null,
 };
 
 /// One handshake and echo between the SDK client and the SDK server. Returns the client
@@ -145,10 +152,12 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
             .client_auth = server_setup.client_auth,
             .client_trust = server_setup.client_trust,
             .send_client_ca_names = server_setup.send_client_ca_names,
+            .client_revocation = server_setup.client_revocation,
         }),
         .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
         .io = io,
         .key_update = client_setup.key_update,
+        .now_sec = server_setup.now_sec,
     };
     defer echo_out.listener.deinit(io);
     const port = echo_out.listener.socket.address.getPort();
@@ -182,6 +191,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
         .alert = &alert,
         .allow_truncation_attacks = true,
         .now_sec = client_setup.now_sec,
+        .revocation = client_setup.revocation,
     }) catch |e| {
         writer.interface.flush() catch {};
         future.await(io);
@@ -300,6 +310,34 @@ test "the client enforces the name constraints of the CA" {
     // The leaf also has the DNS name bad.example.com, and the CA excludes it.
     try std.testing.expectError(error.TlsCertificateNameNotPermitted, roundTrip(io, &excluded, .{}, setup, &echo, null));
     try std.testing.expectEqual(std.crypto.tls.Alert.Description.bad_certificate, echo.alert.description);
+}
+
+test "a CRL from the application refuses a revoked certificate on both sides" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/rev-root.crt");
+    var valid = try loadChain(gpa, io, "rev-chain.crt", "rev-leaf.key");
+    defer valid.deinit();
+    var revoked = try loadChain(gpa, io, "rev-revoked-chain.crt", "rev-leaf.key");
+    defer revoked.deinit();
+    var crl = try tls.Crl.loadFile(gpa, io, "test/fixtures/tls/pem/rev-ca.crl");
+    defer crl.deinit();
+    const policy: tls.Revocation = .{ .crls = &.{&crl}, .unknown = .hard_fail };
+    var echo: Echo = undefined;
+
+    const client: ClientSetup = .{ .trust = .{ .ca_set = &set }, .now_sec = fixture_now, .revocation = policy };
+    try roundTrip(io, &valid, .{}, client, &echo, null);
+    try std.testing.expectError(error.TlsCertificateRevoked, roundTrip(io, &revoked, .{}, client, &echo, null));
+    try std.testing.expectEqual(std.crypto.tls.Alert.Description.certificate_revoked, echo.alert.description);
+
+    // The server checks a client certificate with the same CRL.
+    const server: ServerSetup = .{ .client_auth = .required, .client_trust = .{ .ca_set = &set }, .client_revocation = policy, .now_sec = fixture_now };
+    try roundTrip(io, &valid, server, .{ .trust = .{ .ca_set = &set }, .now_sec = fixture_now, .identity = &valid }, &echo, null);
+    const refused = roundTrip(io, &valid, server, .{ .trust = .{ .ca_set = &set }, .now_sec = fixture_now, .identity = &revoked }, &echo, null);
+    try std.testing.expect(std.meta.isError(refused));
+    try std.testing.expectError(error.TlsCertificateRevoked, echo.result);
 }
 
 test "hello retry request when the server wants another group" {

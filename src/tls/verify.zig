@@ -1,6 +1,6 @@
 //! Certificate chain validation for the TLS client and for client certificates on the
 //! server. It has the trust policies, the chain walk with CA constraints, the name
-//! constraints, the host name check and the CertificateVerify signature check.
+//! constraints, the revocation checks, the host check and the CertificateVerify check.
 const std = @import("std");
 const crypto = std.crypto;
 const tls = crypto.tls;
@@ -9,6 +9,7 @@ const CaSet = @import("CaSet.zig");
 const pss = @import("pss.zig");
 const der = @import("der.zig");
 const name_constraints = @import("name_constraints.zig");
+const revocation = @import("revocation.zig");
 const x509 = @import("x509.zig");
 
 /// How the SDK verifies the peer certificate.
@@ -44,7 +45,15 @@ pub const Error = error{
     /// A critical name constraint has a form that the SDK cannot check, and a certificate
     /// below the CA has a name of that form.
     TlsCertificateUnsupportedConstraint,
+    /// The issuer of a certificate in the chain revoked it.
+    TlsCertificateRevoked,
+    /// The revocation policy is `hard_fail` and a certificate in its scope has no known
+    /// status.
+    TlsCertificateStatusUnknown,
 };
+
+/// The revocation policy. See `revocation.Policy`.
+pub const Revocation = revocation.Policy;
 
 /// The role of the peer that presents the chain. The extended key usage of the leaf and
 /// of each intermediate must permit it, or the certificate has no such extension.
@@ -62,6 +71,8 @@ pub const ChainOptions = struct {
     host: ?[]const u8 = null,
     /// The time for the validity checks, in seconds since the epoch.
     now_sec: i64,
+    /// The revocation checks. The default makes none.
+    revocation: Revocation = .{},
 };
 
 pub const max_certs = 8;
@@ -116,6 +127,11 @@ pub fn verifyChain(certs: []const []const u8, trust: Trust, options: ChainOption
                     name_constraints.checkPath(path, anchor.der, options.host) catch |e| return switch (e) {
                         error.NameNotPermitted => error.TlsCertificateNameNotPermitted,
                         error.UnsupportedConstraint => error.TlsCertificateUnsupportedConstraint,
+                        error.Malformed => error.TlsCertificateInvalid,
+                    };
+                    revocation.checkPath(path, anchor.der, options.revocation, now_sec) catch |e| return switch (e) {
+                        error.Revoked => error.TlsCertificateRevoked,
+                        error.StatusUnknown => error.TlsCertificateStatusUnknown,
                         error.Malformed => error.TlsCertificateInvalid,
                     };
                     return leaf;
@@ -574,6 +590,77 @@ test "name constraints of two CAs intersect and an anchor can have them too" {
     // The constrained CA as the trust anchor.
     try checkFixtureChain(&.{"nc-ok"}, "nc-ca", "www.example.com");
     try std.testing.expectError(error.TlsCertificateNameNotPermitted, checkFixtureChain(&.{"nc-excluded"}, "nc-ca", "127.0.0.1"));
+}
+
+/// The certificates of the revocation fixtures.
+const RevocationFixtures = struct {
+    leaf: []u8,
+    revoked: []u8,
+    ca: []u8,
+    root: []u8,
+    set: CaSet,
+
+    fn load(gpa: std.mem.Allocator) !RevocationFixtures {
+        var self: RevocationFixtures = undefined;
+        self.leaf = try loadDer(gpa, "test/fixtures/tls/pem/rev-leaf.crt");
+        self.revoked = try loadDer(gpa, "test/fixtures/tls/pem/rev-revoked.crt");
+        self.ca = try loadDer(gpa, "test/fixtures/tls/pem/rev-ca.crt");
+        self.root = try loadDer(gpa, "test/fixtures/tls/pem/rev-root.crt");
+        self.set = .init(gpa);
+        try self.set.addDer(self.root);
+        return self;
+    }
+
+    fn deinit(self: *RevocationFixtures, gpa: std.mem.Allocator) void {
+        self.set.deinit();
+        for ([_][]u8{ self.leaf, self.revoked, self.ca, self.root }) |c| gpa.free(c);
+    }
+
+    /// Verify `leaf` and the CA of the fixtures with a revocation policy.
+    fn check(self: *const RevocationFixtures, leaf: []const u8, policy: Revocation) Error!void {
+        _ = try verifyChain(&.{ leaf, self.ca }, .{ .ca_set = &self.set }, .{
+            .purpose = .server,
+            .host = "localhost",
+            .now_sec = test_now,
+            .revocation = policy,
+        });
+    }
+};
+
+test "a CRL refuses a revoked leaf, and the policy decides about an unknown status" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Crl = @import("Crl.zig");
+    var f: RevocationFixtures = try .load(gpa);
+    defer f.deinit(gpa);
+    var crl = try Crl.loadFile(gpa, io, "test/fixtures/tls/pem/rev-ca.crl");
+    defer crl.deinit();
+    var root_crl = try Crl.loadFile(gpa, io, "test/fixtures/tls/pem/rev-root.crl");
+    defer root_crl.deinit();
+    var stale = try Crl.loadFile(gpa, io, "test/fixtures/tls/pem/rev-ca-stale.crl");
+    defer stale.deinit();
+    var bad_signature = try Crl.fromDer(gpa, crl.bytes);
+    defer bad_signature.deinit();
+    bad_signature.bytes[bad_signature.bytes.len - 1] ^= 1;
+
+    // The current CRL of the CA lists the revoked leaf and not the valid one.
+    try std.testing.expectError(error.TlsCertificateRevoked, f.check(f.revoked, .{ .crls = &.{&crl} }));
+    try f.check(f.leaf, .{ .crls = &.{&crl} });
+    try f.check(f.leaf, .{ .crls = &.{&crl}, .unknown = .hard_fail });
+    // The default policy makes no check.
+    try f.check(f.revoked, .{});
+    // A CRL with a bad signature or a stale CRL gives no status.
+    for ([_]*const Crl{ &bad_signature, &stale }) |unusable| {
+        try f.check(f.revoked, .{ .crls = &.{unusable} });
+        try std.testing.expectError(error.TlsCertificateStatusUnknown, f.check(f.leaf, .{ .crls = &.{unusable}, .unknown = .hard_fail }));
+    }
+    try std.testing.expectError(error.TlsCertificateRevoked, f.check(f.revoked, .{ .crls = &.{ &stale, &crl } }));
+    // The CRL of another issuer gives no status, and no CRL at all gives none either.
+    try std.testing.expectError(error.TlsCertificateStatusUnknown, f.check(f.leaf, .{ .crls = &.{&root_crl}, .unknown = .hard_fail }));
+    try std.testing.expectError(error.TlsCertificateStatusUnknown, f.check(f.leaf, .{ .unknown = .hard_fail }));
+    // With the scope `chain`, the intermediate needs the CRL of the root.
+    try std.testing.expectError(error.TlsCertificateStatusUnknown, f.check(f.leaf, .{ .crls = &.{&crl}, .unknown = .hard_fail, .scope = .chain }));
+    try f.check(f.leaf, .{ .crls = &.{ &crl, &root_crl }, .unknown = .hard_fail, .scope = .chain });
 }
 
 test "a self-issued intermediate gets no name check, a critical unknown form fails" {

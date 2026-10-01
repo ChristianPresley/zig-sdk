@@ -114,6 +114,8 @@ pub fn abortVerify(c: *Connection, alert_out: ?*tls.Alert, err: verify.Error) ve
         error.TlsCertificateNotVerified, error.TlsCertificateIssuerNotFound, error.TlsCertificateNotCa => abort(c, alert_out, .unknown_ca, err),
         error.TlsCertificateExpired, error.TlsCertificateNotYetValid => abort(c, alert_out, .certificate_expired, err),
         error.TlsCertificateWrongPurpose => abort(c, alert_out, .unsupported_certificate, err),
+        error.TlsCertificateRevoked => abort(c, alert_out, .certificate_revoked, err),
+        error.TlsCertificateStatusUnknown => abort(c, alert_out, .certificate_unknown, err),
     };
 }
 
