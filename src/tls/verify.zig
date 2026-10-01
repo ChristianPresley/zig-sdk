@@ -35,6 +35,26 @@ pub const Error = error{
     TlsCertificateIssuerNotFound,
     /// An issuer in the chain is not a certificate authority.
     TlsCertificateNotCa,
+    /// The extended key usage of the leaf or of an intermediate does not permit the purpose.
+    TlsCertificateWrongPurpose,
+};
+
+/// The role of the peer that presents the chain. The extended key usage of the leaf and
+/// of each intermediate must permit it, or the certificate has no such extension.
+pub const Purpose = enum {
+    /// A TLS server: `id-kp-serverAuth`.
+    server,
+    /// A TLS client: `id-kp-clientAuth`.
+    client,
+};
+
+pub const ChainOptions = struct {
+    /// The role of the peer.
+    purpose: Purpose,
+    /// The name or IP address to check against the leaf. Null skips the check.
+    host: ?[]const u8 = null,
+    /// The time for the validity checks, in seconds since the epoch.
+    now_sec: i64,
 };
 
 pub const max_certs = 8;
@@ -54,9 +74,9 @@ pub const Leaf = struct {
     }
 };
 
-/// Verify a chain, leaf first, against the trust policy. When `host` is not null, the function
-/// checks it against the leaf. The validity times use `now_sec`.
-pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, now_sec: i64) Error!Leaf {
+/// Verify a chain, leaf first, against the trust policy and the options.
+pub fn verifyChain(certs: []const []const u8, trust: Trust, options: ChainOptions) Error!Leaf {
+    const now_sec = options.now_sec;
     if (certs.len == 0 or certs.len > max_certs) return error.TlsCertificateInvalid;
     const leaf_parsed = parse(certs[0]) catch return error.TlsCertificateInvalid;
     if (leaf_parsed.pubKey().len > max_pub_key_len) return error.TlsCertificateInvalid;
@@ -72,7 +92,8 @@ pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, n
         },
         else => {},
     }
-    if (host) |h| try verifyHost(certs[0], h);
+    if (options.host) |h| try verifyHost(certs[0], h);
+    try requirePurpose(certs[0], options.purpose);
     switch (trust) {
         .self_signed => {
             pss.verifyCertificate(leaf_parsed, leaf_parsed, now_sec) catch |e| return mapVerify(e);
@@ -92,6 +113,7 @@ pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, n
                 const next = parse(certs[index]) catch return error.TlsCertificateInvalid;
                 pss.verifyCertificate(current, next, now_sec) catch |e| return mapVerify(e);
                 try requireCa(certs[index], index - 1);
+                try requirePurpose(certs[index], options.purpose);
                 current = next;
             }
         },
@@ -127,6 +149,18 @@ fn requireCa(cert: []const u8, below: usize) Error!void {
     }
     const ku = x509.keyUsage(cert) catch return error.TlsCertificateInvalid;
     if (ku) |usage| if (!usage.key_cert_sign) return error.TlsCertificateNotCa;
+}
+
+/// When the certificate has an extended key usage, it must permit the purpose or every
+/// purpose. The function checks the leaf and the intermediates, but not the anchor.
+fn requirePurpose(cert: []const u8, purpose: Purpose) Error!void {
+    const eku = (x509.extendedKeyUsage(cert) catch return error.TlsCertificateInvalid) orelse return;
+    if (eku.any) return;
+    const permitted = switch (purpose) {
+        .server => eku.server_auth,
+        .client => eku.client_auth,
+    };
+    if (!permitted) return error.TlsCertificateWrongPurpose;
 }
 
 /// Check the host against the subject alternative name of the leaf: an IP address against
@@ -230,6 +264,17 @@ fn loadDer(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     return it.nextLabeled("CERTIFICATE").?.decode(gpa);
 }
 
+/// The test time: 2027-01-15, inside the validity of the fixtures.
+const test_now: i64 = 1_800_000_000;
+
+fn serverChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, now: i64) Error!Leaf {
+    return verifyChain(certs, trust, .{ .purpose = .server, .host = host, .now_sec = now });
+}
+
+fn clientChain(certs: []const []const u8, trust: Trust) Error!Leaf {
+    return verifyChain(certs, trust, .{ .purpose = .client, .now_sec = test_now });
+}
+
 test "chain validation against the fixture CA" {
     const gpa = std.testing.allocator;
     const leaf = try loadDer(gpa, "test/fixtures/tls/pem/chain-leaf.crt");
@@ -243,22 +288,22 @@ test "chain validation against the fixture CA" {
     try set.addDer(ca);
     const now: i64 = 1_800_000_000; // 2027-01-15, inside the validity of the fixtures
 
-    _ = try verifyChain(&.{leaf}, "localhost", .{ .ca_set = &set }, now);
-    _ = try verifyChain(&.{ leaf, ca }, "127.0.0.1", .{ .ca_set = &set }, now);
-    try std.testing.expectError(error.TlsCertificateHostMismatch, verifyChain(&.{leaf}, "example.com", .{ .ca_set = &set }, now));
-    try std.testing.expectError(error.TlsCertificateHostMismatch, verifyChain(&.{leaf}, "10.0.0.1", .{ .ca_set = &set }, now));
-    try std.testing.expectError(error.TlsCertificateExpired, verifyChain(&.{leaf}, "localhost", .{ .ca_set = &set }, now + 400 * 365 * 86400));
-    try std.testing.expectError(error.TlsCertificateNotYetValid, verifyChain(&.{leaf}, "localhost", .{ .ca_set = &set }, 0));
+    _ = try serverChain(&.{leaf}, "localhost", .{ .ca_set = &set }, now);
+    _ = try serverChain(&.{ leaf, ca }, "127.0.0.1", .{ .ca_set = &set }, now);
+    try std.testing.expectError(error.TlsCertificateHostMismatch, serverChain(&.{leaf}, "example.com", .{ .ca_set = &set }, now));
+    try std.testing.expectError(error.TlsCertificateHostMismatch, serverChain(&.{leaf}, "10.0.0.1", .{ .ca_set = &set }, now));
+    try std.testing.expectError(error.TlsCertificateExpired, serverChain(&.{leaf}, "localhost", .{ .ca_set = &set }, now + 400 * 365 * 86400));
+    try std.testing.expectError(error.TlsCertificateNotYetValid, serverChain(&.{leaf}, "localhost", .{ .ca_set = &set }, 0));
     // The self-signed leaf is not signed by the CA.
-    try std.testing.expectError(error.TlsCertificateIssuerNotFound, verifyChain(&.{self_signed}, "localhost", .{ .ca_set = &set }, now));
-    _ = try verifyChain(&.{self_signed}, "localhost", .self_signed, now);
-    try std.testing.expectError(error.TlsCertificateNotVerified, verifyChain(&.{leaf}, "localhost", .self_signed, now));
-    _ = try verifyChain(&.{leaf}, null, .{ .pinned_leaf = leaf }, now);
-    try std.testing.expectError(error.TlsCertificateNotVerified, verifyChain(&.{leaf}, null, .{ .pinned_leaf = ca }, now));
+    try std.testing.expectError(error.TlsCertificateIssuerNotFound, serverChain(&.{self_signed}, "localhost", .{ .ca_set = &set }, now));
+    _ = try serverChain(&.{self_signed}, "localhost", .self_signed, now);
+    try std.testing.expectError(error.TlsCertificateNotVerified, serverChain(&.{leaf}, "localhost", .self_signed, now));
+    _ = try serverChain(&.{leaf}, null, .{ .pinned_leaf = leaf }, now);
+    try std.testing.expectError(error.TlsCertificateNotVerified, serverChain(&.{leaf}, null, .{ .pinned_leaf = ca }, now));
     // A certificate signed by a leaf that is not a CA does not verify.
     const bad = try loadDer(gpa, "test/fixtures/tls/pem/bad-chain-leaf.crt");
     defer gpa.free(bad);
-    try std.testing.expectError(error.TlsCertificateNotCa, verifyChain(&.{ bad, leaf, ca }, "localhost", .{ .ca_set = &set }, now));
+    try std.testing.expectError(error.TlsCertificateNotCa, serverChain(&.{ bad, leaf, ca }, "localhost", .{ .ca_set = &set }, now));
 }
 
 test "chains and CertificateVerify signatures with RSA-PSS keys" {
@@ -276,18 +321,18 @@ test "chains and CertificateVerify signatures with RSA-PSS keys" {
     const now: i64 = 1_800_000_000;
 
     // RSASSA-PSS signatures in the chain: SHA-256 on the self-signed CA, SHA-384 on the leaf.
-    const ca_leaf = try verifyChain(&.{pss_ca}, "localhost", .self_signed, now);
+    const ca_leaf = try serverChain(&.{pss_ca}, "localhost", .self_signed, now);
     try std.testing.expect(ca_leaf.pss == null);
-    _ = try verifyChain(&.{pss_ca}, "localhost", .{ .ca_set = &set }, now);
-    const leaf = try verifyChain(&.{pss_leaf}, "localhost", .{ .ca_set = &set }, now);
+    _ = try serverChain(&.{pss_ca}, "localhost", .{ .ca_set = &set }, now);
+    const leaf = try serverChain(&.{pss_leaf}, "localhost", .{ .ca_set = &set }, now);
     try std.testing.expectEqual(pss.Params{ .hash = .sha256, .salt_len = 32 }, leaf.pss.?);
-    _ = try verifyChain(&.{ pss_leaf, pss_ca }, "127.0.0.1", .{ .ca_set = &set }, now);
-    try std.testing.expectError(error.TlsCertificateNotVerified, verifyChain(&.{pss_leaf}, "localhost", .self_signed, now));
+    _ = try serverChain(&.{ pss_leaf, pss_ca }, "127.0.0.1", .{ .ca_set = &set }, now);
+    try std.testing.expectError(error.TlsCertificateNotVerified, serverChain(&.{pss_leaf}, "localhost", .self_signed, now));
     // A changed signature on the leaf.
     const tampered = try gpa.dupe(u8, pss_leaf);
     defer gpa.free(tampered);
     tampered[tampered.len - 3] ^= 0x10;
-    try std.testing.expectError(error.TlsCertificateNotVerified, verifyChain(&.{tampered}, "localhost", .{ .ca_set = &set }, now));
+    try std.testing.expectError(error.TlsCertificateNotVerified, serverChain(&.{tampered}, "localhost", .{ .ca_set = &set }, now));
 
     // CertificateVerify: the restricted leaf key accepts rsa_pss_pss_sha256 only.
     const key_text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "test/fixtures/tls/pem/rsa-pss-sha256.key", gpa, .limited(1 << 16));
@@ -314,7 +359,7 @@ test "chains and CertificateVerify signatures with RSA-PSS keys" {
     }
     try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&ca_leaf, .rsa_pss_rsae_sha256, sig, message));
     // An rsaEncryption key does not accept the rsa_pss_pss schemes.
-    const rsa = try verifyChain(&.{rsa_leaf}, "localhost", .self_signed, now);
+    const rsa = try serverChain(&.{rsa_leaf}, "localhost", .self_signed, now);
     try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&rsa, .rsa_pss_pss_sha256, sig, message));
 }
 
@@ -330,7 +375,47 @@ test "the host name check ignores the common name" {
     defer set.deinit();
     try set.addDer(ca);
     const now: i64 = 1_800_000_000;
-    try std.testing.expectError(error.TlsCertificateHostMismatch, verifyChain(&.{cn_only}, "localhost", .{ .ca_set = &set }, now));
+    try std.testing.expectError(error.TlsCertificateHostMismatch, serverChain(&.{cn_only}, "localhost", .{ .ca_set = &set }, now));
     // Without a host the chain itself is good.
-    _ = try verifyChain(&.{cn_only}, null, .{ .ca_set = &set }, now);
+    _ = try serverChain(&.{cn_only}, null, .{ .ca_set = &set }, now);
+}
+
+test "the extended key usage of the leaf and the intermediates must permit the purpose" {
+    const gpa = std.testing.allocator;
+    const ca = try loadDer(gpa, "test/fixtures/tls/pem/ca.crt");
+    defer gpa.free(ca);
+    var set: CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addDer(ca);
+    const trust: Trust = .{ .ca_set = &set };
+
+    // serverAuth only: good for a server, not for a client.
+    const server_leaf = try loadDer(gpa, "test/fixtures/tls/pem/chain-leaf.crt");
+    defer gpa.free(server_leaf);
+    _ = try serverChain(&.{server_leaf}, "localhost", trust, test_now);
+    try std.testing.expectError(error.TlsCertificateWrongPurpose, clientChain(&.{server_leaf}, trust));
+    // clientAuth only: the reverse.
+    const client_leaf = try loadDer(gpa, "test/fixtures/tls/pem/client-leaf.crt");
+    defer gpa.free(client_leaf);
+    _ = try clientChain(&.{client_leaf}, trust);
+    try std.testing.expectError(error.TlsCertificateWrongPurpose, serverChain(&.{client_leaf}, "localhost", trust, test_now));
+    // anyExtendedKeyUsage permits both.
+    const any_leaf = try loadDer(gpa, "test/fixtures/tls/pem/any-eku-leaf.crt");
+    defer gpa.free(any_leaf);
+    _ = try serverChain(&.{any_leaf}, "localhost", trust, test_now);
+    _ = try clientChain(&.{any_leaf}, trust);
+    // Without the extension, every purpose is good.
+    const no_eku = try loadDer(gpa, "test/fixtures/tls/pem/p256.crt");
+    defer gpa.free(no_eku);
+    _ = try clientChain(&.{no_eku}, .self_signed);
+    _ = try serverChain(&.{no_eku}, "localhost", .self_signed, test_now);
+    // The leaf permits both, but the intermediate permits clientAuth only.
+    const eku_ca = try loadDer(gpa, "test/fixtures/tls/pem/eku-ca.crt");
+    defer gpa.free(eku_ca);
+    const eku_leaf = try loadDer(gpa, "test/fixtures/tls/pem/eku-leaf.crt");
+    defer gpa.free(eku_leaf);
+    _ = try clientChain(&.{ eku_leaf, eku_ca }, trust);
+    try std.testing.expectError(error.TlsCertificateWrongPurpose, serverChain(&.{ eku_leaf, eku_ca }, "localhost", trust, test_now));
+    // The self-signed policy checks the leaf as well.
+    try std.testing.expectError(error.TlsCertificateWrongPurpose, verifyChain(&.{client_leaf}, .self_signed, .{ .purpose = .server, .now_sec = test_now }));
 }

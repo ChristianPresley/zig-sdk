@@ -259,7 +259,11 @@ fn run(
     const chain = common.CertificateMessage.parse(msg.body) catch |e| return common.abortParse(c, alert_out, e);
     if (chain.count == 0 or chain.context.len != 0) return common.abort(c, alert_out, .decode_error, error.TlsDecodeError);
     const now_sec = options.now_sec orelse std.Io.Clock.real.now(options.io).toSeconds();
-    const leaf = verify.verifyChain(chain.certs[0..chain.count], options.host, options.trust, now_sec) catch |e| return common.abortVerify(c, alert_out, e);
+    const leaf = verify.verifyChain(chain.certs[0..chain.count], options.trust, .{
+        .purpose = .server,
+        .host = options.host,
+        .now_sec = now_sec,
+    }) catch |e| return common.abortVerify(c, alert_out, e);
     c.peer_fingerprint = common.fingerprint(chain.certs[0]);
     transcript.update(msg.raw);
 

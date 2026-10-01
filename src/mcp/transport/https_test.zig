@@ -337,7 +337,7 @@ test "the MCP client over HTTPS with a client certificate" {
     f.client_trust = .{ .ca_set = &set };
     try f.start("test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/p256.key");
     defer f.stop();
-    var identity = try tls.CertChain.loadFiles(gpa, io, "test/fixtures/tls/pem/chain-leaf.crt", "test/fixtures/tls/pem/chain-leaf.key");
+    var identity = try tls.CertChain.loadFiles(gpa, io, "test/fixtures/tls/pem/client-leaf.crt", "test/fixtures/tls/pem/client-leaf.key");
     defer identity.deinit();
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/mcp", .{f.port()});

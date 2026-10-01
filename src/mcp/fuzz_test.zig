@@ -206,7 +206,8 @@ fn tlsParsers(_: void, smith: *Smith) anyerror!void {
     _ = tls.key_share.respond(std.testing.io, .x25519_mlkem768, bytes, &share_public, &share_secret) catch {};
     _ = tls.x509.basicConstraints(bytes) catch {};
     _ = tls.x509.keyUsage(bytes) catch {};
-    _ = tls.verify.verifyChain(&.{bytes}, "localhost", .self_signed, 0) catch {};
+    _ = tls.x509.extendedKeyUsage(bytes) catch {};
+    _ = tls.verify.verifyChain(&.{bytes}, .self_signed, .{ .purpose = .server, .host = "localhost", .now_sec = 0 }) catch {};
     var it: tls.pem.Iterator = .init(bytes);
     while (it.next()) |block| {
         const decoded = block.decode(std.testing.allocator) catch continue;

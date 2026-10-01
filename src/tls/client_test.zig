@@ -326,7 +326,7 @@ test "mutual authentication with client certificates" {
     const io = std.testing.io;
     var server_chain = try loadChain(gpa, io, "p256.crt", "p256.key");
     defer server_chain.deinit();
-    var identity = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
+    var identity = try loadChain(gpa, io, "client-leaf.crt", "client-leaf.key");
     defer identity.deinit();
     var self_signed = try loadChain(gpa, io, "ed25519.crt", "ed25519.key");
     defer self_signed.deinit();
@@ -391,7 +391,7 @@ test "the server names its trusted authorities and the client chooses a chain" {
     defer server_chain.deinit();
     var self_signed = try loadChain(gpa, io, "ed25519.crt", "ed25519.key");
     defer self_signed.deinit();
-    var ca_signed = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
+    var ca_signed = try loadChain(gpa, io, "client-leaf.crt", "client-leaf.key");
     defer ca_signed.deinit();
     var set: tls.CaSet = .init(gpa);
     defer set.deinit();
@@ -436,7 +436,7 @@ test "a certificate request with many authority names" {
     defer server_chain.deinit();
     var self_signed = try loadChain(gpa, io, "ed25519.crt", "ed25519.key");
     defer self_signed.deinit();
-    var ca_signed = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
+    var ca_signed = try loadChain(gpa, io, "client-leaf.crt", "client-leaf.key");
     defer ca_signed.deinit();
     var ca_buf: [128]u8 = undefined;
     const ca_text = try std.Io.Dir.cwd().readFileAlloc(io, fixture(&ca_buf, "ca.crt"), gpa, .limited(1 << 16));
@@ -493,6 +493,31 @@ test "the client names its trusted authorities and the server chooses a chain" {
     try roundTrip(io, undefined, retry, .{ .trust = .{ .ca_set = &set }, .send_ca_names = true, .groups = &.{ .x25519, .secp384r1 }, .expect_group = .secp384r1 }, &echo, null);
     // The server name comes first: a chain for another host does not count.
     try std.testing.expectError(error.TlsCertificateHostMismatch, roundTrip(io, undefined, server, .{ .trust = .{ .ca_set = &set }, .send_ca_names = true, .host = "example.com" }, &echo, null));
+}
+
+test "the extended key usage of the peer must fit its role" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
+    var server_chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer server_chain.deinit();
+    // chain-leaf.crt permits serverAuth only.
+    var server_only = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
+    defer server_only.deinit();
+    // client-leaf.crt permits clientAuth only.
+    var client_only = try loadChain(gpa, io, "client-leaf.crt", "client-leaf.key");
+    defer client_only.deinit();
+    var echo: Echo = undefined;
+
+    // A server certificate as a client certificate: the server refuses it.
+    const as_client = roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed, .identity = &server_only }, &echo, null);
+    try std.testing.expect(std.meta.isError(as_client));
+    try std.testing.expectError(error.TlsCertificateWrongPurpose, echo.result);
+    // A client certificate as a server certificate: the client refuses it.
+    try std.testing.expectError(error.TlsCertificateWrongPurpose, roundTrip(io, &client_only, .{}, .{ .trust = .{ .ca_set = &set } }, &echo, null));
+    try std.testing.expectEqual(std.crypto.tls.Alert.Description.unsupported_certificate, echo.alert.description);
 }
 
 test "every cipher suite negotiates with the SDK client, with a key update" {
@@ -556,7 +581,7 @@ test "record padding in both directions between the SDK client and server" {
         try roundTrip(io, &chain, .{}, .{ .trust = .self_signed, .padding = policy }, &echo, null);
     }
     // Padding on the client certificate flight, after a HelloRetryRequest, with AEGIS-256.
-    var identity = try loadChain(gpa, io, "chain-leaf.crt", "chain-leaf.key");
+    var identity = try loadChain(gpa, io, "client-leaf.crt", "client-leaf.key");
     defer identity.deinit();
     var set: tls.CaSet = .init(gpa);
     defer set.deinit();

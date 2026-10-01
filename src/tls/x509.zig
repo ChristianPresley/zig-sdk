@@ -7,6 +7,11 @@ const der = @import("der.zig");
 const oid_basic_constraints = "\x55\x1d\x13";
 const oid_key_usage = "\x55\x1d\x0f";
 const oid_subject_alt_name = "\x55\x1d\x11";
+const oid_ext_key_usage = "\x55\x1d\x25";
+const oid_any_ext_key_usage = "\x55\x1d\x25\x00";
+const oid_kp_server_auth = "\x2b\x06\x01\x05\x05\x07\x03\x01";
+const oid_kp_client_auth = "\x2b\x06\x01\x05\x05\x07\x03\x02";
+const oid_kp_ocsp_signing = "\x2b\x06\x01\x05\x05\x07\x03\x09";
 const oid_rsa_encryption = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
 const oid_rsassa_pss = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a";
 const oid_ec_public_key = "\x2a\x86\x48\xce\x3d\x02\x01";
@@ -107,6 +112,16 @@ pub const KeyUsage = struct {
     digital_signature: bool,
 };
 
+/// The purposes of the extended key usage extension that the SDK knows (RFC 5280
+/// section 4.2.1.12). Other purposes do not change a field.
+pub const ExtendedKeyUsage = struct {
+    server_auth: bool = false,
+    client_auth: bool = false,
+    ocsp_signing: bool = false,
+    /// `anyExtendedKeyUsage`: the certificate permits every purpose.
+    any: bool = false,
+};
+
 /// The `extensions` sequence of a certificate, or null when the certificate has none.
 fn extensions(cert: []const u8) der.Error!?der.Element {
     const outer = try (try der.parse(cert)).expect(der.tag_sequence);
@@ -159,6 +174,22 @@ pub fn keyUsage(cert: []const u8) der.Error!?KeyUsage {
         .digital_signature = first & 0x80 != 0,
         .key_cert_sign = first & 0x04 != 0,
     };
+}
+
+/// The extended key usage of a certificate, or null when the extension is absent.
+pub fn extendedKeyUsage(cert: []const u8) der.Error!?ExtendedKeyUsage {
+    const value = (try findExtension(cert, oid_ext_key_usage)) orelse return null;
+    const seq = try (try der.parseExact(value)).expect(der.tag_sequence);
+    var result: ExtendedKeyUsage = .{};
+    var it = seq.children();
+    while (try it.next()) |purpose| {
+        _ = try purpose.expect(der.tag_oid);
+        if (purpose.isOid(oid_kp_server_auth)) result.server_auth = true;
+        if (purpose.isOid(oid_kp_client_auth)) result.client_auth = true;
+        if (purpose.isOid(oid_kp_ocsp_signing)) result.ocsp_signing = true;
+        if (purpose.isOid(oid_any_ext_key_usage)) result.any = true;
+    }
+    return result;
 }
 
 /// The `GeneralNames` sequence of the subject alternative name, or null when absent.

@@ -294,7 +294,10 @@ fn run(
             if (config.client_auth == .required) return abort(c, options, .certificate_required, error.TlsCertificateRequired);
         } else {
             const now_sec = std.Io.Clock.real.now(options.io).toSeconds();
-            const leaf = verify.verifyChain(certs.certs[0..certs.count], null, config.client_trust.?, now_sec) catch |e| return common.abortVerify(c, options.alert, e);
+            const leaf = verify.verifyChain(certs.certs[0..certs.count], config.client_trust.?, .{
+                .purpose = .client,
+                .now_sec = now_sec,
+            }) catch |e| return common.abortVerify(c, options.alert, e);
             c.peer_fingerprint = common.fingerprint(certs.certs[0]);
             const client_cv = try reader.next(c, options.alert);
             if (client_cv.kind != .certificate_verify) return abort(c, options, .unexpected_message, error.TlsUnexpectedMessage);
