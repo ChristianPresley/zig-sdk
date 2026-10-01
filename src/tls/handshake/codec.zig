@@ -46,6 +46,8 @@ pub const ClientHello = struct {
     has_signature_algorithms: bool = false,
     has_pre_shared_key: bool = false,
     has_early_data: bool = false,
+    /// The client asks for a stapled OCSP response (RFC 6066 section 8).
+    status_request: bool = false,
 
     pub fn parse(body: []u8) ParseError!ClientHello {
         var d: Decoder = .fromTheirSlice(body);
@@ -154,6 +156,12 @@ pub const ClientHello = struct {
                 },
                 .certificate_authorities => {
                     hello.certificate_authorities = try ca_names.parse(ext.buf);
+                    continue;
+                },
+                .status_request => {
+                    ext.ensure(1) catch return error.DecodeError;
+                    hello.status_request = ext.decode(u8) == 1; // status_type ocsp
+                    // The server reads no responder ids and no request extensions.
                     continue;
                 },
                 // The parser does not read the body of these extensions and of unknown ones.

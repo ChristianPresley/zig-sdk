@@ -16,12 +16,14 @@ const key_share = @import("key_share.zig");
 const Connection = @import("../Connection.zig");
 const CertChain = @import("../CertChain.zig");
 const PrivateKey = @import("../PrivateKey.zig");
+const ocsp = @import("../ocsp.zig");
 const verify = @import("../verify.zig");
 
 pub const Trust = verify.Trust;
 
-/// The largest server flight the client accepts: certificate chains up to 64 KiB.
-pub const max_handshake_bytes = CertChain.max_chain_bytes + 4096;
+/// The largest server flight the client accepts: certificate chains up to 64 KiB and a
+/// stapled OCSP response.
+pub const max_handshake_bytes = CertChain.max_chain_bytes + ocsp.max_response_len + 4096;
 
 pub const Options = struct {
     io: std.Io,
@@ -261,11 +263,19 @@ fn run(
     const chain = common.CertificateMessage.parse(msg.body) catch |e| return common.abortParse(c, alert_out, e);
     if (chain.count == 0 or chain.context.len != 0) return common.abort(c, alert_out, .decode_error, error.TlsDecodeError);
     const now_sec = options.now_sec orelse std.Io.Clock.real.now(options.io).toSeconds();
+    // The client reads a stapled OCSP response only when it asked for one.
+    var staples: [verify.max_certs]?[]const u8 = @splat(null);
+    if (options.revocation.ocsp_stapling != .off) {
+        for (chain.extensions[0..chain.count], 0..) |extensions, i| {
+            staples[i] = common.ocspStaple(extensions) catch |e| return common.abortParse(c, alert_out, e);
+        }
+    }
     const leaf = verify.verifyChain(chain.certs[0..chain.count], options.trust, .{
         .purpose = .server,
         .host = options.host,
         .now_sec = now_sec,
         .revocation = options.revocation,
+        .staples = staples[0..chain.count],
     }) catch |e| return common.abortVerify(c, alert_out, e);
     c.peer_fingerprint = common.fingerprint(chain.certs[0]);
     transcript.update(msg.raw);
@@ -455,6 +465,14 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
         }
         b.endLen(u16, list);
         b.endLen(u16, ext);
+    }
+    if (options.revocation.ocsp_stapling != .off) {
+        // status_type ocsp, no responder IDs, no request extensions (RFC 6066 section 8).
+        b.int(u16, @intFromEnum(tls.ExtensionType.status_request));
+        b.int(u16, 5);
+        b.byte(1);
+        b.int(u16, 0);
+        b.int(u16, 0);
     }
     var names_sent = false;
     if (send_names) {

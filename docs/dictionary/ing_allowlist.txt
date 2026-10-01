@@ -30,6 +30,7 @@ settings
 signing
 spelling
 spoofing
+stapling
 streaming
 tampering
 testing

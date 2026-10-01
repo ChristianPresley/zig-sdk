@@ -15,6 +15,7 @@ const PrivateKey = @import("../PrivateKey.zig");
 const key_share = @import("key_share.zig");
 const Connection = @import("../Connection.zig");
 const CertChain = @import("../CertChain.zig");
+const ocsp = @import("../ocsp.zig");
 const verify = @import("../verify.zig");
 
 pub const ClientAuth = enum {
@@ -62,8 +63,19 @@ pub const Config = struct {
     /// `bundle` policies have anchors. When the names do not fit in
     /// `ca_names.max_request_list_len` bytes, the server sends no names.
     send_client_ca_names: bool = true,
-    /// The revocation checks of a client certificate. The default makes none.
+    /// The revocation checks of a client certificate. The default makes none. The server
+    /// reads no OCSP staples from clients, so `ocsp_stapling` must be `off`.
     client_revocation: verify.Revocation = .{},
+    /// OCSP responses to staple. When the client sends `status_request`, the server puts
+    /// the response of the selected chain in the entry of its leaf.
+    ocsp_staples: []const OcspStaple = &.{},
+};
+
+/// A DER `OCSPResponse` for the leaf of a chain. The application keeps the bytes. To send
+/// a newer response, the application makes a new server with a new configuration.
+pub const OcspStaple = struct {
+    chain: *const CertChain,
+    response: []const u8,
 };
 
 pub const AcceptOptions = struct {
@@ -85,9 +97,22 @@ pub const AcceptError = common.Error;
 pub const Server = struct {
     config: Config,
 
-    pub fn init(config: Config) error{ NoCertificateChain, NoClientTrust }!Server {
+    pub const InitError = error{
+        NoCertificateChain,
+        NoClientTrust,
+        /// A staple is empty or larger than `ocsp.max_response_len`.
+        InvalidOcspStaple,
+        /// The server reads no OCSP staples from clients.
+        ClientOcspStapling,
+    };
+
+    pub fn init(config: Config) InitError!Server {
         if (config.chains.len == 0) return error.NoCertificateChain;
         if (config.client_auth != .none and config.client_trust == null) return error.NoClientTrust;
+        if (config.client_revocation.ocsp_stapling != .off) return error.ClientOcspStapling;
+        for (config.ocsp_staples) |staple| {
+            if (staple.response.len == 0 or staple.response.len > ocsp.max_response_len) return error.InvalidOcspStaple;
+        }
         return .{ .config = config };
     }
 
@@ -258,8 +283,12 @@ fn run(
         c.writeRecord(.handshake, request) catch return error.WriteFailed;
         transcript.update(request);
     }
-    c.writeRecord(.handshake, chain.handshake_message) catch return error.WriteFailed;
-    transcript.update(chain.handshake_message);
+    if (stapleFor(config, chain, &hello)) |response| {
+        writeStapledCertificate(c, &transcript, chain, response) catch return error.WriteFailed;
+    } else {
+        c.writeRecord(.handshake, chain.handshake_message) catch return error.WriteFailed;
+        transcript.update(chain.handshake_message);
+    }
 
     var to_sign: [codec.certificate_verify_context.len + S.digest_length]u8 = undefined;
     @memcpy(to_sign[0..codec.certificate_verify_context.len], codec.certificate_verify_context);
@@ -332,6 +361,44 @@ fn run(
     c.suite = suite;
     c.group = choice.group.wire();
     return c.*;
+}
+
+/// The OCSP response for the leaf of `chain`, when the client asks for one.
+fn stapleFor(config: Config, chain: *const CertChain, hello: *const codec.ClientHello) ?[]const u8 {
+    if (!hello.status_request) return null;
+    for (config.ocsp_staples) |staple| if (staple.chain == chain) return staple.response;
+    return null;
+}
+
+/// Write the Certificate message of `chain` with `response` in the `status_request`
+/// extension of the leaf entry (RFC 8446 section 4.4.2.1). The message goes out in parts,
+/// and each part is a record.
+fn writeStapledCertificate(c: *Connection, transcript: *suites.Transcript, chain: *const CertChain, response: []const u8) Writer.Error!void {
+    const leaf = chain.certs[0];
+    // The pre-encoded message: type(1) length(3) context(1) list length(3), then the leaf
+    // entry: length(3) certificate extensions(2), then the other entries.
+    const others = chain.handshake_message[8 + 3 + leaf.len + 2 ..];
+    const status_len = 1 + 3 + response.len;
+    const extensions_len = 4 + status_len;
+    const list_len = 3 + leaf.len + 2 + extensions_len + others.len;
+    var head: [11]u8 = undefined;
+    head[0] = @intFromEnum(tls.HandshakeType.certificate);
+    std.mem.writeInt(u24, head[1..4], @intCast(1 + 3 + list_len), .big);
+    head[4] = 0; // empty certificate_request_context
+    std.mem.writeInt(u24, head[5..8], @intCast(list_len), .big);
+    std.mem.writeInt(u24, head[8..11], @intCast(leaf.len), .big);
+    var status_head: [10]u8 = undefined;
+    std.mem.writeInt(u16, status_head[0..2], @intCast(extensions_len), .big);
+    std.mem.writeInt(u16, status_head[2..4], @intFromEnum(tls.ExtensionType.status_request), .big);
+    std.mem.writeInt(u16, status_head[4..6], @intCast(status_len), .big);
+    status_head[6] = 1; // status_type ocsp
+    std.mem.writeInt(u24, status_head[7..10], @intCast(response.len), .big);
+    for ([_][]const u8{ &head, leaf, &status_head, response, others }) |part| {
+        // A record never carries an empty handshake fragment.
+        if (part.len == 0) continue;
+        try c.writeRecord(.handshake, part);
+        transcript.update(part);
+    }
 }
 
 fn hrrSent(reader: *const common.MessageReader) bool {

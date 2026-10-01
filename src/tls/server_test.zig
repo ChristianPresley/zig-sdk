@@ -304,6 +304,33 @@ fn opensslClientPadded(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertCha
     return opensslClientConfig(gpa, io, .{ .chains = &chains, .groups = groups, .padding = padding }, extra, echo, greeting);
 }
 
+test "interop: openssl s_client reads the OCSP response that the SDK server staples" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (opensslVersion(io, gpa) == null) return error.SkipZigTest;
+    var chain = try loadChain(gpa, io, "rev-chain.crt", "rev-leaf.key");
+    defer chain.deinit();
+    const response = try Io.Dir.cwd().readFileAlloc(io, "test/fixtures/tls/der/rev-leaf-good.ocsp", gpa, .limited(1 << 16));
+    defer gpa.free(response);
+    const chains = [_]*const tls.CertChain{&chain};
+    const config: tls.server.Config = .{ .chains = &chains, .ocsp_staples = &.{.{ .chain = &chain, .response = response }} };
+    var echo: Echo = undefined;
+    {
+        const out = try opensslClientConfig(gpa, io, config, &.{"-status"}, &echo, null);
+        defer gpa.free(out);
+        try echo.result;
+        try expectContains(out, "OCSP Response Status: successful");
+        try expectContains(out, "Cert Status: good");
+    }
+    // Without -status the client does not ask, and the server sends no staple.
+    {
+        const out = try opensslClientConfig(gpa, io, config, &.{}, &echo, null);
+        defer gpa.free(out);
+        try echo.result;
+        if (std.mem.indexOf(u8, out, "OCSP Response Status") != null) return error.TestUnexpectedResult;
+    }
+}
+
 /// Run `openssl s_client` with `extra` arguments against an SDK server with `config`. With a
 /// `greeting`, the server sends it after the handshake and closes.
 fn opensslClientConfig(gpa: std.mem.Allocator, io: Io, config: tls.server.Config, extra: []const []const u8, echo: *Echo, greeting: ?[]const u8) ![]u8 {

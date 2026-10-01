@@ -57,6 +57,8 @@ pub fn acceptedScheme(wire: u16) ?tls.SignatureScheme {
 pub const CertificateMessage = struct {
     context: []const u8,
     certs: [verify.max_certs][]const u8,
+    /// The extensions of each `CertificateEntry`.
+    extensions: [verify.max_certs][]const u8,
     count: usize,
 
     pub fn parse(body: []u8) codec.ParseError!CertificateMessage {
@@ -64,7 +66,7 @@ pub const CertificateMessage = struct {
         d.ensure(1) catch return error.DecodeError;
         const ctx_len = d.decode(u8);
         d.ensure(@as(usize, ctx_len) + 3) catch return error.DecodeError;
-        var result: CertificateMessage = .{ .context = d.slice(ctx_len), .certs = undefined, .count = 0 };
+        var result: CertificateMessage = .{ .context = d.slice(ctx_len), .certs = undefined, .extensions = undefined, .count = 0 };
         const list_len = d.decode(u24);
         var list = d.sub(list_len) catch return error.DecodeError;
         if (!d.eof()) return error.DecodeError;
@@ -76,14 +78,53 @@ pub const CertificateMessage = struct {
             const cert = list.slice(cert_len);
             const ext_len = list.decode(u16);
             list.ensure(ext_len) catch return error.DecodeError;
-            _ = list.slice(ext_len);
+            const extensions = list.slice(ext_len);
             if (result.count == result.certs.len) return error.IllegalParameter;
             result.certs[result.count] = cert;
+            result.extensions[result.count] = extensions;
             result.count += 1;
         }
         return result;
     }
 };
+
+/// The OCSP response in the `status_request` extension of a `CertificateEntry` (RFC 8446
+/// section 4.4.2.1), or null when the entry has none. The extension holds a
+/// `CertificateStatus` of the type `ocsp` (RFC 6066 section 8).
+pub fn ocspStaple(extensions: []const u8) codec.ParseError!?[]const u8 {
+    var found: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < extensions.len) {
+        if (extensions.len - i < 4) return error.DecodeError;
+        const ext_type = std.mem.readInt(u16, extensions[i..][0..2], .big);
+        const len = std.mem.readInt(u16, extensions[i + 2 ..][0..2], .big);
+        i += 4;
+        if (extensions.len - i < len) return error.DecodeError;
+        const data = extensions[i..][0..len];
+        i += len;
+        if (ext_type != @intFromEnum(tls.ExtensionType.status_request)) continue;
+        if (found != null) return error.IllegalParameter;
+        if (data.len < 4) return error.DecodeError;
+        if (data[0] != 1) return error.IllegalParameter; // status_type ocsp
+        const response_len = std.mem.readInt(u24, data[1..4], .big);
+        if (response_len == 0 or data.len - 4 != response_len) return error.DecodeError;
+        found = data[4..];
+    }
+    return found;
+}
+
+test "the OCSP staple of a certificate entry" {
+    // No extension, then an extension of another type.
+    try std.testing.expect(try ocspStaple("") == null);
+    try std.testing.expect(try ocspStaple("\x00\x12\x00\x00") == null);
+    // status_request with a response of three bytes.
+    try std.testing.expectEqualStrings("abc", (try ocspStaple("\x00\x05\x00\x07\x01\x00\x00\x03abc")).?);
+    try std.testing.expectError(error.DecodeError, ocspStaple("\x00\x05\x00\x07\x01\x00\x00\x04abc"));
+    try std.testing.expectError(error.DecodeError, ocspStaple("\x00\x05\x00\x04\x01\x00\x00\x00"));
+    try std.testing.expectError(error.IllegalParameter, ocspStaple("\x00\x05\x00\x07\x02\x00\x00\x03abc"));
+    try std.testing.expectError(error.IllegalParameter, ocspStaple("\x00\x05\x00\x07\x01\x00\x00\x03abc" ++ "\x00\x05\x00\x07\x01\x00\x00\x03abc"));
+    try std.testing.expectError(error.DecodeError, ocspStaple("\x00\x05\x00\x09\x01"));
+}
 
 /// The scheme and signature of a CertificateVerify message.
 pub const CertificateVerifyMessage = struct {
@@ -116,6 +157,7 @@ pub fn abortVerify(c: *Connection, alert_out: ?*tls.Alert, err: verify.Error) ve
         error.TlsCertificateWrongPurpose => abort(c, alert_out, .unsupported_certificate, err),
         error.TlsCertificateRevoked => abort(c, alert_out, .certificate_revoked, err),
         error.TlsCertificateStatusUnknown => abort(c, alert_out, .certificate_unknown, err),
+        error.TlsBadCertificateStatus, error.TlsCertificateStatusMissing => abort(c, alert_out, .bad_certificate_status_response, err),
     };
 }
 

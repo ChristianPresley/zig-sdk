@@ -636,6 +636,7 @@ Technical nouns and adjectives that end in -ing (rule 3.5).
 - signing
 - spelling
 - spoofing
+- stapling
 - streaming
 - tampering
 - testing

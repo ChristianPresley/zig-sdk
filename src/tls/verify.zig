@@ -50,6 +50,10 @@ pub const Error = error{
     /// The revocation policy is `hard_fail` and a certificate in its scope has no known
     /// status.
     TlsCertificateStatusUnknown,
+    /// The server stapled an OCSP response that the client does not accept.
+    TlsBadCertificateStatus,
+    /// The OCSP stapling policy is `require` and the server stapled no response to the leaf.
+    TlsCertificateStatusMissing,
 };
 
 /// The revocation policy. See `revocation.Policy`.
@@ -73,6 +77,9 @@ pub const ChainOptions = struct {
     now_sec: i64,
     /// The revocation checks. The default makes none.
     revocation: Revocation = .{},
+    /// The stapled OCSP response of each certificate of the chain, by index. A shorter
+    /// list or a null item means no staple.
+    staples: []const ?[]const u8 = &.{},
 };
 
 pub const max_certs = 8;
@@ -129,9 +136,11 @@ pub fn verifyChain(certs: []const []const u8, trust: Trust, options: ChainOption
                         error.UnsupportedConstraint => error.TlsCertificateUnsupportedConstraint,
                         error.Malformed => error.TlsCertificateInvalid,
                     };
-                    revocation.checkPath(path, anchor.der, options.revocation, now_sec) catch |e| return switch (e) {
+                    revocation.checkPath(path, anchor.der, options.staples, options.revocation, now_sec) catch |e| return switch (e) {
                         error.Revoked => error.TlsCertificateRevoked,
                         error.StatusUnknown => error.TlsCertificateStatusUnknown,
+                        error.BadStaple => error.TlsBadCertificateStatus,
+                        error.StapleMissing => error.TlsCertificateStatusMissing,
                         error.Malformed => error.TlsCertificateInvalid,
                     };
                     return leaf;
@@ -618,11 +627,25 @@ const RevocationFixtures = struct {
 
     /// Verify `leaf` and the CA of the fixtures with a revocation policy.
     fn check(self: *const RevocationFixtures, leaf: []const u8, policy: Revocation) Error!void {
+        return self.checkStapled(leaf, null, policy);
+    }
+
+    /// Verify `leaf` and the CA with the named OCSP response stapled to the leaf.
+    fn checkStapled(self: *const RevocationFixtures, leaf: []const u8, staple_name: ?[]const u8, policy: Revocation) Error!void {
+        const gpa = std.testing.allocator;
+        var staple: ?[]u8 = null;
+        defer if (staple) |s| gpa.free(s);
+        if (staple_name) |name| {
+            var path_buf: [96]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "test/fixtures/tls/der/{s}.ocsp", .{name}) catch unreachable;
+            staple = std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1 << 16)) catch return error.TlsCertificateInvalid;
+        }
         _ = try verifyChain(&.{ leaf, self.ca }, .{ .ca_set = &self.set }, .{
             .purpose = .server,
             .host = "localhost",
             .now_sec = test_now,
             .revocation = policy,
+            .staples = &.{staple},
         });
     }
 };
@@ -661,6 +684,37 @@ test "a CRL refuses a revoked leaf, and the policy decides about an unknown stat
     // With the scope `chain`, the intermediate needs the CRL of the root.
     try std.testing.expectError(error.TlsCertificateStatusUnknown, f.check(f.leaf, .{ .crls = &.{&crl}, .unknown = .hard_fail, .scope = .chain }));
     try f.check(f.leaf, .{ .crls = &.{ &crl, &root_crl }, .unknown = .hard_fail, .scope = .chain });
+}
+
+test "a stapled OCSP response gives the status, and the client refuses a bad one" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const Crl = @import("Crl.zig");
+    var f: RevocationFixtures = try .load(gpa);
+    defer f.deinit(gpa);
+    const request: Revocation = .{ .ocsp_stapling = .request };
+    const require: Revocation = .{ .ocsp_stapling = .require };
+    const hard: Revocation = .{ .ocsp_stapling = .request, .unknown = .hard_fail };
+
+    try f.checkStapled(f.leaf, "rev-leaf-good", require);
+    try f.checkStapled(f.leaf, "rev-leaf-good-delegated", hard);
+    try std.testing.expectError(error.TlsCertificateRevoked, f.checkStapled(f.revoked, "rev-revoked", request));
+    // The status "unknown" and a missing staple follow the policy.
+    try f.checkStapled(f.leaf, "rev-leaf-unknown", request);
+    try std.testing.expectError(error.TlsCertificateStatusUnknown, f.checkStapled(f.leaf, "rev-leaf-unknown", hard));
+    try f.checkStapled(f.leaf, null, request);
+    try std.testing.expectError(error.TlsCertificateStatusUnknown, f.checkStapled(f.leaf, null, hard));
+    try std.testing.expectError(error.TlsCertificateStatusMissing, f.checkStapled(f.leaf, null, require));
+    // A staple that the client cannot accept ends the check, also with `soft_fail`.
+    for ([_][]const u8{ "rev-revoked", "rev-leaf-noeku", "rev-leaf-stale" }) |bad| {
+        try std.testing.expectError(error.TlsBadCertificateStatus, f.checkStapled(f.leaf, bad, request));
+    }
+    // With stapling off, the client ignores a staple.
+    try f.checkStapled(f.revoked, "rev-revoked", .{});
+    // When the staple gives "unknown", a current CRL gives the status.
+    var crl = try Crl.loadFile(gpa, io, "test/fixtures/tls/pem/rev-ca.crl");
+    defer crl.deinit();
+    try f.checkStapled(f.leaf, "rev-leaf-unknown", .{ .ocsp_stapling = .request, .crls = &.{&crl}, .unknown = .hard_fail });
 }
 
 test "a self-issued intermediate gets no name check, a critical unknown form fails" {

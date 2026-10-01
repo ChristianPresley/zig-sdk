@@ -136,12 +136,15 @@ const ServerSetup = struct {
     client_revocation: tls.Revocation = .{},
     /// The verification time of client certificates. Null reads the clock.
     now_sec: ?i64 = null,
+    /// An OCSP response to staple to the leaf.
+    ocsp_staple: ?[]const u8 = null,
 };
 
 /// One handshake and echo between the SDK client and the SDK server. Returns the client
 /// error, if any. The server result is in `echo`. The client checks `expect_alpn`.
 fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, client_setup: ClientSetup, echo_out: *Echo, expect_alpn: ?[]const u8) !void {
     const one = [_]*const tls.CertChain{chain};
+    const staples = [_]tls.OcspStaple{.{ .chain = chain, .response = server_setup.ocsp_staple orelse "" }};
     echo_out.* = .{
         .server = try tls.Server.init(.{
             .chains = server_setup.chains orelse &one,
@@ -153,6 +156,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
             .client_trust = server_setup.client_trust,
             .send_client_ca_names = server_setup.send_client_ca_names,
             .client_revocation = server_setup.client_revocation,
+            .ocsp_staples = if (server_setup.ocsp_staple != null) &staples else &.{},
         }),
         .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
         .io = io,
@@ -338,6 +342,53 @@ test "a CRL from the application refuses a revoked certificate on both sides" {
     const refused = roundTrip(io, &valid, server, .{ .trust = .{ .ca_set = &set }, .now_sec = fixture_now, .identity = &revoked }, &echo, null);
     try std.testing.expect(std.meta.isError(refused));
     try std.testing.expectError(error.TlsCertificateRevoked, echo.result);
+}
+
+fn readOcspFixture(gpa: std.mem.Allocator, io: Io, name: []const u8) ![]u8 {
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "test/fixtures/tls/der/{s}.ocsp", .{name});
+    return Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 16));
+}
+
+test "the SDK server staples OCSP responses and the SDK client checks them" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/rev-root.crt");
+    var valid = try loadChain(gpa, io, "rev-chain.crt", "rev-leaf.key");
+    defer valid.deinit();
+    var revoked = try loadChain(gpa, io, "rev-revoked-chain.crt", "rev-leaf.key");
+    defer revoked.deinit();
+    const good = try readOcspFixture(gpa, io, "rev-leaf-good");
+    defer gpa.free(good);
+    const revoked_status = try readOcspFixture(gpa, io, "rev-revoked");
+    defer gpa.free(revoked_status);
+    var echo: Echo = undefined;
+    const client: ClientSetup = .{ .trust = .{ .ca_set = &set }, .now_sec = fixture_now, .revocation = .{ .ocsp_stapling = .require } };
+    const Alert = std.crypto.tls.Alert.Description;
+
+    try roundTrip(io, &valid, .{ .ocsp_staple = good }, client, &echo, null);
+    try std.testing.expectError(error.TlsCertificateRevoked, roundTrip(io, &revoked, .{ .ocsp_staple = revoked_status }, client, &echo, null));
+    try std.testing.expectEqual(Alert.certificate_revoked, echo.alert.description);
+    // A staple for another certificate.
+    try std.testing.expectError(error.TlsBadCertificateStatus, roundTrip(io, &valid, .{ .ocsp_staple = revoked_status }, client, &echo, null));
+    try std.testing.expectEqual(Alert.bad_certificate_status_response, echo.alert.description);
+    // `require` and no staple.
+    try std.testing.expectError(error.TlsCertificateStatusMissing, roundTrip(io, &valid, .{}, client, &echo, null));
+    try std.testing.expectEqual(Alert.bad_certificate_status_response, echo.alert.description);
+    // A client that does not ask gets no staple, so it never sees the wrong one.
+    try roundTrip(io, &valid, .{ .ocsp_staple = revoked_status }, .{ .trust = .{ .ca_set = &set }, .now_sec = fixture_now }, &echo, null);
+}
+
+test "the server refuses OCSP stapling for client certificates and an empty staple" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var chain = try loadChain(gpa, io, "rev-chain.crt", "rev-leaf.key");
+    defer chain.deinit();
+    const chains = [_]*const tls.CertChain{&chain};
+    try std.testing.expectError(error.ClientOcspStapling, tls.Server.init(.{ .chains = &chains, .client_revocation = .{ .ocsp_stapling = .request } }));
+    try std.testing.expectError(error.InvalidOcspStaple, tls.Server.init(.{ .chains = &chains, .ocsp_staples = &.{.{ .chain = &chain, .response = "" }} }));
 }
 
 test "hello retry request when the server wants another group" {
@@ -770,6 +821,20 @@ fn opensslServerRoundTrip(io: Io, extra: []const []const u8, trust: tls.Trust, g
     return opensslServer(io, extra, .{ .trust = trust, .groups = groups, .expect_group = expect_group, .padding = padding });
 }
 
+test "interop: openssl s_server staples an OCSP response for the SDK client" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!haveOpenssl(io, gpa)) return error.SkipZigTest;
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/rev-root.crt");
+    const setup: ClientSetup = .{ .trust = .{ .ca_set = &set }, .revocation = .{ .ocsp_stapling = .require }, .now_sec = fixture_now };
+    const cert = [_][]const u8{ "-cert", "test/fixtures/tls/pem/rev-leaf.crt", "-key", "test/fixtures/tls/pem/rev-leaf.key", "-cert_chain", "test/fixtures/tls/pem/rev-ca.crt" };
+    try opensslServer(io, &(cert ++ [_][]const u8{ "-status_file", "test/fixtures/tls/der/rev-leaf-good.ocsp" }), setup);
+    try std.testing.expectError(error.TlsBadCertificateStatus, opensslServer(io, &(cert ++ [_][]const u8{ "-status_file", "test/fixtures/tls/der/rev-leaf-stale.ocsp" }), setup));
+    try std.testing.expectError(error.TlsCertificateStatusMissing, opensslServer(io, &cert, setup));
+}
+
 /// Run `openssl s_server` with `extra` arguments, connect the SDK client with `setup` and
 /// check an echo. The client always offers the protocol "http/1.1".
 fn opensslServer(io: Io, extra: []const []const u8, setup: ClientSetup) !void {
@@ -829,6 +894,8 @@ fn opensslServer(io: Io, extra: []const []const u8, setup: ClientSetup) !void {
         .read_buffer = &read_buf,
         .write_buffer = &write_buf,
         .allow_truncation_attacks = true,
+        .revocation = setup.revocation,
+        .now_sec = setup.now_sec,
     });
     defer conn.deinit();
     try std.testing.expectEqualStrings("http/1.1", conn.alpn().?);

@@ -221,6 +221,7 @@ fn tlsParsers(_: void, smith: *Smith) anyerror!void {
         _ = crl.isCurrent(0, 0);
     } else |_| {}
     if (tls.der.parse(bytes)) |element| _ = element.time() catch {} else |_| {}
+    _ = tls.ocsp.check(bytes, bytes, bytes, 0, 0) catch {};
     _ = tls.verify.verifyChain(&.{bytes}, .self_signed, .{ .purpose = .server, .host = "localhost", .now_sec = 0 }) catch {};
     var it: tls.pem.Iterator = .init(bytes);
     while (it.next()) |block| {

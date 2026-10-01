@@ -32,6 +32,8 @@ pub const revocation = @import("revocation.zig");
 /// The revocation policy of the client and of the server for client certificates.
 pub const Revocation = revocation.Policy;
 pub const Crl = @import("Crl.zig");
+pub const ocsp = @import("ocsp.zig");
+pub const OcspStaple = server.OcspStaple;
 
 /// The std TLS toolbox this implementation reuses: enums, `Decoder` and key derivation.
 pub const std_tls = std.crypto.tls;

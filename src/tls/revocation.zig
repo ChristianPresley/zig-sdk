@@ -1,8 +1,10 @@
 //! Offline revocation checks of a verified certificate path. The SDK does not fetch
-//! revocation data from the network. The application supplies CRLs (RFC 5280 section 5).
+//! revocation data from the network. The application supplies CRLs (RFC 5280 section 5),
+//! and a TLS server can staple OCSP responses (RFC 6960) to its certificates.
 const std = @import("std");
 const Certificate = std.crypto.Certificate;
 const Crl = @import("Crl.zig");
+const ocsp = @import("ocsp.zig");
 const x509 = @import("x509.zig");
 
 /// The tolerance for the clocks of the CA and of this host, in seconds: five minutes.
@@ -14,24 +16,43 @@ pub const clock_skew_sec: i64 = 300;
 ///
 /// For each certificate of the path, the SDK finds a status:
 ///
-/// - "revoked": a current CRL of the issuer of the certificate lists its serial number.
-/// - "good": a current CRL of the issuer does not list the serial number.
-/// - "unknown": there is no such CRL. A missing CRL, a stale CRL, a CRL with a bad
-///   signature and a CRL of another issuer all give this status.
+/// - "revoked": a current CRL of the issuer lists the serial number of the certificate,
+///   or a stapled OCSP response gives "revoked".
+/// - "good": a current CRL of the issuer does not list the serial number, or a stapled
+///   OCSP response gives "good".
+/// - "unknown": else. A missing CRL, a stale CRL, a CRL with a bad signature and a CRL
+///   of another issuer give this status. A missing staple and the OCSP status "unknown"
+///   give it too.
 ///
 /// The status "revoked" always ends the handshake. The status "unknown" ends the handshake
 /// only with `hard_fail`, and only for a certificate in `scope`. With `hard_fail` and no
-/// CRL, each certificate in `scope` has the status "unknown".
+/// source of status, each certificate in `scope` has the status "unknown".
+///
+/// A stapled OCSP response that the client cannot accept always ends the handshake (RFC
+/// 6066 section 8). Thus a stale staple, a staple for another certificate and a staple
+/// without a valid signature end it, also with `soft_fail`.
 pub const Policy = struct {
     /// The CRLs from the application. A CRL applies to a certificate when the CRL issuer
     /// has the name of the certificate issuer. The issuer in the path must sign the CRL.
     /// A current CRL has a `thisUpdate` and a `nextUpdate` around the verification time,
     /// with the tolerance `clock_skew_sec`.
     crls: []const *const Crl = &.{},
+    /// OCSP stapling of the server certificates. Only the TLS client uses it. The server
+    /// refuses a policy for client certificates with a value other than `off`.
+    ocsp_stapling: OcspStapling = .off,
     /// The certificates that need a known status for `hard_fail`.
     scope: Scope = .leaf,
     /// What to do with a certificate in `scope` that has the status "unknown".
     unknown: Unknown = .soft_fail,
+
+    pub const OcspStapling = enum {
+        /// Do not ask for a staple. The client does not read a staple.
+        off,
+        /// Send `status_request` and check each staple that the server sends.
+        request,
+        /// As `request`, and refuse a leaf without a staple.
+        require,
+    };
 
     pub const Scope = enum {
         /// Only the leaf needs a known status.
@@ -49,7 +70,7 @@ pub const Policy = struct {
 
     /// True when the policy makes a check.
     pub fn active(self: Policy) bool {
-        return self.crls.len > 0 or self.unknown == .hard_fail;
+        return self.crls.len > 0 or self.ocsp_stapling != .off or self.unknown == .hard_fail;
     }
 };
 
@@ -60,17 +81,41 @@ pub const Error = error{
     Revoked,
     /// A certificate in scope has no known status, and the policy is `hard_fail`.
     StatusUnknown,
+    /// The server stapled an OCSP response that the client does not accept.
+    BadStaple,
+    /// The policy is `require` and the server stapled no OCSP response to the leaf.
+    StapleMissing,
     /// A certificate of the path does not parse.
     Malformed,
 };
 
 /// Check the status of each certificate of a verified path. `path` holds the leaf first
 /// and then the intermediates. `anchor` is the trust anchor that signs the last one.
-pub fn checkPath(path: []const []const u8, anchor: []const u8, policy: Policy, now_sec: i64) Error!void {
+/// `staples` holds the stapled OCSP response of each certificate of `path`, by index.
+pub fn checkPath(path: []const []const u8, anchor: []const u8, staples: []const ?[]const u8, policy: Policy, now_sec: i64) Error!void {
     if (!policy.active()) return;
     for (path, 0..) |cert, i| {
         const issuer = if (i + 1 < path.len) path[i + 1] else anchor;
-        const status = try crlStatus(cert, issuer, policy.crls, now_sec);
+        var status: Status = .unknown;
+        if (policy.ocsp_stapling != .off) {
+            const staple: ?[]const u8 = if (i < staples.len) staples[i] else null;
+            if (staple) |response| {
+                status = switch (ocsp.check(response, cert, issuer, now_sec, clock_skew_sec) catch return error.BadStaple) {
+                    .good => .good,
+                    .revoked => .revoked,
+                    .unknown => .unknown,
+                };
+            } else if (i == 0 and policy.ocsp_stapling == .require) return error.StapleMissing;
+        }
+        if (status != .revoked) {
+            switch (try crlStatus(cert, issuer, policy.crls, now_sec)) {
+                .revoked => status = .revoked,
+                .good => if (status == .unknown) {
+                    status = .good;
+                },
+                .unknown => {},
+            }
+        }
         switch (status) {
             .good => {},
             .revoked => return error.Revoked,
