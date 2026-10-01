@@ -16,6 +16,10 @@ pub const TlsSetup = struct {
     identity: ?*const tls.CertChain = null,
     /// The name to verify the server certificate against. Null uses the connection host.
     server_name: ?[]const u8 = null,
+    /// The cipher suites in preference order, for example `tls.suites.default_suites_with_aegis`.
+    cipher_suites: []const tls.Suite = tls.suites.default_suites,
+    /// The padding of the encrypted records that the client sends.
+    padding: tls.Padding = .none,
 };
 
 pub const OpenError = error{
@@ -91,6 +95,8 @@ pub const Connection = struct {
                 .trust = setup.trust,
                 .alpn = &.{"http/1.1"},
                 .identity = setup.identity,
+                .cipher_suites = setup.cipher_suites,
+                .padding = setup.padding,
                 .read_buffer = self.tls_read_buf,
                 .write_buffer = self.tls_write_buf,
                 .alert = &alert,

@@ -28,6 +28,9 @@ const Fixture = struct {
     /// Set before `start` to ask for client certificates.
     client_auth: tls.server.ClientAuth = .none,
     client_trust: ?tls.Trust = null,
+    /// Set before `start` to change the suites and the record padding of the server.
+    cipher_suites: []const tls.Suite = tls.suites.default_suites,
+    padding: tls.Padding = .none,
 
     fn blank() Fixture {
         return .{ .server = undefined, .chain = undefined, .tls_server = undefined, .transport = undefined, .future = undefined, .chains = undefined };
@@ -39,7 +42,7 @@ const Fixture = struct {
         self.chain = try tls.CertChain.loadFiles(gpa, io, cert, key);
         errdefer self.chain.deinit();
         self.chains = .{&self.chain};
-        self.tls_server = try tls.Server.init(.{ .chains = &self.chains, .alpn = &.{"http/1.1"}, .client_auth = self.client_auth, .client_trust = self.client_trust });
+        self.tls_server = try tls.Server.init(.{ .chains = &self.chains, .alpn = &.{"http/1.1"}, .client_auth = self.client_auth, .client_trust = self.client_trust, .cipher_suites = self.cipher_suites, .padding = self.padding });
         self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "https-test", .version = "1" } });
         errdefer self.server.deinit();
         try self.server.addTool(.{ .name = "add" }, add);
@@ -287,6 +290,37 @@ test "the MCP client over HTTPS with the SDK TLS client" {
     var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
     defer client.deinit();
     client.connect(untrusted.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.TransportFailed, client.discover(arena_state.allocator(), .{ .retry = .never }));
+}
+
+test "the MCP client over HTTPS with AEGIS and record padding" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = .blank();
+    // The server accepts only an AEGIS suite and pads its records.
+    f.cipher_suites = &.{.AEGIS_128L_SHA256};
+    f.padding = .{ .block = 512 };
+    try f.start("test/fixtures/tls/pem/chain.crt", "test/fixtures/tls/pem/chain-leaf.key");
+    defer f.stop();
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/ca.crt");
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/mcp", .{f.port()});
+    try discoverAndAdd(gpa, io, url, .{
+        .trust = .{ .ca_set = &set },
+        .cipher_suites = tls.suites.default_suites_with_aegis,
+        .padding = .{ .random = 64 },
+    });
+
+    // A client with the default suites has no suite in common with this server.
+    const plain = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url, .tls = .{ .trust = .{ .ca_set = &set } } });
+    defer plain.deinit();
+    var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(plain.transport());
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     try std.testing.expectError(error.TransportFailed, client.discover(arena_state.allocator(), .{ .retry = .never }));
