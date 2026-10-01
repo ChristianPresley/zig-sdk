@@ -760,6 +760,123 @@ test "client drops a log notification with an invalid level" {
     try std.testing.expectEqualStrings("debug", params.object.get("_meta").?.object.get("io.modelcontextprotocol/logLevel").?.string);
 }
 
+/// The time of the rate limits in the logging tests, in nanoseconds. The tests move it.
+var log_now_ns: i64 = 0;
+
+fn logNow() i64 {
+    return log_now_ns;
+}
+
+/// Logs five messages at the `error` level.
+fn loud(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    for (0..5) |i| try ctx.logText(.@"error", "spec", "line {d}", .{i});
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "done", .{}) };
+}
+
+/// The `params` objects of the output notifications `notifications/message`, in order. They
+/// are valid until the next request of the fixture.
+fn logParams(f: *ServerFixture) ![]Value {
+    var list: std.ArrayList(Value) = .empty;
+    for (f.harness.out.items) |frame| {
+        const v = try json.parseTree(f.arena(), frame);
+        const m = v.object.get("method") orelse continue;
+        if (std.mem.eql(u8, m.string, "notifications/message")) try list.append(f.arena(), v.object.get("params").?);
+    }
+    return list.items;
+}
+
+fn expectLine(params: Value, text: []const u8) !void {
+    try std.testing.expectEqualStrings("spec", params.object.get("logger").?.string);
+    try std.testing.expectEqualStrings(text, params.object.get("data").?.string);
+}
+
+fn expectSummary(params: Value, level: []const u8, dropped: i64) !void {
+    try std.testing.expectEqualStrings(level, params.object.get("level").?.string);
+    try std.testing.expectEqualStrings(RequestContext.log_summary_logger, params.object.get("logger").?.string);
+    const data = params.object.get("data").?;
+    try std.testing.expectEqualStrings("rate_limited", data.object.get("reason").?.string);
+    try std.testing.expectEqual(dropped, data.object.get("dropped").?.integer);
+}
+
+test "log messages over the rate limit of a caller are dropped, counted and reported in one summary" {
+    log_now_ns = 0;
+    var options: Server.Options = .{ .info = .{ .name = "t", .version = "1" }, .capabilities = .{ .logging = .{ .object = .empty } }, .rate_limit_clock = logNow };
+    options.limits.rate_limits.log_messages = .{ .count = 2, .period = .fromSeconds(1) };
+    var f: ServerFixture = undefined;
+    try f.init(options);
+    defer f.deinit();
+    try f.server.addToolJson(.{ .name = "loud" }, loud);
+    f.harness.peer = .{ .connection = 1 };
+
+    // The first call sends two messages and drops three. The call itself completes.
+    _ = result(try f.call(1, "tools/call", try metaWithLevel(f.arena(), "debug"), "\"name\":\"loud\""));
+    var notes = try logParams(&f);
+    try std.testing.expectEqual(2, notes.len);
+    try expectLine(notes[0], "line 0");
+    try expectLine(notes[1], "line 1");
+    try std.testing.expectEqual(3, f.server.rateLimitStats(std.testing.io).log_messages_dropped);
+
+    // Another caller has its own bucket and gets no summary.
+    f.harness.peer = .{ .connection = 2 };
+    _ = result(try f.call(2, "tools/call", try metaWithLevel(f.arena(), "debug"), "\"name\":\"loud\""));
+    notes = try logParams(&f);
+    try std.testing.expectEqual(2, notes.len);
+    try expectLine(notes[0], "line 0");
+
+    // After one second, the first caller gets one summary of the three dropped messages,
+    // then two messages. The summary has at least the level of the request.
+    log_now_ns += std.time.ns_per_s;
+    f.harness.peer = .{ .connection = 1 };
+    _ = result(try f.call(3, "tools/call", try metaWithLevel(f.arena(), "error"), "\"name\":\"loud\""));
+    notes = try logParams(&f);
+    try std.testing.expectEqual(3, notes.len);
+    try expectSummary(notes[0], "error", 3);
+    try expectLine(notes[1], "line 0");
+    try expectLine(notes[2], "line 1");
+
+    // With the level debug, the summary has the level warning.
+    log_now_ns += std.time.ns_per_s;
+    _ = result(try f.call(4, "tools/call", try metaWithLevel(f.arena(), "debug"), "\"name\":\"loud\""));
+    notes = try logParams(&f);
+    try std.testing.expectEqual(3, notes.len);
+    try expectSummary(notes[0], "warning", 3);
+    try std.testing.expectEqual(12, f.server.rateLimitStats(std.testing.io).log_messages_dropped);
+
+    // A server without the limit sends all messages.
+    var g: ServerFixture = undefined;
+    try g.init(.{ .info = .{ .name = "t", .version = "1" }, .capabilities = .{ .logging = .{ .object = .empty } } });
+    defer g.deinit();
+    try g.server.addToolJson(.{ .name = "loud" }, loud);
+    for (0..3) |i| {
+        _ = result(try g.call(@intCast(i), "tools/call", try metaWithLevel(g.arena(), "debug"), "\"name\":\"loud\""));
+        try std.testing.expectEqual(5, try g.notificationCount("notifications/message"));
+    }
+    try std.testing.expectEqual(0, g.server.rateLimitStats(std.testing.io).log_messages_dropped);
+}
+
+test "the log limit of one principal does not affect another principal" {
+    log_now_ns = 0;
+    var options: Server.Options = .{ .info = .{ .name = "t", .version = "1" }, .capabilities = .{ .logging = .{ .object = .empty } }, .rate_limit_clock = logNow };
+    options.limits.rate_limits.log_messages = .{ .count = 1, .period = .fromSeconds(60) };
+    var f: ServerFixture = undefined;
+    try f.init(options);
+    defer f.deinit();
+    try f.server.addToolJson(.{ .name = "loud" }, loud);
+    const alice: mcp.auth.Principal = .{ .issuer = "https://as.example", .subject = "alice" };
+    const bob: mcp.auth.Principal = .{ .issuer = "https://as.example", .subject = "bob" };
+    // Both principals share one address. Each has its own bucket.
+    f.harness.peer = .{ .address = try Io.net.IpAddress.parse("192.0.2.1", 443) };
+    for ([_]*const mcp.auth.Principal{ &alice, &bob }, 0..) |p, i| {
+        f.harness.principal = p;
+        _ = result(try f.call(@intCast(i), "tools/call", try metaWithLevel(f.arena(), "debug"), "\"name\":\"loud\""));
+        const notes = try logParams(&f);
+        try std.testing.expectEqual(1, notes.len);
+        try expectLine(notes[0], "line 0");
+    }
+    try std.testing.expectEqual(8, f.server.rateLimitStats(std.testing.io).log_messages_dropped);
+}
+
 // -- Pagination ---------------------------------------------------------------------------------
 
 test "server cursors are stable" {

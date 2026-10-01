@@ -193,6 +193,38 @@ test "unix socket server cancels the requests of a closed connection" {
     try awaitCount(&closed_by_peer, 1);
 }
 
+test "unix socket server gives each connection its own rate limit bucket" {
+    if (!unix.supported) return error.SkipZigTest;
+    var limits: mcp.Limits = .{};
+    limits.rate_limits.tool_calls = .{ .count = 1, .period = .fromSeconds(3600) };
+    var f: Fixture = undefined;
+    try f.start(limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transports: [2]*unix.Client = undefined;
+    var clients: [2]Client = undefined;
+    var connected: usize = 0;
+    defer for (0..connected) |i| {
+        clients[i].deinit();
+        transports[i].deinit();
+    };
+    for (0..2) |i| {
+        try connectClient(f.path, &transports[i], &clients[i]);
+        connected += 1;
+    }
+
+    const sum = try clients[0].callTool(arena, "add", .{ .a = 1, .b = 1 }, .{ .timeout = .fromSeconds(10) });
+    try std.testing.expectEqualStrings("2", sum.content[0].text.text);
+    var diagnostics: Client.Diagnostics = .{};
+    try std.testing.expectError(error.Rpc, clients[0].callTool(arena, "add", .{ .a = 1, .b = 1 }, .{ .timeout = .fromSeconds(10), .diagnostics = &diagnostics }));
+    try std.testing.expectEqual(@as(i64, -31429), diagnostics.rpc_error.?.code);
+    // The second connection has its own bucket.
+    const other = try clients[1].callTool(arena, "add", .{ .a = 2, .b = 2 }, .{ .timeout = .fromSeconds(10) });
+    try std.testing.expectEqualStrings("4", other.content[0].text.text);
+}
+
 const Job = struct {
     client: *Client,
     a: i64,

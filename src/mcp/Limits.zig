@@ -70,6 +70,9 @@ completion_max_values: u32 = 100,
 mrtr_max_rounds_client: u8 = 10,
 max_step_up_attempts: u8 = 3,
 
+/// Rate limits of the server for each caller. All limits are off by default.
+rate_limits: RateLimits = .{},
+
 schema: Schema = .{},
 
 /// Limits of one skill of the Skills extension. The defaults are the limits of the extension.
@@ -95,6 +98,59 @@ uri_template: struct {
     /// and a completion reference to it is invalid.
     max_uri_bytes: usize = 64 << 10,
 } = .{},
+
+/// The rate of a token bucket. The bucket gets `count` tokens in each `period` at an even rate
+/// and holds at most `burst` tokens. Each event takes one token. A new bucket is full.
+pub const Rate = struct {
+    /// Tokens in each period. Zero disables the limit.
+    count: u32 = 0,
+    period: Io.Duration = .fromSeconds(1),
+    /// The maximum tokens in the bucket, thus the largest burst. Zero means `count`.
+    burst: u32 = 0,
+
+    /// True when the rate limits events.
+    pub fn enabled(self: Rate) bool {
+        return self.count > 0;
+    }
+
+    /// The period in nanoseconds, from 1 to the maximum of `u64`.
+    pub fn periodNs(self: Rate) u64 {
+        const ns = self.period.nanoseconds;
+        if (ns <= 0) return 1;
+        return std.math.cast(u64, ns) orelse std.math.maxInt(u64);
+    }
+
+    /// The maximum tokens in the bucket.
+    pub fn capacity(self: Rate) u32 {
+        return if (self.burst > 0) self.burst else self.count;
+    }
+};
+
+/// The rate limits of the server. A limit applies to each caller.
+///
+/// The caller of a request is the authorization principal: the issuer, the subject and the
+/// client of the token. A request without a principal has the IP address of the client as its
+/// caller on HTTP and gRPC. The server counts all IPv6 addresses of one /64 network as one
+/// caller. On stdio and on a Unix socket, the caller is the connection. Requests from a
+/// transport without this data share one caller.
+pub const RateLimits = struct {
+    /// `tools/call` requests of one caller. `ToolDef.rate_limit` replaces this rate for one
+    /// tool. Each round of a multi round-trip call counts. Overflow: `-31429` with
+    /// `data.retryAfterMs`. On HTTP with a JSON response, also status 429 with `Retry-After`.
+    tool_calls: Rate = .{},
+    /// `tools/call` requests of all callers together. A call that this limit refuses does not
+    /// use a token of its caller. Overflow: the same as `tool_calls`.
+    tool_calls_total: Rate = .{},
+    /// `notifications/message` of one caller. Overflow: the server drops the message and
+    /// counts it. Before the next message that the bucket of the caller admits, the server
+    /// sends one summary message with the count.
+    log_messages: Rate = .{},
+    /// Maximum buckets for the tool calls, and also for the log messages. A caller has one
+    /// bucket, plus one bucket for each tool with `ToolDef.rate_limit` that it calls.
+    /// Overflow: the server forgets the bucket that it used least recently. The next request
+    /// of that caller gets a full bucket.
+    max_callers: u32 = 4096,
+};
 
 /// Limits of the JSON Schema validator.
 pub const Schema = struct {
@@ -139,6 +195,18 @@ test "defaults are sane" {
     const l: Limits = .{};
     try std.testing.expect(l.stdio.max_line_bytes > l.http.max_body_bytes);
     try std.testing.expectEqual(64, l.json_max_depth);
+}
+
+test "rate limits are off by default" {
+    const l: Limits = .{};
+    try std.testing.expect(!l.rate_limits.tool_calls.enabled());
+    try std.testing.expect(!l.rate_limits.tool_calls_total.enabled());
+    try std.testing.expect(!l.rate_limits.log_messages.enabled());
+    try std.testing.expectEqual(4096, l.rate_limits.max_callers);
+    // A rate without a burst holds `count` tokens. A period of zero counts as 1 ns.
+    const r: Rate = .{ .count = 5, .period = .fromSeconds(0) };
+    try std.testing.expectEqual(5, r.capacity());
+    try std.testing.expectEqual(1, r.periodNs());
 }
 
 test "skill limits are the limits of the extension" {

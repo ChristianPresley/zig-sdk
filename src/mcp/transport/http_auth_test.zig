@@ -49,9 +49,13 @@ const Fixture = struct {
     base: []u8,
 
     fn start(self: *Fixture) !void {
+        return self.startWith(.{ .info = .{ .name = "auth-test", .version = "1" } });
+    }
+
+    fn startWith(self: *Fixture, options: mcp.Server.Options) !void {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
-        self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "auth-test", .version = "1" } });
+        self.server = try mcp.Server.init(gpa, io, options);
         try self.server.addToolJson(.{ .name = "whoami" }, whoami);
         try self.server.addToolJson(.{ .name = "ask" }, askName);
         self.keys = .{.{ .alg = .HS256, .material = .{ .secret = secret } }};
@@ -84,7 +88,7 @@ const Fixture = struct {
         std.testing.allocator.free(self.base);
     }
 
-    const Reply = struct { status: http.Status, body: []u8, www_authenticate: ?[]u8 };
+    const Reply = struct { status: http.Status, body: []u8, www_authenticate: ?[]u8, retry_after: ?[]u8 = null };
 
     fn send(self: *Fixture, arena: std.mem.Allocator, method: http.Method, path: []const u8, body: ?[]const u8, extra: []const http.Header) !Reply {
         const url = try std.mem.concat(arena, u8, &.{ self.base, path });
@@ -98,14 +102,16 @@ const Fixture = struct {
         var redirect_buf: [256]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);
         var www: ?[]u8 = null;
+        var retry_after: ?[]u8 = null;
         var it = response.head.iterateHeaders();
-        while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate")) {
-            www = try arena.dupe(u8, h.value);
-        };
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate")) www = try arena.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) retry_after = try arena.dupe(u8, h.value);
+        }
         const status = response.head.status;
         var transfer: [4096]u8 = undefined;
         const text = try response.reader(&transfer).allocRemaining(arena, .limited(1 << 20));
-        return .{ .status = status, .body = text, .www_authenticate = www };
+        return .{ .status = status, .body = text, .www_authenticate = www, .retry_after = retry_after };
     }
 };
 
@@ -215,4 +221,55 @@ test "resource server: sealed request state opens only for the principal that it
     const done = try callAsk(&f, arena, again, state, .ok);
     const text = done.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string;
     try std.testing.expectEqualStrings("hello Ann from {\"asked\":\"alice\"}", text);
+}
+
+/// The time of the rate limits of the HTTP test, in nanoseconds. The test moves it.
+var rate_now_ns: i64 = 0;
+
+fn rateNow() i64 {
+    return rate_now_ns;
+}
+
+test "resource server: rate limits keep principals apart and answer 429 with Retry-After" {
+    rate_now_ns = 0;
+    var options: mcp.Server.Options = .{ .info = .{ .name = "auth-test", .version = "1" }, .rate_limit_clock = rateNow };
+    options.limits.rate_limits.tool_calls = .{ .count = 1, .period = .fromMilliseconds(2500) };
+    var f: Fixture = undefined;
+    try f.startWith(options);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const alice = try jwt.signHs256(arena, "{\"iss\":\"https://as.example\",\"sub\":\"alice\",\"aud\":\"http://127.0.0.1/mcp\",\"exp\":2000,\"scope\":\"mcp:read\"}", secret, null);
+    const bob = try jwt.signHs256(arena, "{\"iss\":\"https://as.example\",\"sub\":\"bob\",\"aud\":\"http://127.0.0.1/mcp\",\"exp\":2000,\"scope\":\"mcp:read\"}", secret, null);
+    const as_alice = std_headers ++ [_]http.Header{.{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Bearer ", alice }) }};
+    const as_bob = std_headers ++ [_]http.Header{.{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Bearer ", bob }) }};
+
+    const first = try f.send(arena, .POST, "/mcp", call_whoami, &as_alice);
+    try std.testing.expectEqual(http.Status.ok, first.status);
+    try std.testing.expect(first.retry_after == null);
+
+    // The second call of the same principal: 429, `Retry-After` in whole seconds, and the
+    // JSON-RPC error with the time in milliseconds.
+    const second = try f.send(arena, .POST, "/mcp", call_whoami, &as_alice);
+    try std.testing.expectEqual(http.Status.too_many_requests, second.status);
+    try std.testing.expectEqualStrings("3", second.retry_after.?);
+    const tree = try json.parseTree(arena, second.body);
+    try std.testing.expectEqual(@as(i64, 1), tree.object.get("id").?.integer);
+    const err = tree.object.get("error").?;
+    try std.testing.expectEqual(@as(i64, -31429), err.object.get("code").?.integer);
+    try std.testing.expectEqual(@as(i64, 2500), err.object.get("data").?.object.get("retryAfterMs").?.integer);
+
+    // Another principal on the same address has its own bucket.
+    const other = try f.send(arena, .POST, "/mcp", call_whoami, &as_bob);
+    try std.testing.expectEqual(http.Status.ok, other.status);
+    const who = try json.parseTree(arena, other.body);
+    try std.testing.expectEqualStrings("bob", who.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string);
+
+    // After the refill time, the first principal can call again.
+    rate_now_ns += 2500 * std.time.ns_per_ms;
+    const later = try f.send(arena, .POST, "/mcp", call_whoami, &as_alice);
+    try std.testing.expectEqual(http.Status.ok, later.status);
+    try std.testing.expectEqual(1, f.server.rateLimitStats(std.testing.io).tool_calls_refused);
 }

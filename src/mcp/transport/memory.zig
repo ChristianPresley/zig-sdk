@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const Transport = @import("Transport.zig");
 const jsonrpc = @import("../jsonrpc.zig");
 const Server = @import("../server/Server.zig");
+const Principal = @import("../auth/resource_server.zig").Principal;
 
 pub const Harness = struct {
     io: Io,
@@ -13,6 +14,11 @@ pub const Harness = struct {
     out: std.ArrayList([]u8) = .empty,
     out_lock: Io.Mutex = .init,
     finished: bool = false,
+    /// The source of the requests for the rate limits of the server.
+    peer: Transport.Peer = .unknown,
+    /// The authorization principal of the requests. With a principal, the requests have the
+    /// kind `streamable_http`, as the requests of the HTTP transport.
+    principal: ?*const Principal = null,
 
     pub fn init(io: Io, gpa: Allocator, server: *Server) Harness {
         return .{ .io = io, .gpa = gpa, .server = server };
@@ -42,11 +48,13 @@ pub const Harness = struct {
         const arena = arena_state.allocator();
         const msg = try jsonrpc.Message.parse(arena, text);
         self.server.handle(self.io, .{
-            .kind = .memory,
+            .kind = if (self.principal != null) .streamable_http else .memory,
             .arena = arena,
             .message = msg,
             .responder = self.responder(),
             .cancel = token,
+            .context = @ptrCast(@constCast(self.principal)),
+            .peer = self.peer,
         });
     }
 

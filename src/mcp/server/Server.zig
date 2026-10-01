@@ -30,9 +30,12 @@ const skills = @import("skills.zig");
 const skills_proto = @import("../protocol/skills.zig");
 const apps = @import("apps.zig");
 const apps_proto = @import("../protocol/apps.zig");
+const rate_limits = @import("rate_limits.zig");
 pub const RequestContext = @import("RequestContext.zig");
 pub const Outcome = mrtr.Outcome;
 pub const InputRequired = mrtr.InputRequired;
+/// Counters of the rate limits. See `rateLimitStats`.
+pub const RateLimitStats = rate_limits.Stats;
 
 const Server = @This();
 
@@ -55,6 +58,9 @@ pub const Options = struct {
         roots: bool = false,
     } = .{},
     limits: Limits = .{},
+    /// The clock of the rate limits in `limits.rate_limits`, in nanoseconds of a monotonic
+    /// time. Null reads the awake clock of the `Io`. Tests give a clock that they control.
+    rate_limit_clock: ?*const fn () i64 = null,
     /// How the server protects `requestState`. `unprotected` is only acceptable when tampering
     /// can cause nothing worse than request failure.
     request_state: enum { sealed_ephemeral, unprotected } = .sealed_ephemeral,
@@ -119,6 +125,10 @@ pub const ToolDef = struct {
     /// The MCP Apps metadata. The server puts it under `_meta.ui`. `resourceUri` must be a
     /// `ui://` URI. `checkUiLinks` checks that the resource exists.
     ui: ?apps_proto.ToolMeta = null,
+    /// The rate limit of this tool for each caller, in place of `limits.rate_limits.tool_calls`.
+    /// Each caller has a bucket for this tool alone. A count of zero disables the limit for
+    /// each caller. `limits.rate_limits.tool_calls_total` also counts the calls of this tool.
+    rate_limit: ?Limits.Rate = null,
     userdata: ?*anyopaque = null,
 };
 
@@ -163,6 +173,7 @@ const ToolEntry = struct {
     task_support: tasks.TaskSupport,
     /// The MCP Apps metadata, also present under `def._meta.ui`.
     ui: ?apps_proto.ToolMeta = null,
+    rate_limit: ?Limits.Rate = null,
     userdata: ?*anyopaque,
     enabled: bool = true,
 };
@@ -216,6 +227,8 @@ subscriptions_lock: Io.Mutex = .init,
 state_codec: ?request_state.Codec = null,
 task_store: ?tasks.Store = null,
 skill_registry: ?skills.Registry = null,
+/// The buckets of the rate limits of each caller.
+rate_limiter: rate_limits.Limiter,
 /// Counts of protocol violations by peers, for diagnostics.
 violations: std.atomic.Value(u64) = .init(0),
 /// Set once `shutdownSubscriptions` ran. Later listen requests end immediately.
@@ -228,6 +241,7 @@ pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
         .gpa = gpa,
         .options = options,
         .registry_arena = .init(gpa),
+        .rate_limiter = .init(options.limits.rate_limits.max_callers),
     };
     if (options.request_state == .sealed_ephemeral) {
         server.state_codec = try request_state.Codec.initRandom(io, options.limits.request_state_ttl);
@@ -271,6 +285,7 @@ pub fn deinit(self: *Server) void {
     if (self.task_store) |*store| store.deinit();
     if (self.skill_registry) |*r| r.deinit(self.gpa);
     if (self.state_codec) |*c| c.deinit();
+    self.rate_limiter.deinit(self.gpa);
     self.tools.deinit(self.gpa);
     self.resources.deinit(self.gpa);
     self.templates.deinit(self.gpa);
@@ -435,6 +450,7 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
         .handler = handler,
         .requires_client = def.requires_client,
         .task_support = def.task_support,
+        .rate_limit = def.rate_limit,
         .ui = if (def.ui) |ui| .{
             .resourceUri = if (ui.resourceUri) |u| try arena.dupe(u8, u) else null,
             .visibility = if (ui.visibility) |v| try arena.dupe(apps_proto.Visibility, v) else null,
@@ -708,6 +724,7 @@ fn handleRequest(self: *Server, io: Io, inbound: Transport.Inbound, req: message
         .transport_context = inbound.context,
         .responder = inbound.responder,
         .kind = inbound.kind,
+        .peer = inbound.peer,
     };
     self.dispatch(&ctx) catch |e| switch (e) {
         error.Rpc => {
@@ -1081,6 +1098,7 @@ fn callTool(self: *Server, ctx: *RequestContext, params: types.CallToolRequestPa
         const msg = try std.fmt.allocPrint(ctx.arena, "Unknown tool: {s}", .{params.name});
         return ctx.setError(errors.invalidParams(msg));
     };
+    try self.limitToolCall(ctx, entry);
     if (params.arguments) |a| if (a != .object) return ctx.setError(errors.invalidParams("arguments must be an object"));
     if (entry.requires_client) |required| try self.requireCapabilities(ctx, required);
     const client_has_tasks = self.task_store != null and ctx.meta.client_capabilities.hasExtension(tasks.extension_id);
@@ -1153,6 +1171,32 @@ fn callTool(self: *Server, ctx: *RequestContext, params: types.CallToolRequestPa
         },
         .input_required => |ir| try self.finishInputRequired(ctx, .@"tools/call", ir),
     }
+}
+
+/// Take a token for the tool call from the bucket of the caller and from the total bucket.
+/// Without a token, the call gets `-31429`. The check comes before the check of the arguments,
+/// thus a call over the limit does not cost the work of the validation.
+fn limitToolCall(self: *Server, ctx: *RequestContext, entry: *const ToolEntry) RequestContext.Error!void {
+    const limits = self.options.limits.rate_limits;
+    const per_caller = entry.rate_limit orelse limits.tool_calls;
+    if (!per_caller.enabled() and !limits.tool_calls_total.enabled()) return;
+    const own = entry.rate_limit != null;
+    const key: ?rate_limits.Key = if (per_caller.enabled()) rate_limits.callerKey(ctx.principal(), ctx.peer, if (own) entry.def.name else null) else null;
+    const limit: rate_limits.Limit = if (own) .tool else .caller;
+    const denial = try self.rate_limiter.admitToolCall(self.gpa, ctx.io, key, per_caller, limit, limits.tool_calls_total, self.rateLimitNow(ctx.io)) orelse return;
+    return ctx.setError(try errors.rateLimited(ctx.arena, "Too many tool calls", denial.retryAfterMs(), @tagName(denial.limit)));
+}
+
+/// The time of the rate limits, in nanoseconds.
+pub fn rateLimitNow(self: *const Server, io: Io) i96 {
+    if (self.options.rate_limit_clock) |f| return f();
+    return Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+}
+
+/// The counters of the rate limits: refused tool calls, dropped log messages and the buckets
+/// of the callers. Use them for metrics and alerts.
+pub fn rateLimitStats(self: *Server, io: Io) RateLimitStats {
+    return self.rate_limiter.stats(io);
 }
 
 /// Validate tool arguments against the input schema. Returns a detail string on failure.
@@ -1486,6 +1530,7 @@ fn runTask(self: *Server, io: Io, task: *tasks.Task) void {
         .responder = .{ .ptr = &dummy, .vtable = &noop_responder_vtable },
         .kind = task.kind,
         .task = task,
+        .background = true,
     };
     const outcome = self.runTaskBody(&ctx, task) catch |e| switch (e) {
         error.Canceled => {

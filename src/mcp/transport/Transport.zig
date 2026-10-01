@@ -115,6 +115,25 @@ pub const Responder = struct {
 /// `notifications/cancelled` exists only on stdio and on the Unix socket).
 pub const Kind = enum { stdio, memory, streamable_http, grpc, unix_socket };
 
+/// Where a request comes from, apart from its authorization principal. The rate limits of the
+/// server use it as the caller of a request without a principal.
+pub const Peer = union(enum) {
+    /// The transport gives no data. All such requests share one caller.
+    unknown,
+    /// The connection of the request, on stdio and on a Unix socket. `nextConnectionId`
+    /// gives the value.
+    connection: u64,
+    /// The IP address of the client, on HTTP and gRPC. The port does not count.
+    address: Io.net.IpAddress,
+};
+
+var connection_ids: std.atomic.Value(u64) = .init(1);
+
+/// A connection identifier that no other connection of the process has.
+pub fn nextConnectionId() u64 {
+    return connection_ids.fetchAdd(1, .monotonic);
+}
+
 /// One inbound message with everything a handler needs. The transport owns `arena` and frees
 /// it after the engine returns.
 pub const Inbound = struct {
@@ -125,6 +144,8 @@ pub const Inbound = struct {
     cancel: *CancelToken,
     /// Transport-specific data (for example HTTP authentication) for the handler.
     context: ?*anyopaque = null,
+    /// The source of the request, for the rate limits of the server.
+    peer: Peer = .unknown,
 };
 
 /// A client transport: sends one request and streams its frames back.
@@ -204,6 +225,12 @@ pub const Exchange = struct {
         }
     };
 };
+
+test "each connection gets a new identifier" {
+    const a = nextConnectionId();
+    const b = nextConnectionId();
+    try std.testing.expect(a != b);
+}
 
 test "cancel token" {
     var token: CancelToken = .{};

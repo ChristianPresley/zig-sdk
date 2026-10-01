@@ -53,6 +53,7 @@ test {
     _ = @import("mcp/client/cache.zig");
     _ = @import("mcp/server/request_state.zig");
     _ = @import("mcp/server/mrtr.zig");
+    _ = @import("mcp/server/rate_limits.zig");
     _ = @import("mcp/server/server_test.zig");
     _ = @import("mcp/client/client_test.zig");
     _ = @import("mcp/extensions_test.zig");

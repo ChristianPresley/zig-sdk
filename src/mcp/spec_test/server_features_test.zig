@@ -924,3 +924,208 @@ test "the client pages through a long prompt list with the cursor" {
     try std.testing.expectEqual(names.len, seen);
     try std.testing.expectEqual(3, pages);
 }
+
+// -- Rate limits of tool calls ------------------------------------------------------------------
+
+/// The time of the rate limits in the tests, in nanoseconds. The tests move it.
+var rate_now_ns: i64 = 0;
+
+fn rateNow() i64 {
+    return rate_now_ns;
+}
+
+var counted_calls: u32 = 0;
+
+fn countedTool(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    counted_calls += 1;
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "ok", .{}) };
+}
+
+/// A server with three tools. `counted` has an input schema. `slow` has its own limit of one
+/// call per minute. `free` has no limit for each caller.
+fn rateServer(gpa: std.mem.Allocator, rates: mcp.Limits.RateLimits) !Server {
+    rate_now_ns = 1_000 * std.time.ns_per_s;
+    counted_calls = 0;
+    var options: Server.Options = .{ .info = info, .rate_limit_clock = rateNow };
+    options.limits.rate_limits = rates;
+    var server = try Server.init(gpa, std.testing.io, options);
+    errdefer server.deinit();
+    try server.addToolJson(.{ .name = "counted", .input_schema = "{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}}}" }, countedTool);
+    try server.addToolJson(.{ .name = "slow", .rate_limit = .{ .count = 1, .period = .fromSeconds(60) } }, countedTool);
+    try server.addToolJson(.{ .name = "free", .rate_limit = .{} }, countedTool);
+    return server;
+}
+
+fn callNamed(h: *Harness, arena: std.mem.Allocator, id: i64, name: []const u8) !Value {
+    return call(h, arena, id, "tools/call", meta_none, try std.fmt.allocPrint(arena, "\"name\":\"{s}\",\"arguments\":{{}}", .{name}));
+}
+
+/// Check that `v` is the rate limit error of `limit` with `retry_ms`.
+fn expectRateLimited(v: Value, limit: []const u8, retry_ms: i64) !void {
+    try std.testing.expectEqual(@as(i64, -31429), errorCode(v).?);
+    const err = v.object.get("error").?;
+    try std.testing.expectEqualStrings("Too many tool calls", err.object.get("message").?.string);
+    const data = err.object.get("data").?;
+    try std.testing.expectEqualStrings("rate_limited", data.object.get("reason").?.string);
+    try std.testing.expectEqualStrings(limit, data.object.get("limit").?.string);
+    try std.testing.expectEqual(retry_ms, data.object.get("retryAfterMs").?.integer);
+}
+
+test "tool calls over the rate limit of a caller get -31429 with a retry time" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server = try rateServer(gpa, .{ .tool_calls = .{ .count = 2, .period = .fromSeconds(1) } });
+    defer server.deinit();
+    var h: Harness = .init(std.testing.io, gpa, &server);
+    defer h.deinit();
+    h.peer = .{ .connection = 1 };
+
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 1, "counted")) == null);
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 2, "counted")) == null);
+    try expectRateLimited(try callNamed(&h, arena, 3, "counted"), "caller", 500);
+    // The limit comes before the check of the arguments, and the handler does not run.
+    try expectRateLimited(try call(&h, arena, 4, "tools/call", meta_none, "\"name\":\"counted\",\"arguments\":{\"n\":\"text\"}"), "caller", 500);
+    try std.testing.expectEqual(2, counted_calls);
+    // The bucket gets one token each 500 ms.
+    rate_now_ns += 200 * std.time.ns_per_ms;
+    try expectRateLimited(try callNamed(&h, arena, 5, "counted"), "caller", 300);
+    rate_now_ns += 300 * std.time.ns_per_ms;
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 6, "counted")) == null);
+    try expectRateLimited(try callNamed(&h, arena, 7, "counted"), "caller", 500);
+    // An unknown tool is not a tool call and gets -32602.
+    try std.testing.expectEqual(@as(i64, -32602), errorCode(try callNamed(&h, arena, 8, "missing")).?);
+    try std.testing.expectEqual(3, counted_calls);
+    const stats = server.rateLimitStats(std.testing.io);
+    try std.testing.expectEqual(4, stats.tool_calls_refused);
+    try std.testing.expectEqual(1, stats.buckets);
+}
+
+test "the tool call limit of one principal does not affect another principal" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server = try rateServer(gpa, .{ .tool_calls = .{ .count = 1, .period = .fromSeconds(10) } });
+    defer server.deinit();
+    var h: Harness = .init(std.testing.io, gpa, &server);
+    defer h.deinit();
+
+    const alice: mcp.auth.Principal = .{ .issuer = "https://as.example", .subject = "alice", .client_id = "app" };
+    const bob: mcp.auth.Principal = .{ .issuer = "https://as.example", .subject = "bob", .client_id = "app" };
+    const alice_other_app: mcp.auth.Principal = .{ .issuer = "https://as.example", .subject = "alice", .client_id = "other" };
+    h.peer = .{ .address = try Io.net.IpAddress.parse("192.0.2.1", 5000) };
+    h.principal = &alice;
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 1, "counted")) == null);
+    try expectRateLimited(try callNamed(&h, arena, 2, "counted"), "caller", 10_000);
+    // The same principal from another address has the same bucket.
+    h.peer = .{ .address = try Io.net.IpAddress.parse("198.51.100.7", 5000) };
+    try expectRateLimited(try callNamed(&h, arena, 3, "counted"), "caller", 10_000);
+    // Another subject and another client have their own buckets.
+    h.principal = &bob;
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 4, "counted")) == null);
+    h.principal = &alice_other_app;
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 5, "counted")) == null);
+    // Without a principal, each address and each connection has its own bucket. The port
+    // does not count.
+    h.principal = null;
+    h.peer = .{ .address = try Io.net.IpAddress.parse("192.0.2.1", 5000) };
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 6, "counted")) == null);
+    h.peer = .{ .address = try Io.net.IpAddress.parse("192.0.2.1", 6000) };
+    try expectRateLimited(try callNamed(&h, arena, 7, "counted"), "caller", 10_000);
+    h.peer = .{ .connection = 41 };
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 8, "counted")) == null);
+    h.peer = .{ .connection = 42 };
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 9, "counted")) == null);
+    // After the period, the first principal has a token again.
+    rate_now_ns += 10 * std.time.ns_per_s;
+    h.principal = &alice;
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 10, "counted")) == null);
+}
+
+test "a tool with its own rate limit has its own bucket, and the total limit counts all callers" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    {
+        var server = try rateServer(gpa, .{ .tool_calls = .{ .count = 1, .period = .fromSeconds(1) } });
+        defer server.deinit();
+        var h: Harness = .init(std.testing.io, gpa, &server);
+        defer h.deinit();
+        h.peer = .{ .connection = 1 };
+        // The tool `slow` has one call per minute. It does not use the bucket of the caller.
+        try std.testing.expect(errorCode(try callNamed(&h, arena, 1, "slow")) == null);
+        try expectRateLimited(try callNamed(&h, arena, 2, "slow"), "tool", 60_000);
+        try std.testing.expect(errorCode(try callNamed(&h, arena, 3, "counted")) == null);
+        try expectRateLimited(try callNamed(&h, arena, 4, "counted"), "caller", 1_000);
+        // The tool `free` has no limit for each caller.
+        for (0..20) |i| try std.testing.expect(errorCode(try callNamed(&h, arena, @intCast(10 + i), "free")) == null);
+    }
+    {
+        var server = try rateServer(gpa, .{ .tool_calls = .{ .count = 2, .period = .fromSeconds(1) }, .tool_calls_total = .{ .count = 3, .period = .fromSeconds(1) } });
+        defer server.deinit();
+        var h: Harness = .init(std.testing.io, gpa, &server);
+        defer h.deinit();
+        h.peer = .{ .connection = 1 };
+        try std.testing.expect(errorCode(try callNamed(&h, arena, 1, "counted")) == null);
+        try std.testing.expect(errorCode(try callNamed(&h, arena, 2, "free")) == null);
+        h.peer = .{ .connection = 2 };
+        try std.testing.expect(errorCode(try callNamed(&h, arena, 3, "counted")) == null);
+        // The fourth call of all callers is over the total limit.
+        try expectRateLimited(try callNamed(&h, arena, 4, "counted"), "total", 334);
+        // The refusal of the total limit did not take the token of the caller: after 400 ms
+        // the caller has 1.8 tokens and the total bucket has 1.2 tokens.
+        rate_now_ns += 400 * std.time.ns_per_ms;
+        try std.testing.expect(errorCode(try callNamed(&h, arena, 5, "counted")) == null);
+        try expectRateLimited(try callNamed(&h, arena, 6, "counted"), "caller", 100);
+    }
+}
+
+test "the server keeps buckets for at most max_callers callers and forgets the least recent one" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server = try rateServer(gpa, .{ .tool_calls = .{ .count = 1, .period = .fromSeconds(60) }, .max_callers = 2 });
+    defer server.deinit();
+    var h: Harness = .init(std.testing.io, gpa, &server);
+    defer h.deinit();
+    for ([_]u64{ 1, 2 }) |c| {
+        h.peer = .{ .connection = c };
+        try std.testing.expect(errorCode(try callNamed(&h, arena, 1, "counted")) == null);
+        try expectRateLimited(try callNamed(&h, arena, 2, "counted"), "caller", 60_000);
+    }
+    // Many new callers do not make the server keep more buckets.
+    for (3..100) |c| {
+        h.peer = .{ .connection = c };
+        try std.testing.expect(errorCode(try callNamed(&h, arena, 3, "counted")) == null);
+    }
+    const stats = server.rateLimitStats(std.testing.io);
+    try std.testing.expectEqual(2, stats.buckets);
+    try std.testing.expectEqual(97, stats.buckets_forgotten);
+    // The server forgot the first caller. It gets a full bucket again.
+    h.peer = .{ .connection = 1 };
+    try std.testing.expect(errorCode(try callNamed(&h, arena, 4, "counted")) == null);
+    // The caller of the last call keeps its bucket.
+    h.peer = .{ .connection = 99 };
+    try expectRateLimited(try callNamed(&h, arena, 5, "counted"), "caller", 60_000);
+}
+
+test "rate limits are off by default and every tool call runs" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var server = try rateServer(gpa, .{});
+    defer server.deinit();
+    var h: Harness = .init(std.testing.io, gpa, &server);
+    defer h.deinit();
+    for (0..500) |i| try std.testing.expect(errorCode(try callNamed(&h, arena, @intCast(i), "counted")) == null);
+    try std.testing.expectEqual(500, counted_calls);
+    const stats = server.rateLimitStats(std.testing.io);
+    try std.testing.expectEqual(0, stats.tool_calls_refused);
+    try std.testing.expectEqual(0, stats.buckets);
+}

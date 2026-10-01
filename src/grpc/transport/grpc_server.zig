@@ -344,6 +344,7 @@ fn handleRequest(conn: *Conn, stream: *Stream, arena: Allocator, env: envelope.H
         .responder = .{ .ptr = &exchange, .vtable = &exchange_vtable },
         .cancel = &token,
         .context = principal,
+        .peer = .{ .address = conn.stream.socket.address },
     });
     if (!exchange.done) {
         // The handler ended without a response: the request was cancelled.

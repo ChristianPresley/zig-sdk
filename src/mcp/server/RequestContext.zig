@@ -15,6 +15,7 @@ const Server = @import("Server.zig");
 const Principal = @import("../auth/resource_server.zig").Principal;
 const tasks = @import("tasks.zig");
 const rate_limit = @import("../util/rate_limit.zig");
+const rate_limits = @import("rate_limits.zig");
 
 const RequestContext = @This();
 
@@ -48,6 +49,12 @@ target: []const u8 = "",
 /// The rate limit of the progress notifications of this request.
 progress_window: rate_limit.Window = .{},
 long_lived: bool = false,
+/// The source of the request from the transport. The rate limits use it when the request has
+/// no principal.
+peer: Transport.Peer = .unknown,
+/// True while a task of the Tasks extension runs after the request that started it. The task
+/// then has no stream to the client, and `log` sends nothing.
+background: bool = false,
 
 pub const Error = error{ Canceled, Rpc, OutOfMemory };
 
@@ -95,13 +102,43 @@ pub fn progress(self: *RequestContext, value: f64, total: ?f64, note: ?[]const u
 }
 
 /// Send `notifications/message` on the request stream. Dropped unless the server declares the
-/// logging capability, the request set a log level, and `level` is at least that level.
+/// logging capability, the request set a log level, and `level` is at least that level. The
+/// server also drops a message over `limits.rate_limits.log_messages` of the caller. Before
+/// the next message that the limit admits for the caller, the server sends one summary with
+/// the count of dropped messages. The summary has the logger `log_summary_logger`.
 pub fn log(self: *RequestContext, level: types.LoggingLevel, logger: ?[]const u8, data: Value) Error!void {
     if (self.server.options.capabilities.logging == null) return;
     const min = self.meta.log_level orelse return;
     if (level.severity() < min.severity()) return;
-    if (self.long_lived) return;
+    if (self.long_lived or self.background) return;
+    switch (try self.admitLog()) {
+        .send => {},
+        .drop => return,
+        .send_summary => |dropped| try self.sendLogSummary(min, dropped),
+    }
     const params: types.LoggingMessageNotificationParams = .{ .level = level, .logger = logger, .data = data };
+    try self.sendNotification("notifications/message", params);
+}
+
+/// The logger name of the summary of the dropped log messages.
+pub const log_summary_logger = "rate_limit";
+
+fn admitLog(self: *RequestContext) Error!rate_limits.LogDecision {
+    const server = self.server;
+    const rate = server.options.limits.rate_limits.log_messages;
+    if (!rate.enabled()) return .send;
+    const key = rate_limits.callerKey(self.principal(), self.peer, null);
+    return server.rate_limiter.admitLog(server.gpa, self.io, key, rate, server.rateLimitNow(self.io));
+}
+
+/// Send the summary of `dropped` log messages, at the level `warning` or at `min` when that is
+/// more severe. The data has `reason` and `dropped`.
+fn sendLogSummary(self: *RequestContext, min: types.LoggingLevel, dropped: u64) Error!void {
+    const level: types.LoggingLevel = if (min.severity() > types.LoggingLevel.warning.severity()) min else .warning;
+    var map: std.json.ObjectMap = .empty;
+    try map.put(self.arena, "reason", .{ .string = errors.rate_limited_reason });
+    try map.put(self.arena, "dropped", .{ .integer = std.math.cast(i64, dropped) orelse std.math.maxInt(i64) });
+    const params: types.LoggingMessageNotificationParams = .{ .level = level, .logger = log_summary_logger, .data = .{ .object = map } };
     try self.sendNotification("notifications/message", params);
 }
 

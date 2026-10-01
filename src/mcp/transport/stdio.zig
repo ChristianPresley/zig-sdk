@@ -33,6 +33,9 @@ pub const Server = struct {
     on_close: OnClose = .shutdown_subscriptions,
     /// When set, `run` reads no more frames after the flag becomes true.
     stop: ?*const std.atomic.Value(bool) = null,
+    /// The caller of the requests of this peer for the rate limits of the server. `init` gives
+    /// each instance a new connection identifier.
+    peer: Transport.Peer,
     out_lock: Io.Mutex = .init,
     in_flight: std.ArrayList(*Slot) = .empty,
     in_flight_lock: Io.Mutex = .init,
@@ -72,6 +75,7 @@ pub const Server = struct {
             .server = server,
             .limits = server.options.limits,
             .out = out,
+            .peer = .{ .connection = Transport.nextConnectionId() },
             .permits = .{ .permits = server.options.limits.max_in_flight_requests },
         };
     }
@@ -227,6 +231,7 @@ pub const Server = struct {
             .message = slot.message,
             .responder = .{ .ptr = slot, .vtable = &slot_vtable },
             .cancel = &slot.token,
+            .peer = self.peer,
         });
     }
 

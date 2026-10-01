@@ -561,6 +561,48 @@ test "tasks extension: gate, sync fallback and lifecycle" {
     try std.testing.expectEqualStrings("complete", ack2.object.get("resultType").?.string);
 }
 
+/// Logs three messages. With the Tasks extension, it logs them in a task.
+fn logTask(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    if (!ctx.inTask()) return .start_task;
+    for (0..3) |i| try ctx.logText(.info, "task", "step {d}", .{i});
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "logged", .{}) };
+}
+
+test "a task in the background sends no log messages and takes no log tokens" {
+    const meta_tasks_debug =
+        \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}},"io.modelcontextprotocol/logLevel":"debug"}
+    ;
+    const meta_debug =
+        \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/logLevel":"debug"}
+    ;
+    var options: Server.Options = .{ .info = .{ .name = "test", .version = "0.1.0" }, .tasks = .{ .poll_interval_ms = 10 }, .capabilities = .{ .logging = .{ .object = .empty } } };
+    options.limits.rate_limits.log_messages = .{ .count = 1, .period = .fromSeconds(3600) };
+    var f: TaskFixture = .{ .base = undefined };
+    try f.base.init(options);
+    defer f.deinit();
+    try f.base.server.addToolJson(.{ .name = "log_task", .task_support = .optional }, logTask);
+
+    const created = try f.call("tools/call", meta_tasks_debug, "\"name\":\"log_task\",\"arguments\":{}");
+    _ = try f.waitFor(taskId(created), "completed");
+    try std.testing.expectEqual(0, f.base.server.rateLimitStats(std.testing.io).log_messages_dropped);
+
+    // Without the extension, the task runs inside the request and logs on its stream. The
+    // background task took no token, thus the first message goes out.
+    const v = try f.call("tools/call", meta_debug, "\"name\":\"log_task\",\"arguments\":{}");
+    try std.testing.expectEqualStrings("logged", result(v).object.get("content").?.array.items[0].object.get("text").?.string);
+    var messages: usize = 0;
+    for (f.base.harness.out.items) |frame| {
+        const note = try json.parseTree(f.base.arena(), frame);
+        const m = note.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, m.string, "notifications/message")) continue;
+        messages += 1;
+        try std.testing.expectEqualStrings("step 0", note.object.get("params").?.object.get("data").?.string);
+    }
+    try std.testing.expectEqual(1, messages);
+    try std.testing.expectEqual(2, f.base.server.rateLimitStats(std.testing.io).log_messages_dropped);
+}
+
 test "tasks extension: input required inside a task" {
     var f: TaskFixture = undefined;
     try f.init();

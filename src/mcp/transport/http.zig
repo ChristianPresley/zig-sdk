@@ -324,8 +324,20 @@ fn statusForCode(code: i64) http.Status {
     return switch (code) {
         -32700, -32600, -32602, -32020, -32021, -32022 => .bad_request,
         -32601 => .not_found,
+        @intFromEnum(errors.Code.rate_limited) => .too_many_requests,
         else => .ok,
     };
+}
+
+/// The value of `Retry-After` for an error with `data.retryAfterMs`: whole seconds, rounded
+/// up, at least 1 (RFC 9110 section 10.2.3). Null when the error has no such field.
+fn retryAfterSeconds(err: Value) ?u64 {
+    const data = err.object.get("data") orelse return null;
+    if (data != .object) return null;
+    const ms = data.object.get("retryAfterMs") orelse return null;
+    if (ms != .integer or ms.integer < 0) return null;
+    const ms_u: u64 = @intCast(ms.integer);
+    return @max(1, ms_u / std.time.ms_per_s + @intFromBool(ms_u % std.time.ms_per_s != 0));
 }
 
 /// Handle one request on a connection. Returns whether the connection can carry one more request.
@@ -503,6 +515,7 @@ fn handleRpcRequest(self: *Server, request: *http.Server.Request, socket: *Io.ne
         .responder = .{ .ptr = &exchange, .vtable = &exchange_vtable },
         .cancel = &token,
         .context = principal,
+        .peer = .{ .address = socket.stream.socket.address },
     });
     if (exchange.keepalive_future) |*f| {
         exchange.keepalive_stop.store(true, .release);
@@ -649,20 +662,30 @@ fn exchangeFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendErro
         bw.end() catch return error.WriteFailed;
         return;
     }
-    // JSON mode: the HTTP status follows the error code for status-bearing codes.
+    // JSON mode: the HTTP status follows the error code for status-bearing codes. A rate
+    // limit error also gets `Retry-After`.
     var status: http.Status = .ok;
+    var retry_after: ?u64 = null;
     if (json.parseTree(self.arena, frame)) |tree| {
         if (tree == .object) {
             if (tree.object.get("error")) |e| {
                 if (e == .object) {
                     if (e.object.get("code")) |c| if (c == .integer) {
                         status = statusForCode(c.integer);
+                        if (status == .too_many_requests) retry_after = retryAfterSeconds(e);
                     };
                 }
             }
         }
     } else |_| {}
-    self.request.respond(frame, .{ .status = status, .keep_alive = self.request.head.keep_alive, .extra_headers = &json_headers }) catch return error.WriteFailed;
+    var headers: [2]http.Header = .{ json_headers[0], undefined };
+    var count: usize = 1;
+    var seconds_buf: [20]u8 = undefined;
+    if (retry_after) |s| {
+        headers[1] = .{ .name = "retry-after", .value = std.fmt.bufPrint(&seconds_buf, "{d}", .{s}) catch unreachable };
+        count = 2;
+    }
+    self.request.respond(frame, .{ .status = status, .keep_alive = self.request.head.keep_alive, .extra_headers = headers[0..count] }) catch return error.WriteFailed;
 }
 
 fn exchangeAbort(ptr: *anyopaque, io: Io) void {
@@ -677,6 +700,24 @@ fn exchangeAbort(ptr: *anyopaque, io: Io) void {
         self.request.respond("", .{ .status = .service_unavailable }) catch {};
     }
     self.reusable = false;
+}
+
+test "a rate limit error maps to status 429 and Retry-After in whole seconds" {
+    try std.testing.expectEqual(http.Status.too_many_requests, statusForCode(-31429));
+    try std.testing.expectEqual(http.Status.bad_request, statusForCode(-32602));
+    try std.testing.expectEqual(http.Status.ok, statusForCode(-32603));
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { text: []const u8, seconds: ?u64 }{
+        .{ .text = "{\"code\":-31429,\"message\":\"m\",\"data\":{\"retryAfterMs\":1}}", .seconds = 1 },
+        .{ .text = "{\"code\":-31429,\"message\":\"m\",\"data\":{\"retryAfterMs\":1000}}", .seconds = 1 },
+        .{ .text = "{\"code\":-31429,\"message\":\"m\",\"data\":{\"retryAfterMs\":1001}}", .seconds = 2 },
+        .{ .text = "{\"code\":-31429,\"message\":\"m\",\"data\":{\"retryAfterMs\":0}}", .seconds = 1 },
+        .{ .text = "{\"code\":-31429,\"message\":\"m\",\"data\":{\"retryAfterMs\":-5}}", .seconds = null },
+        .{ .text = "{\"code\":-31429,\"message\":\"m\"}", .seconds = null },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.seconds, retryAfterSeconds(try json.parseTree(arena, c.text)));
 }
 
 test {
