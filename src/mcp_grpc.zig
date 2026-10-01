@@ -5,6 +5,19 @@ const std = @import("std");
 pub const protobuf = struct {
     pub const wire = @import("grpc/protobuf/wire.zig");
     pub const messages = @import("grpc/protobuf/messages.zig");
+    /// The table-driven codec of the typed messages.
+    pub const codec = @import("grpc/protobuf/codec.zig");
+    /// `google.protobuf.Struct`, `Value`, `ListValue` and `Duration`.
+    pub const well_known = @import("grpc/protobuf/well_known.zig");
+    /// The messages of the Google Cloud proto files for MCP.
+    pub const mcp_messages = @import("grpc/protobuf/mcp_messages.zig");
+};
+
+/// The typed binding: the service `model_context_protocol.Mcp` and the mapping between MCP
+/// JSON and its messages.
+pub const typed = struct {
+    pub const service = @import("grpc/typed/service.zig");
+    pub const convert = @import("grpc/typed/convert.zig");
 };
 
 pub const http2 = struct {
@@ -31,6 +44,11 @@ test {
     std.testing.refAllDecls(@This());
     _ = protobuf.wire;
     _ = protobuf.messages;
+    _ = protobuf.codec;
+    _ = protobuf.well_known;
+    _ = protobuf.mcp_messages;
+    _ = typed.service;
+    _ = typed.convert;
     _ = http2.hpack;
     _ = http2.huffman;
     _ = http2.frame;

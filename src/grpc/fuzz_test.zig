@@ -1,5 +1,5 @@
-//! Fuzz targets for the parsers of the gRPC module: HPACK, Huffman, frames, protobuf, the
-//! tunnel message, the timeout header and the status message.
+//! Fuzz targets for the parsers of the gRPC module: HPACK, Huffman, frames and protobuf. Other
+//! targets are the tunnel message, the typed messages, the timeout header and the status.
 const std = @import("std");
 const Smith = std.testing.Smith;
 const hpack = @import("http2/hpack/hpack.zig");
@@ -7,6 +7,10 @@ const huffman = @import("http2/hpack/huffman.zig");
 const frame = @import("http2/frame.zig");
 const wire = @import("protobuf/wire.zig");
 const messages = @import("protobuf/messages.zig");
+const codec = @import("protobuf/codec.zig");
+const well_known = @import("protobuf/well_known.zig");
+const service = @import("typed/service.zig");
+const convert = @import("typed/convert.zig");
 const timeout = @import("grpc/timeout.zig");
 const status = @import("grpc/status.zig");
 
@@ -62,6 +66,41 @@ fn protobuf(_: void, smith: *Smith) anyerror!void {
 
 test "fuzz: protobuf and the tunnel message" {
     try std.testing.fuzz({}, protobuf, .{ .corpus = &.{ "\x0a\x02{}", "\x08\xac\x02\x12\x05hello", "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01" } });
+}
+
+/// The decoders of every request and response message of the typed binding, the conversion
+/// to MCP JSON and back, and the `Struct` decoder.
+fn typedMessages(_: void, smith: *Smith) anyerror!void {
+    var buf: [max_input]u8 = undefined;
+    const bytes = input(smith, &buf, 0x2005);
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const limits: codec.Limits = .{ .max_depth = 16, .max_elements = 4096 };
+    for (std.enums.values(service.Rpc)) |rpc| {
+        var cx: convert.Context = .{ .arena = arena, .limits = limits };
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        if (convert.decodeRequest(&cx, rpc, bytes)) |params| {
+            convert.encodeRequest(&cx, gpa, &out, rpc, params) catch {};
+        } else |_| {}
+        out.clearRetainingCapacity();
+        if (convert.decodeResponse(&cx, rpc, bytes)) |result| {
+            convert.encodeResult(&cx, gpa, &out, rpc, result) catch {};
+        } else |_| {}
+    }
+    var budget: codec.Budget = .{ .limits = limits };
+    _ = well_known.decodeStruct(arena, bytes, &budget, 0) catch {};
+}
+
+test "fuzz: typed messages and their conversion" {
+    try std.testing.fuzz({}, typedMessages, .{ .corpus = &.{
+        "\x0a\x02\x0a\x00\x12\x17\x0a\x03add\x12\x10\x0a\x0e\x0a\x01a\x12\x09\x11\x00\x00\x00\x00\x00\x00\xf0\x3f",
+        "\x12\x06\x12\x04\x0a\x02AA",
+        "\x0a\x02\x48\x02",
+        "\x0a\x03\x0a\x01a\x12\x05\x0a\x03u:x",
+    } });
 }
 
 fn headerText(_: void, smith: *Smith) anyerror!void {

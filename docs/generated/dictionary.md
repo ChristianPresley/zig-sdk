@@ -637,6 +637,7 @@ Technical nouns and adjectives that end in -ing (rule 3.5).
 - polling
 - processing
 - rebinding
+- routing
 - sampling
 - setting
 - settings

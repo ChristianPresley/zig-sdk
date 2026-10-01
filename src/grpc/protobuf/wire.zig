@@ -62,6 +62,22 @@ pub const Reader = struct {
         return error.Malformed;
     }
 
+    /// Four little-endian bytes, for example one value of a packed `float` field.
+    pub fn fixed32(self: *Reader) Error!u32 {
+        if (self.buf.len - self.pos < 4) return error.Truncated;
+        const v = std.mem.readInt(u32, self.buf[self.pos..][0..4], .little);
+        self.pos += 4;
+        return v;
+    }
+
+    /// Eight little-endian bytes, for example one value of a packed `double` field.
+    pub fn fixed64(self: *Reader) Error!u64 {
+        if (self.buf.len - self.pos < 8) return error.Truncated;
+        const v = std.mem.readInt(u64, self.buf[self.pos..][0..8], .little);
+        self.pos += 8;
+        return v;
+    }
+
     /// The next field, or null at the end.
     pub fn next(self: *Reader) Error!?Field {
         if (self.eof()) return null;
@@ -121,7 +137,55 @@ pub const Writer = struct {
         try self.tag(number, .varint);
         try self.varint(value);
     }
+
+    /// Four little-endian bytes without a tag.
+    pub fn fixed32(self: Writer, value: u32) Allocator.Error!void {
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf, value, .little);
+        try self.out.appendSlice(self.gpa, &buf);
+    }
+
+    /// Eight little-endian bytes without a tag.
+    pub fn fixed64(self: Writer, value: u64) Allocator.Error!void {
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, value, .little);
+        try self.out.appendSlice(self.gpa, &buf);
+    }
+
+    /// Start a length-delimited field before the encoder knows its length. The function
+    /// writes the tag and keeps five bytes for the length. Give the result to `endNested`.
+    pub fn beginNested(self: Writer, number: u32) Allocator.Error!usize {
+        try self.tag(number, .length_delimited);
+        const start = self.out.items.len;
+        try self.out.appendNTimes(self.gpa, 0, max_nested_prefix);
+        return start;
+    }
+
+    /// End a field from `beginNested`: write its length and move its bytes next to the length.
+    pub fn endNested(self: Writer, start: usize) error{MessageTooLarge}!void {
+        const body_start = start + max_nested_prefix;
+        const len = self.out.items.len - body_start;
+        if (len > std.math.maxInt(u32)) return error.MessageTooLarge;
+        var prefix: [max_nested_prefix]u8 = undefined;
+        var n: usize = 0;
+        var v: u64 = len;
+        while (v >= 0x80) : (v >>= 7) {
+            prefix[n] = @as(u8, @truncate(v)) | 0x80;
+            n += 1;
+        }
+        prefix[n] = @intCast(v);
+        n += 1;
+        const items = self.out.items;
+        @memcpy(items[start..][0..n], prefix[0..n]);
+        if (n < max_nested_prefix) {
+            std.mem.copyForwards(u8, items[start + n ..], items[body_start..]);
+            self.out.shrinkRetainingCapacity(items.len - (max_nested_prefix - n));
+        }
+    }
 };
+
+/// The bytes that `beginNested` keeps for a length: enough for any length below 2^35.
+const max_nested_prefix = 5;
 
 /// The size of a varint on the wire.
 pub fn varintLen(value: u64) usize {
@@ -155,6 +219,36 @@ test "varints and fields round trip" {
     try std.testing.expect((try r.next()) == null);
     try std.testing.expectEqual(2, varintLen(300));
     try std.testing.expectEqual(10, varintLen(std.math.maxInt(u64)));
+}
+
+test "nested fields get the shortest length prefix" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const w: Writer = .{ .out = &out, .gpa = gpa };
+    const outer = try w.beginNested(1);
+    try w.bytesField(2, "hi");
+    const inner = try w.beginNested(3);
+    try w.endNested(inner);
+    try w.endNested(outer);
+    try std.testing.expectEqualSlices(u8, &.{ 0x0a, 0x06, 0x12, 0x02, 'h', 'i', 0x1a, 0x00 }, out.items);
+    // A body of 200 bytes needs two bytes of length.
+    out.clearRetainingCapacity();
+    const big = try w.beginNested(1);
+    try out.appendNTimes(gpa, 'x', 200);
+    try w.endNested(big);
+    try std.testing.expectEqualSlices(u8, &.{ 0x0a, 0xc8, 0x01 }, out.items[0..3]);
+    try std.testing.expectEqual(203, out.items.len);
+
+    out.clearRetainingCapacity();
+    try w.fixed32(1);
+    try w.fixed64(2);
+    try out.append(gpa, 9);
+    var r: Reader = .init(out.items);
+    try std.testing.expectEqual(1, try r.fixed32());
+    try std.testing.expectEqual(2, try r.fixed64());
+    try std.testing.expectError(error.Truncated, r.fixed32());
+    try std.testing.expectError(error.Truncated, r.fixed64());
 }
 
 test "malformed input" {
