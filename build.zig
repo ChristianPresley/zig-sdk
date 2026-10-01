@@ -171,8 +171,8 @@ pub fn build(b: *std.Build) void {
     addTool(b, "extract-requirements", "Extract the normative sentences of the specification", "tools/extract_requirements.zig", &.{});
     addTool(b, "spec-matrix", "Check the requirement mapping and render the conformance matrix", "tools/gen_spec_matrix.zig", &.{});
 
-    // Unit tests of the requirement tools run with the other tests.
-    for ([_][]const u8{ "tools/extract_requirements.zig", "tools/gen_spec_matrix.zig" }) |path| {
+    // Unit tests of the requirement tools and the changelog tool run with the other tests.
+    for ([_][]const u8{ "tools/extract_requirements.zig", "tools/gen_spec_matrix.zig", "tools/changelog_section.zig" }) |path| {
         const tool_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(path), .target = b.graph.host }) });
         test_step.dependOn(&b.addRunArtifact(tool_tests).step);
     }

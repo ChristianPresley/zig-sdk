@@ -7,6 +7,7 @@ All notable changes to this project are recorded in this file. The format follow
 ### Fixed
 
 - The HTTP/2 connection of the gRPC transport answers a frame larger than the maximum frame size with `GOAWAY` and `FRAME_SIZE_ERROR` (RFC 9113 section 4.2). Before, it sent `PROTOCOL_ERROR`. A `PING`, `PRIORITY`, `RST_STREAM`, `SETTINGS` or `WINDOW_UPDATE` frame with a wrong length also gives `FRAME_SIZE_ERROR`.
+- Correction to the notes of 0.2.0: only the server checks `includeContext` against the client capability `sampling.context`. The client does not. The client validates elicitation URLs, form answers and sampling messages with tool results, as the notes say.
 
 ## [0.2.0] - 2026-09-30
 
@@ -135,3 +136,7 @@ All notable changes to this project are recorded in this file. The format follow
 - Benchmarks (`zig build bench`) for request dispatch, HPACK decoding and the TLS handshake, with the baseline in `docs/generated/bench.md` and a nightly smoke run.
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
+
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/ChristianPresley/zig-sdk/releases/tag/v0.1.0
