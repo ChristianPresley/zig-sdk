@@ -464,7 +464,11 @@ test "keychain token storage keeps a large record in the keychain of this host" 
         .refresh_token = "made-up-refresh-token",
         .scopes = &.{"mcp:read"},
     };
-    try s.save(gpa, test_key, record);
+    // A locked keychain cannot take the record without a prompt, and the test shows none.
+    s.save(gpa, test_key, record) catch |e| switch (e) {
+        error.KeychainLocked, error.KeychainUnavailable => return error.SkipZigTest,
+        else => return e,
+    };
     var loaded = (try s.load(gpa, test_key)).?;
     defer loaded.deinit(gpa);
     try std.testing.expectEqualStrings(big, loaded.access_token.?);

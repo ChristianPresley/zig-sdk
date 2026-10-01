@@ -467,7 +467,9 @@ pub const Client = struct {
     fn ensureRegistered(self: *Client, arena: Allocator, meta: common.ServerMetadata) Error!void {
         if (self.registration != null) return;
         try self.register(arena, meta);
-        self.saveStored();
+        // The configuration holds pre-registered credentials, so only another registration
+        // changes the record.
+        if (self.options.registration != .pre_registered) self.saveStored();
     }
 
     /// True when the access token expires within the refresh margin.
