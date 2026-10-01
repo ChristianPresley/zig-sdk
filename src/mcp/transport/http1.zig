@@ -6,6 +6,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const http = std.http;
 const tls = @import("../../tls/tls.zig");
+const http_syntax = @import("../util/http_syntax.zig");
 
 pub const Header = http.Header;
 
@@ -151,10 +152,15 @@ pub const Connection = struct {
         return c.alpn();
     }
 
+    pub const SendError = Io.Writer.Error || error{InvalidRequestHead};
+
     /// Send one request with a complete body. The connection closes after the response.
-    /// A GET request without a body has no `content-length` header.
-    pub fn send(self: *Connection, method: []const u8, target: []const u8, host: []const u8, headers: []const Header, body: []const u8) Io.Writer.Error!void {
+    /// A GET request without a body has no `content-length` header. A part of the head with a
+    /// character that its rule does not permit gives `error.InvalidRequestHead`, and nothing
+    /// goes out.
+    pub fn send(self: *Connection, method: []const u8, target: []const u8, host: []const u8, headers: []const Header, body: []const u8) SendError!void {
         const w = self.writer;
+        try checkHead(method, target, host, headers);
         try w.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\nconnection: close\r\n", .{ method, target, host });
         if (body.len > 0 or !std.mem.eql(u8, method, "GET")) try w.print("content-length: {d}\r\n", .{body.len});
         for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
@@ -190,6 +196,14 @@ pub const Connection = struct {
     }
 };
 
+/// Check the parts of a request head against the rules of RFC 9110 and RFC 9112: the method
+/// and each field name are tokens, the target and the host are visible ASCII, and no field
+/// value has CR, LF or another control character.
+pub fn checkHead(method: []const u8, target: []const u8, host: []const u8, headers: []const Header) error{InvalidRequestHead}!void {
+    if (!http_syntax.isToken(method) or !http_syntax.isVisibleAscii(target) or !http_syntax.isVisibleAscii(host)) return error.InvalidRequestHead;
+    for (headers) |h| if (!http_syntax.isToken(h.name) or !http_syntax.isFieldValue(h.value)) return error.InvalidRequestHead;
+}
+
 /// The host, port and request target of a URL, for `Connection.open` and `send`.
 pub const Target = struct {
     host: []const u8,
@@ -201,6 +215,7 @@ pub const Target = struct {
     host_header: []const u8,
 
     pub fn parse(arena: Allocator, url: []const u8) error{ OutOfMemory, InvalidUrl }!Target {
+        if (!http_syntax.isRequestUrl(url)) return error.InvalidUrl;
         const uri = std.Uri.parse(url) catch return error.InvalidUrl;
         const secure = std.ascii.eqlIgnoreCase(uri.scheme, "https");
         if (!secure and !std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidUrl;
@@ -238,4 +253,16 @@ test "url targets" {
     try std.testing.expectEqualStrings("mcp.example.com", secure.host_header);
     try std.testing.expectError(error.InvalidUrl, Target.parse(arena, "ftp://x/"));
     try std.testing.expectError(error.InvalidUrl, Target.parse(arena, "http:///nohost"));
+    try std.testing.expectError(error.InvalidUrl, Target.parse(arena, "http://a/mcp\r\nx-injected: 1"));
+    try std.testing.expectError(error.InvalidUrl, Target.parse(arena, "http://a%0d%0ax-injected:1/mcp"));
+}
+
+test "a request head with CR or LF in a part is refused" {
+    const ok: []const Header = &.{.{ .name = "authorization", .value = "Bearer abc" }};
+    try checkHead("POST", "/mcp", "127.0.0.1:8080", ok);
+    try std.testing.expectError(error.InvalidRequestHead, checkHead("POST", "/mcp", "127.0.0.1", &.{.{ .name = "authorization", .value = "Bearer abc\r\nx-injected: 1" }}));
+    try std.testing.expectError(error.InvalidRequestHead, checkHead("POST", "/mcp", "127.0.0.1", &.{.{ .name = "x\r\ny", .value = "1" }}));
+    try std.testing.expectError(error.InvalidRequestHead, checkHead("POST", "/mcp\r\nx: 1", "127.0.0.1", ok));
+    try std.testing.expectError(error.InvalidRequestHead, checkHead("POST", "/mcp", "a\r\nx: 1", ok));
+    try std.testing.expectError(error.InvalidRequestHead, checkHead("PO ST", "/mcp", "127.0.0.1", ok));
 }

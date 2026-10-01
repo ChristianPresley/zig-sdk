@@ -9,6 +9,9 @@ const http = std.http;
 const json = @import("../json.zig");
 const jwt = @import("jwt.zig");
 const dpop = @import("dpop.zig");
+const http_syntax = @import("../util/http_syntax.zig");
+
+const log = std.log.scoped(.mcp_auth);
 
 // -- Provider ------------------------------------------------------------------------------------
 
@@ -323,6 +326,9 @@ pub const Fetcher = struct {
     };
 
     pub fn fetch(self: *Fetcher, arena: Allocator, method: http.Method, url: []const u8, body: ?[]const u8, content_type: ?[]const u8, extra: []const http.Header) !Reply {
+        // The URL can come from metadata, and `std.http.Client` only asserts on CR and LF.
+        if (!http_syntax.isRequestUrl(url)) return error.InvalidUrl;
+        for (extra) |h| if (!http_syntax.isToken(h.name) or !http_syntax.isFieldValue(h.value)) return error.InvalidHeader;
         const uri = try std.Uri.parse(url);
         var req = try self.http_client.request(method, uri, .{
             .redirect_behavior = .unhandled,
@@ -445,6 +451,13 @@ pub const Fetcher = struct {
             else => return .{ .failed = .{ .status = 0 } },
         };
         if (prover) |p| if (reply.dpop_nonce) |n| if (reply.status == 200) try p.rememberNonce(token_endpoint, n);
+        return tokenResult(arena, reply);
+    }
+
+    /// Parse the answer of a token endpoint. An access token that is not a `token68` value
+    /// is a failure, because the token goes into an `Authorization` header (RFC 6750 section
+    /// 2.1, RFC 9449 section 7.1).
+    pub fn tokenResult(arena: Allocator, reply: Reply) Allocator.Error!TokenResult {
         const tree = json.parseTree(arena, reply.body) catch return .{ .failed = .{ .status = reply.status } };
         if (tree != .object) return .{ .failed = .{ .status = reply.status } };
         if (reply.status != 200) return .{ .failed = .{
@@ -454,6 +467,10 @@ pub const Fetcher = struct {
             .dpop_nonce = reply.dpop_nonce,
         } };
         const access_token = json.getString(tree, "access_token") orelse return .{ .failed = .{ .status = reply.status } };
+        if (!http_syntax.isToken68(access_token)) {
+            log.warn("the token endpoint gave an access token with characters that a header cannot carry", .{});
+            return .{ .failed = .{ .status = reply.status, .description = "The access token is not a token68 value" } };
+        }
         return .{ .ok = .{
             .access_token = access_token,
             .token_type = json.getString(tree, "token_type"),
@@ -465,6 +482,29 @@ pub const Fetcher = struct {
         } };
     }
 };
+
+test "a token response with an access token that is not a token68 value is a failure" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const good = try Fetcher.tokenResult(arena, .{ .status = 200, .body = try arena.dupe(u8, "{\"access_token\":\"eyJ.eyJ.sig\",\"token_type\":\"Bearer\"}"), .location = null });
+    try std.testing.expectEqualStrings("eyJ.eyJ.sig", good.ok.access_token);
+    const injected = try Fetcher.tokenResult(arena, .{ .status = 200, .body = try arena.dupe(u8, "{\"access_token\":\"abc\\r\\nx-injected: 1\",\"token_type\":\"Bearer\"}"), .location = null });
+    try std.testing.expect(injected == .failed);
+    const spaced = try Fetcher.tokenResult(arena, .{ .status = 200, .body = try arena.dupe(u8, "{\"access_token\":\"a b\"}"), .location = null });
+    try std.testing.expect(spaced == .failed);
+}
+
+test "the fetcher refuses a URL or a header with CR or LF before it sends a request" {
+    var fetcher: Fetcher = .init(std.testing.io, std.testing.allocator, 1 << 16, false);
+    defer fetcher.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectError(error.InvalidUrl, fetcher.fetch(arena, .GET, "https://as.example/token\r\nx-injected: 1", null, null, &.{}));
+    try std.testing.expectError(error.InvalidUrl, fetcher.fetch(arena, .GET, "https://as%0d%0aexample/token", null, null, &.{}));
+    try std.testing.expectError(error.InvalidHeader, fetcher.fetch(arena, .GET, "https://as.example/token", null, null, &.{.{ .name = "dpop", .value = "a\r\nx: 1" }}));
+}
 
 // -- Client authentication -----------------------------------------------------------------------
 

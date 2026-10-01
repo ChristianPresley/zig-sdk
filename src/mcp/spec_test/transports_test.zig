@@ -359,7 +359,14 @@ const Fixture = struct {
     fn send(self: *Fixture, arena: std.mem.Allocator, method: []const u8, headers: []const http.Header, body: []const u8) !Reply {
         const conn = try http1.Connection.open(std.testing.io, std.testing.allocator, "127.0.0.1", self.transport.bound_port, null);
         defer conn.close();
-        try conn.send(method, "/mcp", self.host, headers, body);
+        // A raw head: these tests send bytes that `Connection.send` refuses, such as DEL.
+        const w = conn.writer;
+        try w.print("{s} /mcp HTTP/1.1\r\nhost: {s}\r\nconnection: close\r\n", .{ method, self.host });
+        if (body.len > 0 or !std.mem.eql(u8, method, "GET")) try w.print("content-length: {d}\r\n", .{body.len});
+        for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+        try w.writeAll("\r\n");
+        try w.writeAll(body);
+        try conn.flush();
         const response = try conn.receiveHead();
         const head = try arena.dupe(u8, response.bytes);
         const status: u16 = @intFromEnum(response.head.status);

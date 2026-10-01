@@ -1256,14 +1256,18 @@ pub const Client = struct {
         defer if (!keep) conn.close();
         if (conn.alpn()) |p| if (!std.mem.eql(u8, p, "http/1.1")) return error.HandshakeFailed;
         const key = try ws.newKey(io);
+        var headers: std.ArrayList(http1.Header) = .empty;
+        if (self.options.origin) |o| try headers.append(arena, .{ .name = "origin", .value = o });
+        if (self.authProvider()) |auth| if (auth.credentials(arena, "GET", self.target.http_url)) |c| {
+            try headers.append(arena, .{ .name = "authorization", .value = try c.authorization(arena) });
+            if (c.proof) |p| try headers.append(arena, .{ .name = dpop.header_name, .value = p });
+        };
+        try headers.appendSlice(arena, self.options.extra_headers);
+        // A token or a header value with CR or LF must not add a header.
+        http1.checkHead("GET", self.target.path, self.target.host_header, headers.items) catch return error.ConnectFailed;
         const w = conn.writer;
         w.print("GET {s} HTTP/1.1\r\nhost: {s}\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: {s}\r\nsec-websocket-version: 13\r\nsec-websocket-protocol: {s}\r\n", .{ self.target.path, self.target.host_header, &key, subprotocol }) catch return error.ConnectFailed;
-        if (self.options.origin) |o| w.print("origin: {s}\r\n", .{o}) catch return error.ConnectFailed;
-        if (self.authProvider()) |auth| if (auth.credentials(arena, "GET", self.target.http_url)) |c| {
-            w.print("authorization: {s}\r\n", .{try c.authorization(arena)}) catch return error.ConnectFailed;
-            if (c.proof) |p| w.print("{s}: {s}\r\n", .{ dpop.header_name, p }) catch return error.ConnectFailed;
-        };
-        for (self.options.extra_headers) |h| w.print("{s}: {s}\r\n", .{ h.name, h.value }) catch return error.ConnectFailed;
+        for (headers.items) |h| w.print("{s}: {s}\r\n", .{ h.name, h.value }) catch return error.ConnectFailed;
         w.writeAll("\r\n") catch return error.ConnectFailed;
         conn.flush() catch return error.ConnectFailed;
 
