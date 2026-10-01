@@ -5,6 +5,7 @@ const Certificate = std.crypto.Certificate;
 const der = @import("der.zig");
 const pem = @import("pem.zig");
 const PrivateKey = @import("PrivateKey.zig");
+const pss = @import("pss.zig");
 const x509 = @import("x509.zig");
 
 const CertChain = @This();
@@ -72,7 +73,11 @@ pub fn fromPem(gpa: Allocator, cert_pem: []const u8, key_pem: []const u8) Error!
 }
 
 /// Build a chain from owned DER certificates and a parsed key. Ownership moves to the chain.
-pub fn fromDerOwned(gpa: Allocator, certs: [][]u8, key: PrivateKey) Error!CertChain {
+/// A leaf with an id-RSASSA-PSS public key needs an RSA key. An `rsa` key becomes an
+/// `rsa_pss` key. The parameters of the leaf key restrict the key, and parameters of the key
+/// with another hash give `error.KeyMismatch`.
+pub fn fromDerOwned(gpa: Allocator, certs: [][]u8, key_in: PrivateKey) Error!CertChain {
+    var key = key_in;
     var total: usize = 0;
     for (certs) |c| total += c.len;
     if (total > max_chain_bytes) return error.ChainTooLarge;
@@ -80,8 +85,7 @@ pub fn fromDerOwned(gpa: Allocator, certs: [][]u8, key: PrivateKey) Error!CertCh
     // Check that the key matches the leaf. Every certificate must pass the precheck, so
     // that the std parser never reads out of bounds later.
     for (certs) |c| x509.precheck(c) catch return error.InvalidCertificate;
-    const leaf: Certificate = .{ .buffer = certs[0], .index = 0 };
-    const parsed = leaf.parse() catch return error.InvalidCertificate;
+    const parsed = pss.parseCertificate(.{ .buffer = certs[0], .index = 0 }) catch return error.InvalidCertificate;
     var pk_buf: [PrivateKey.max_public_key_len]u8 = undefined;
     const pk = key.publicKeyBytes(&pk_buf);
     if (!std.mem.eql(u8, pk, parsed.pubKey())) return error.KeyMismatch;
@@ -93,9 +97,20 @@ pub fn fromDerOwned(gpa: Allocator, certs: [][]u8, key: PrivateKey) Error!CertCh
         },
         .curveEd25519 => key.kind() == .ed25519,
         .rsaEncryption => key.kind() == .rsa,
-        else => false,
+        .rsassa_pss => switch (key.key) {
+            .rsa_pss => true,
+            .rsa => |k| blk: {
+                key = .{ .key = .{ .rsa_pss = .{ .key = k } } };
+                break :blk true;
+            },
+            else => false,
+        },
     };
     if (!algo_ok) return error.KeyMismatch;
+    if (parsed.pub_key_algo == .rsassa_pss) {
+        const leaf_params = pss.publicKeyParams(certs[0]) catch return error.InvalidCertificate;
+        try restrictKey(&key.key.rsa_pss, leaf_params);
+    }
     const common_name = try gpa.dupe(u8, parsed.commonName());
     errdefer gpa.free(common_name);
 
@@ -122,6 +137,20 @@ pub fn fromDerOwned(gpa: Allocator, certs: [][]u8, key: PrivateKey) Error!CertCh
     return .{ .gpa = gpa, .certs = certs, .key = key, .handshake_message = msg, .leaf_common_name = common_name };
 }
 
+/// Combine the parameters of an RSA-PSS key with the parameters of the leaf key. The leaf
+/// parameters tell the peers how the key signs, so the key must agree with them.
+fn restrictKey(key: *PrivateKey.RsaPss, leaf: ?pss.Params) Error!void {
+    const cert_params = leaf orelse return;
+    // TLS 1.3 signs with a salt as long as the hash, so these parameters permit no scheme.
+    if (cert_params.scheme() == null) return error.UnsupportedKey;
+    if (key.params) |own| {
+        if (own.hash != cert_params.hash) return error.KeyMismatch;
+        key.params = .{ .hash = own.hash, .salt_len = @max(own.salt_len, cert_params.salt_len) };
+    } else {
+        key.params = cert_params;
+    }
+}
+
 pub fn deinit(self: *CertChain) void {
     for (self.certs) |c| self.gpa.free(c);
     self.gpa.free(self.certs);
@@ -133,8 +162,7 @@ pub fn deinit(self: *CertChain) void {
 
 /// True when the leaf certificate names `host` (common name or subject alternative name).
 pub fn matchesHost(self: *const CertChain, host: []const u8) bool {
-    const leaf: Certificate = .{ .buffer = self.certs[0], .index = 0 };
-    const parsed = leaf.parse() catch return false;
+    const parsed = pss.parseCertificate(.{ .buffer = self.certs[0], .index = 0 }) catch return false;
     parsed.verifyHostName(host) catch return false;
     return true;
 }
@@ -174,4 +202,55 @@ test "load fixture chains" {
     try std.testing.expectError(error.KeyMismatch, loadFiles(gpa, io, "test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/p384.key"));
     try std.testing.expectError(error.KeyMismatch, loadFiles(gpa, io, "test/fixtures/tls/pem/rsa2048.crt", "test/fixtures/tls/pem/rsa3072.key"));
     try std.testing.expectError(error.KeyMismatch, loadFiles(gpa, io, "test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/rsa2048.key"));
+    try std.testing.expectError(error.KeyMismatch, loadFiles(gpa, io, "test/fixtures/tls/pem/rsa-pss.crt", "test/fixtures/tls/pem/rsa-pss-sha256.key"));
+}
+
+test "chains with an RSA-PSS leaf key" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // The self-signed CA has a key without parameters: every rsa_pss_pss scheme.
+    var free = try loadFiles(gpa, io, "test/fixtures/tls/pem/rsa-pss.crt", "test/fixtures/tls/pem/rsa-pss.key");
+    defer free.deinit();
+    try std.testing.expectEqualSlices(std.crypto.tls.SignatureScheme, &.{ .rsa_pss_pss_sha256, .rsa_pss_pss_sha384, .rsa_pss_pss_sha512 }, free.key.schemes());
+    try std.testing.expect(free.matchesHost("localhost"));
+    // The leaf restricts its key to SHA-256.
+    var restricted = try loadFiles(gpa, io, "test/fixtures/tls/pem/rsa-pss-sha256.crt", "test/fixtures/tls/pem/rsa-pss-sha256.key");
+    defer restricted.deinit();
+    try std.testing.expectEqualSlices(std.crypto.tls.SignatureScheme, &.{.rsa_pss_pss_sha256}, restricted.key.schemes());
+    try std.testing.expect(restricted.matchesHost("127.0.0.1") or restricted.matchesHost("localhost"));
+
+    // The same RSA key in PKCS#1 form becomes an RSA-PSS key with the leaf parameters.
+    const key_text = try std.Io.Dir.cwd().readFileAlloc(io, "test/fixtures/tls/pem/rsa-pss-sha256.key", gpa, .limited(1 << 16));
+    defer gpa.free(key_text);
+    var key_it: pem.Iterator = .init(key_text);
+    const pkcs8 = try key_it.nextLabeled("PRIVATE KEY").?.decode(gpa);
+    defer gpa.free(pkcs8);
+    var fields = (try der.parseExact(pkcs8)).children();
+    _ = try fields.require();
+    _ = try fields.require();
+    const pkcs1 = (try fields.require()).content;
+    const rsa_key: PrivateKey = .{ .key = .{ .rsa = try PrivateKey.rsa.parsePkcs1(pkcs1) } };
+    const cert_text = try std.Io.Dir.cwd().readFileAlloc(io, "test/fixtures/tls/pem/rsa-pss-sha256.crt", gpa, .limited(1 << 16));
+    defer gpa.free(cert_text);
+    var cert_it: pem.Iterator = .init(cert_text);
+    const certs = try gpa.alloc([]u8, 1);
+    certs[0] = try cert_it.nextLabeled("CERTIFICATE").?.decode(gpa);
+    var converted = try fromDerOwned(gpa, certs, rsa_key);
+    defer converted.deinit();
+    try std.testing.expectEqual(PrivateKey.Kind.rsa_pss, converted.key.kind());
+    try std.testing.expectEqualSlices(std.crypto.tls.SignatureScheme, &.{.rsa_pss_pss_sha256}, converted.key.schemes());
+}
+
+test "the parameters of the leaf restrict an RSA-PSS key" {
+    var key: PrivateKey.RsaPss = .{ .key = undefined };
+    try restrictKey(&key, null);
+    try std.testing.expect(key.params == null);
+    try restrictKey(&key, .{ .hash = .sha384, .salt_len = 20 });
+    try std.testing.expectEqual(pss.Params{ .hash = .sha384, .salt_len = 20 }, key.params.?);
+    try restrictKey(&key, .{ .hash = .sha384, .salt_len = 48 });
+    try std.testing.expectEqual(pss.Params{ .hash = .sha384, .salt_len = 48 }, key.params.?);
+    try restrictKey(&key, .{ .hash = .sha384, .salt_len = 0 });
+    try std.testing.expectEqual(pss.Params{ .hash = .sha384, .salt_len = 48 }, key.params.?);
+    try std.testing.expectError(error.KeyMismatch, restrictKey(&key, .{ .hash = .sha256, .salt_len = 32 }));
+    try std.testing.expectError(error.UnsupportedKey, restrictKey(&key, .{ .hash = .sha384, .salt_len = 49 }));
 }

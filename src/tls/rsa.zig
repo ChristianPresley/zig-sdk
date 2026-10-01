@@ -262,6 +262,70 @@ fn checkComponents(key: *const PrivateKey) ParseError!void {
     if (!std.mem.eql(u8, input[0..k], back[0..k])) return error.InvalidKey;
 }
 
+pub const VerifyError = error{
+    /// The signature does not match the message and the key.
+    InvalidSignature,
+    /// The modulus has less than 2048 or more than 4096 bits, or the exponent is too long.
+    UnsupportedKey,
+};
+
+/// Verify an RSASSA-PSS signature (RFC 8017 section 8.1.2) with a public key. `Hash` is the
+/// message hash and the MGF1 hash. The salt has `salt_len` bytes. `modulus` and `exponent` are
+/// big-endian. A certificate signature can have a salt of another length than the hash.
+pub fn verifyPss(comptime Hash: type, modulus: []const u8, exponent: []const u8, message: []const u8, signature: []const u8, salt_len: usize) VerifyError!void {
+    var n_bytes = modulus;
+    while (n_bytes.len > 0 and n_bytes[0] == 0) n_bytes = n_bytes[1..];
+    var e_bytes = exponent;
+    while (e_bytes.len > 0 and e_bytes[0] == 0) e_bytes = e_bytes[1..];
+    if (n_bytes.len == 0 or n_bytes.len > max_modulus_len or e_bytes.len == 0 or e_bytes.len > 4) return error.UnsupportedKey;
+    const k = n_bytes.len;
+    const bits = (k - 1) * 8 + (8 - @as(usize, @clz(n_bytes[0])));
+    if (bits < min_modulus_bits) return error.UnsupportedKey;
+    if (signature.len != k) return error.InvalidSignature;
+    const n = Modulus.fromBytes(n_bytes, .big) catch return error.UnsupportedKey;
+    // A signature value that is not less than the modulus is not valid (section 5.2.2).
+    const s = Fe.fromBytes(n, signature, .big) catch return error.InvalidSignature;
+    const m = n.powWithEncodedPublicExponent(s, e_bytes, .big) catch return error.InvalidSignature;
+    var em_buf: [max_modulus_len]u8 = undefined;
+    m.toBytes(em_buf[0..k], .big) catch return error.InvalidSignature;
+    const em_bits = bits - 1;
+    const em_len = (em_bits + 7) / 8;
+    // When the modulus has 8 * k - 7 bits, the encoded message is one byte shorter.
+    if (em_len < k and em_buf[0] != 0) return error.InvalidSignature;
+    return emsaPssVerify(Hash, message, em_buf[k - em_len .. k], em_bits, salt_len);
+}
+
+/// `EMSA-PSS-VERIFY` (RFC 8017 section 9.1.2) with MGF1 of `Hash` and a salt of `salt_len`
+/// bytes.
+fn emsaPssVerify(comptime Hash: type, message: []const u8, em: []const u8, em_bits: usize, salt_len: usize) error{InvalidSignature}!void {
+    const h_len = Hash.digest_length;
+    const em_len = em.len;
+    if (em_len < h_len + salt_len + 2) return error.InvalidSignature;
+    if (em[em_len - 1] != 0xbc) return error.InvalidSignature;
+    const db_len = em_len - h_len - 1;
+    const h = em[db_len..][0..h_len];
+    // The leftmost 8 * emLen - emBits bits must be zero.
+    const top_mask = @as(u8, 0xff) >> @intCast(8 * em_len - em_bits);
+    if (em[0] & ~top_mask != 0) return error.InvalidSignature;
+    var db: [max_modulus_len]u8 = undefined;
+    @memcpy(db[0..db_len], em[0..db_len]);
+    mgf1Xor(Hash, h, db[0..db_len]);
+    db[0] &= top_mask;
+    // DB = PS || 0x01 || salt, with PS all zero.
+    const ps_len = db_len - salt_len - 1;
+    for (db[0..ps_len]) |b| if (b != 0) return error.InvalidSignature;
+    if (db[ps_len] != 0x01) return error.InvalidSignature;
+    var m_hash: [h_len]u8 = undefined;
+    Hash.hash(message, &m_hash, .{});
+    var expected: [h_len]u8 = undefined;
+    var hasher: Hash = .init(.{});
+    hasher.update(&([_]u8{0} ** 8));
+    hasher.update(&m_hash);
+    hasher.update(db[db_len - salt_len .. db_len]);
+    hasher.final(&expected);
+    if (!std.mem.eql(u8, &expected, h)) return error.InvalidSignature;
+}
+
 /// The next element as a non-negative `INTEGER`, without leading zero bytes.
 fn integer(it: *der.Iterator) ParseError![]const u8 {
     const elem = it.require() catch return error.InvalidEncoding;
@@ -415,6 +479,42 @@ test "RSASSA-PKCS1-v1_5 signatures verify with the std verifier" {
         try Std.PKCS1v1_5Signature.verify(256, sig[0..256].*, "header.payload", public_key, Hash);
         try std.testing.expectError(error.InvalidSignature, Std.PKCS1v1_5Signature.verify(256, sig[0..256].*, "other", public_key, Hash));
     }
+}
+
+test "RSASSA-PSS verification with the public key and a salt length" {
+    const gpa = std.testing.allocator;
+    const Sha256 = crypto.hash.sha2.Sha256;
+    const Sha384 = crypto.hash.sha2.Sha384;
+    const bytes = try loadKeyDer(gpa, "test/fixtures/tls/pem/rsa2048-pkcs1.key", "RSA PRIVATE KEY");
+    defer gpa.free(bytes);
+    var key = try parsePkcs1(bytes);
+    defer crypto.secureZero(u8, std.mem.asBytes(&key));
+    var out: [max_modulus_len]u8 = undefined;
+    const salt: [32]u8 = @splat(0x33);
+    const sig = try key.signPss(Sha256, "message", &salt, &out);
+    try verifyPss(Sha256, key.modulus(), key.publicExponent(), "message", sig, 32);
+    // A leading zero byte of the modulus or the exponent does not change the key.
+    var padded: [max_modulus_len + 1]u8 = undefined;
+    padded[0] = 0;
+    @memcpy(padded[1..][0..key.modulus().len], key.modulus());
+    try verifyPss(Sha256, padded[0 .. key.modulus().len + 1], key.publicExponent(), "message", sig, 32);
+    // Another message, salt length, hash or signature fails.
+    try std.testing.expectError(error.InvalidSignature, verifyPss(Sha256, key.modulus(), key.publicExponent(), "other", sig, 32));
+    try std.testing.expectError(error.InvalidSignature, verifyPss(Sha256, key.modulus(), key.publicExponent(), "message", sig, 20));
+    try std.testing.expectError(error.InvalidSignature, verifyPss(Sha256, key.modulus(), key.publicExponent(), "message", sig, 0));
+    try std.testing.expectError(error.InvalidSignature, verifyPss(Sha384, key.modulus(), key.publicExponent(), "message", sig, 32));
+    try std.testing.expectError(error.InvalidSignature, verifyPss(Sha256, key.modulus(), key.publicExponent(), "message", sig[0..255], 32));
+    var bad = out;
+    bad[100] ^= 1;
+    try std.testing.expectError(error.InvalidSignature, verifyPss(Sha256, key.modulus(), key.publicExponent(), "message", bad[0..256], 32));
+    // A signature value equal to the modulus is out of range.
+    try std.testing.expectError(error.InvalidSignature, verifyPss(Sha256, key.modulus(), key.publicExponent(), "message", key.modulus(), 32));
+    // An impossible salt length fails and does not overflow.
+    try std.testing.expectError(error.InvalidSignature, verifyPss(Sha256, key.modulus(), key.publicExponent(), "message", sig, 300));
+    // Keys out of the supported range.
+    try std.testing.expectError(error.UnsupportedKey, verifyPss(Sha256, key.modulus()[0..128], key.publicExponent(), "message", sig[0..128], 32));
+    try std.testing.expectError(error.UnsupportedKey, verifyPss(Sha256, "", key.publicExponent(), "message", sig, 32));
+    try std.testing.expectError(error.UnsupportedKey, verifyPss(Sha256, key.modulus(), "\x01\x00\x00\x00\x01", "message", sig, 32));
 }
 
 test "EMSA-PSS encoding layout" {

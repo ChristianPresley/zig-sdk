@@ -215,6 +215,8 @@ test "handshake with every self-signed key type" {
         .{ "ed25519.crt", "ed25519.key" },
         .{ "rsa2048.crt", "rsa2048.key" },
         .{ "rsa3072.crt", "rsa3072-pkcs1.key" },
+        // An id-RSASSA-PSS key that signs its own certificate with RSASSA-PSS.
+        .{ "rsa-pss.crt", "rsa-pss.key" },
     };
     for (cases) |case| {
         var chain = try loadChain(gpa, io, case[0], case[1]);
@@ -342,6 +344,34 @@ test "mutual authentication with client certificates" {
     var rsa_identity = try loadChain(gpa, io, "rsa2048.crt", "rsa2048.key");
     defer rsa_identity.deinit();
     try roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .self_signed }, .{ .trust = .self_signed, .identity = &rsa_identity }, &echo, null);
+}
+
+test "RSA-PSS certificates on the server and on the client" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var ca_chain = try loadChain(gpa, io, "rsa-pss.crt", "rsa-pss.key");
+    defer ca_chain.deinit();
+    var leaf_chain = try loadChain(gpa, io, "rsa-pss-sha256.crt", "rsa-pss-sha256.key");
+    defer leaf_chain.deinit();
+    var p256 = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer p256.deinit();
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/rsa-pss.crt");
+    var echo: Echo = undefined;
+
+    // The server leaf key signs with rsa_pss_pss_sha256 only. The CA signs the leaf with
+    // RSASSA-PSS and SHA-384.
+    try roundTrip(io, &leaf_chain, .{}, .{ .trust = .{ .ca_set = &set } }, &echo, null);
+    try roundTrip(io, &leaf_chain, .{}, .{ .trust = .{ .ca_set = &set }, .host = "127.0.0.1" }, &echo, null);
+    // The same leaf as a client certificate, and the self-signed CA as a client certificate.
+    try roundTrip(io, &p256, .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed, .identity = &leaf_chain }, &echo, null);
+    try roundTrip(io, &p256, .{ .client_auth = .required, .client_trust = .{ .ca_set = &set } }, .{ .trust = .self_signed, .identity = &ca_chain }, &echo, null);
+    try roundTrip(io, &p256, .{ .client_auth = .required, .client_trust = .self_signed }, .{ .trust = .self_signed, .identity = &ca_chain }, &echo, null);
+    // The leaf is not self-signed.
+    const refused = roundTrip(io, &p256, .{ .client_auth = .required, .client_trust = .self_signed }, .{ .trust = .self_signed, .identity = &leaf_chain }, &echo, null);
+    try std.testing.expect(std.meta.isError(refused));
+    try std.testing.expectError(error.TlsCertificateNotVerified, echo.result);
 }
 
 test "every cipher suite negotiates with the SDK client, with a key update" {
@@ -489,8 +519,35 @@ test "interop: openssl s_server removes the padding of the SDK client" {
     }
 }
 
+test "interop: the SDK client and openssl s_server with RSA-PSS keys" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!haveOpenssl(io, gpa)) return error.SkipZigTest;
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/rsa-pss.crt");
+    // The self-signed RSA-PSS CA as the server certificate, for each hash.
+    const ca_cert = [_][]const u8{ "-cert", "test/fixtures/tls/pem/rsa-pss.crt", "-key", "test/fixtures/tls/pem/rsa-pss.key" };
+    for ([_][]const u8{ "rsa_pss_pss_sha256", "rsa_pss_pss_sha384", "rsa_pss_pss_sha512" }) |sigalg| {
+        try opensslServer(io, &(ca_cert ++ [_][]const u8{ "-sigalgs", sigalg }), .{ .trust = .{ .ca_set = &set } });
+    }
+    try opensslServer(io, &ca_cert, .{ .trust = .self_signed });
+    // The restricted leaf as the server certificate.
+    try opensslServer(io, &.{ "-cert", "test/fixtures/tls/pem/rsa-pss-sha256.crt", "-key", "test/fixtures/tls/pem/rsa-pss-sha256.key" }, .{ .trust = .{ .ca_set = &set } });
+    // The restricted leaf as a client certificate. The server requires and verifies it.
+    var identity = try loadChain(gpa, io, "rsa-pss-sha256.crt", "rsa-pss-sha256.key");
+    defer identity.deinit();
+    try opensslServer(io, &.{ "-cert", "test/fixtures/tls/pem/p256.crt", "-key", "test/fixtures/tls/pem/p256.key", "-Verify", "1", "-CAfile", "test/fixtures/tls/pem/rsa-pss.crt", "-verify_return_error" }, .{ .trust = .self_signed, .identity = &identity });
+}
+
 /// Run `openssl s_server` with `extra` arguments, connect the SDK client and check an echo.
 fn opensslServerRoundTrip(io: Io, extra: []const []const u8, trust: tls.Trust, groups: []const tls.key_share.Group, expect_group: ?tls.key_share.Group, padding: tls.Padding) !void {
+    return opensslServer(io, extra, .{ .trust = trust, .groups = groups, .expect_group = expect_group, .padding = padding });
+}
+
+/// Run `openssl s_server` with `extra` arguments, connect the SDK client with `setup` and
+/// check an echo. The client always offers the protocol "http/1.1".
+fn opensslServer(io: Io, extra: []const []const u8, setup: ClientSetup) !void {
     // Pick a free port by binding and releasing it.
     const port = blk: {
         var probe = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{});
@@ -535,18 +592,19 @@ fn opensslServerRoundTrip(io: Io, extra: []const []const u8, trust: tls.Trust, g
     var write_buf: [1024]u8 = undefined;
     var conn = try tls.connect(&reader.interface, &writer.interface, .{
         .io = io,
-        .host = "localhost",
-        .trust = trust,
+        .host = setup.host,
+        .trust = setup.trust,
         .alpn = &.{"http/1.1"},
-        .groups = groups,
-        .padding = padding,
+        .groups = setup.groups,
+        .identity = setup.identity,
+        .padding = setup.padding,
         .read_buffer = &read_buf,
         .write_buffer = &write_buf,
         .allow_truncation_attacks = true,
     });
     defer conn.deinit();
     try std.testing.expectEqualStrings("http/1.1", conn.alpn().?);
-    if (expect_group) |g| try std.testing.expectEqual(g.wire(), conn.group);
+    if (setup.expect_group) |g| try std.testing.expectEqual(g.wire(), conn.group);
     try conn.writer.writeAll("hello\n");
     try conn.writer.flush();
     try writer.interface.flush();

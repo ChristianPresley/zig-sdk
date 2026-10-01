@@ -6,6 +6,7 @@ const crypto = std.crypto;
 const tls = crypto.tls;
 const Certificate = crypto.Certificate;
 const CaSet = @import("CaSet.zig");
+const pss = @import("pss.zig");
 const x509 = @import("x509.zig");
 
 /// How the SDK verifies the peer certificate.
@@ -44,6 +45,9 @@ pub const Leaf = struct {
     algo: Certificate.Parsed.PubKeyAlgo,
     pub_key_buf: [max_pub_key_len]u8,
     pub_key_len: u16,
+    /// The parameters of an id-RSASSA-PSS key. Null for other keys and for a key without
+    /// parameters.
+    pss: ?pss.Params = null,
 
     pub fn pubKey(self: *const Leaf) []const u8 {
         return self.pub_key_buf[0..self.pub_key_len];
@@ -58,6 +62,7 @@ pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, n
     if (leaf_parsed.pubKey().len > max_pub_key_len) return error.TlsCertificateInvalid;
     var leaf: Leaf = .{ .algo = leaf_parsed.pub_key_algo, .pub_key_buf = undefined, .pub_key_len = @intCast(leaf_parsed.pubKey().len) };
     @memcpy(leaf.pub_key_buf[0..leaf.pub_key_len], leaf_parsed.pubKey());
+    if (leaf.algo == .rsassa_pss) leaf.pss = pss.publicKeyParams(certs[0]) catch return error.TlsCertificateInvalid;
 
     switch (trust) {
         .no_verification => return leaf,
@@ -70,7 +75,7 @@ pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, n
     if (host) |h| try verifyHost(certs[0], leaf_parsed, h);
     switch (trust) {
         .self_signed => {
-            leaf_parsed.verify(leaf_parsed, now_sec) catch |e| return mapVerify(e);
+            pss.verifyCertificate(leaf_parsed, leaf_parsed, now_sec) catch |e| return mapVerify(e);
             return leaf;
         },
         .ca_set, .bundle => {
@@ -78,14 +83,14 @@ pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, n
             var index: usize = 0;
             while (true) {
                 if (findAnchor(trust, current.issuer())) |anchor| {
-                    current.verify(anchor, now_sec) catch |e| return mapVerify(e);
+                    pss.verifyCertificate(current, anchor, now_sec) catch |e| return mapVerify(e);
                     try requireCa(anchor.certificate.buffer[anchor.certificate.index..], index);
                     return leaf;
                 }
                 index += 1;
                 if (index >= certs.len) return error.TlsCertificateIssuerNotFound;
                 const next = parse(certs[index]) catch return error.TlsCertificateInvalid;
-                current.verify(next, now_sec) catch |e| return mapVerify(e);
+                pss.verifyCertificate(current, next, now_sec) catch |e| return mapVerify(e);
                 try requireCa(certs[index], index - 1);
                 current = next;
             }
@@ -95,10 +100,9 @@ pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, n
 }
 
 fn parse(bytes: []const u8) !Certificate.Parsed {
-    // The std parser reads without bounds checks; the precheck rejects what would crash it.
-    try x509.precheck(bytes);
-    const cert: Certificate = .{ .buffer = bytes, .index = 0 };
-    return cert.parse();
+    // The std parser reads without bounds checks. The precheck in `pss.parseCertificate`
+    // refuses what would crash it. That function also parses RSASSA-PSS signatures.
+    return pss.parseCertificate(.{ .buffer = bytes, .index = 0 });
 }
 
 fn findAnchor(trust: Trust, issuer_name: []const u8) ?Certificate.Parsed {
@@ -179,6 +183,8 @@ pub fn verifySignature(leaf: *const Leaf, scheme: tls.SignatureScheme, signature
         },
         inline .rsa_pss_pss_sha256, .rsa_pss_pss_sha384, .rsa_pss_pss_sha512 => |s| {
             if (leaf.algo != .rsassa_pss) return error.TlsBadSignatureScheme;
+            // Key parameters permit one hash, with a salt as long as the hash.
+            if (leaf.pss) |params| if (!params.permits(s)) return error.TlsBadSignatureScheme;
             verifyRsaPss(s, pub_key, signature, message) catch return error.TlsDecryptError;
         },
         // PKCS#1 v1.5 is not allowed in a TLS 1.3 CertificateVerify.
@@ -251,4 +257,61 @@ test "chain validation against the fixture CA" {
     const bad = try loadDer(gpa, "test/fixtures/tls/pem/bad-chain-leaf.crt");
     defer gpa.free(bad);
     try std.testing.expectError(error.TlsCertificateNotCa, verifyChain(&.{ bad, leaf, ca }, "localhost", .{ .ca_set = &set }, now));
+}
+
+test "chains and CertificateVerify signatures with RSA-PSS keys" {
+    const gpa = std.testing.allocator;
+    const PrivateKey = @import("PrivateKey.zig");
+    const pss_ca = try loadDer(gpa, "test/fixtures/tls/pem/rsa-pss.crt");
+    defer gpa.free(pss_ca);
+    const pss_leaf = try loadDer(gpa, "test/fixtures/tls/pem/rsa-pss-sha256.crt");
+    defer gpa.free(pss_leaf);
+    const rsa_leaf = try loadDer(gpa, "test/fixtures/tls/pem/rsa2048.crt");
+    defer gpa.free(rsa_leaf);
+    var set: CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addDer(pss_ca);
+    const now: i64 = 1_800_000_000;
+
+    // RSASSA-PSS signatures in the chain: SHA-256 on the self-signed CA, SHA-384 on the leaf.
+    const ca_leaf = try verifyChain(&.{pss_ca}, "localhost", .self_signed, now);
+    try std.testing.expect(ca_leaf.pss == null);
+    _ = try verifyChain(&.{pss_ca}, "localhost", .{ .ca_set = &set }, now);
+    const leaf = try verifyChain(&.{pss_leaf}, "localhost", .{ .ca_set = &set }, now);
+    try std.testing.expectEqual(pss.Params{ .hash = .sha256, .salt_len = 32 }, leaf.pss.?);
+    _ = try verifyChain(&.{ pss_leaf, pss_ca }, "127.0.0.1", .{ .ca_set = &set }, now);
+    try std.testing.expectError(error.TlsCertificateNotVerified, verifyChain(&.{pss_leaf}, "localhost", .self_signed, now));
+    // A changed signature on the leaf.
+    const tampered = try gpa.dupe(u8, pss_leaf);
+    defer gpa.free(tampered);
+    tampered[tampered.len - 3] ^= 0x10;
+    try std.testing.expectError(error.TlsCertificateNotVerified, verifyChain(&.{tampered}, "localhost", .{ .ca_set = &set }, now));
+
+    // CertificateVerify: the restricted leaf key accepts rsa_pss_pss_sha256 only.
+    const key_text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "test/fixtures/tls/pem/rsa-pss-sha256.key", gpa, .limited(1 << 16));
+    defer gpa.free(key_text);
+    var key = try PrivateKey.parsePem(gpa, key_text);
+    defer key.deinit();
+    var sig_buf: [PrivateKey.max_signature_len]u8 = undefined;
+    const message = "transcript hash";
+    const sig = try key.signScheme(.rsa_pss_pss_sha256, message, [_]u8{3} ** 48, &sig_buf);
+    try verifySignature(&leaf, .rsa_pss_pss_sha256, sig, message);
+    try std.testing.expectError(error.TlsDecryptError, verifySignature(&leaf, .rsa_pss_pss_sha256, sig, "another hash"));
+    try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&leaf, .rsa_pss_pss_sha384, sig, message));
+    try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&leaf, .rsa_pss_rsae_sha256, sig, message));
+    try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&leaf, .rsa_pkcs1_sha256, sig, message));
+
+    // The CA key has no parameters: each rsa_pss_pss scheme, and no rsa_pss_rsae scheme.
+    const ca_key_text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "test/fixtures/tls/pem/rsa-pss.key", gpa, .limited(1 << 16));
+    defer gpa.free(ca_key_text);
+    var ca_key = try PrivateKey.parsePem(gpa, ca_key_text);
+    defer ca_key.deinit();
+    for ([_]tls.SignatureScheme{ .rsa_pss_pss_sha256, .rsa_pss_pss_sha384, .rsa_pss_pss_sha512 }) |s| {
+        const ca_sig = try ca_key.signScheme(s, message, [_]u8{4} ** 48, &sig_buf);
+        try verifySignature(&ca_leaf, s, ca_sig, message);
+    }
+    try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&ca_leaf, .rsa_pss_rsae_sha256, sig, message));
+    // An rsaEncryption key does not accept the rsa_pss_pss schemes.
+    const rsa = try verifyChain(&.{rsa_leaf}, "localhost", .self_signed, now);
+    try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&rsa, .rsa_pss_pss_sha256, sig, message));
 }

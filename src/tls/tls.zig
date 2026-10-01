@@ -9,6 +9,7 @@ pub const der = @import("der.zig");
 pub const pem = @import("pem.zig");
 pub const PrivateKey = @import("PrivateKey.zig");
 pub const rsa = @import("rsa.zig");
+pub const pss = @import("pss.zig");
 pub const CertChain = @import("CertChain.zig");
 pub const Connection = @import("Connection.zig");
 /// The record padding policy of the client and the server (RFC 8446 section 5.4).

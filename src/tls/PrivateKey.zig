@@ -1,11 +1,12 @@
-//! A private key for a certificate: ECDSA P-256, ECDSA P-384, Ed25519 or RSA. It loads from
-//! PKCS#8, SEC1 or PKCS#1 DER. An RSA key signs only with RSA-PSS.
+//! A private key for a certificate: ECDSA P-256, ECDSA P-384, Ed25519, RSA or RSA-PSS. It
+//! loads from PKCS#8, SEC1 or PKCS#1 DER. An RSA key signs only with RSA-PSS.
 const std = @import("std");
 const crypto = std.crypto;
 const tls = crypto.tls;
 const der = @import("der.zig");
 const pem = @import("pem.zig");
 pub const rsa = @import("rsa.zig");
+pub const pss = @import("pss.zig");
 
 const PrivateKey = @This();
 
@@ -13,19 +14,31 @@ pub const EcdsaP256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 pub const EcdsaP384 = crypto.sign.ecdsa.EcdsaP384Sha384;
 pub const Ed25519 = crypto.sign.Ed25519;
 
-pub const Kind = enum { ecdsa_p256, ecdsa_p384, ed25519, rsa };
+/// The kind of a key. `rsa` is an rsaEncryption key, and `rsa_pss` is an id-RSASSA-PSS key
+/// (RFC 4055). Both have the same RSA private key, but they make different TLS 1.3 schemes.
+pub const Kind = enum { ecdsa_p256, ecdsa_p384, ed25519, rsa, rsa_pss };
+
+/// An RSA key that signs only with RSASSA-PSS (RFC 4055 section 3.1).
+pub const RsaPss = struct {
+    key: rsa.PrivateKey,
+    /// The restriction of the key: one hash and a minimum salt length. Null when the key has
+    /// no restriction.
+    params: ?pss.Params = null,
+};
 
 key: union(Kind) {
     ecdsa_p256: EcdsaP256.KeyPair,
     ecdsa_p384: EcdsaP384.KeyPair,
     ed25519: Ed25519.KeyPair,
     rsa: rsa.PrivateKey,
+    rsa_pss: RsaPss,
 },
 
 pub const ParseError = error{
     /// The DER structure is malformed.
     InvalidEncoding,
-    /// The SDK does not support the key algorithm, the curve or the RSA key size.
+    /// The SDK does not support the key algorithm, the curve or the RSA key size. An RSA-PSS
+    /// key with parameters that no TLS 1.3 scheme satisfies also gives this error.
     UnsupportedKey,
     /// The scalar is out of range or the key pair is inconsistent.
     InvalidKey,
@@ -37,7 +50,10 @@ const oid_secp384r1 = "\x2b\x81\x04\x00\x22";
 const oid_ed25519 = "\x2b\x65\x70";
 const oid_rsa_encryption = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
 
-/// Parse a PKCS#8 `PrivateKeyInfo`, a SEC1 `ECPrivateKey` or a PKCS#1 `RSAPrivateKey`.
+/// Parse a PKCS#8 `PrivateKeyInfo`, a SEC1 `ECPrivateKey` or a PKCS#1 `RSAPrivateKey`. A
+/// PKCS#8 key with the algorithm id-RSASSA-PSS gives an `rsa_pss` key. Its parameters are
+/// optional. They must name SHA-256, SHA-384 or SHA-512 and MGF1 with the same hash. The
+/// minimum salt length must not be longer than the hash.
 pub fn parseDer(bytes: []const u8) ParseError!PrivateKey {
     const root = der.parseExact(bytes) catch return error.InvalidEncoding;
     if (root.tag != der.tag_sequence) return error.InvalidEncoding;
@@ -66,6 +82,15 @@ pub fn parseDer(bytes: []const u8) ParseError!PrivateKey {
                 if (params.tag != der.tag_null or params.content.len != 0) return error.InvalidEncoding;
             }
             return .{ .key = .{ .rsa = try rsa.parsePkcs1(private.content) } };
+        }
+        if (oid.isOid(pss.oid_rsassa_pss)) {
+            const params = pss.keyParams(second) catch |e| return switch (e) {
+                error.InvalidEncoding => error.InvalidEncoding,
+                error.UnsupportedParams => error.UnsupportedKey,
+            };
+            // TLS 1.3 and PS256 use a salt as long as the hash.
+            if (params) |p| if (p.scheme() == null) return error.UnsupportedKey;
+            return .{ .key = .{ .rsa_pss = .{ .key = try rsa.parsePkcs1(private.content), .params = params } } };
         }
         return error.UnsupportedKey;
     }
@@ -118,7 +143,7 @@ fn scalarToKey(scalar: []const u8, curve: Kind) ParseError!PrivateKey {
             const kp = EcdsaP384.KeyPair.fromSecretKey(sk) catch return error.InvalidKey;
             return .{ .key = .{ .ecdsa_p384 = kp } };
         },
-        .ed25519, .rsa => unreachable,
+        .ed25519, .rsa, .rsa_pss => unreachable,
     }
 }
 
@@ -153,13 +178,20 @@ pub fn scheme(self: *const PrivateKey) tls.SignatureScheme {
 }
 
 /// The TLS signature schemes this key produces, in preference order. An RSA key never
-/// produces a PKCS#1 v1.5 signature, because TLS 1.3 forbids it in a CertificateVerify.
+/// produces a PKCS#1 v1.5 signature, because TLS 1.3 forbids it in a CertificateVerify. An
+/// RSA-PSS key produces only the `rsa_pss_pss` schemes, and only the scheme of its hash when
+/// it has parameters (RFC 8446 section 4.2.3).
 pub fn schemes(self: *const PrivateKey) []const tls.SignatureScheme {
     return switch (self.key) {
         .ecdsa_p256 => &.{.ecdsa_secp256r1_sha256},
         .ecdsa_p384 => &.{.ecdsa_secp384r1_sha384},
         .ed25519 => &.{.ed25519},
         .rsa => &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
+        .rsa_pss => |k| if (k.params) |p| switch (p.hash) {
+            .sha256 => &.{.rsa_pss_pss_sha256},
+            .sha384 => &.{.rsa_pss_pss_sha384},
+            .sha512 => &.{.rsa_pss_pss_sha512},
+        } else &.{ .rsa_pss_pss_sha256, .rsa_pss_pss_sha384, .rsa_pss_pss_sha512 },
     };
 }
 
@@ -185,6 +217,7 @@ pub fn publicKeyBytes(self: *const PrivateKey, buf: *[max_public_key_len]u8) []c
             return buf[0..p.len];
         },
         .rsa => |*k| return k.publicKeyDer(buf),
+        .rsa_pss => |*k| return k.key.publicKeyDer(buf),
     }
 }
 
@@ -205,15 +238,16 @@ pub fn signScheme(self: *const PrivateKey, with: tls.SignatureScheme, message: [
         if (s == with) break;
     } else return error.SigningFailed;
     switch (self.key) {
-        .rsa => |*k| {
+        inline .rsa, .rsa_pss => |*k, tag| {
+            const key: *const rsa.PrivateKey = if (tag == .rsa) k else &k.key;
             // The salt is as long as the hash. SHA-512 of the noise gives enough bytes.
             var salt: [64]u8 = undefined;
             defer crypto.secureZero(u8, &salt);
             crypto.hash.sha2.Sha512.hash(&noise, &salt, .{});
             return switch (with) {
-                .rsa_pss_rsae_sha256 => k.signPss(crypto.hash.sha2.Sha256, message, salt[0..32], out),
-                .rsa_pss_rsae_sha384 => k.signPss(crypto.hash.sha2.Sha384, message, salt[0..48], out),
-                .rsa_pss_rsae_sha512 => k.signPss(crypto.hash.sha2.Sha512, message, &salt, out),
+                .rsa_pss_rsae_sha256, .rsa_pss_pss_sha256 => key.signPss(crypto.hash.sha2.Sha256, message, salt[0..32], out),
+                .rsa_pss_rsae_sha384, .rsa_pss_pss_sha384 => key.signPss(crypto.hash.sha2.Sha384, message, salt[0..48], out),
+                .rsa_pss_rsae_sha512, .rsa_pss_pss_sha512 => key.signPss(crypto.hash.sha2.Sha512, message, &salt, out),
                 else => unreachable,
             };
         },
@@ -253,6 +287,8 @@ test "parse fixture keys" {
         .{ .path = "test/fixtures/tls/pem/ed25519.key", .kind = .ed25519 },
         .{ .path = "test/fixtures/tls/pem/rsa2048.key", .kind = .rsa },
         .{ .path = "test/fixtures/tls/pem/rsa2048-pkcs1.key", .kind = .rsa },
+        .{ .path = "test/fixtures/tls/pem/rsa-pss.key", .kind = .rsa_pss },
+        .{ .path = "test/fixtures/tls/pem/rsa-pss-sha256.key", .kind = .rsa_pss },
     };
     for (cases) |case| {
         const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, case.path, gpa, .limited(1 << 16));
@@ -289,8 +325,115 @@ test "the PKCS#1 and the PKCS#8 form of an RSA key are the same key" {
     var buf_b: [max_public_key_len]u8 = undefined;
     try std.testing.expectEqualSlices(u8, a.publicKeyBytes(&buf_a), b.publicKeyBytes(&buf_b));
     try std.testing.expectEqual(tls.SignatureScheme.rsa_pss_rsae_sha256, a.scheme());
-    // An RSA-PSS key (id-RSASSA-PSS) is not supported.
-    const pss = try std.Io.Dir.cwd().readFileAlloc(io, "test/fixtures/tls/pem/rsa-pss.key", gpa, .limited(1 << 16));
-    defer gpa.free(pss);
-    try std.testing.expectError(error.UnsupportedKey, parsePem(gpa, pss));
+}
+
+fn readFixture(path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1 << 16));
+}
+
+test "RSA-PSS keys sign only with the rsa_pss_pss schemes" {
+    const gpa = std.testing.allocator;
+    var sig_buf: [max_signature_len]u8 = undefined;
+    var pk_buf: [max_public_key_len]u8 = undefined;
+    const noise = [_]u8{7} ** 48;
+
+    // A key without parameters: every rsa_pss_pss scheme, and no rsa_pss_rsae scheme.
+    const free_text = try readFixture("test/fixtures/tls/pem/rsa-pss.key");
+    defer gpa.free(free_text);
+    var free = try parsePem(gpa, free_text);
+    defer free.deinit();
+    try std.testing.expectEqual(Kind.rsa_pss, free.kind());
+    try std.testing.expect(free.key.rsa_pss.params == null);
+    try std.testing.expectEqualSlices(tls.SignatureScheme, &.{ .rsa_pss_pss_sha256, .rsa_pss_pss_sha384, .rsa_pss_pss_sha512 }, free.schemes());
+    const public = free.publicKeyBytes(&pk_buf);
+    try std.testing.expectEqual(270, public.len);
+    for (free.schemes()) |s| {
+        const sig = try free.signScheme(s, "to be signed", noise, &sig_buf);
+        const hash: pss.Hash = switch (s) {
+            .rsa_pss_pss_sha256 => .sha256,
+            .rsa_pss_pss_sha384 => .sha384,
+            else => .sha512,
+        };
+        const k = &free.key.rsa_pss.key;
+        try pss.verify(.{ .hash = hash, .salt_len = @intCast(hash.digestLength()) }, k.modulus(), k.publicExponent(), "to be signed", sig);
+    }
+    for ([_]tls.SignatureScheme{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512, .rsa_pkcs1_sha256 }) |s| {
+        try std.testing.expectError(error.SigningFailed, free.signScheme(s, "to be signed", noise, &sig_buf));
+    }
+
+    // A key with parameters: SHA-256 only.
+    const restricted_text = try readFixture("test/fixtures/tls/pem/rsa-pss-sha256.key");
+    defer gpa.free(restricted_text);
+    var restricted = try parsePem(gpa, restricted_text);
+    defer restricted.deinit();
+    try std.testing.expectEqual(pss.Params{ .hash = .sha256, .salt_len = 32 }, restricted.key.rsa_pss.params.?);
+    try std.testing.expectEqualSlices(tls.SignatureScheme, &.{.rsa_pss_pss_sha256}, restricted.schemes());
+    try std.testing.expectEqual(tls.SignatureScheme.rsa_pss_pss_sha256, restricted.scheme());
+    _ = try restricted.sign("to be signed", noise, &sig_buf);
+    try std.testing.expectError(error.SigningFailed, restricted.signScheme(.rsa_pss_pss_sha384, "to be signed", noise, &sig_buf));
+    try std.testing.expectError(error.SigningFailed, restricted.signScheme(.rsa_pss_rsae_sha256, "to be signed", noise, &sig_buf));
+}
+
+/// Append a DER element with `tag` and `content` to `buf` at `pos`. Returns the new position.
+fn appendTlv(buf: []u8, pos: usize, tag: u8, content: []const u8) usize {
+    var i = pos;
+    buf[i] = tag;
+    i += 1;
+    if (content.len < 0x80) {
+        buf[i] = @intCast(content.len);
+        i += 1;
+    } else {
+        buf[i] = 0x82;
+        std.mem.writeInt(u16, buf[i + 1 ..][0..2], @intCast(content.len), .big);
+        i += 3;
+    }
+    @memcpy(buf[i..][0..content.len], content);
+    return i + content.len;
+}
+
+/// A PKCS#8 key with the id-RSASSA-PSS algorithm, the DER parameters `params` and the
+/// PKCS#1 key `private`.
+fn pssPkcs8(buf: []u8, params: []const u8, private: []const u8) []const u8 {
+    var alg: [128]u8 = undefined;
+    var alg_len = appendTlv(&alg, 0, der.tag_oid, pss.oid_rsassa_pss);
+    @memcpy(alg[alg_len..][0..params.len], params);
+    alg_len += params.len;
+    var body: [4096]u8 = undefined;
+    var len = appendTlv(&body, 0, der.tag_integer, "\x00");
+    len = appendTlv(&body, len, der.tag_sequence, alg[0..alg_len]);
+    len = appendTlv(&body, len, der.tag_octet_string, private);
+    return buf[0..appendTlv(buf, 0, der.tag_sequence, body[0..len])];
+}
+
+test "RSA-PSS key parameters that the SDK refuses" {
+    const gpa = std.testing.allocator;
+    const text = try readFixture("test/fixtures/tls/pem/rsa2048-pkcs1.key");
+    defer gpa.free(text);
+    var it: pem.Iterator = .init(text);
+    const private = try it.nextLabeled("RSA PRIVATE KEY").?.decode(gpa);
+    defer gpa.free(private);
+    var buf: [4096]u8 = undefined;
+    const sha256 = "\xa0\x0d\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01";
+    const sha512 = "\xa0\x0d\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03";
+    const mgf1_sha256 = "\xa1\x1a\x30\x18\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x08\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01";
+    const mgf1_sha512 = "\xa1\x1a\x30\x18\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x08\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03";
+
+    // Without parameters, and with SHA-512 and a salt of 64 bytes.
+    var free = try parseDer(pssPkcs8(&buf, "", private));
+    defer free.deinit();
+    try std.testing.expect(free.key.rsa_pss.params == null);
+    var sha512_key = try parseDer(pssPkcs8(&buf, "\x30\x30" ++ sha512 ++ mgf1_sha512 ++ "\xa2\x03\x02\x01\x40", private));
+    defer sha512_key.deinit();
+    try std.testing.expectEqualSlices(tls.SignatureScheme, &.{.rsa_pss_pss_sha512}, sha512_key.schemes());
+
+    // The SHA-1 defaults, two different hashes, and a salt longer than the hash.
+    try std.testing.expectError(error.UnsupportedKey, parseDer(pssPkcs8(&buf, "\x30\x00", private)));
+    try std.testing.expectError(error.UnsupportedKey, parseDer(pssPkcs8(&buf, "\x30\x2b" ++ sha256 ++ mgf1_sha512, private)));
+    try std.testing.expectError(error.UnsupportedKey, parseDer(pssPkcs8(&buf, "\x30\x30" ++ sha256 ++ mgf1_sha256 ++ "\xa2\x03\x02\x01\x21", private)));
+    // NULL parameters, and data after the parameters.
+    try std.testing.expectError(error.InvalidEncoding, parseDer(pssPkcs8(&buf, "\x05\x00", private)));
+    try std.testing.expectError(error.InvalidEncoding, parseDer(pssPkcs8(&buf, "\x30\x2d" ++ sha256 ++ mgf1_sha256 ++ "\x05\x00", private)));
+    try std.testing.expectError(error.InvalidEncoding, parseDer(pssPkcs8(&buf, "\x30\x2b" ++ sha256 ++ mgf1_sha256 ++ "\x05\x00", private)));
+    // A bad inner key.
+    try std.testing.expectError(error.InvalidEncoding, parseDer(pssPkcs8(&buf, "", private[0 .. private.len - 1])));
 }

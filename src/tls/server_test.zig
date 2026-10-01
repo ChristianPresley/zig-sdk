@@ -301,8 +301,14 @@ fn opensslClient(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, gr
 /// it after the handshake and closes.
 fn opensslClientPadded(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, groups: []const tls.key_share.Group, extra: []const []const u8, echo: *Echo, padding: tls.Padding, greeting: ?[]const u8) ![]u8 {
     const chains = [_]*const tls.CertChain{chain};
+    return opensslClientConfig(gpa, io, .{ .chains = &chains, .groups = groups, .padding = padding }, extra, echo, greeting);
+}
+
+/// Run `openssl s_client` with `extra` arguments against an SDK server with `config`. With a
+/// `greeting`, the server sends it after the handshake and closes.
+fn opensslClientConfig(gpa: std.mem.Allocator, io: Io, config: tls.server.Config, extra: []const []const u8, echo: *Echo, greeting: ?[]const u8) ![]u8 {
     echo.* = .{
-        .server = try tls.Server.init(.{ .chains = &chains, .groups = groups, .padding = padding }),
+        .server = try tls.Server.init(config),
         .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
         .io = io,
         .handshake_only = true,
@@ -408,5 +414,52 @@ test "interop: openssl s_client removes the padding of the SDK server" {
         try echo.result;
         try expectContains(out, "Verify return code: 0 (ok)");
         try expectContains(out, "padded greeting");
+    }
+}
+
+test "interop: openssl s_client with an RSA-PSS server key" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    _ = opensslVersion(io, gpa) orelse return error.SkipZigTest;
+    var chain = try loadChain(gpa, io, "rsa-pss.crt", "rsa-pss.key");
+    defer chain.deinit();
+    var echo: Echo = undefined;
+    const verify_args = [_][]const u8{ "-CAfile", "test/fixtures/tls/pem/rsa-pss.crt", "-verify_return_error" };
+
+    // Every rsa_pss_pss hash, chosen by the client. OpenSSL verifies the RSASSA-PSS
+    // signature of the certificate too.
+    for ([_][2][]const u8{
+        .{ "rsa_pss_pss_sha256", "Peer signing digest: SHA256" },
+        .{ "rsa_pss_pss_sha384", "Peer signing digest: SHA384" },
+        .{ "rsa_pss_pss_sha512", "Peer signing digest: SHA512" },
+    }) |case| {
+        const out = try opensslClient(gpa, io, &chain, tls.key_share.default_groups, &(verify_args ++ [_][]const u8{ "-sigalgs", case[0] }), &echo);
+        defer gpa.free(out);
+        try echo.result;
+        try expectContains(out, "Verify return code: 0 (ok)");
+        if (std.mem.indexOf(u8, out, "RSA-PSS") == null) try expectContains(out, case[0]);
+        try expectContains(out, case[1]);
+    }
+    // A client that offers only the rsa_pss_rsae schemes gets no signature from an
+    // id-RSASSA-PSS key (RFC 8446 section 4.2.3).
+    {
+        const out = try opensslClient(gpa, io, &chain, tls.key_share.default_groups, &.{ "-sigalgs", "rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512" }, &echo);
+        defer gpa.free(out);
+        try std.testing.expectError(error.TlsHandshakeFailure, echo.result);
+    }
+    // The restricted leaf key signs with SHA-256 only.
+    var leaf = try loadChain(gpa, io, "rsa-pss-sha256.crt", "rsa-pss-sha256.key");
+    defer leaf.deinit();
+    {
+        const out = try opensslClient(gpa, io, &leaf, tls.key_share.default_groups, &verify_args, &echo);
+        defer gpa.free(out);
+        try echo.result;
+        try expectContains(out, "Verify return code: 0 (ok)");
+        try expectContains(out, "Peer signing digest: SHA256");
+    }
+    {
+        const out = try opensslClient(gpa, io, &leaf, tls.key_share.default_groups, &.{ "-sigalgs", "rsa_pss_pss_sha384:rsa_pss_pss_sha512" }, &echo);
+        defer gpa.free(out);
+        try std.testing.expectError(error.TlsHandshakeFailure, echo.result);
     }
 }

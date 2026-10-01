@@ -340,7 +340,10 @@ pub const SigningKey = union(enum) {
         return error.NoKeyFound;
     }
 
-    /// Load a private key from PKCS#8, SEC1 or PKCS#1 DER. Call `deinit` to erase it.
+    /// Load a private key from PKCS#8, SEC1 or PKCS#1 DER. Call `deinit` to erase it. An RSA
+    /// key gives RS256, and `usePss` changes it to PS256. A PKCS#8 key with the algorithm
+    /// id-RSASSA-PSS gives PS256. When its parameters require another hash than SHA-256, the
+    /// function returns `error.UnsupportedKey`.
     pub fn fromDer(bytes: []const u8) LoadError!SigningKey {
         var key = TlsPrivateKey.parseDer(bytes) catch |err| return switch (err) {
             error.UnsupportedKey => error.UnsupportedKey,
@@ -353,6 +356,12 @@ pub const SigningKey = union(enum) {
             .ecdsa_p384 => |kp| .{ .es384 = kp },
             .ed25519 => |kp| .{ .eddsa = kp },
             .rsa => |k| .{ .rs256 = k },
+            // PS256 uses SHA-256, MGF1 with SHA-256 and a salt of 32 bytes (RFC 7518
+            // section 3.5). The key parser refuses a minimum salt longer than the hash.
+            .rsa_pss => |k| if (k.params) |p| switch (p.hash) {
+                .sha256 => .{ .ps256 = k.key },
+                .sha384, .sha512 => error.UnsupportedKey,
+            } else .{ .ps256 = k.key },
         };
     }
 
@@ -700,6 +709,46 @@ test "signatures round trip for every signing algorithm" {
         try std.testing.expectEqualStrings(token, try sign(arena, &ps, payload, .{}));
         const rs_keys = [_]Key{rs.verificationKey(&buf, null)};
         try std.testing.expectError(error.UnknownKey, verify(arena, token, .{ .keys = &rs_keys }, 1000));
+    }
+    // An id-RSASSA-PSS key gives PS256, with and without parameters for SHA-256.
+    for ([_][]const u8{ "test/fixtures/tls/pem/rsa-pss.key", "test/fixtures/tls/pem/rsa-pss-sha256.key" }) |path| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 16));
+        defer gpa.free(text);
+        var ps = try SigningKey.fromPem(gpa, text);
+        defer ps.deinit();
+        try std.testing.expectEqual(Algorithm.PS256, ps.algorithm());
+        try std.testing.expectEqual(Algorithm.PS256, ps.usePss().algorithm());
+        const token = try sign(arena, &ps, payload, .{ .kid = "pss" });
+        var buf: [97]u8 = undefined;
+        const ps_keys = [_]Key{ps.verificationKey(&buf, "pss")};
+        const claims = try verify(arena, token, .{ .keys = &ps_keys, .audience = "https://as.example" }, 1000);
+        try std.testing.expectEqualStrings("client-1", claims.subject.?);
+        // The JWK of the key gives the same verification key.
+        const jwk = try publicJwk(arena, &ps);
+        const set = try std.fmt.allocPrint(arena, "{{\"keys\":[{s}]}}", .{jwk});
+        const from_set = try parseJwks(arena, set);
+        _ = try verify(arena, token, .{ .keys = from_set }, 1000);
+    }
+    {
+        // Parameters that require SHA-384: change both hash identifiers of the SHA-256 key.
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, "test/fixtures/tls/pem/rsa-pss-sha256.key", gpa, .limited(1 << 16));
+        defer gpa.free(text);
+        var it: pem.Iterator = .init(text);
+        const bytes = try it.nextLabeled("PRIVATE KEY").?.decode(gpa);
+        defer gpa.free(bytes);
+        const oid_sha256 = "\x60\x86\x48\x01\x65\x03\x04\x02\x01";
+        var changed: usize = 0;
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, bytes, at, oid_sha256)) |i| : (at = i + oid_sha256.len) {
+            bytes[i + oid_sha256.len - 1] = 0x02;
+            changed += 1;
+        }
+        try std.testing.expectEqual(2, changed);
+        // TLS can use the key, but PS256 cannot.
+        var tls_key = try TlsPrivateKey.parseDer(bytes);
+        defer tls_key.deinit();
+        try std.testing.expectEqual(std.crypto.tls.SignatureScheme.rsa_pss_pss_sha384, tls_key.scheme());
+        try std.testing.expectError(error.UnsupportedKey, SigningKey.fromDer(bytes));
     }
     var hs: SigningKey = .{ .hs256 = "a-shared-secret-of-thirty-two-b!" };
     const token = try sign(arena, &hs, payload, .{ .typ = null });
