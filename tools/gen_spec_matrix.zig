@@ -8,8 +8,8 @@
 //! - A mapping cites a test that does not exist.
 //!
 //! A Zig test is `path:name` and must match a `test "name"` declaration in that file. A
-//! conformance scenario is `conformance:server/NAME` or `conformance:client/NAME` and must be
-//! in the scenario list of the mapping. The harness version of the mapping must be the
+//! conformance scenario is `conformance:server/NAME`, `conformance:client/NAME` or
+//! `conformance:authorization/NAME` and must be in the scenario list of the mapping. The harness version of the mapping must be the
 //! version that CI runs.
 //!
 //! Usage: `spec-matrix [--check] [--fail-on-must-gap] [--out PATH]`
@@ -54,6 +54,8 @@ pub const MappingFile = struct {
     scenarios: struct {
         server: []const []const u8,
         client: []const []const u8,
+        /// The authorization server scenarios of the `authorization` command.
+        authorization: []const []const u8 = &.{},
     },
     mappings: []const Mapping,
 };
@@ -203,8 +205,10 @@ const Checker = struct {
                 .{ map.scenarios.server, rest["server/".len..] }
             else if (std.mem.startsWith(u8, rest, "client/"))
                 .{ map.scenarios.client, rest["client/".len..] }
+            else if (std.mem.startsWith(u8, rest, "authorization/"))
+                .{ map.scenarios.authorization, rest["authorization/".len..] }
             else {
-                try self.problem("{s}: {s}: a scenario starts with conformance:server/ or conformance:client/", .{ id, ref });
+                try self.problem("{s}: {s}: a scenario starts with conformance:server/, conformance:client/ or conformance:authorization/", .{ id, ref });
                 return;
             };
             for (list) |s| if (std.mem.eql(u8, s, name)) return;

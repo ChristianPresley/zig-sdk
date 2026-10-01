@@ -56,6 +56,7 @@ All notable changes to this project are recorded in this file. The format follow
 
 - `zig build lint-docs` runs in strict mode by default, and the CI and the nightly wiki lint use strict mode.
 - The default TLS group order is X25519MLKEM768, X25519, P-256, P-384.
+- The requirement matrix maps the obligations of an authorization server to the tests of `AuthorizationServer` and to the authorization server scenarios (`conformance:authorization/NAME`). The Unix socket transport covers the framing rules of custom transports.
 - Breaking: `tls.verify.verifyChain` takes `(certs, trust, ChainOptions)`. `ChainOptions` has the purpose of the peer (`server` or `client`), the host, the time, the revocation policy and the staples.
 - `mcp.tls.PrivateKey.publicKeyBytes` takes a larger buffer, and `max_signature_len` is 512 for RSA keys.
 - The TLS client refuses a HelloRetryRequest cookie of more than 8 KiB.

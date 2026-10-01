@@ -401,6 +401,8 @@ test "authorization code flow: a pre-registered public client gets a bearer JWT"
     try std.testing.expectEqualStrings("mcp:read offline_access", json.getString(claims, "scope").?);
     try std.testing.expect(json.getString(claims, "jti") != null);
     try std.testing.expect(claims.object.get("cnf") == null);
+    // A short lifetime: 900 seconds by default.
+    try std.testing.expectEqual(@as(i64, 900), jwt.integerClaim(claims, "exp").? - jwt.integerClaim(claims, "iat").?);
 }
 
 fn decodeSegment(arena: Allocator, text: []const u8) ![]u8 {
@@ -715,7 +717,10 @@ fn field(arena: Allocator, resp: as_mod.Response, name: []const u8) !?[]const u8
 /// The `error` of the redirect of an authorization response.
 fn redirectError(arena: Allocator, resp: as_mod.Response) !?[]const u8 {
     const loc = headerOf(resp, "location") orelse return null;
-    return (try common.parseQuery(arena, loc)).get("error");
+    const q = try common.parseQuery(arena, loc);
+    // An error response also has the issuer (RFC 9207 section 2).
+    if (q.get("error") != null) try std.testing.expectEqualStrings(as_issuer, q.get("iss").?);
+    return q.get("error");
 }
 
 test "metadata and the JWK set" {
