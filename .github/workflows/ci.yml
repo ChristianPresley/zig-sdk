@@ -152,6 +152,50 @@ jobs:
           kill "$(cat server.pid)" || true
           cat server.log || true
 
+  websocket-interop:
+    name: websocket-interop
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      # The global WebSocket client of Node needs Node 22 or later.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - run: zig build conformance-server examples -Doptimize=ReleaseSafe
+      - name: Start the everything server with WebSocket
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/mcp-conformance-server --port 3000 --ws-port 3001 > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 50); do
+            if curl -s --max-time 2 -o /dev/null http://127.0.0.1:3001/mcp; then exit 0; fi
+            sleep 0.2
+          done
+          echo "server did not start" >&2
+          cat server.log >&2
+          exit 1
+      - name: Call the server from the global WebSocket client of Node
+        run: node .github/interop/ws_peer.mjs 3001
+      - name: Call the server with the SDK client
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/client_cli ws ws://127.0.0.1:3001/mcp -- call test_simple_text | tee call.txt
+          grep -q "This is a simple text response" call.txt
+      - name: Check that the server refuses an upgrade without the subprotocol mcp
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'connection: Upgrade' -H 'upgrade: websocket' -H 'sec-websocket-version: 13' \
+            -H 'sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==' http://127.0.0.1:3001/mcp)
+          echo "curl: $status"
+          test "$status" = "400"
+      - name: Stop the everything server
+        if: always()
+        run: |
+          kill "$(cat server.pid)" || true
+          cat server.log || true
+
   conformance:
     name: conformance
     runs-on: ubuntu-24.04
