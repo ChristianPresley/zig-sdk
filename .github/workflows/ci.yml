@@ -114,7 +114,7 @@ jobs:
       - name: Start the everything server with gRPC
         run: |
           set -euo pipefail
-          ./zig-out/bin/mcp-conformance-server --port 3000 --grpc-port 50051 > server.log 2>&1 &
+          ./zig-out/bin/mcp-conformance-server --port 3000 --grpc-port 50051 --grpc-typed > server.log 2>&1 &
           echo $! > server.pid
           for i in $(seq 1 50); do
             if curl -s --max-time 2 -o /dev/null -X POST http://127.0.0.1:3000/mcp; then exit 0; fi
@@ -125,6 +125,12 @@ jobs:
           exit 1
       - name: Call the server from the Node http2 peer
         run: node .github/interop/h2_peer.mjs 50051
+      - name: Call the typed service from grpc-js with the vendored proto files
+        run: |
+          set -euo pipefail
+          deps="$(mktemp -d)"
+          npm install --prefix "$deps" --no-save --no-audit --no-fund @grpc/grpc-js@^1.14.0 @grpc/proto-loader@^0.8.0
+          node .github/interop/grpc_typed_peer.mjs 50051 "$deps"
       - name: Call the server with curl over HTTP/2 prior knowledge
         run: |
           set -euo pipefail

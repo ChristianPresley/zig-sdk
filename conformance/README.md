@@ -23,7 +23,7 @@ Do these steps to run the suite on your computer:
 4. Run the client suite: `npx --yes @modelcontextprotocol/conformance@0.2.0-alpha.11 client --command ./zig-out/bin/mcp-conformance-client --requirements 2026-07-28 --timeout 60000 --expected-failures conformance/expected-failures-client.yml`. On Windows, give the command as an absolute path.
 5. Read the summary. The suite exits with code 0 when each scored scenario passes.
 
-Add `--stdio` to the start command to serve on standard input and output instead. Add `--grpc-port N` to serve the gRPC binding as well. The CI job `grpc-interop` calls it from a Node `http2` peer and from `curl` with HTTP/2 prior knowledge.
+Add `--stdio` to the start command to serve on standard input and output instead. Add `--grpc-port N` to serve the gRPC binding as well. The CI job `grpc-interop` calls it from a Node `http2` peer and from `curl` with HTTP/2 prior knowledge. Add `--grpc-typed` to serve the typed service `model_context_protocol.Mcp` on the same port. The CI job calls it from `@grpc/grpc-js` with the proto files in `test/fixtures/google_mcp_grpc_proto/`.
 
 ## Steps for the authorization server scenarios
 

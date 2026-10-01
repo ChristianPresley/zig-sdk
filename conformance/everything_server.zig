@@ -1,9 +1,10 @@
 //! The conformance "everything server": every tool, resource and prompt that the official
 //! conformance suite for MCP 2026-07-28 expects. Serves Streamable HTTP by default and
-//! stdio with `--stdio`. `--grpc-port` adds the gRPC binding and `--ws-port` adds the
+//! stdio with `--stdio`. `--grpc-port` adds the gRPC tunnel, `--grpc-typed` also serves the
+//! typed service `model_context_protocol.Mcp` on that port, and `--ws-port` adds the
 //! WebSocket binding on `ws://127.0.0.1:N/mcp`.
 //!
-//! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--ws-port N] [--stdio]
+//! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--ws-port N] [--stdio]
 const std = @import("std");
 const mcp = @import("mcp");
 const mcp_grpc = @import("mcp_grpc");
@@ -463,6 +464,7 @@ pub fn main(init: std.process.Init) !void {
     var port: u16 = 3000;
     var use_stdio = false;
     var grpc_port: ?u16 = null;
+    var grpc_typed = false;
     var ws_port: ?u16 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -472,6 +474,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--grpc-port") and i + 1 < args.len) {
             i += 1;
             grpc_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
+        } else if (std.mem.eql(u8, args[i], "--grpc-typed")) {
+            grpc_typed = true;
         } else if (std.mem.eql(u8, args[i], "--ws-port") and i + 1 < args.len) {
             i += 1;
             ws_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
@@ -556,7 +560,7 @@ pub fn main(init: std.process.Init) !void {
     try transport.bind();
     std.log.info("everything server listening on http://127.0.0.1:{d}/mcp", .{transport.bound_port});
 
-    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &server, .{ .port = grpc_port orelse 0 });
+    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &server, .{ .port = grpc_port orelse 0, .bindings = .{ .typed = grpc_typed } });
     defer grpc_transport.deinit();
     var grpc_future: ?std.Io.Future(void) = null;
     defer if (grpc_future) |*f| {
@@ -565,7 +569,7 @@ pub fn main(init: std.process.Init) !void {
     };
     if (grpc_port != null) {
         try grpc_transport.bind();
-        std.log.info("everything server listening for gRPC on 127.0.0.1:{d}", .{grpc_transport.bound_port});
+        std.log.info("everything server listening for gRPC on 127.0.0.1:{d}{s}", .{ grpc_transport.bound_port, if (grpc_typed) " with the typed service" else "" });
         grpc_future = try io.concurrent(serveGrpc, .{&grpc_transport});
     }
 
