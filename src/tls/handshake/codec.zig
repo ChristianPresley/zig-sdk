@@ -18,6 +18,9 @@ pub const ParseError = error{
 
 pub const HandshakeType = tls.HandshakeType;
 
+/// One bit for each of the 2^16 extension types or group code points.
+pub const ExtensionSet = std.StaticBitSet(1 << 16);
+
 /// A parsed ClientHello. Slices point into the message buffer.
 pub const ClientHello = struct {
     random: [32]u8,
@@ -63,19 +66,16 @@ pub const ClientHello = struct {
         var exts = d.sub(ext_len) catch return error.DecodeError;
         if (!d.eof()) return error.DecodeError;
 
-        var seen: [32]u16 = undefined;
-        var seen_len: usize = 0;
+        // Every extension type at most once (section 4.2). The set covers all 2^16 types.
+        var seen: ExtensionSet = .initEmpty();
         while (!exts.eof()) {
             if (hello.has_pre_shared_key) return error.IllegalParameter; // pre_shared_key must be last
             exts.ensure(4) catch return error.DecodeError;
             const et = exts.decode(u16);
             const len = exts.decode(u16);
             var ext = exts.sub(len) catch return error.DecodeError;
-            for (seen[0..seen_len]) |s| if (s == et) return error.IllegalParameter;
-            if (seen_len < seen.len) {
-                seen[seen_len] = et;
-                seen_len += 1;
-            }
+            if (seen.isSet(et)) return error.IllegalParameter;
+            seen.set(et);
             switch (@as(tls.ExtensionType, @enumFromInt(et))) {
                 .supported_versions => {
                     ext.ensure(1) catch return error.DecodeError;
@@ -100,20 +100,13 @@ pub const ClientHello = struct {
                     const list_len = ext.decode(u16);
                     var list = ext.sub(list_len) catch return error.DecodeError;
                     hello.key_shares = list.buf;
-                    var groups_seen: [16]u16 = undefined;
-                    var n: usize = 0;
                     while (!list.eof()) {
                         list.ensure(4) catch return error.DecodeError;
-                        const g = list.decode(u16);
+                        _ = list.decode(u16);
                         const klen = list.decode(u16);
                         if (klen == 0) return error.DecodeError;
                         list.ensure(klen) catch return error.DecodeError;
                         _ = list.slice(klen);
-                        for (groups_seen[0..n]) |s| if (s == g) return error.IllegalParameter;
-                        if (n < groups_seen.len) {
-                            groups_seen[n] = g;
-                            n += 1;
-                        }
                     }
                     hello.has_key_share = true;
                 },
@@ -137,6 +130,8 @@ pub const ClientHello = struct {
                     if (name_type != 0) return error.IllegalParameter;
                     if (name.len == 0 or name.len > 255) return error.IllegalParameter;
                     for (name) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '.')) return error.IllegalParameter;
+                    // The list has one host name. Another entry has no length that a parser can skip.
+                    if (!list.eof()) return error.DecodeError;
                     hello.server_name = name;
                 },
                 .application_layer_protocol_negotiation => {
@@ -153,14 +148,41 @@ pub const ClientHello = struct {
                         _ = list.slice(plen);
                     }
                 },
-                .pre_shared_key => hello.has_pre_shared_key = true,
-                .early_data => hello.has_early_data = true,
-                else => {},
+                // The parser does not read the body of these extensions and of unknown ones.
+                .pre_shared_key => {
+                    hello.has_pre_shared_key = true;
+                    continue;
+                },
+                .early_data => {
+                    hello.has_early_data = true;
+                    continue;
+                },
+                else => continue,
             }
+            // The body of a known extension ends where its structure ends.
+            if (!ext.eof()) return error.DecodeError;
         }
         if (!hello.offers_tls_1_3) return error.ProtocolVersion;
         if (!hello.has_key_share or !hello.has_groups or !hello.has_signature_algorithms) return error.MissingExtension;
+        try hello.checkKeyShareGroups();
         return hello;
+    }
+
+    /// Each key share is for a group in supported_groups, and no two key shares have the same
+    /// group (section 4.2.8). The parser checked the layout of both lists.
+    fn checkKeyShareGroups(self: *const ClientHello) ParseError!void {
+        var offered: ExtensionSet = .initEmpty();
+        var i: usize = 0;
+        while (i + 2 <= self.supported_groups.len) : (i += 2) offered.set(std.mem.readInt(u16, self.supported_groups[i..][0..2], .big));
+        i = 0;
+        while (i + 4 <= self.key_shares.len) {
+            const group = std.mem.readInt(u16, self.key_shares[i..][0..2], .big);
+            const len = std.mem.readInt(u16, self.key_shares[i + 2 ..][0..2], .big);
+            // A group that is not offered, or a second share for a group, is not in the set.
+            if (!offered.isSet(group)) return error.IllegalParameter;
+            offered.unset(group);
+            i += 4 + @as(usize, len);
+        }
     }
 
     pub fn offersSuite(self: *const ClientHello, id: u16) bool {
@@ -426,6 +448,103 @@ test "parse a minimal client hello" {
     try std.testing.expectError(error.MissingExtension, ClientHello.parse(short));
     // Truncated.
     try std.testing.expectError(error.DecodeError, ClientHello.parse(b.slice()[0..40]));
+}
+
+/// An extension for the test ClientHellos.
+const TestExtension = struct { type: u16, body: []const u8 };
+
+/// A ClientHello body with one cipher suite and the extensions `exts` in this order.
+fn testHello(buf: []u8, exts: []const TestExtension) []u8 {
+    var b: Builder = .{ .buf = buf };
+    b.int(u16, 0x0303);
+    b.bytes(&([_]u8{7} ** 32));
+    b.byte(0);
+    b.int(u16, 2);
+    b.int(u16, 0x1301);
+    b.byte(1);
+    b.byte(0);
+    const list = b.beginLen(u16);
+    for (exts) |e| {
+        b.int(u16, e.type);
+        b.int(u16, @intCast(e.body.len));
+        b.bytes(e.body);
+    }
+    b.endLen(u16, list);
+    return b.slice();
+}
+
+const test_versions: TestExtension = .{ .type = 43, .body = "\x02\x03\x04" };
+const test_groups: TestExtension = .{ .type = 10, .body = "\x00\x04\x00\x1d\x00\x17" };
+const test_schemes: TestExtension = .{ .type = 13, .body = "\x00\x02\x04\x03" };
+const test_share: TestExtension = .{ .type = 51, .body = "\x00\x24\x00\x1d\x00\x20" ++ "\x09" ** 32 };
+
+test "a duplicate extension after many other extensions is refused" {
+    var buf: [4096]u8 = undefined;
+    var exts: [40]TestExtension = undefined;
+    // 32 distinct unknown extensions, then the mandatory ones.
+    for (exts[0..32], 0..) |*e, i| e.* = .{ .type = @intCast(0x7000 + i), .body = "" };
+    exts[32..36].* = .{ test_versions, test_groups, test_schemes, test_share };
+    _ = try ClientHello.parse(testHello(&buf, exts[0..36]));
+    // A second key_share or supported_versions after all of them.
+    exts[36] = test_share;
+    try std.testing.expectError(error.IllegalParameter, ClientHello.parse(testHello(&buf, exts[0..37])));
+    exts[36] = test_versions;
+    try std.testing.expectError(error.IllegalParameter, ClientHello.parse(testHello(&buf, exts[0..37])));
+    // A second unknown extension of the same type.
+    exts[36] = exts[0];
+    try std.testing.expectError(error.IllegalParameter, ClientHello.parse(testHello(&buf, exts[0..37])));
+}
+
+test "key shares must be for distinct offered groups" {
+    var buf: [4096]u8 = undefined;
+    var groups_buf: [2 + 2 * 20]u8 = undefined;
+    var shares_buf: [2 + 20 * 5]u8 = undefined;
+    // 18 distinct groups in supported_groups and one share of one byte for each.
+    std.mem.writeInt(u16, groups_buf[0..2], 2 * 18, .big);
+    for (0..18) |i| std.mem.writeInt(u16, groups_buf[2 + 2 * i ..][0..2], @intCast(0x0100 + i), .big);
+    const groups: TestExtension = .{ .type = 10, .body = groups_buf[0 .. 2 + 2 * 18] };
+    for (0..18) |i| {
+        std.mem.writeInt(u16, shares_buf[2 + 5 * i ..][0..2], @intCast(0x0100 + i), .big);
+        std.mem.writeInt(u16, shares_buf[2 + 5 * i + 2 ..][0..2], 1, .big);
+        shares_buf[2 + 5 * i + 4] = 0x42;
+    }
+    std.mem.writeInt(u16, shares_buf[0..2], 5 * 18, .big);
+    _ = try ClientHello.parse(testHello(&buf, &.{ test_versions, groups, test_schemes, .{ .type = 51, .body = shares_buf[0 .. 2 + 5 * 18] } }));
+    // A 19th share for the first group again.
+    @memcpy(shares_buf[2 + 5 * 18 ..][0..5], shares_buf[2..7]);
+    std.mem.writeInt(u16, shares_buf[0..2], 5 * 19, .big);
+    try std.testing.expectError(error.IllegalParameter, ClientHello.parse(testHello(&buf, &.{ test_versions, groups, test_schemes, .{ .type = 51, .body = shares_buf[0 .. 2 + 5 * 19] } })));
+    // A share for a group that supported_groups does not list, before or after that list.
+    const other_share: TestExtension = .{ .type = 51, .body = "\x00\x05\x00\x18\x00\x01\x42" };
+    try std.testing.expectError(error.IllegalParameter, ClientHello.parse(testHello(&buf, &.{ test_versions, test_groups, test_schemes, other_share })));
+    try std.testing.expectError(error.IllegalParameter, ClientHello.parse(testHello(&buf, &.{ other_share, test_versions, test_groups, test_schemes })));
+}
+
+test "trailing bytes in a known client hello extension are a decode error" {
+    var buf: [4096]u8 = undefined;
+    _ = try ClientHello.parse(testHello(&buf, &.{ test_versions, test_groups, test_schemes, test_share }));
+    const bad = [_]TestExtension{
+        .{ .type = 43, .body = "\x02\x03\x04\x00" },
+        .{ .type = 10, .body = "\x00\x04\x00\x1d\x00\x17\x00" },
+        .{ .type = 13, .body = "\x00\x02\x04\x03\x00" },
+        .{ .type = 51, .body = "\x00\x24\x00\x1d\x00\x20" ++ "\x09" ** 32 ++ "\x00" },
+        .{ .type = 0, .body = "\x00\x0c\x00\x00\x09localhost\x00" },
+        .{ .type = 0, .body = "\x00\x0d\x00\x00\x09localhost\x00" },
+        .{ .type = 16, .body = "\x00\x03\x02h2\x00" },
+    };
+    const mandatory = [_]TestExtension{ test_versions, test_groups, test_schemes, test_share };
+    for (bad) |e| {
+        // Replace the mandatory extension of the same type, or add the extension.
+        var list: [5]TestExtension = undefined;
+        var n: usize = 0;
+        for (mandatory) |m| {
+            if (m.type == e.type) continue;
+            list[n] = m;
+            n += 1;
+        }
+        list[n] = e;
+        try std.testing.expectError(error.DecodeError, ClientHello.parse(testHello(&buf, list[0 .. n + 1])));
+    }
 }
 
 test "server hello builder" {

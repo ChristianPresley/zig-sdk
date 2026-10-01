@@ -474,6 +474,7 @@ pub const ServerHello = struct {
                     if (version_ok) return error.IllegalParameter;
                     ext.ensure(2) catch return error.DecodeError;
                     if (ext.decode(u16) != @intFromEnum(tls.ProtocolVersion.tls_1_3)) return error.ProtocolVersion;
+                    if (!ext.eof()) return error.DecodeError;
                     version_ok = true;
                 },
                 .key_share => {
@@ -499,6 +500,7 @@ pub const ServerHello = struct {
                     if (clen == 0) return error.DecodeError;
                     ext.ensure(clen) catch return error.DecodeError;
                     sh.cookie = ext.slice(clen);
+                    if (!ext.eof()) return error.DecodeError;
                 },
                 // The client offered no pre-shared key, so the server must not select one.
                 else => return error.IllegalParameter,
@@ -519,18 +521,21 @@ pub const EncryptedExtensions = struct {
         var exts = d.sub(ext_len) catch return error.DecodeError;
         if (!d.eof()) return error.DecodeError;
         var result: EncryptedExtensions = .{};
+        var seen: codec.ExtensionSet = .initEmpty();
         while (!exts.eof()) {
             exts.ensure(4) catch return error.DecodeError;
             const et = exts.decode(u16);
             const len = exts.decode(u16);
             var ext = exts.sub(len) catch return error.DecodeError;
+            if (seen.isSet(et)) return error.IllegalParameter;
+            seen.set(et);
             switch (@as(tls.ExtensionType, @enumFromInt(et))) {
                 .application_layer_protocol_negotiation => {
-                    if (result.alpn != null) return error.IllegalParameter;
                     ext.ensure(3) catch return error.DecodeError;
                     const list_len = ext.decode(u16);
                     if (list_len == 0) return error.DecodeError;
                     var list = ext.sub(list_len) catch return error.DecodeError;
+                    if (!ext.eof()) return error.DecodeError;
                     list.ensure(1) catch return error.DecodeError;
                     const plen = list.decode(u8);
                     if (plen == 0) return error.IllegalParameter;
@@ -568,19 +573,20 @@ pub const CertificateRequest = struct {
         const ext_len = d.decode(u16);
         var exts = d.sub(ext_len) catch return error.DecodeError;
         if (!d.eof()) return error.DecodeError;
-        var seen = false;
+        var seen: codec.ExtensionSet = .initEmpty();
         while (!exts.eof()) {
             exts.ensure(4) catch return error.DecodeError;
             const et = exts.decode(u16);
             const len = exts.decode(u16);
             var ext = exts.sub(len) catch return error.DecodeError;
+            if (seen.isSet(et)) return error.IllegalParameter;
+            seen.set(et);
             if (@as(tls.ExtensionType, @enumFromInt(et)) == .signature_algorithms) {
-                if (seen) return error.IllegalParameter;
-                seen = true;
                 ext.ensure(2) catch return error.DecodeError;
                 const list_len = ext.decode(u16);
                 if (list_len < 2 or list_len % 2 != 0) return error.DecodeError;
                 var list = ext.sub(list_len) catch return error.DecodeError;
+                if (!ext.eof()) return error.DecodeError;
                 while (!list.eof()) {
                     list.ensure(2) catch return error.DecodeError;
                     const scheme = list.decode(u16);
@@ -591,7 +597,7 @@ pub const CertificateRequest = struct {
                 }
             }
         }
-        if (!seen) return error.MissingExtension;
+        if (!seen.isSet(@intFromEnum(tls.ExtensionType.signature_algorithms))) return error.MissingExtension;
         return result;
     }
 
@@ -653,6 +659,49 @@ test "the default client hello offers no AEGIS suite" {
         try std.testing.expect(hello.offersSuite(Suite.AEGIS_128L_SHA256.wire()));
         try std.testing.expect(hello.offersSuite(Suite.AEGIS_256_SHA512.wire()));
     }
+}
+
+/// A ServerHello body with the `legacy_session_id` "abc", `TLS_AES_128_GCM_SHA256` and `exts`.
+fn testServerHello(buf: []u8, random: [32]u8, exts: []const u8) []u8 {
+    var b: codec.Builder = .{ .buf = buf };
+    b.int(u16, 0x0303);
+    b.bytes(&random);
+    b.byte(3);
+    b.bytes("abc");
+    b.int(u16, 0x1301);
+    b.byte(0);
+    b.int(u16, @intCast(exts.len));
+    b.bytes(exts);
+    return b.slice();
+}
+
+test "trailing bytes and duplicates in server extensions are refused" {
+    var buf: [256]u8 = undefined;
+    const versions = "\x00\x2b\x00\x02\x03\x04";
+    const versions_long = "\x00\x2b\x00\x03\x03\x04\x00";
+    const share = "\x00\x33\x00\x24\x00\x1d\x00\x20" ++ "\x02" ** 32;
+    _ = try ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions ++ share));
+    try std.testing.expectError(error.DecodeError, ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions_long ++ share)));
+    // A HelloRetryRequest cookie with a trailing byte.
+    const hrr_share = "\x00\x33\x00\x02\x00\x1d";
+    _ = try ServerHello.parse(testServerHello(&buf, tls.hello_retry_request_sequence, versions ++ "\x00\x2c\x00\x04\x00\x02\xaa\xbb" ++ hrr_share));
+    try std.testing.expectError(error.DecodeError, ServerHello.parse(testServerHello(&buf, tls.hello_retry_request_sequence, versions ++ "\x00\x2c\x00\x05\x00\x02\xaa\xbb\x00" ++ hrr_share)));
+
+    // EncryptedExtensions: an ALPN body with a trailing byte, and a second server_name.
+    var ee_alpn = [_]u8{ 0, 10, 0, 16, 0, 6, 0, 3, 2, 'h', '2', 0 };
+    try std.testing.expectError(error.DecodeError, EncryptedExtensions.parse(&ee_alpn));
+    var ee_names = [_]u8{ 0, 8, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectError(error.IllegalParameter, EncryptedExtensions.parse(&ee_names));
+
+    // CertificateRequest: signature_algorithms with a trailing byte, and a duplicate unknown
+    // extension.
+    var cr_ok = [_]u8{ 0, 0, 8, 0, 13, 0, 4, 0, 2, 0x04, 0x03 };
+    const parsed = try CertificateRequest.parse(&cr_ok);
+    try std.testing.expect(parsed.offersScheme(0x0403));
+    var cr_trailing = [_]u8{ 0, 0, 9, 0, 13, 0, 5, 0, 2, 0x04, 0x03, 0 };
+    try std.testing.expectError(error.DecodeError, CertificateRequest.parse(&cr_trailing));
+    var cr_dup = [_]u8{ 0, 0, 16, 0x7a, 0x7a, 0, 0, 0, 13, 0, 4, 0, 2, 0x04, 0x03, 0x7a, 0x7a, 0, 0 };
+    try std.testing.expectError(error.IllegalParameter, CertificateRequest.parse(&cr_dup));
 }
 
 test "server name eligibility" {
