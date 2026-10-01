@@ -1782,3 +1782,45 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-29
 - Note: For verifying Zig tarballs in CI; Ubuntu package https://packages.ubuntu.com/noble/minisign (200).
 
+## Other
+
+### APPLE-KEYCHAIN-SERVICES
+
+- Title: Keychain Services
+- Author: Apple Inc.
+- Publisher: Apple Developer Documentation
+- Date: accessed 2026-10-01
+- URL: <https://developer.apple.com/documentation/security/keychain-services>
+- Accessed: 2026-10-01
+- Note: Generic password items with SecItemAdd, SecItemCopyMatching, SecItemUpdate and SecItemDelete.
+
+### FDO-DBUS-SPEC
+
+- Title: D-Bus Specification
+- Author: H. Pennington, A. Carlsson, A. Larsson, S. Herzberg, S. McVittie, D. Zeuthen
+- Publisher: freedesktop.org
+- Date: version 0.43
+- URL: <https://dbus.freedesktop.org/doc/dbus-specification.html>
+- Accessed: 2026-10-01
+- Note: The wire format, the EXTERNAL authentication and the session bus address of the D-Bus client of the SDK.
+
+### FDO-SECRET-SERVICE
+
+- Title: Secret Service API Draft
+- Author: S. Walter, M. Leupold
+- Publisher: freedesktop.org specifications
+- Date: version 0.2 (draft)
+- URL: <https://specifications.freedesktop.org/secret-service-spec/latest/>
+- Accessed: 2026-10-01
+- Note: The collections, items, sessions with the plain algorithm and prompts that KeychainTokenStorage uses on Linux.
+
+### MS-CREDWRITEW
+
+- Title: CredWriteW function (wincred.h)
+- Author: Microsoft
+- Publisher: Microsoft Learn
+- Date: accessed 2026-10-01
+- URL: <https://learn.microsoft.com/en-us/windows/win32/api/wincred/nf-wincred-credwritew>
+- Accessed: 2026-10-01
+- Note: Generic credentials of the Credential Manager and the limit of 2560 bytes for the credential blob.
+
