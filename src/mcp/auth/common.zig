@@ -288,11 +288,7 @@ pub const Fetcher = struct {
         return .{ .ok = .{
             .access_token = access_token,
             .token_type = json.getString(tree, "token_type"),
-            .expires_in = if (tree.object.get("expires_in")) |v| switch (v) {
-                .integer => |i| i,
-                .float => |f| @intFromFloat(f),
-                else => null,
-            } else null,
+            .expires_in = jwt.integerClaim(tree, "expires_in"),
             .scope = json.getString(tree, "scope"),
             .refresh_token = json.getString(tree, "refresh_token"),
             .issued_token_type = json.getString(tree, "issued_token_type"),

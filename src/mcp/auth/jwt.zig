@@ -129,9 +129,9 @@ pub fn verify(arena: Allocator, token: []const u8, options: Options, now: i64) V
     claims.audience = try audienceList(arena, payload);
     claims.scopes = try scopeList(arena, payload);
     const skew = options.clock_skew_seconds;
-    if (claims.expires_at) |exp| if (now > exp + skew) return error.Expired;
-    if (claims.not_before) |nbf| if (now + skew < nbf) return error.NotYetValid;
-    if (claims.issued_at) |iat| if (now + skew < iat) return error.NotYetValid;
+    if (claims.expires_at) |exp| if (now > exp +| skew) return error.Expired;
+    if (claims.not_before) |nbf| if (now +| skew < nbf) return error.NotYetValid;
+    if (claims.issued_at) |iat| if (now +| skew < iat) return error.NotYetValid;
     if (options.issuer) |want| {
         const got = claims.issuer orelse return error.IssuerMismatch;
         if (!std.mem.eql(u8, got, want)) return error.IssuerMismatch;
@@ -217,11 +217,13 @@ fn verifySignature(key: Key, alg: Algorithm, input: []const u8, signature: []con
     }
 }
 
+/// An integer claim. A float claim counts when it is in the range of `i64`, and the value is
+/// the integer part. Other values give null.
 fn intClaim(payload: Value, key: []const u8) ?i64 {
     const v = payload.object.get(key) orelse return null;
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| if (std.math.isNan(f) or f < -9.0e18 or f > 9.0e18) null else @intFromFloat(f),
         else => null,
     };
 }
@@ -634,4 +636,24 @@ test "jwk set parsing" {
     try std.testing.expectEqual(Algorithm.RS256, keys[1].alg);
     try std.testing.expectEqual(Algorithm.PS256, keys[2].alg);
     try std.testing.expectError(error.Malformed, parseJwks(arena, "{}"));
+}
+
+test "time claims at the limits of i64 and large floats do not overflow" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const secret = "test-secret-of-32-bytes-or-more!!";
+    const keys = [_]Key{.{ .alg = .HS256, .material = .{ .secret = secret } }};
+    const max = try signHs256(arena, "{\"exp\":9223372036854775807,\"nbf\":-9223372036854775808,\"iat\":-9223372036854775808}", secret, null);
+    _ = try verify(arena, max, .{ .keys = &keys }, 1000);
+    const min = try signHs256(arena, "{\"exp\":-9223372036854775808}", secret, null);
+    try std.testing.expectError(error.Expired, verify(arena, min, .{ .keys = &keys }, 1000));
+    const future = try signHs256(arena, "{\"nbf\":9223372036854775807}", secret, null);
+    try std.testing.expectError(error.NotYetValid, verify(arena, future, .{ .keys = &keys }, 1000));
+    _ = try verify(arena, future, .{ .keys = &keys }, std.math.maxInt(i64));
+    // A float outside the range of `i64` does not count as a time.
+    const huge = try signHs256(arena, "{\"exp\":1e300,\"iat\":-1e300}", secret, null);
+    const claims = try verify(arena, huge, .{ .keys = &keys }, 1000);
+    try std.testing.expect(claims.expires_at == null and claims.issued_at == null);
+    try std.testing.expectEqual(1500, integerClaim(try json.parseTree(arena, "{\"exp\":1500.7}"), "exp").?);
 }

@@ -191,7 +191,7 @@ pub const ClientCredentials = struct {
             .ok => |reply| {
                 try common.replaceOwned(self.gpa, &self.last_error, null);
                 try common.replaceOwned(self.gpa, &self.token, reply.access_token);
-                self.expires_at = if (reply.expires_in) |s| time + s else null;
+                self.expires_at = if (reply.expires_in) |s| time +| s else null;
                 if (reply.scope) |granted| try common.replaceOwned(self.gpa, &self.scope, granted);
             },
         }

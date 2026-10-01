@@ -301,7 +301,7 @@ pub const EnterpriseClient = struct {
                 }
                 try common.replaceOwned(self.gpa, &self.grant, reply.access_token);
                 // The lifetime: `expires_in`, else the `exp` claim of the grant.
-                self.grant_expires_at = if (reply.expires_in) |s| time + s else if (jwt.decodePayloadUnverified(arena, reply.access_token)) |p| jwt.integerClaim(p, "exp") else |_| null;
+                self.grant_expires_at = if (reply.expires_in) |s| time +| s else if (jwt.decodePayloadUnverified(arena, reply.access_token)) |p| jwt.integerClaim(p, "exp") else |_| null;
             },
         }
     }
@@ -327,7 +327,7 @@ pub const EnterpriseClient = struct {
             .ok => |reply| {
                 try common.replaceOwned(self.gpa, &self.last_error, null);
                 try common.replaceOwned(self.gpa, &self.token, reply.access_token);
-                self.expires_at = if (reply.expires_in) |s| time + s else null;
+                self.expires_at = if (reply.expires_in) |s| time +| s else null;
             },
         }
     }
@@ -453,7 +453,7 @@ pub const IdJagValidator = struct {
         const exp = claims.expires_at orelse return error.Malformed;
         const iat = claims.issued_at orelse return error.Malformed;
         const grant_client = claims.client_id orelse return error.Malformed;
-        if (self.max_lifetime_seconds) |max| if (exp - iat > max) return error.LifetimeTooLong;
+        if (self.max_lifetime_seconds) |max| if (exp -| iat > max) return error.LifetimeTooLong;
 
         // `aud`: one string, or an array with exactly one element, equal to our issuer.
         const aud = payload.object.get("aud") orelse return error.Malformed;
