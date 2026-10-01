@@ -508,6 +508,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | URL | uniform resource locator |
 | UTC | Coordinated Universal Time |
 | UTF-8 | the 8-bit encoding of Unicode |
+| UTF-16 | the 16-bit encoding of Unicode |
 | GET | the HTTP method that reads a resource |
 | GIF | Graphics Interchange Format |
 | JPEG | the image format of the Joint Photographic Experts Group |
@@ -542,6 +543,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | RS256 | RSA PKCS #1 version 1.5 signature with SHA-256 |
 | RSA | the Rivest-Shamir-Adleman public key algorithm |
 | SEC1 | the elliptic curve private key format of SECG |
+| SASL | Simple Authentication and Security Layer (RFC 4422) |
 | SHA | Secure Hash Algorithm |
 | SNI | server name indication |
 | SPIFFE | Secure Production Identity Framework for Everyone, a standard for workload identities |

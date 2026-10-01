@@ -26,6 +26,15 @@ pub fn wakeUnix(io: Io, path: []const u8) void {
 /// its own task, and this function connects to the listener until the task ends. Thus the
 /// loop wakes also when it waits in `accept`, and also when an inner call used up the cancel.
 pub fn cancelAcceptLoop(io: Io, future: anytype, address: Io.net.IpAddress, stopping: *std.atomic.Value(bool)) void {
+    cancelLoop(io, future, stopping, address, wakeIp);
+}
+
+/// `cancelAcceptLoop` for an accept loop that listens on the Unix socket at `path`.
+pub fn cancelUnixAcceptLoop(io: Io, future: anytype, path: []const u8, stopping: *std.atomic.Value(bool)) void {
+    cancelLoop(io, future, stopping, path, wakeUnix);
+}
+
+fn cancelLoop(io: Io, future: anytype, stopping: *std.atomic.Value(bool), target: anytype, comptime wakeFn: fn (Io, @TypeOf(target)) void) void {
     stopping.store(true, .release);
     const Canceller = struct {
         fn run(f: @TypeOf(future), done: *std.atomic.Value(bool), task_io: Io) void {
@@ -39,7 +48,7 @@ pub fn cancelAcceptLoop(io: Io, future: anytype, address: Io.net.IpAddress, stop
         return;
     };
     while (!done.load(.acquire)) {
-        wakeIp(io, address);
+        wakeFn(io, target);
         io.sleep(.fromMilliseconds(5), .awake) catch break;
     }
     canceller.await(io);

@@ -15,6 +15,10 @@ pub const token_storage = @import("auth/token_storage.zig");
 pub const TokenStorage = token_storage.TokenStorage;
 pub const MemoryTokenStorage = token_storage.MemoryTokenStorage;
 pub const FileTokenStorage = token_storage.FileTokenStorage;
+/// Token storage in the keychain of the host: the Credential Manager, Keychain Services or
+/// the Secret Service.
+pub const keychain = @import("auth/keychain.zig");
+pub const KeychainTokenStorage = keychain.KeychainTokenStorage;
 /// The OAuth Client Credentials extension.
 pub const client_credentials = @import("auth/client_credentials.zig");
 pub const ClientCredentials = client_credentials.ClientCredentials;
