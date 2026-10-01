@@ -855,40 +855,44 @@ test "interop: openssl s_server staples an OCSP response for the SDK client" {
 /// check an echo. The client always offers the protocol "http/1.1".
 fn opensslServer(io: Io, extra: []const []const u8, setup: ClientSetup) !void {
     // Pick a free port by binding and releasing it.
-    const port = blk: {
-        var probe = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{});
-        defer probe.deinit(io);
-        break :blk probe.socket.address.getPort();
-    };
+    // Another socket can take the released port before s_server binds it. Then s_server ends
+    // at once, and the helper starts it again on a new port.
     var port_buf: [8]u8 = undefined;
-    const port_text = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
     var argv_buf: [32][]const u8 = undefined;
-    const base = [_][]const u8{ "openssl", "s_server", "-accept", port_text, "-tls1_3", "-alpn", "http/1.1", "-rev", "-naccept", "1" };
-    @memcpy(argv_buf[0..base.len], &base);
-    @memcpy(argv_buf[base.len..][0..extra.len], extra);
-    var child = try std.process.spawn(io, .{
-        .argv = argv_buf[0 .. base.len + extra.len],
-        .stdin = .pipe,
-        .stdout = .ignore,
-        .stderr = .ignore,
-        .create_no_window = true,
-    });
-    defer {
+    var child: std.process.Child = undefined;
+    var stream: Io.net.Stream = undefined;
+    var starts: u32 = 0;
+    start: while (true) : (starts += 1) {
+        if (starts == 3) return error.OpensslDidNotListen;
+        const port = blk: {
+            var probe = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{});
+            defer probe.deinit(io);
+            break :blk probe.socket.address.getPort();
+        };
+        const port_text = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+        const base = [_][]const u8{ "openssl", "s_server", "-accept", port_text, "-tls1_3", "-alpn", "http/1.1", "-rev", "-naccept", "1" };
+        @memcpy(argv_buf[0..base.len], &base);
+        @memcpy(argv_buf[base.len..][0..extra.len], extra);
+        child = try std.process.spawn(io, .{
+            .argv = argv_buf[0 .. base.len + extra.len],
+            .stdin = .pipe,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .create_no_window = true,
+        });
+        // Wait for the listener.
+        const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+        var attempts: u32 = 0;
+        while (attempts <= 100) : (attempts += 1) {
+            stream = address.connect(io, .{ .mode = .stream }) catch {
+                try io.sleep(.fromMilliseconds(50), .awake);
+                continue;
+            };
+            break :start;
+        }
         child.kill(io);
     }
-
-    // Wait for the listener.
-    const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    var stream: Io.net.Stream = undefined;
-    var attempts: u32 = 0;
-    while (true) : (attempts += 1) {
-        stream = address.connect(io, .{ .mode = .stream }) catch {
-            if (attempts > 100) return error.OpensslDidNotListen;
-            try io.sleep(.fromMilliseconds(50), .awake);
-            continue;
-        };
-        break;
-    }
+    defer child.kill(io);
     defer stream.close(io);
     var in_buf: [tls.Connection.min_input_buffer_len]u8 = undefined;
     var out_buf: [tls.Connection.min_output_buffer_len]u8 = undefined;
