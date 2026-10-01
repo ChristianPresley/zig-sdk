@@ -307,6 +307,29 @@ test "multi round-trip request with sealed state" {
     try std.testing.expectEqual(@as(i64, -32021), errorCode(no_caps).?);
 }
 
+test "uri template limits: template length at registration and URI length at match" {
+    var options: Server.Options = .{ .info = .{ .name = "test", .version = "0.1.0" } };
+    options.limits.uri_template.max_uri_bytes = 32;
+    var f: Fixture = undefined;
+    try f.init(options);
+    defer f.deinit();
+
+    // The fixture template "test://template/{id}/data" matches a URI of 32 bytes or less.
+    const short = result(try f.call(1, "resources/read", meta_none, "\"uri\":\"test://template/12345/data\""));
+    try std.testing.expectEqualStrings("{\"id\":\"12345\"}", short.object.get("contents").?.array.items[0].object.get("text").?.string);
+    // A longer URI matches no template: the resource is not found.
+    const long = try f.call(2, "resources/read", meta_none, "\"uri\":\"test://template/123456789012345/data\"");
+    try std.testing.expectEqual(@as(i64, -32602), errorCode(long).?);
+
+    // A template longer than the limit fails at registration.
+    var small: Server.Options = .{ .info = .{ .name = "test", .version = "0.1.0" } };
+    small.limits.uri_template.max_template_bytes = 16;
+    var server = try Server.init(std.testing.allocator, std.testing.io, small);
+    defer server.deinit();
+    try std.testing.expectError(error.InvalidUriTemplate, server.addResourceTemplate(.{ .uri_template = "test://template/{id}/data", .name = "tpl" }, readTemplate));
+    try server.addResourceTemplate(.{ .uri_template = "t://{id}", .name = "ok" }, readTemplate);
+}
+
 test "resources, templates, prompts, completion" {
     var f: Fixture = undefined;
     try f.init(.{ .info = .{ .name = "test", .version = "0.1.0" } });

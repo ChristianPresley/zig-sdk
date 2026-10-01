@@ -549,7 +549,7 @@ pub fn checkUiLinks(self: *Server, broken_tool: ?*[]const u8) UiLinkError!void {
             for (self.resources.items) |r| if (std.mem.eql(u8, r.def.uri, uri)) break :blk true;
             for (self.templates.items) |tpl| {
                 vars.clearRetainingCapacity();
-                if (tpl.template.match(uri, &vars, scratch.allocator()) catch false) break :blk true;
+                if (self.matchTemplate(tpl.template, uri, &vars, scratch.allocator()) catch false) break :blk true;
             }
             break :blk false;
         };
@@ -592,6 +592,7 @@ fn withoutUiMeta(arena: Allocator, def: types.Tool) Allocator.Error!types.Tool {
 
 pub fn addResourceTemplate(self: *Server, def: ResourceTemplateDef, handler: TemplateHandler) RegisterError!void {
     const arena = self.registry_arena.allocator();
+    if (def.uri_template.len > self.options.limits.uri_template.max_template_bytes) return error.InvalidUriTemplate;
     const source = try arena.dupe(u8, def.uri_template);
     const template = UriTemplate.parse(arena, source, self.options.limits.uri_template.max_expressions) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -928,12 +929,19 @@ fn completionTargetExists(self: *Server, ctx: *RequestContext, ref: types.Comple
                 if (!t.enabled) continue;
                 if (std.mem.eql(u8, t.def.uriTemplate, r.uri)) return true;
                 vars.clearRetainingCapacity();
-                if (try t.template.match(r.uri, &vars, ctx.arena)) return true;
+                if (try self.matchTemplate(t.template, r.uri, &vars, ctx.arena)) return true;
             }
             for (self.resources.items) |e| if (e.enabled and std.mem.eql(u8, e.def.uri, r.uri)) return true;
             return false;
         },
     }
+}
+
+/// Match `uri` against a resource template. A URI longer than
+/// `limits.uri_template.max_uri_bytes` matches no template.
+fn matchTemplate(self: *const Server, template: UriTemplate, uri: []const u8, out: *std.ArrayList(UriTemplate.Variable), gpa: Allocator) Allocator.Error!bool {
+    if (uri.len > self.options.limits.uri_template.max_uri_bytes) return false;
+    return template.match(uri, out, gpa);
 }
 
 fn mapHandlerError(ctx: *RequestContext, e: anyerror) RequestContext.Error {
@@ -1210,7 +1218,7 @@ fn readResource(self: *Server, ctx: *RequestContext, params: types.ReadResourceR
     for (self.templates.items) |t| {
         if (!t.enabled) continue;
         vars.clearRetainingCapacity();
-        if (!try t.template.match(params.uri, &vars, ctx.arena)) continue;
+        if (!try self.matchTemplate(t.template, params.uri, &vars, ctx.arena)) continue;
         ctx.userdata = t.userdata;
         const outcome = t.handler(ctx, params.uri, vars.items) catch |e| return mapHandlerError(ctx, e);
         return self.finishRead(ctx, outcome, params.uri);

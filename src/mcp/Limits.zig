@@ -86,11 +86,13 @@ skills: struct {
 icon: Icon = .{},
 
 uri_template: struct {
-    /// Reserved. Version 0.1.0 does not check this limit.
+    /// Maximum length of one URI template in bytes. Overflow: the registration fails.
     max_template_bytes: usize = 64 << 10,
     /// Maximum expressions in one template. Overflow: the registration fails.
     max_expressions: u16 = 256,
-    /// Reserved. Version 0.1.0 does not check this limit.
+    /// Maximum length in bytes of a URI that the server matches against its templates. A
+    /// longer URI matches no template: `resources/read` gives the error "resource not found",
+    /// and a completion reference to it is invalid.
     max_uri_bytes: usize = 64 << 10,
 } = .{},
 
