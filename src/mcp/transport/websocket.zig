@@ -451,6 +451,8 @@ const Conn = struct {
         const principal = conn.handshake() catch return .handshake_failed;
         conn.peer = .initSink(io, self.gpa, self.server, .{ .ptr = conn, .write = sinkWrite });
         conn.peer.kind = .websocket;
+        // The rate limits count the IP address of a client without a principal, as on HTTP.
+        conn.peer.peer = .{ .address = conn.stream.socket.address };
         conn.peer.context = principal;
         conn.peer.on_close = .cancel_requests;
         conn.peer.when_full = .{ .reject = self.limits.websocket.max_in_flight_requests };

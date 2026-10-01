@@ -863,6 +863,33 @@ test "websocket limits: connections, requests in flight and the handshake time" 
     if (third.upgrade(arena, null, "")) |_| return error.TestUnexpectedResult else |_| {}
 }
 
+test "websocket rate limits: the connections of one IP address share the bucket of the address" {
+    resetCounters();
+    var limits: mcp.Limits = .{};
+    limits.rate_limits.tool_calls = .{ .count = 1, .period = .fromSeconds(3600) };
+    var f: Fixture = undefined;
+    try f.start(limits, .{});
+    try f.run();
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first = try Raw.open(f.port());
+    defer first.close();
+    try std.testing.expectEqual(101, (try first.upgrade(arena, null, "")).status);
+    try first.sendText("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"add\",\"arguments\":{\"a\":1,\"b\":1}," ++ meta_none ++ "}}");
+    try std.testing.expect((try first.awaitResponse(arena, 1)) == .response);
+
+    // A new connection from the same address does not get a new bucket.
+    const second = try Raw.open(f.port());
+    defer second.close();
+    try std.testing.expectEqual(101, (try second.upgrade(arena, null, "")).status);
+    try second.sendText("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"add\",\"arguments\":{\"a\":1,\"b\":1}," ++ meta_none ++ "}}");
+    const refused = try second.awaitResponse(arena, 2);
+    try std.testing.expectEqual(@as(i64, -31429), refused.error_response.code);
+}
+
 fn noConnections(t: *websocket.Server) bool {
     return t.connectionCount() == 0;
 }
