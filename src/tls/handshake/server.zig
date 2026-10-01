@@ -69,6 +69,10 @@ pub const Config = struct {
     /// OCSP responses to staple. When the client sends `status_request`, the server puts
     /// the response of the selected chain in the entry of its leaf.
     ocsp_staples: []const OcspStaple = &.{},
+    /// Send a HelloRetryRequest with a cookie of 32 random bytes to each client, and require
+    /// the cookie in the second ClientHello (RFC 8446 section 4.2.2). The client thus shows
+    /// that it receives data at its address before the key exchange. It costs one round trip.
+    retry_cookie: bool = false,
 };
 
 /// A DER `OCSPResponse` for the leaf of a chain. The application keeps the bytes. To send
@@ -209,13 +213,17 @@ fn run(
     // Large enough for a ServerHello with a hybrid key share and for an RSA CertificateVerify.
     var msg_buf: [2048]u8 = undefined;
 
-    if (choice.share == null) {
+    var cookie: [32]u8 = undefined;
+    if (choice.share == null or config.retry_cookie) {
         // HelloRetryRequest: replace ClientHello1 in the transcript with its hash.
         transcript.update(hello1_raw);
         const ch1_hash = transcript.peek(S);
         transcript = .init(S);
         transcript.update(codec.messageHash(&msg_buf, &ch1_hash));
-        const hrr = codec.serverHello(&msg_buf, tls.hello_retry_request_sequence, session_id, suite.wire(), choice.group.wire(), &.{}, true);
+        if (config.retry_cookie) options.io.randomSecure(&cookie) catch return abort(c, options, .internal_error, error.EntropyUnavailable);
+        // A request for a cookie alone keeps the key share of the client.
+        const wanted: ?u16 = if (choice.share == null) choice.group.wire() else null;
+        const hrr = codec.helloRetryRequest(&msg_buf, session_id, suite.wire(), wanted, if (config.retry_cookie) &cookie else null);
         c.writeRecord(.handshake, hrr) catch return error.WriteFailed;
         transcript.update(hrr);
         if (compat_mode) c.writeChangeCipherSpec() catch return error.WriteFailed;
@@ -226,6 +234,10 @@ fn run(
         hello = codec.ClientHello.parse(second.body) catch |e| return abortParse(c, options, e);
         if (selectSuite(config, &hello) != suite) return abort(c, options, .illegal_parameter, error.TlsIllegalParameter);
         if (!std.mem.eql(u8, hello.session_id, session_id)) return abort(c, options, .illegal_parameter, error.TlsIllegalParameter);
+        if (config.retry_cookie) {
+            const echoed = hello.cookie orelse return abort(c, options, .missing_extension, error.TlsMissingExtension);
+            if (!std.mem.eql(u8, echoed, &cookie)) return abort(c, options, .illegal_parameter, error.TlsIllegalParameter);
+        }
         const share = hello.keyShare(choice.group.wire()) orelse return abort(c, options, .illegal_parameter, error.TlsIllegalParameter);
         choice = .{ .group = choice.group, .share = share };
         transcript.update(second.raw);

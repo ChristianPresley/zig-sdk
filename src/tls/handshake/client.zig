@@ -31,7 +31,8 @@ pub const Options = struct {
     /// checks an IP address literal against the certificate but does not send it as SNI.
     host: []const u8,
     trust: Trust,
-    /// Application protocols in preference order. Empty sends no ALPN extension.
+    /// Application protocols in preference order. Empty sends no ALPN extension. Each name has
+    /// 1 to 255 bytes, and the list has at most `max_alpn_list_len` bytes with the length bytes.
     alpn: []const []const u8 = &.{},
     /// Cipher suites in preference order. The default has no AEGIS suite. To offer AEGIS
     /// too, use `suites.default_suites_with_aegis` or a list of your own.
@@ -81,6 +82,12 @@ pub const ConnectError = common.Error;
 const offered_schemes = common.signature_schemes;
 const client_verify_context = codec.client_certificate_verify_context;
 
+/// The limits of the lists of `Options`. The ClientHello buffer has a fixed size, so a longer
+/// list gives `error.TlsInvalidOptions` before the client sends anything.
+pub const max_alpn_list_len = 1024;
+pub const max_cipher_suites = 16;
+pub const max_groups = 16;
+
 /// The largest HelloRetryRequest cookie the client echoes. A larger cookie ends the
 /// handshake with `illegal_parameter`.
 pub const max_cookie_len = 8 << 10;
@@ -124,6 +131,7 @@ const Shares = struct {
 /// Run the client side of a handshake on a connected stream.
 pub fn connect(input: *Reader, output: *Writer, options: Options) ConnectError!Connection {
     if (options.cipher_suites.len == 0 or options.groups.len == 0) return error.TlsInternalError;
+    if (!optionsFit(options)) return error.TlsInvalidOptions;
     var c: Connection = .init(input, output, .client, options.read_buffer, options.write_buffer, options.allow_truncation_attacks);
     errdefer c.deinit();
     try c.setPadding(options.io, options.padding);
@@ -176,12 +184,19 @@ fn run(
     var ccs_sent = false;
 
     if (sh.is_hrr) {
-        // HelloRetryRequest: the server wants a key share for another group.
+        // HelloRetryRequest: the server wants a key share for another group, a cookie in the
+        // next ClientHello, or both (RFC 8446 section 4.1.4).
         if (!std.mem.eql(u8, sh.session_id, session_id)) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
-        const wanted = sh.key_share_group orelse return common.abort(c, alert_out, .missing_extension, error.TlsMissingExtension);
-        const group = key_share.Group.fromWire(wanted) orelse return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
-        // The group must be offered, and must not be one that already has a key share.
-        if (!offersGroup(options, group) or shares.find(group) != null) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
+        var new_group: ?key_share.Group = null;
+        if (sh.key_share_group) |wanted| {
+            const group = key_share.Group.fromWire(wanted) orelse return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
+            // The group must be offered, and must not be one that already has a key share.
+            if (!offersGroup(options, group) or shares.find(group) != null) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
+            new_group = group;
+        } else if (sh.cookie == null) {
+            // Without a key share and a cookie, the request changes nothing in the ClientHello.
+            return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
+        }
         if (sh.cookie) |cookie| if (cookie.len > max_cookie_len) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
         transcript.update(hello1);
         const ch1_hash = transcript.peek(S);
@@ -189,9 +204,12 @@ fn run(
         transcript.update(codec.messageHash(&msg_buf, &ch1_hash));
         transcript.update(first.raw);
 
-        shares.wipe();
-        shares.items[0] = key_share.KeyShare.generate(options.io, group) catch return common.abort(c, alert_out, .internal_error, error.EntropyUnavailable);
-        shares.len = 1;
+        // A request with only a cookie keeps the key shares of the first ClientHello.
+        if (new_group) |group| {
+            shares.wipe();
+            shares.items[0] = key_share.KeyShare.generate(options.io, group) catch return common.abort(c, alert_out, .internal_error, error.EntropyUnavailable);
+            shares.len = 1;
+        }
         // The first ClientHello is in the transcript, so its buffer is free again. The second
         // ClientHello has the names of the first one (RFC 8446 section 4.1.2).
         const hello2 = clientHello(ch_buf, random, session_id, options, shares.slice(), sh.cookie, first_hello.names_sent).bytes;
@@ -239,7 +257,7 @@ fn run(
     // EncryptedExtensions.
     const ee = try reader.next(c, alert_out);
     if (ee.kind != .encrypted_extensions) return common.abort(c, alert_out, .unexpected_message, error.TlsUnexpectedMessage);
-    const ee_parsed = EncryptedExtensions.parse(ee.body) catch |e| return common.abortParse(c, alert_out, e);
+    const ee_parsed = EncryptedExtensions.parse(ee.body, .{ .alpn = options.alpn.len > 0, .server_name = isServerName(options.host) }) catch |e| return common.abortParse(c, alert_out, e);
     if (ee_parsed.alpn) |name| {
         if (!offersAlpn(options, name)) return common.abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter);
         c.setAlpn(name);
@@ -382,6 +400,18 @@ fn sendClientCertificate(comptime S: type, c: *Connection, transcript: *suites.T
 // -- ClientHello -------------------------------------------------------------------------------
 
 /// True when `host` can go into the server_name extension: a DNS name, not an address.
+/// True when the lists of `options` fit in the ClientHello buffer. A host name of more than 255
+/// bytes goes out without server name indication, so it needs no check here.
+fn optionsFit(options: Options) bool {
+    if (options.cipher_suites.len > max_cipher_suites or options.groups.len > max_groups) return false;
+    var alpn_len: usize = 0;
+    for (options.alpn) |name| {
+        if (name.len == 0 or name.len > 255) return false;
+        alpn_len += 1 + name.len;
+    }
+    return alpn_len <= max_alpn_list_len;
+}
+
 fn isServerName(host: []const u8) bool {
     if (host.len == 0 or host.len > 255) return false;
     if (std.Io.net.IpAddress.parse(host, 0)) |_| return false else |_| {}
@@ -580,7 +610,8 @@ pub const ServerHello = struct {
                     if (!ext.eof()) return error.DecodeError;
                 },
                 // The client offered no pre-shared key, so the server must not select one.
-                else => return error.IllegalParameter,
+                .pre_shared_key => return error.UnsupportedExtension,
+                else => return if (codec.isKnownExtension(et)) error.IllegalParameter else error.UnsupportedExtension,
             }
         }
         if (!version_ok) return error.ProtocolVersion;
@@ -591,7 +622,13 @@ pub const ServerHello = struct {
 pub const EncryptedExtensions = struct {
     alpn: ?[]const u8 = null,
 
-    pub fn parse(body: []u8) codec.ParseError!EncryptedExtensions {
+    /// The extensions of the ClientHello that permit an answer in EncryptedExtensions.
+    pub const Offered = struct {
+        alpn: bool = true,
+        server_name: bool = true,
+    };
+
+    pub fn parse(body: []u8, offered: Offered) codec.ParseError!EncryptedExtensions {
         var d: Decoder = .fromTheirSlice(body);
         d.ensure(2) catch return error.DecodeError;
         const ext_len = d.decode(u16);
@@ -608,6 +645,7 @@ pub const EncryptedExtensions = struct {
             seen.set(et);
             switch (@as(tls.ExtensionType, @enumFromInt(et))) {
                 .application_layer_protocol_negotiation => {
+                    if (!offered.alpn) return error.UnsupportedExtension;
                     ext.ensure(3) catch return error.DecodeError;
                     const list_len = ext.decode(u16);
                     if (list_len == 0) return error.DecodeError;
@@ -621,11 +659,15 @@ pub const EncryptedExtensions = struct {
                     if (!list.eof()) return error.IllegalParameter; // exactly one protocol
                 },
                 .server_name => {
+                    if (!offered.server_name) return error.UnsupportedExtension;
                     if (len != 0) return error.DecodeError;
                 },
                 .supported_groups => {},
-                // Anything the client did not offer is a protocol violation (section 4.2).
-                else => return error.IllegalParameter,
+                // RFC 8446 section 4.2: a known extension that EncryptedExtensions cannot carry is
+                // illegal_parameter. An answer to an extension that the client did not send, or an
+                // unknown extension, is unsupported_extension.
+                .max_fragment_length, .use_srtp, .heartbeat, .client_certificate_type, .server_certificate_type, .early_data => return error.UnsupportedExtension,
+                else => return if (codec.isKnownExtension(et)) error.IllegalParameter else error.UnsupportedExtension,
             }
         }
         return result;
@@ -770,9 +812,27 @@ test "trailing bytes and duplicates in server extensions are refused" {
 
     // EncryptedExtensions: an ALPN body with a trailing byte, and a second server_name.
     var ee_alpn = [_]u8{ 0, 10, 0, 16, 0, 6, 0, 3, 2, 'h', '2', 0 };
-    try std.testing.expectError(error.DecodeError, EncryptedExtensions.parse(&ee_alpn));
+    try std.testing.expectError(error.DecodeError, EncryptedExtensions.parse(&ee_alpn, .{}));
     var ee_names = [_]u8{ 0, 8, 0, 0, 0, 0, 0, 0, 0, 0 };
-    try std.testing.expectError(error.IllegalParameter, EncryptedExtensions.parse(&ee_names));
+    try std.testing.expectError(error.IllegalParameter, EncryptedExtensions.parse(&ee_names, .{}));
+
+    // EncryptedExtensions: answers to extensions that the client did not send, unknown
+    // extensions, and known extensions that the message cannot carry.
+    var ee_alpn_ok = [_]u8{ 0, 9, 0, 16, 0, 5, 0, 3, 2, 'h', '2' };
+    _ = try EncryptedExtensions.parse(&ee_alpn_ok, .{});
+    try std.testing.expectError(error.UnsupportedExtension, EncryptedExtensions.parse(&ee_alpn_ok, .{ .alpn = false }));
+    var ee_name = [_]u8{ 0, 4, 0, 0, 0, 0 };
+    try std.testing.expectError(error.UnsupportedExtension, EncryptedExtensions.parse(&ee_name, .{ .server_name = false }));
+    var ee_unknown = [_]u8{ 0, 4, 0xfe, 0xfe, 0, 0 };
+    try std.testing.expectError(error.UnsupportedExtension, EncryptedExtensions.parse(&ee_unknown, .{}));
+    var ee_early = [_]u8{ 0, 4, 0, 42, 0, 0 };
+    try std.testing.expectError(error.UnsupportedExtension, EncryptedExtensions.parse(&ee_early, .{}));
+    var ee_versions = [_]u8{ 0, 6, 0, 43, 0, 2, 3, 4 };
+    try std.testing.expectError(error.IllegalParameter, EncryptedExtensions.parse(&ee_versions, .{}));
+    // ServerHello: a pre-shared key that the client did not offer, and an unknown extension.
+    try std.testing.expectError(error.UnsupportedExtension, ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions ++ share ++ "\x00\x29\x00\x02\x00\x00")));
+    try std.testing.expectError(error.UnsupportedExtension, ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions ++ share ++ "\xfe\xfe\x00\x00")));
+    try std.testing.expectError(error.IllegalParameter, ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions ++ share ++ "\x00\x10\x00\x00")));
 
     // CertificateRequest: signature_algorithms with a trailing byte, and a duplicate unknown
     // extension.
@@ -805,4 +865,37 @@ test "server name eligibility" {
     try std.testing.expect(!isServerName("::1"));
     try std.testing.expect(!isServerName(""));
     try std.testing.expect(!isServerName("bad host"));
+}
+
+test "options outside the limits of the client hello buffer give TlsInvalidOptions" {
+    const io = std.testing.io;
+    var read_buf: [Connection.min_read_buffer_len]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+    var in: Reader = .fixed("");
+    var out_buf: [64]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    const base: Options = .{ .io = io, .host = "localhost", .trust = .self_signed, .read_buffer = &read_buf, .write_buffer = &write_buf };
+    try std.testing.expect(optionsFit(base));
+    const long_name = [_]u8{'a'} ** 256;
+    var options = base;
+    options.alpn = &.{&long_name};
+    try std.testing.expect(!optionsFit(options));
+    options.alpn = &.{""};
+    try std.testing.expect(!optionsFit(options));
+    const name = [_]u8{'a'} ** 200;
+    options.alpn = &.{ &name, &name, &name, &name, &name, &name };
+    try std.testing.expect(!optionsFit(options));
+    options.alpn = &.{ &name, &name, &name, &name, &name };
+    try std.testing.expect(optionsFit(options));
+    options = base;
+    options.cipher_suites = &([_]Suite{.AES_128_GCM_SHA256} ** (max_cipher_suites + 1));
+    try std.testing.expect(!optionsFit(options));
+    options = base;
+    options.groups = &([_]key_share.Group{.x25519} ** (max_groups + 1));
+    try std.testing.expect(!optionsFit(options));
+    // connect refuses the options before it writes a byte.
+    options = base;
+    options.alpn = &.{&long_name};
+    try std.testing.expectError(error.TlsInvalidOptions, connect(&in, &out, options));
+    try std.testing.expectEqual(0, out.end);
 }

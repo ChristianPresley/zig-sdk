@@ -138,6 +138,7 @@ const ServerSetup = struct {
     now_sec: ?i64 = null,
     /// An OCSP response to staple to the leaf.
     ocsp_staple: ?[]const u8 = null,
+    retry_cookie: bool = false,
 };
 
 /// One handshake and echo between the SDK client and the SDK server. Returns the client
@@ -157,6 +158,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
             .send_client_ca_names = server_setup.send_client_ca_names,
             .client_revocation = server_setup.client_revocation,
             .ocsp_staples = if (server_setup.ocsp_staple != null) &staples else &.{},
+            .retry_cookie = server_setup.retry_cookie,
         }),
         .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
         .io = io,
@@ -255,6 +257,20 @@ test "handshake with every self-signed key type" {
         try roundTrip(io, &chain, .{ .alpn = &.{ "h2", "http/1.1" } }, .{ .trust = .self_signed, .alpn = &.{"http/1.1"} }, &echo, "http/1.1");
         try std.testing.expectEqualStrings("http/1.1", echo.alpn().?);
     }
+}
+
+test "a HelloRetryRequest with a cookie, with and without a key share" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer chain.deinit();
+    var echo: Echo = undefined;
+    // Only a cookie: the client keeps its key share and echoes the cookie.
+    try roundTrip(io, &chain, .{ .retry_cookie = true }, .{ .trust = .self_signed, .groups = &.{.x25519}, .expect_group = .x25519 }, &echo, null);
+    // The default groups: the hybrid share and the X25519 share stay.
+    try roundTrip(io, &chain, .{ .retry_cookie = true }, .{ .trust = .self_signed, .expect_group = .x25519_mlkem768 }, &echo, null);
+    // A cookie and a key share for another group.
+    try roundTrip(io, &chain, .{ .retry_cookie = true, .groups = &.{.secp384r1} }, .{ .trust = .self_signed, .groups = &.{ .x25519, .secp384r1 }, .expect_group = .secp384r1 }, &echo, null);
 }
 
 test "a chain verifies against the CA set, by name and by address" {

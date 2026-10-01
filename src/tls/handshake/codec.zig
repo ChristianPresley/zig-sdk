@@ -15,7 +15,16 @@ pub const ParseError = error{
     ProtocolVersion,
     /// A mandatory extension is absent: alert `missing_extension`.
     MissingExtension,
+    /// The peer answered with an extension that this side did not send, or with an unknown
+    /// one: alert `unsupported_extension` (RFC 8446 section 4.2).
+    UnsupportedExtension,
 };
+
+/// True when `extension_type` has a name in `tls.ExtensionType`.
+pub fn isKnownExtension(extension_type: u16) bool {
+    for (std.enums.values(tls.ExtensionType)) |v| if (@intFromEnum(v) == extension_type) return true;
+    return false;
+}
 
 pub const HandshakeType = tls.HandshakeType;
 
@@ -48,6 +57,8 @@ pub const ClientHello = struct {
     has_early_data: bool = false,
     /// The client asks for a stapled OCSP response (RFC 6066 section 8).
     status_request: bool = false,
+    /// The cookie of a second ClientHello (RFC 8446 section 4.2.2).
+    cookie: ?[]const u8 = null,
 
     pub fn parse(body: []u8) ParseError!ClientHello {
         var d: Decoder = .fromTheirSlice(body);
@@ -157,6 +168,13 @@ pub const ClientHello = struct {
                 .certificate_authorities => {
                     hello.certificate_authorities = try ca_names.parse(ext.buf);
                     continue;
+                },
+                .cookie => {
+                    ext.ensure(2) catch return error.DecodeError;
+                    const cookie_len = ext.decode(u16);
+                    if (cookie_len == 0) return error.DecodeError;
+                    ext.ensure(cookie_len) catch return error.DecodeError;
+                    hello.cookie = ext.slice(cookie_len);
                 },
                 .status_request => {
                     ext.ensure(1) catch return error.DecodeError;
@@ -310,6 +328,40 @@ pub fn serverHello(buf: []u8, random: [32]u8, session_id: []const u8, suite: u16
         b.bytes(public);
     }
     b.endLen(u16, ks);
+    b.endLen(u16, exts);
+    b.endLen(u24, msg);
+    return b.slice();
+}
+
+/// A HelloRetryRequest (RFC 8446 section 4.1.4) with the group of the wanted key share, a
+/// cookie, or both. At least one of the two must be present.
+pub fn helloRetryRequest(buf: []u8, session_id: []const u8, suite: u16, group: ?u16, cookie: ?[]const u8) []u8 {
+    std.debug.assert(group != null or cookie != null);
+    var b: Builder = .{ .buf = buf };
+    b.byte(@intFromEnum(HandshakeType.server_hello));
+    const msg = b.beginLen(u24);
+    b.int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2));
+    b.bytes(&tls.hello_retry_request_sequence);
+    b.byte(@intCast(session_id.len));
+    b.bytes(session_id);
+    b.int(u16, suite);
+    b.byte(0); // legacy_compression_method
+    const exts = b.beginLen(u16);
+    b.int(u16, @intFromEnum(tls.ExtensionType.supported_versions));
+    b.int(u16, 2);
+    b.int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_3));
+    if (group) |g| {
+        b.int(u16, @intFromEnum(tls.ExtensionType.key_share));
+        b.int(u16, 2);
+        b.int(u16, g);
+    }
+    if (cookie) |value| {
+        b.int(u16, @intFromEnum(tls.ExtensionType.cookie));
+        const ext = b.beginLen(u16);
+        b.int(u16, @intCast(value.len));
+        b.bytes(value);
+        b.endLen(u16, ext);
+    }
     b.endLen(u16, exts);
     b.endLen(u24, msg);
     return b.slice();

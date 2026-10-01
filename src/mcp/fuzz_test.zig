@@ -193,7 +193,7 @@ fn tlsParsers(_: void, smith: *Smith) anyerror!void {
     @memcpy(copy[0..bytes.len], bytes);
     _ = tls.codec.ClientHello.parse(copy[0..bytes.len]) catch {};
     _ = tls.client.ServerHello.parse(copy[0..bytes.len]) catch {};
-    _ = tls.client.EncryptedExtensions.parse(copy[0..bytes.len]) catch {};
+    _ = tls.client.EncryptedExtensions.parse(copy[0..bytes.len], .{}) catch {};
     _ = tls.client.CertificateRequest.parse(copy[0..bytes.len]) catch {};
     _ = tls.ca_names.parse(bytes) catch {};
     _ = tls.pss.signatureParams(bytes) catch {};

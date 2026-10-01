@@ -20,6 +20,7 @@ pub const Error = verify.Error || verify.SignatureError || error{
     TlsUnexpectedMessage,
     TlsProtocolVersion,
     TlsMissingExtension,
+    TlsUnsupportedExtension,
     TlsHandshakeFailure,
     TlsNoApplicationProtocol,
     TlsUnrecognizedName,
@@ -29,6 +30,9 @@ pub const Error = verify.Error || verify.SignatureError || error{
     TlsInternalError,
     /// The server requires a client certificate and the client sent none.
     TlsCertificateRequired,
+    /// An option of the client is outside its limits, for example an ALPN name of more than
+    /// 255 bytes. The client sent nothing.
+    TlsInvalidOptions,
 };
 
 /// The signature schemes both sides accept in a CertificateVerify and, for the certificate
@@ -271,6 +275,7 @@ pub fn abortParse(c: *Connection, alert_out: ?*tls.Alert, err: codec.ParseError)
         error.IllegalParameter => abort(c, alert_out, .illegal_parameter, error.TlsIllegalParameter),
         error.ProtocolVersion => abort(c, alert_out, .protocol_version, error.TlsProtocolVersion),
         error.MissingExtension => abort(c, alert_out, .missing_extension, error.TlsMissingExtension),
+        error.UnsupportedExtension => abort(c, alert_out, .unsupported_extension, error.TlsUnsupportedExtension),
     };
 }
 

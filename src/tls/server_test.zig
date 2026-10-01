@@ -427,6 +427,22 @@ test "interop: openssl s_client with RSA-PSS and X25519MLKEM768" {
     }
 }
 
+test "interop: openssl s_client echoes the cookie of a HelloRetryRequest of the SDK server" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (opensslVersion(io, gpa) == null) return error.SkipZigTest;
+    var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer chain.deinit();
+    const chains = [_]*const tls.CertChain{&chain};
+    var echo: Echo = undefined;
+    // The X25519 share of s_client is good, so the request has only the cookie.
+    const out = try opensslClientConfig(gpa, io, .{ .chains = &chains, .retry_cookie = true }, &.{ "-CAfile", "test/fixtures/tls/pem/p256.crt", "-verify_return_error", "-ign_eof", "-groups", "X25519" }, &echo, "after the cookie\n");
+    defer gpa.free(out);
+    try echo.result;
+    try expectContains(out, "Verify return code: 0 (ok)");
+    try expectContains(out, "after the cookie");
+}
+
 test "interop: openssl s_client removes the padding of the SDK server" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
