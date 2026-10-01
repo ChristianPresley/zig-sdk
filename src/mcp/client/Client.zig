@@ -509,8 +509,8 @@ pub fn complete(self: *Client, arena: Allocator, params: types.CompleteRequestPa
     return (try self.request(arena, .@"completion/complete", try toValue(arena, params), options)).result;
 }
 
-/// Open a `subscriptions/listen` stream. `on_event` receives every event notification. The
-/// call returns when the server closes the stream gracefully, or with `error.Canceled` when
+/// Open a `subscriptions/listen` stream. `options.on_notification` receives every event
+/// notification. The call returns when the server closes the stream gracefully, or with `error.Canceled` when
 /// the cancel token fires.
 pub fn listen(self: *Client, arena: Allocator, filter: types.SubscriptionsListenRequestParams, options: RequestOptions) RequestError!types.SubscriptionsListenResult {
     return (try self.request(arena, .@"subscriptions/listen", try toValue(arena, filter), options)).result;

@@ -328,7 +328,8 @@ pub const Client = struct {
 
     pub const Challenge = common.Challenge;
 
-    /// Parse a `WWW-Authenticate` value. The parser knows only the `Bearer` scheme.
+    /// Parse a `WWW-Authenticate` value. The parser reads the `Bearer` and `DPoP` schemes and
+    /// ignores other schemes.
     pub const parseChallenge = common.parseChallenge;
 
     /// Obtain a token for `server_url` after a challenge. `attempt` starts at 1 for the first

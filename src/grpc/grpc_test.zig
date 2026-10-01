@@ -171,7 +171,7 @@ test "grpc: discover, tools, progress, header mirroring, mrtr and errors" {
     var diag: Client.Diagnostics = .{};
     try std.testing.expectError(error.Rpc, f.client.callTool(arena, "nope", null, .{ .timeout = .fromSeconds(10), .diagnostics = &diag }));
     try std.testing.expectEqual(@as(i64, -32602), diag.rpc_error.?.code);
-    // An unknown method ends the call in the trailers; the client still sees the error.
+    // An unknown method gets a JSON-RPC error response message, then `grpc-status: 0`.
     try std.testing.expectError(error.Rpc, f.client.requestAs(arena, types.EmptyResult, "nope/method", .{ .object = .empty }, .{ .timeout = .fromSeconds(10), .diagnostics = &diag }));
     try std.testing.expectEqual(@as(i64, -32601), diag.rpc_error.?.code);
 
