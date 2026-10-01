@@ -4,8 +4,27 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- `limits.listen_ack_timeout` (10 s): the client waits this time for the acknowledgment of a `subscriptions/listen` stream. Then it cancels the stream, and the request returns `error.Timeout`. Zero disables the limit. All client transports obey it through `Transport.Exchange.first_frame_timeout`.
+- `json.checkDepth`, `json.parseTreeMaxDepth` and `jsonrpc.Message.parseMaxDepth` check the nesting depth of a JSON text before the parse, without recursion.
+
+### Changed
+
+- `json.parseTree` and `jsonrpc.Message.parse` reject a text that nests deeper than 256 levels (`json.max_tree_depth`) or 200 levels (`json.max_message_depth`). `std.json.Stringify` cannot write more than 256 levels in a safe build mode.
+- The HTTP server supervises each connection in a second task. At the shutdown, it ends a connection that waits for a request at once, and a busy connection after `limits.shutdown_grace`. Before, the shutdown waited until each peer closed its connection.
+
+### Removed
+
+- Breaking: `Limits.cancel_notify_timeout` and `Limits.max_step_up_attempts`. No code used them. Each authorization client has its own `max_step_up_attempts` option.
+- Breaking: `Limits.http.listen_ack_timeout`. It is now `Limits.listen_ack_timeout`, because all transports obey it.
+
 ### Fixed
 
+- The Streamable HTTP server obeys `limits.http.head_timeout` and `limits.http.idle_timeout`. A request head that does not arrive in `head_timeout` (10 s, with the TLS handshake for the first request) gets HTTP 408. A body that does not arrive in `idle_timeout` (60 s) after its head also gets HTTP 408. A keep-alive connection without a new request for `idle_timeout` closes without a response. Before, a slow client could keep one of the `http.max_connections` connections without a time limit.
+- The servers of all transports obey `limits.json_max_depth` (64). A message that nests deeper gets `-32700` with a null id. The client fails a request whose response nests deeper with `error.InvalidResponse`. Before, the server parsed a message of any depth, and `std.json.Stringify` panics in a safe build mode when the server serializes a part of more than 256 levels, for example the parameters of a task.
+- The server refuses a `subscriptions/listen` filter larger than `limits.max_filter_bytes` (64 KiB) as compact JSON with `-32603`.
+- The HTTP client transport gives each SSE event to the request when its bytes arrive. Before, it held back an event until the next bytes came, thus a listen stream got its acknowledgment and its events late, with the next keep-alive comment.
 - The HTTP/2 connection of the gRPC transport answers a frame larger than the maximum frame size with `GOAWAY` and `FRAME_SIZE_ERROR` (RFC 9113 section 4.2). Before, it sent `PROTOCOL_ERROR`. A `PING`, `PRIORITY`, `RST_STREAM`, `SETTINGS` or `WINDOW_UPDATE` frame with a wrong length also gives `FRAME_SIZE_ERROR`.
 - Correction to the notes of 0.2.0: only the server checks `includeContext` against the client capability `sampling.context`. The client does not. The client validates elicitation URLs, form answers and sampling messages with tool results, as the notes say.
 
