@@ -1,0 +1,73 @@
+// MCP protocol schema based on the MCP specification:
+// https://modelcontextprotocol.io/specification/2026-07-28/
+// Last Updated on: 2026-07-20
+
+syntax = "proto3";
+
+package model_context_protocol;
+
+import "mcp_messages.proto";
+
+option java_multiple_files = true;
+option java_outer_classname = "McpProto";
+option java_package = "com.google.mcp";
+
+// TODO(roth):
+// - add Tasks support
+// - add Discovery and Capabilities
+// - add anything else that might be missing from the 2026-07-28 spec
+// - add a server-side streaming call for watch-based notifications
+
+service Mcp {
+  //
+  // Resources
+  //
+
+  // List resources.
+  rpc ListResources(ListResourcesRequest) returns (ListResourcesResponse);
+  // Read a resource.
+  // In order to better integrate with existing data plane mechanisms for
+  // request routing and authz, the client will add a header called
+  // mcp_resource whose value is the name of the resource being requested.
+  rpc ReadResource(ReadResourceRequest) returns (ReadResourceResponse);
+  // List resource templates.
+  rpc ListResourceTemplates(ListResourceTemplatesRequest)
+      returns (ListResourceTemplatesResponse);
+
+  //
+  // Prompts
+  //
+
+  // List prompts.
+  rpc ListPrompts(ListPromptsRequest) returns (ListPromptsResponse);
+
+  // Get a prompt.
+  // In order to better integrate with existing data plane mechanisms for
+  // request routing and authz, the client will add a header called
+  // mcp_prompt whose value is the name of the prompt being requested.
+  rpc GetPrompt(GetPromptRequest) returns (GetPromptResponse);
+
+  //
+  // Tools
+  //
+
+  // List tools.
+  rpc ListTools(ListToolsRequest) returns (ListToolsResponse);
+
+  // Call a tool.
+  // In order to better integrate with existing data plane mechanisms for
+  // request routing and authz, the client will add a header called
+  // mcp_tool whose value is the name of the tool being called.
+  rpc CallTool(CallToolRequest) returns (CallToolResponse);
+
+  //
+  // Completions
+  //
+
+  // Requests completions.
+  // In order to better integrate with existing data plane mechanisms for
+  // request routing and authz, the client will add a header called
+  // mcp_resource whose value is the name of the resource or prompt being
+  // used for completion.
+  rpc Complete(CompletionRequest) returns (CompletionResponse);
+}

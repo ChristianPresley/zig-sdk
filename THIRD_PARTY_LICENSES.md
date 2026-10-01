@@ -9,5 +9,6 @@ This repository has no third-party source code. The items below are data files.
 | Normative sentences quoted from these pages | `docs/spec/requirements.zon`, `docs/generated/conformance-matrix.md` | Extracted from `test/fixtures/mcp_spec_2026_07_28/` by `zig build extract-requirements` | The license of the pages. |
 | HPACK static table, Huffman code and the examples of appendix C | `src/grpc/http2/hpack/tables.zig`, `src/grpc/http2/hpack/rfc7541_examples.zig` | RFC 7541, https://www.rfc-editor.org/rfc/rfc7541 | IETF Trust Legal Provisions, code components under the BSD licence. |
 | JSON Schema Test Suite, draft 2020-12 test cases and remote documents | `test/fixtures/json_schema_test_suite/` | https://github.com/json-schema-org/JSON-Schema-Test-Suite (commit in `UPSTREAM.zon`) | MIT. See `LICENSE` in that directory. |
+| Proto files `mcp.proto` and `mcp_messages.proto` of the typed gRPC binding | `test/fixtures/google_mcp_grpc_proto/` | https://github.com/GoogleCloudPlatform/mcp-grpc-transport-proto (commit in `UPSTREAM.zon`) | MIT. See `LICENSE` in that directory. |
 
 The ASD-STE100 standard is cited by rule number only. No rule text and no dictionary entry of the standard is included.

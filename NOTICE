@@ -16,5 +16,11 @@ the commit recorded in UPSTREAM.zon, with the upstream LICENSE file next to them
 docs/spec/requirements.zon and docs/generated/conformance-matrix.md quote sentences of these
 pages.
 
+This product includes the proto files mcp.proto and mcp_messages.proto from the repository
+https://github.com/GoogleCloudPlatform/mcp-grpc-transport-proto, Copyright (c) 2025 Google
+Cloud Platform, vendored under test/fixtures/google_mcp_grpc_proto/ at the commit recorded in
+UPSTREAM.zon. The upstream project distributes them under the MIT License; the upstream
+LICENSE file is included next to the files.
+
 No text of the ASD-STE100 Simplified Technical English standard is included in this
 product. The project cites its rules by number only.

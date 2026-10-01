@@ -1,0 +1,15 @@
+.{
+    .repo = "https://github.com/GoogleCloudPlatform/mcp-grpc-transport-proto",
+    .commit = "1d2216c1eca5ac20267f49cd666efaeac2fd2eb9",
+    .release = "v0.2.0",
+    .committed = "2026-08-31",
+    .fetched = "2026-09-30",
+    .license = "LICENSE (MIT)",
+    .modified = false,
+    // Copied files, below the root of the upstream repository, with their git blob ids:
+    .copied = .{
+        "proto/mcp.proto (33e26a74e6c5968924c6ffe272eb774349c50299)",
+        "proto/mcp_messages.proto (d1bfc1a510675dce3737a1e165b9d580c24795b9)",
+        "LICENSE (4d2d9bdfdfbed75817d10edf0fe2aea0ff01749b)",
+    },
+}
