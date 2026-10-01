@@ -106,7 +106,11 @@ pub const CertificateVerifyMessage = struct {
 /// Map a chain validation error to its alert and return it.
 pub fn abortVerify(c: *Connection, alert_out: ?*tls.Alert, err: verify.Error) verify.Error {
     return switch (err) {
-        error.TlsCertificateInvalid, error.TlsCertificateHostMismatch => abort(c, alert_out, .bad_certificate, err),
+        error.TlsCertificateInvalid,
+        error.TlsCertificateHostMismatch,
+        error.TlsCertificateNameNotPermitted,
+        error.TlsCertificateUnsupportedConstraint,
+        => abort(c, alert_out, .bad_certificate, err),
         error.TlsCertificateNotVerified, error.TlsCertificateIssuerNotFound, error.TlsCertificateNotCa => abort(c, alert_out, .unknown_ca, err),
         error.TlsCertificateExpired, error.TlsCertificateNotYetValid => abort(c, alert_out, .certificate_expired, err),
         error.TlsCertificateWrongPurpose => abort(c, alert_out, .unsupported_certificate, err),

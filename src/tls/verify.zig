@@ -1,6 +1,6 @@
 //! Certificate chain validation for the TLS client and for client certificates on the
-//! server. It has the trust policies, the chain walk with CA constraints, the host name
-//! check and the CertificateVerify signature check.
+//! server. It has the trust policies, the chain walk with CA constraints, the name
+//! constraints, the host name check and the CertificateVerify signature check.
 const std = @import("std");
 const crypto = std.crypto;
 const tls = crypto.tls;
@@ -8,6 +8,7 @@ const Certificate = crypto.Certificate;
 const CaSet = @import("CaSet.zig");
 const pss = @import("pss.zig");
 const der = @import("der.zig");
+const name_constraints = @import("name_constraints.zig");
 const x509 = @import("x509.zig");
 
 /// How the SDK verifies the peer certificate.
@@ -38,6 +39,11 @@ pub const Error = error{
     TlsCertificateNotCa,
     /// The extended key usage of the leaf or of an intermediate does not permit the purpose.
     TlsCertificateWrongPurpose,
+    /// A name of a certificate is outside the name constraints of a CA above it.
+    TlsCertificateNameNotPermitted,
+    /// A critical name constraint has a form that the SDK cannot check, and a certificate
+    /// below the CA has a name of that form.
+    TlsCertificateUnsupportedConstraint,
 };
 
 /// The role of the peer that presents the chain. The extended key usage of the leaf and
@@ -106,6 +112,12 @@ pub fn verifyChain(certs: []const []const u8, trust: Trust, options: ChainOption
             while (true) {
                 if (try issuingAnchor(trust, current, now_sec)) |anchor| {
                     try requireCa(anchor.der, index, .anchor);
+                    const path = certs[0 .. index + 1];
+                    name_constraints.checkPath(path, anchor.der, options.host) catch |e| return switch (e) {
+                        error.NameNotPermitted => error.TlsCertificateNameNotPermitted,
+                        error.UnsupportedConstraint => error.TlsCertificateUnsupportedConstraint,
+                        error.Malformed => error.TlsCertificateInvalid,
+                    };
                     return leaf;
                 }
                 index += 1;
@@ -500,4 +512,74 @@ test "every anchor with the issuer name gets a try" {
     _ = try serverChain(&.{leaf}, "localhost", .{ .ca_set = &set }, test_now);
     // The time error of the leaf comes first when no anchor verifies it.
     try std.testing.expectError(error.TlsCertificateExpired, serverChain(&.{leaf}, "localhost", .{ .ca_set = &set }, test_now + 400 * 365 * 86400));
+}
+
+/// Load each named fixture of `pem/` into `out` and return the filled part.
+fn loadFixtures(gpa: std.mem.Allocator, names: []const []const u8, out: [][]u8) ![][]u8 {
+    for (names, 0..) |name, i| {
+        var path_buf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "test/fixtures/tls/pem/{s}.crt", .{name});
+        out[i] = try loadDer(gpa, path);
+    }
+    return out[0..names.len];
+}
+
+fn freeFixtures(gpa: std.mem.Allocator, certs: [][]u8) void {
+    for (certs) |c| gpa.free(c);
+}
+
+/// Verify the named chain against the named anchor for `host`.
+fn checkFixtureChain(names: []const []const u8, anchor_name: []const u8, host: ?[]const u8) Error!void {
+    const gpa = std.testing.allocator;
+    var buf: [max_certs][]u8 = undefined;
+    const certs = loadFixtures(gpa, names, &buf) catch return error.TlsCertificateInvalid;
+    defer freeFixtures(gpa, certs);
+    var anchor_buf: [1][]u8 = undefined;
+    const anchor = loadFixtures(gpa, &.{anchor_name}, &anchor_buf) catch return error.TlsCertificateInvalid;
+    defer freeFixtures(gpa, anchor);
+    var set: CaSet = .init(gpa);
+    defer set.deinit();
+    set.addDer(anchor[0]) catch return error.TlsCertificateInvalid;
+    var list: [max_certs][]const u8 = undefined;
+    for (certs, 0..) |c, i| list[i] = c;
+    _ = try serverChain(list[0..certs.len], host, .{ .ca_set = &set }, test_now);
+}
+
+test "name constraints of an intermediate limit each name form" {
+    // nc-ok.crt has a permitted name of each form.
+    for ([_][]const u8{ "www.example.com", "example.com", "api.example.org", "10.2.3.4", "127.0.0.1", "fd00::1" }) |host| {
+        try checkFixtureChain(&.{ "nc-ok", "nc-ca" }, "nc-root", host);
+    }
+    const refused = [_]struct { leaf: []const u8, host: []const u8 }{
+        .{ .leaf = "nc-excluded", .host = "127.0.0.1" }, // the dNSName bad.example.com is excluded
+        .{ .leaf = "nc-outside", .host = "www.example.net" },
+        .{ .leaf = "nc-apex", .host = "example.org" }, // .example.org permits only subdomains
+        .{ .leaf = "nc-ip-excluded", .host = "www.example.com" },
+        .{ .leaf = "nc-ip-outside", .host = "www.example.com" },
+        .{ .leaf = "nc-dn-outside", .host = "www.example.com" },
+        .{ .leaf = "nc-email-outside", .host = "www.example.com" },
+        .{ .leaf = "nc-uri-outside", .host = "www.example.com" },
+    };
+    for (refused) |case| {
+        try std.testing.expectError(error.TlsCertificateNameNotPermitted, checkFixtureChain(&.{ case.leaf, "nc-ca" }, "nc-root", case.host));
+    }
+    // The checks also apply without a host, for example to a client certificate.
+    try std.testing.expectError(error.TlsCertificateNameNotPermitted, checkFixtureChain(&.{ "nc-outside", "nc-ca" }, "nc-root", null));
+}
+
+test "name constraints of two CAs intersect and an anchor can have them too" {
+    // nc-sub-ca.crt permits only www.example.com, below nc-ca.crt.
+    try checkFixtureChain(&.{ "nc-sub-ok", "nc-sub-ca", "nc-ca" }, "nc-root", "www.example.com");
+    try std.testing.expectError(error.TlsCertificateNameNotPermitted, checkFixtureChain(&.{ "nc-sub-outside", "nc-sub-ca", "nc-ca" }, "nc-root", "api.example.com"));
+    // The constrained CA as the trust anchor.
+    try checkFixtureChain(&.{"nc-ok"}, "nc-ca", "www.example.com");
+    try std.testing.expectError(error.TlsCertificateNameNotPermitted, checkFixtureChain(&.{"nc-excluded"}, "nc-ca", "127.0.0.1"));
+}
+
+test "a self-issued intermediate gets no name check, a critical unknown form fails" {
+    // The subject of nc-self-ca.crt is outside the permitted directory name, but it is
+    // self-issued and not the leaf.
+    try checkFixtureChain(&.{ "nc-self-leaf", "nc-self-ca", "nc-ca" }, "nc-root", "www.example.com");
+    // nc-rid-ca.crt constrains registered IDs and the leaf has one.
+    try std.testing.expectError(error.TlsCertificateUnsupportedConstraint, checkFixtureChain(&.{ "nc-rid-leaf", "nc-rid-ca" }, "nc-root", "www.example.com"));
 }

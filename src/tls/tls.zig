@@ -27,6 +27,7 @@ pub const CaSet = @import("CaSet.zig");
 pub const verify = @import("verify.zig");
 pub const Trust = verify.Trust;
 pub const x509 = @import("x509.zig");
+pub const name_constraints = @import("name_constraints.zig");
 
 /// The std TLS toolbox this implementation reuses: enums, `Decoder` and key derivation.
 pub const std_tls = std.crypto.tls;

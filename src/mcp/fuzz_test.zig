@@ -207,6 +207,13 @@ fn tlsParsers(_: void, smith: *Smith) anyerror!void {
     _ = tls.x509.basicConstraints(bytes) catch {};
     _ = tls.x509.keyUsage(bytes) catch {};
     _ = tls.x509.extendedKeyUsage(bytes) catch {};
+    if (tls.name_constraints.NameConstraints.parse(bytes, true)) |nc| {
+        nc.checkName(.{ .form = .dns_name, .value = "www.example.com" }) catch {};
+        nc.checkName(.{ .form = .directory_name, .value = bytes }) catch {};
+        nc.checkName(.{ .form = .uri, .value = bytes }) catch {};
+        nc.checkName(.{ .form = .rfc822_name, .value = bytes }) catch {};
+    } else |_| {}
+    tls.name_constraints.checkPath(&.{bytes}, bytes, "localhost") catch {};
     _ = tls.verify.verifyChain(&.{bytes}, .self_signed, .{ .purpose = .server, .host = "localhost", .now_sec = 0 }) catch {};
     var it: tls.pem.Iterator = .init(bytes);
     while (it.next()) |block| {

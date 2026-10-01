@@ -7,6 +7,7 @@ const der = @import("der.zig");
 const oid_basic_constraints = "\x55\x1d\x13";
 const oid_key_usage = "\x55\x1d\x0f";
 const oid_subject_alt_name = "\x55\x1d\x11";
+pub const oid_name_constraints = "\x55\x1d\x1e";
 const oid_ext_key_usage = "\x55\x1d\x25";
 const oid_any_ext_key_usage = "\x55\x1d\x25\x00";
 const oid_kp_server_auth = "\x2b\x06\x01\x05\x05\x07\x03\x01";
@@ -134,18 +135,78 @@ fn extensions(cert: []const u8) der.Error!?der.Element {
     return null;
 }
 
-/// The value of the extension `oid`, or null when absent.
-fn findExtension(cert: []const u8, oid: []const u8) der.Error!?[]const u8 {
+/// One extension: the content of its `OCTET STRING` and its critical flag.
+pub const Extension = struct {
+    value: []const u8,
+    critical: bool,
+};
+
+/// Parse one `Extension` of a certificate, a CRL or an OCSP response. The `oid` field is
+/// the element of the extension ID.
+pub fn parseExtension(ext: der.Element) der.Error!struct { oid: der.Element, extension: Extension } {
+    var parts = (try ext.expect(der.tag_sequence)).children();
+    const id = try (try parts.require()).expect(der.tag_oid);
+    var value = try parts.require();
+    var critical = false;
+    if (value.tag == 0x01) {
+        if (value.content.len != 1) return error.InvalidLength;
+        critical = value.content[0] != 0;
+        value = try parts.require();
+    }
+    _ = try value.expect(der.tag_octet_string);
+    if (try parts.next() != null) return error.InvalidLength;
+    return .{ .oid = id, .extension = .{ .value = value.content, .critical = critical } };
+}
+
+/// The extension `oid` of a certificate, or null when absent.
+pub fn findExtensionFull(cert: []const u8, oid: []const u8) der.Error!?Extension {
     const exts = (try extensions(cert)) orelse return null;
     var it = exts.children();
     while (try it.next()) |ext| {
-        var parts = (try ext.expect(der.tag_sequence)).children();
-        const id = try (try parts.require()).expect(der.tag_oid);
-        var value = try parts.require();
-        if (value.tag == 0x01) value = try parts.require(); // critical BOOLEAN
-        if (id.isOid(oid)) return (try value.expect(der.tag_octet_string)).content;
+        const parsed = try parseExtension(ext);
+        if (parsed.oid.isOid(oid)) return parsed.extension;
     }
     return null;
+}
+
+/// The value of the extension `oid`, or null when absent.
+fn findExtension(cert: []const u8, oid: []const u8) der.Error!?[]const u8 {
+    const ext = (try findExtensionFull(cert, oid)) orelse return null;
+    return ext.value;
+}
+
+/// The fields of the to-be-signed part of a certificate that the checks of the SDK read.
+pub const TbsFields = struct {
+    /// The `INTEGER` of the serial number.
+    serial: der.Element,
+    /// The `Name` of the issuer.
+    issuer: der.Element,
+    /// The `Name` of the subject.
+    subject: der.Element,
+    /// The `SubjectPublicKeyInfo`.
+    spki: der.Element,
+};
+
+/// Read the fields of `TbsFields` from a DER certificate.
+pub fn tbsFields(cert: []const u8) der.Error!TbsFields {
+    const outer = try (try der.parse(cert)).expect(der.tag_sequence);
+    var it = outer.children();
+    const tbs = try (try it.require()).expect(der.tag_sequence);
+    var fields = tbs.children();
+    var serial = try fields.require();
+    if (serial.tag == 0xa0) serial = try fields.require(); // the version
+    _ = try fields.require(); // the signature algorithm
+    const issuer = try (try fields.require()).expect(der.tag_sequence);
+    _ = try fields.require(); // the validity
+    const subject = try (try fields.require()).expect(der.tag_sequence);
+    const spki = try (try fields.require()).expect(der.tag_sequence);
+    return .{ .serial = try serial.expect(der.tag_integer), .issuer = issuer, .subject = subject, .spki = spki };
+}
+
+/// True when the issuer and the subject of the certificate have the same bytes.
+pub fn isSelfIssued(cert: []const u8) der.Error!bool {
+    const fields = try tbsFields(cert);
+    return std.mem.eql(u8, fields.issuer.raw, fields.subject.raw);
 }
 
 /// The basic constraints of a certificate, or null when the extension is absent.

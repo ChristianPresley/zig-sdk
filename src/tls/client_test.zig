@@ -112,7 +112,12 @@ const ClientSetup = struct {
     /// Send a second line after a key update. The server answers with a key update too.
     key_update: bool = false,
     padding: tls.Padding = .none,
+    /// The verification time. Null reads the clock.
+    now_sec: ?i64 = null,
 };
+
+/// The fixed verification time of the newer fixtures: 2027-01-15.
+const fixture_now: i64 = 1_800_000_000;
 
 const ServerSetup = struct {
     alpn: []const []const u8 = &.{},
@@ -176,6 +181,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
         .write_buffer = &write_buf,
         .alert = &alert,
         .allow_truncation_attacks = true,
+        .now_sec = client_setup.now_sec,
     }) catch |e| {
         writer.interface.flush() catch {};
         future.await(io);
@@ -276,6 +282,24 @@ test "certificate problems end the handshake with an alert" {
     try std.testing.expectError(error.TlsCertificateNotVerified, roundTrip(io, &chain, .{}, .{ .trust = .self_signed }, &echo, null));
     try std.testing.expectError(error.TlsCertificateNotVerified, roundTrip(io, &chain, .{}, .{ .trust = .{ .pinned_leaf = self_signed.certs[0] } }, &echo, null));
     try roundTrip(io, &chain, .{}, .{ .trust = .{ .pinned_leaf = chain.certs[0] }, .host = "anything.invalid" }, &echo, null);
+}
+
+test "the client enforces the name constraints of the CA" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var set: tls.CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addFile(io, "test/fixtures/tls/pem/nc-root.crt");
+    var permitted = try loadChain(gpa, io, "nc-ok-chain.crt", "nc-leaf.key");
+    defer permitted.deinit();
+    var excluded = try loadChain(gpa, io, "nc-excluded-chain.crt", "nc-leaf.key");
+    defer excluded.deinit();
+    var echo: Echo = undefined;
+    const setup: ClientSetup = .{ .trust = .{ .ca_set = &set }, .host = "127.0.0.1", .now_sec = fixture_now };
+    try roundTrip(io, &permitted, .{}, setup, &echo, null);
+    // The leaf also has the DNS name bad.example.com, and the CA excludes it.
+    try std.testing.expectError(error.TlsCertificateNameNotPermitted, roundTrip(io, &excluded, .{}, setup, &echo, null));
+    try std.testing.expectEqual(std.crypto.tls.Alert.Description.bad_certificate, echo.alert.description);
 }
 
 test "hello retry request when the server wants another group" {
