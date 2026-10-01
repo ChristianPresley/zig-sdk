@@ -17,7 +17,7 @@ Tests are Zig tests of this repository and scenarios of the conformance suite `@
 
 ## Summary
 
-The specification has 733 normative sentences. 393 are MUST or MUST NOT requirements. Of these, 285 are tested, 28 do not apply, 80 are for the application and 0 are gaps.
+The specification has 733 normative sentences. 393 are MUST or MUST NOT requirements. Of these, 286 are tested, 28 do not apply, 79 are for the application and 0 are gaps.
 
 The column Covered gives the part of the requirements that has a test, an n/a reason or an app reason.
 
@@ -25,12 +25,12 @@ The column Covered gives the part of the requirements that has a test, an n/a re
 
 | Keyword | Total | Tested | n/a | App | Gap | Covered |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| MUST | 314 | 224 | 27 | 63 | 0 | 100 % |
+| MUST | 314 | 225 | 27 | 62 | 0 | 100 % |
 | MUST NOT | 79 | 61 | 1 | 17 | 0 | 100 % |
-| SHOULD | 220 | 122 | 20 | 78 | 0 | 100 % |
+| SHOULD | 220 | 124 | 20 | 76 | 0 | 100 % |
 | SHOULD NOT | 19 | 3 | 1 | 15 | 0 | 100 % |
 | MAY | 101 | 52 | 27 | 22 | 0 | 100 % |
-| All | 733 | 462 | 76 | 195 | 0 | 100 % |
+| All | 733 | 465 | 76 | 192 | 0 | 100 % |
 
 ### By page
 
@@ -58,10 +58,10 @@ The column Covered gives the part of the requirements that has a test, an n/a re
 | [server/discover](#serverdiscover) | 4 | 2 | 1 | 1 | 0 | 100 % | 0 |
 | [server/prompts](#serverprompts) | 20 | 13 | 1 | 6 | 0 | 100 % | 0 |
 | [server/resources](#serverresources) | 21 | 10 | 1 | 10 | 0 | 100 % | 0 |
-| [server/tools](#servertools) | 53 | 33 | 2 | 18 | 0 | 100 % | 0 |
+| [server/tools](#servertools) | 53 | 34 | 2 | 17 | 0 | 100 % | 0 |
 | [server/utilities/caching](#serverutilitiescaching) | 35 | 26 | 3 | 6 | 0 | 100 % | 0 |
 | [server/utilities/completion](#serverutilitiescompletion) | 17 | 7 | 1 | 9 | 0 | 100 % | 0 |
-| [server/utilities/logging](#serverutilitieslogging) | 22 | 6 | 1 | 15 | 0 | 100 % | 0 |
+| [server/utilities/logging](#serverutilitieslogging) | 22 | 8 | 1 | 13 | 0 | 100 % | 0 |
 | [server/utilities/pagination](#serverutilitiespagination) | 10 | 8 | 1 | 1 | 0 | 100 % | 0 |
 
 ## Requirements
@@ -845,7 +845,7 @@ Specification page: <https://modelcontextprotocol.io/specification/2026-07-28/se
 | [server/tools#043-6f4cc2](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#error-handling) | SHOULD | client | Clients SHOULD provide tool execution errors to language models to enable self-correction. | app | The host passes the result to the model. The client returns tool execution errors as a CallToolResult with isError. |
 | [server/tools#044-bf895c](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations) | MUST | server | Servers MUST: Validate all tool inputs | tested | [server_test.zig](../../src/mcp/server/server_test.zig): tool schemas validate arguments and structured output<br>[server_test.zig](../../src/mcp/server/server_test.zig): tools list and call (Arguments are validated against inputSchema before the handler runs.) |
 | [server/tools#045-51ccd6](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations) | MUST | server | Servers MUST: Implement proper access controls | app | Access control policy belongs to the handler. The SDK gives RequestContext.principal() and ToolDef.requires_client. |
-| [server/tools#046-88a982](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations) | MUST | server | Servers MUST: Rate limit tool invocations | app | Rate limit policy belongs to the server application. The SDK only caps concurrent requests with Limits.max_in_flight_requests. |
+| [server/tools#046-88a982](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations) | MUST | server | Servers MUST: Rate limit tool invocations | tested | [server_features_test.zig](../../src/mcp/spec_test/server_features_test.zig): tool calls over the rate limit of a caller get -31429 with a retry time<br>[server_features_test.zig](../../src/mcp/spec_test/server_features_test.zig): the tool call limit of one principal does not affect another principal<br>[server_features_test.zig](../../src/mcp/spec_test/server_features_test.zig): a tool with its own rate limit has its own bucket, and the total limit counts all callers<br>[server_features_test.zig](../../src/mcp/spec_test/server_features_test.zig): the server keeps buckets for at most max_callers callers and forgets the least recent one<br>[http_auth_test.zig](../../src/mcp/transport/http_auth_test.zig): resource server: rate limits keep principals apart and answer 429 with Retry-After<br>[unix_test.zig](../../src/mcp/transport/unix_test.zig): unix socket server gives each connection its own rate limit bucket (Off by default. Limits.rate_limits.tool_calls limits each caller: the principal, else the client address or the connection. A call over the limit gets -31429 with data.retryAfterMs, on HTTP also status 429 with Retry-After.) |
 | [server/tools#047-5dc584](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations) | MUST | server | Servers MUST: Sanitize tool outputs | app | The tool handler sanitizes its output. The SDK sends the result as the handler gives it. |
 | [server/tools#048-8da3c4](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations) | SHOULD | client | Clients SHOULD: Prompt for user confirmation on sensitive operations | app | The host prompts the user before it calls callTool. |
 | [server/tools#049-080acb](https://modelcontextprotocol.io/specification/2026-07-28/server/tools#security-considerations) | SHOULD | client | Clients SHOULD: Show tool inputs to the user before calling the server, to avoid malicious or accidental data exfiltration | app | The host shows the arguments before it calls callTool. |
@@ -930,7 +930,7 @@ Specification page: <https://modelcontextprotocol.io/specification/2026-07-28/se
 | [server/utilities/logging#005-a9e84b](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#per-request-log-level) | MUST NOT | server | `notifications/message` is request-scoped: the server MUST NOT deliver it on a `subscriptions/listen` stream or on any stream other than the one carrying the response to the request that set the log level. | tested | [utilities_test.zig](../../src/mcp/spec_test/utilities_test.zig): log messages go only to the stream of the request that set the level |
 | [server/utilities/logging#006-d931a4](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#error-handling) | SHOULD | server | If the `io.modelcontextprotocol/logLevel` value carried in a request's `_meta` is not a recognized log level, the server SHOULD reject that request with a standard JSON-RPC error: Invalid log level: `-32602` (Invalid params) | tested | [utilities_test.zig](../../src/mcp/spec_test/utilities_test.zig): an unknown log level in the request is invalid params |
 | [server/utilities/logging#007-738605](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#error-handling) | SHOULD | server | If the `io.modelcontextprotocol/logLevel` value carried in a request's `_meta` is not a recognized log level, the server SHOULD reject that request with a standard JSON-RPC error: Internal errors: `-32603` (Internal error) | n/a | The list item names the general internal error code. The SDK has no internal failure that is specific to the log level. |
-| [server/utilities/logging#008-d3a04d](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#implementation-considerations) | SHOULD | server | Servers SHOULD: Rate limit log messages | app | The handler decides how often it logs. The SDK has no rate limit for log messages. |
+| [server/utilities/logging#008-d3a04d](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#implementation-considerations) | SHOULD | server | Servers SHOULD: Rate limit log messages | tested | [utilities_test.zig](../../src/mcp/spec_test/utilities_test.zig): log messages over the rate limit of a caller are dropped, counted and reported in one summary<br>[utilities_test.zig](../../src/mcp/spec_test/utilities_test.zig): the log limit of one principal does not affect another principal<br>[rate_limits.zig](../../src/mcp/server/rate_limits.zig): the limiter drops log messages over the rate and reports the count once<br>[server_test.zig](../../src/mcp/server/server_test.zig): a task in the background sends no log messages and takes no log tokens (Off by default. Limits.rate_limits.log_messages limits each caller. The server drops the messages over the limit and then sends one summary with the count.) |
 | [server/utilities/logging#009-6e494e](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#implementation-considerations) | SHOULD | server | Servers SHOULD: Include relevant context in data field | app | The handler supplies the data field of RequestContext.log. |
 | [server/utilities/logging#010-fd2984](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#implementation-considerations) | SHOULD | server | Servers SHOULD: Use consistent logger names | app | The handler supplies the logger name of RequestContext.log. |
 | [server/utilities/logging#011-a83f99](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#implementation-considerations) | SHOULD | server | Servers SHOULD: Remove sensitive information | app | The handler decides the content of each log message. |
@@ -941,7 +941,7 @@ Specification page: <https://modelcontextprotocol.io/specification/2026-07-28/se
 | [server/utilities/logging#016-77fa11](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#security) | MUST NOT | server | Log messages MUST NOT contain: Credentials or secrets | app | The handler decides the content of each log message. |
 | [server/utilities/logging#017-9ed229](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#security) | MUST NOT | server | Log messages MUST NOT contain: Personal identifying information | app | The handler decides the content of each log message. |
 | [server/utilities/logging#018-b69c76](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#security) | MUST NOT | server | Log messages MUST NOT contain: Internal system details that could aid attacks | app | The handler decides the content of each log message. |
-| [server/utilities/logging#019-f89e4f](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#security) | SHOULD | both | Implementations SHOULD: Rate limit messages | app | Rate limit policy belongs to the application. The SDK has no rate limit for log messages. |
+| [server/utilities/logging#019-f89e4f](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#security) | SHOULD | both | Implementations SHOULD: Rate limit messages | tested | [utilities_test.zig](../../src/mcp/spec_test/utilities_test.zig): log messages over the rate limit of a caller are dropped, counted and reported in one summary<br>[utilities_test.zig](../../src/mcp/spec_test/utilities_test.zig): the log limit of one principal does not affect another principal (The server limits the log messages of each caller with Limits.rate_limits.log_messages. A client sends no log messages.) |
 | [server/utilities/logging#020-176dc3](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#security) | SHOULD | both | Implementations SHOULD: Validate all data fields | tested | [utilities_test.zig](../../src/mcp/spec_test/utilities_test.zig): client drops a log notification with an invalid level<br>[utilities_test.zig](../../src/mcp/spec_test/utilities_test.zig): an unknown log level in the request is invalid params |
 | [server/utilities/logging#021-db3887](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#security) | SHOULD | both | Implementations SHOULD: Control log access | app | The host controls who can read the log messages. |
 | [server/utilities/logging#022-ace848](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/logging#security) | SHOULD | both | Implementations SHOULD: Monitor for sensitive content | app | The server author and the host monitor the content of the log messages. |
