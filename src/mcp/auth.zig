@@ -10,6 +10,11 @@ pub const Provider = common.Provider;
 pub const ClientAuth = common.ClientAuth;
 pub const oauth_client = @import("auth/oauth_client.zig");
 pub const OAuthClient = oauth_client.Client;
+/// Storages for the registration and the tokens of `OAuthClient`.
+pub const token_storage = @import("auth/token_storage.zig");
+pub const TokenStorage = token_storage.TokenStorage;
+pub const MemoryTokenStorage = token_storage.MemoryTokenStorage;
+pub const FileTokenStorage = token_storage.FileTokenStorage;
 /// The OAuth Client Credentials extension.
 pub const client_credentials = @import("auth/client_credentials.zig");
 pub const ClientCredentials = client_credentials.ClientCredentials;

@@ -5,6 +5,9 @@
 //! The client keeps credentials per issuer and never uses them for another authorization server.
 //! When the server issues a refresh token, the client gets new access tokens with it and does
 //! not send the user to the browser again.
+//!
+//! With the `storage` option, the client keeps the registration and the tokens in a
+//! `TokenStorage`. A new process then uses them and needs no new authorization.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -12,6 +15,7 @@ const http = std.http;
 const json = @import("../json.zig");
 const common = @import("common.zig");
 const dpop = @import("dpop.zig");
+const token_storage = @import("token_storage.zig");
 
 const log = std.log.scoped(.mcp_auth);
 
@@ -46,6 +50,8 @@ pub const Client = struct {
     bound_issuer: ?[]u8 = null,
     /// The last error that an authorization server sent.
     failure: ?Failure = null,
+    /// The client read the storage for the current issuer and resource.
+    storage_loaded: bool = false,
     lock: Io.Mutex = .init,
 
     pub const Registration = union(enum) {
@@ -116,6 +122,14 @@ pub const Client = struct {
         /// Send `dpop_bound_access_tokens` in dynamic client registration: the authorization
         /// server must then refuse token requests without a proof. It needs `dpop`.
         dpop_bound_access_tokens: bool = false,
+        /// Keep the registration and the tokens in this storage. The client loads the record
+        /// at the first challenge for an issuer and saves it after each change. The storage
+        /// does not get the secret of pre-registered credentials.
+        storage: ?token_storage.TokenStorage = null,
+        /// The client part of the storage key. Null takes a value from `registration`: the client
+        /// ID, the metadata document URL, or the client name and the redirect URI. Set it to
+        /// keep the records of two accounts apart.
+        storage_identity: ?[]const u8 = null,
     };
 
     const Registered = struct {
@@ -124,7 +138,7 @@ pub const Client = struct {
         auth_method: AuthMethod,
     };
 
-    pub const AuthMethod = enum { client_secret_basic, client_secret_post, none };
+    pub const AuthMethod = token_storage.AuthMethod;
 
     /// An error that an authorization server sent for a registration or a token request.
     pub const Failure = struct {
@@ -351,15 +365,24 @@ pub const Client = struct {
         try meta.checkDpop(self.options.dpop);
         try common.replaceOwned(self.gpa, &self.token_endpoint, meta.token_endpoint);
 
-        // Registration.
-        if (self.registration == null) try self.register(arena, meta);
+        // The storage can have a registration and tokens from an earlier process.
+        var stored_token = false;
+        if (!self.storage_loaded) {
+            self.storage_loaded = true;
+            stored_token = try self.loadStored(issuer, resource);
+        }
 
+        // Registration.
+        try self.ensureRegistered(arena, meta);
+
+        // A token from the storage was not in the request of this challenge, so try it first.
+        if (stored_token and !step_up and !self.expiresSoon()) return self.token.?;
         // A refresh gets a new access token without the user. A step-up needs a new grant with
         // more scopes, and a refresh never widens the scope.
         if (!step_up and self.refresh_token != null) switch (try self.refresh(arena)) {
             .refreshed => return self.token.?,
             .grant_refused => {},
-            .client_refused => try self.register(arena, meta),
+            .client_refused => try self.ensureRegistered(arena, meta),
         };
         const reg = self.registration.?;
 
@@ -427,12 +450,133 @@ pub const Client = struct {
             .ok => |r| r,
             .failed => |f| {
                 try self.recordFailure(.token, f.status, f.code, f.description);
+                if (f.code) |c| if (std.mem.eql(u8, c, "invalid_client")) {
+                    // The server does not know the client. The next challenge registers again.
+                    self.deleteStored();
+                    self.clearCredentials();
+                };
                 return error.TokenRequestFailed;
             },
         };
         // A new grant replaces the refresh token of the old grant, also with none.
         try self.keepTokens(reply, scope_text orelse "", false);
+        self.saveStored();
         return self.token.?;
+    }
+
+    fn ensureRegistered(self: *Client, arena: Allocator, meta: common.ServerMetadata) Error!void {
+        if (self.registration != null) return;
+        try self.register(arena, meta);
+        self.saveStored();
+    }
+
+    /// True when the access token expires within the refresh margin.
+    fn expiresSoon(self: *Client) bool {
+        const exp = self.expires_at orelse return false;
+        return common.now(self.io, self.options.clock) +| self.options.refresh_margin_seconds >= exp;
+    }
+
+    // -- Storage ---------------------------------------------------------------------------------
+
+    /// The client ID of the pre-registered credentials for `issuer`, without a binding.
+    fn configuredClientId(list: []const Credentials, issuer: []const u8) ?[]const u8 {
+        for (list) |c| if (c.issuer) |i| if (std.mem.eql(u8, i, issuer)) return c.client_id;
+        for (list) |c| if (c.issuer == null) return c.client_id;
+        return null;
+    }
+
+    /// The client part of the storage key, owned by the caller. Null when the client has no
+    /// identity for `issuer`.
+    fn storageIdentity(self: *Client, issuer: []const u8) Allocator.Error!?[]u8 {
+        if (self.options.storage_identity) |id| return try self.gpa.dupe(u8, id);
+        return switch (self.options.registration) {
+            .pre_registered => |list| if (configuredClientId(list, issuer)) |id| try self.gpa.dupe(u8, id) else null,
+            .client_metadata_url => |url| try self.gpa.dupe(u8, url),
+            .dynamic => try std.fmt.allocPrint(self.gpa, "dynamic {s} {s}", .{ self.options.client_name, self.options.redirect_uri }),
+        };
+    }
+
+    /// Read the record of `issuer` and `resource`. Returns true when the record gave an access
+    /// token. A DPoP-bound token works only with the DPoP key of its request. The same applies
+    /// to the refresh token of a public client. Thus the client skips the tokens of another key.
+    fn loadStored(self: *Client, issuer: []const u8, resource: []const u8) Allocator.Error!bool {
+        const storage = self.options.storage orelse return false;
+        const identity = (try self.storageIdentity(issuer)) orelse return false;
+        defer self.gpa.free(identity);
+        const key: token_storage.Key = .{ .issuer = issuer, .resource = resource, .client = identity };
+        var record = (storage.load(self.gpa, key) catch |e| {
+            if (e == error.OutOfMemory) return error.OutOfMemory;
+            log.warn("could not load the token record: {t}", .{e});
+            if (e == error.InvalidRecord) storage.delete(key) catch {};
+            return false;
+        }) orelse return false;
+        defer record.deinit(self.gpa);
+        if (record.registration) |r| switch (self.options.registration) {
+            // The configuration has the pre-registered credentials. A record of another client
+            // ID is stale.
+            .pre_registered => |list| if (!std.mem.eql(u8, configuredClientId(list, issuer) orelse "", r.client_id)) return false,
+            else => if (self.registration == null) {
+                const id = try self.gpa.dupe(u8, r.client_id);
+                errdefer self.gpa.free(id);
+                const secret: ?[]u8 = if (r.client_secret) |s| try self.gpa.dupe(u8, s) else null;
+                self.registration = .{ .client_id = id, .client_secret = secret, .auth_method = r.auth_method };
+            },
+        };
+        const jkt: ?[]const u8 = if (self.options.dpop) |p| p.jkt else null;
+        const same_key = if (record.dpop_jkt) |a| (jkt != null and std.mem.eql(u8, a, jkt.?)) else jkt == null;
+        if (!same_key) {
+            log.info("the stored tokens are for another DPoP key", .{});
+            return false;
+        }
+        try common.replaceOwned(self.gpa, &self.token, record.access_token);
+        try common.replaceOwned(self.gpa, &self.refresh_token, record.refresh_token);
+        self.token_dpop = record.dpop_bound and self.options.dpop != null;
+        self.expires_at = record.expires_at;
+        for (self.granted_scopes.items) |s| self.gpa.free(s);
+        self.granted_scopes.clearRetainingCapacity();
+        for (record.scopes) |s| {
+            const copy = try self.gpa.dupe(u8, s);
+            errdefer self.gpa.free(copy);
+            try self.granted_scopes.append(self.gpa, copy);
+        }
+        return self.token != null;
+    }
+
+    /// Save the registration and the tokens for the current issuer and resource. A failure of
+    /// the storage does not stop the flow. The log has it.
+    fn saveStored(self: *Client) void {
+        const storage = self.options.storage orelse return;
+        const issuer = self.issuer orelse return;
+        const resource = self.resource orelse return;
+        const identity = (self.storageIdentity(issuer) catch return) orelse return;
+        defer self.gpa.free(identity);
+        const registration: ?token_storage.Record.Registration = if (self.registration) |r| .{
+            .client_id = r.client_id,
+            .client_secret = if (self.options.registration == .pre_registered) null else r.client_secret,
+            .auth_method = r.auth_method,
+        } else null;
+        const record: token_storage.Record = .{
+            .registration = registration,
+            .access_token = self.token,
+            .expires_at = self.expires_at,
+            .refresh_token = self.refresh_token,
+            .scopes = self.granted_scopes.items,
+            .dpop_bound = self.token_dpop,
+            .dpop_jkt = if (self.options.dpop) |p| p.jkt else null,
+        };
+        storage.save(self.gpa, .{ .issuer = issuer, .resource = resource, .client = identity }, record) catch |e|
+            log.warn("could not save the token record: {t}", .{e});
+    }
+
+    /// Delete the record of the current issuer and resource.
+    fn deleteStored(self: *Client) void {
+        const storage = self.options.storage orelse return;
+        const issuer = self.issuer orelse return;
+        const resource = self.resource orelse return;
+        const identity = (self.storageIdentity(issuer) catch return) orelse return;
+        defer self.gpa.free(identity);
+        storage.delete(.{ .issuer = issuer, .resource = resource, .client = identity }) catch |e|
+            log.warn("could not delete the token record: {t}", .{e});
     }
 
     /// Add the client authentication of the registration to a token request.
@@ -472,16 +616,20 @@ pub const Client = struct {
     }
 
     /// Use the issuer and the resource of a challenge. A new authorization server discards
-    /// everything of the old one. A new resource discards the tokens, because a token is for one
-    /// resource (RFC 8707).
+    /// everything of the old one. When the same resource names a new authorization server, the
+    /// client also deletes the stored record of the old one. A new resource discards the tokens,
+    /// because a token is for one resource (RFC 8707).
     fn selectServer(self: *Client, issuer: []const u8, resource: []const u8) Allocator.Error!void {
         if (self.issuer == null or !std.mem.eql(u8, self.issuer.?, issuer)) {
+            if (self.resource) |r| if (std.mem.eql(u8, r, resource)) self.deleteStored();
             self.clearCredentials();
             try common.replaceOwned(self.gpa, &self.issuer, issuer);
+            self.storage_loaded = false;
         }
         if (self.resource == null or !std.mem.eql(u8, self.resource.?, resource)) {
             self.clearTokens();
             try common.replaceOwned(self.gpa, &self.resource, resource);
+            self.storage_loaded = false;
         }
     }
 
@@ -516,18 +664,22 @@ pub const Client = struct {
         switch (result) {
             .ok => |reply| {
                 try self.keepTokens(reply, null, true);
+                self.saveStored();
                 return .refreshed;
             },
             .failed => |f| {
                 try self.recordFailure(.refresh, f.status, f.code, f.description);
                 const code = f.code orelse return error.TokenRequestFailed;
                 if (std.mem.eql(u8, code, "invalid_client")) {
+                    self.deleteStored();
                     self.clearCredentials();
                     return .client_refused;
                 }
                 const refused = [_][]const u8{ "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope" };
                 if (listContains(&refused, code)) {
+                    // The record keeps the registration without the refused tokens.
                     self.clearTokens();
+                    self.saveStored();
                     return .grant_refused;
                 }
                 return error.TokenRequestFailed;

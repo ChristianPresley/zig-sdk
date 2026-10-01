@@ -63,6 +63,8 @@ const Mock = struct {
     rotate: bool = true,
     /// Refuse each refresh with `invalid_grant`.
     refuse_refresh: bool = false,
+    /// Refuse each token request with `invalid_client`.
+    refuse_client: bool = false,
     /// The `expires_in` of each token.
     expires_in: i64 = 3600,
     /// The valid refresh token is `ref-{refresh_serial}`. Zero: none is valid.
@@ -183,6 +185,7 @@ const Mock = struct {
         if (std.mem.eql(u8, path, "/token")) {
             const grant = (try formValue(arena, body, "grant_type")) orelse "";
             const refreshing = std.mem.eql(u8, grant, "refresh_token");
+            if (self.refuse_client) return request.respond("{\"error\":\"invalid_client\"}", .{ .status = .unauthorized, .keep_alive = false, .extra_headers = json_type });
             self.lock.lockUncancelable(self.io);
             if (refreshing) {
                 const want = try std.fmt.allocPrint(arena, "ref-{d}", .{self.refresh_serial});
@@ -602,6 +605,164 @@ test "oauth client sends a DPoP proof with the refresh token" {
         const proof = try mcp.auth.dpop.verifyProof(arena, t.dpop.?, .{ .method = "POST", .uri = token_url }, .{}, time);
         try std.testing.expectEqualStrings(prover.jkt, proof.jkt);
     }
+}
+
+// -- Token storage ------------------------------------------------------------------------------
+
+/// The storage key of the dynamic registration of a client with the default options.
+fn dynamicKey(arena: Allocator, issuer: []const u8, resource: []const u8) !mcp.auth.token_storage.Key {
+    const options: OAuthClient.Options = .{};
+    return .{ .issuer = issuer, .resource = resource, .client = try std.fmt.allocPrint(arena, "dynamic {s} {s}", .{ options.client_name, options.redirect_uri }) };
+}
+
+test "oauth client keeps its record in a file storage, and a second client needs no new authorization" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
+    const file_key = [_]u8{0x5a} ** 32;
+    const server_url = try mock.serverUrl(arena);
+    test_time = 1_000_000;
+
+    {
+        var files: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+        defer files.deinit();
+        var first: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = files.storage(), .clock = testNow });
+        defer first.deinit();
+        try std.testing.expectEqualStrings("tok-1", try first.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    }
+
+    // A new storage and a new client, as in a new process. The client loads the record at the
+    // first challenge and sends the stored token without registration, authorization or token
+    // request.
+    {
+        var files: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+        defer files.deinit();
+        var second: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = files.storage(), .clock = testNow });
+        defer second.deinit();
+        const transport = try mcp.transport.HttpClient.init(io, gpa, .{ .url = server_url, .auth = &second });
+        defer transport.deinit();
+        var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+        defer client.deinit();
+        client.connect(transport.transport());
+        _ = try client.callTool(arena, "t", null, .{});
+    }
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/register")).len);
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/authorize")).len);
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/token")).len);
+    const posts = try mock.requests(arena, "/mcp");
+    try std.testing.expectEqualStrings("Bearer tok-1", posts[posts.len - 1].authorization.?);
+
+    // After the expiry, a third client refreshes the stored token. The user sees no browser.
+    test_time += 7200;
+    var files: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer files.deinit();
+    {
+        var third: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = files.storage(), .clock = testNow });
+        defer third.deinit();
+        try std.testing.expectEqualStrings("tok-2", try third.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    }
+    const tok = try mock.requests(arena, "/token");
+    try std.testing.expectEqual(2, tok.len);
+    try std.testing.expectEqualStrings("refresh_token", try grantOf(arena, tok[1]));
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/authorize")).len);
+    // The record has the rotated refresh token and the registration.
+    var record = (try files.storage().load(gpa, try dynamicKey(arena, mock.base, server_url))).?;
+    defer record.deinit(gpa);
+    try std.testing.expectEqualStrings("tok-2", record.access_token.?);
+    try std.testing.expectEqualStrings("ref-2", record.refresh_token.?);
+    try std.testing.expectEqualStrings("dyn-client", record.registration.?.client_id);
+    try std.testing.expectEqual(test_time + 3600, record.expires_at.?);
+}
+
+test "oauth client deletes the stored record when the issuer changes or the server refuses the client" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var other: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try other.start();
+    defer other.stop();
+    var memory: mcp.auth.MemoryTokenStorage = .init(io, gpa);
+    defer memory.deinit();
+    const storage = memory.storage();
+    const server_url = try mock.serverUrl(arena);
+    const first_key = try dynamicKey(arena, mock.base, server_url);
+    const second_key = try dynamicKey(arena, other.base, server_url);
+
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = storage });
+    defer oauth.deinit();
+    _ = try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1);
+    try std.testing.expect(try hasRecord(storage, first_key));
+
+    // The protected resource names another authorization server. The record of the old one goes.
+    mock.authorization_server = other.base;
+    _ = try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1);
+    try std.testing.expect(!try hasRecord(storage, first_key));
+    try std.testing.expect(try hasRecord(storage, second_key));
+    try std.testing.expectEqual(1, (try other.requests(arena, "/register")).len);
+
+    // The new authorization server refuses the client for the refresh and the code exchange.
+    other.refuse_client = true;
+    try std.testing.expectError(error.TokenRequestFailed, oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    try std.testing.expect(!try hasRecord(storage, second_key));
+    try std.testing.expectEqual(0, memory.count());
+    // The client registered again after the refusal of the refresh.
+    try std.testing.expectEqual(2, (try other.requests(arena, "/register")).len);
+}
+
+fn hasRecord(storage: mcp.auth.TokenStorage, key: mcp.auth.token_storage.Key) !bool {
+    var record = (try storage.load(std.testing.allocator, key)) orelse return false;
+    record.deinit(std.testing.allocator);
+    return true;
+}
+
+test "oauth client skips stored tokens of another DPoP key and keeps the registration" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var memory: mcp.auth.MemoryTokenStorage = .init(io, gpa);
+    defer memory.deinit();
+    const server_url = try mock.serverUrl(arena);
+
+    var old_key: mcp.auth.DpopProver = try .generate(io, gpa);
+    defer old_key.deinit();
+    {
+        var first: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = memory.storage(), .dpop = &old_key });
+        defer first.deinit();
+        _ = try first.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1);
+        try std.testing.expect(first.token_dpop);
+    }
+    var record = (try memory.storage().load(gpa, try dynamicKey(arena, mock.base, server_url))).?;
+    try std.testing.expect(record.dpop_bound);
+    try std.testing.expectEqualStrings(old_key.jkt, record.dpop_jkt.?);
+    record.deinit(gpa);
+
+    // A new key cannot use the bound tokens. The client authorizes again with the stored client.
+    var new_key: mcp.auth.DpopProver = try .generate(io, gpa);
+    defer new_key.deinit();
+    var second: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = memory.storage(), .dpop = &new_key });
+    defer second.deinit();
+    try std.testing.expectEqualStrings("tok-2", try second.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/register")).len);
+    try std.testing.expectEqual(2, (try mock.requests(arena, "/authorize")).len);
+    for (try mock.requests(arena, "/token")) |t| try std.testing.expectEqualStrings("authorization_code", try grantOf(arena, t));
 }
 
 // -- Server side --------------------------------------------------------------------------------
