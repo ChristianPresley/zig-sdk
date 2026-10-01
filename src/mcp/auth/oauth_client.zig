@@ -3,6 +3,8 @@
 //! PKCE and requests tokens. The HTTP client transport calls it for 401 and 403 challenges.
 //!
 //! The client keeps credentials per issuer and never uses them for another authorization server.
+//! When the server issues a refresh token, the client gets new access tokens with it and does
+//! not send the user to the browser again.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -25,10 +27,18 @@ pub const Client = struct {
     options: Options,
     /// State for the current server: the issuer it delegates to and what we hold for it.
     issuer: ?[]u8 = null,
+    /// The resource indicator of the tokens: the `resource` of the protected resource metadata.
+    resource: ?[]u8 = null,
+    /// The token endpoint of the issuer. A refresh before a request uses it without discovery.
+    token_endpoint: ?[]u8 = null,
     registration: ?Registered = null,
     token: ?[]u8 = null,
     /// The token is DPoP-bound: requests carry it with the DPoP scheme and a proof.
     token_dpop: bool = false,
+    /// Unix seconds. Null when the server gave no `expires_in`.
+    expires_at: ?i64 = null,
+    /// The refresh token of the current grant. Null when the server issued none.
+    refresh_token: ?[]u8 = null,
     /// Scopes granted with the current token (space separated list kept as a slice list).
     granted_scopes: std.ArrayList([]u8) = .empty,
     /// The issuer of the first authorization server that used pre-registered credentials
@@ -91,6 +101,10 @@ pub const Client = struct {
         authorize: Authorize = .headless_redirect,
         /// Ask for `offline_access` when the authorization server lists it.
         want_refresh_token: bool = true,
+        /// Refresh the access token when it expires within this number of seconds.
+        refresh_margin_seconds: i64 = 60,
+        /// The clock for token lifetimes. Null uses the real clock.
+        clock: common.Clock = null,
         max_step_up_attempts: u8 = 3,
         /// Accept `http` metadata, registration, authorization and token endpoints. Tests
         /// only, production needs https.
@@ -122,7 +136,8 @@ pub const Client = struct {
         /// The `error_description` of the response. It is text from the server.
         description: ?[]const u8 = null,
 
-        pub const Step = enum { registration, token };
+        /// `refresh` is a token request with a refresh token.
+        pub const Step = enum { registration, token, refresh };
     };
 
     pub const Error = error{
@@ -170,12 +185,14 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         self.fetcher.deinit();
         self.clearCredentials();
-        if (self.issuer) |i| self.gpa.free(i);
-        if (self.bound_issuer) |i| self.gpa.free(i);
+        inline for (.{ "issuer", "resource", "token_endpoint", "bound_issuer" }) |name| {
+            common.replaceOwned(self.gpa, &@field(self, name), null) catch unreachable;
+        }
         self.clearFailure();
         self.granted_scopes.deinit(self.gpa);
     }
 
+    /// Discard the registration and the tokens.
     fn clearCredentials(self: *Client) void {
         if (self.registration) |r| {
             self.gpa.free(r.client_id);
@@ -185,12 +202,15 @@ pub const Client = struct {
             }
             self.registration = null;
         }
-        if (self.token) |t| {
-            std.crypto.secureZero(u8, t);
-            self.gpa.free(t);
-            self.token = null;
-        }
+        self.clearTokens();
+    }
+
+    /// Discard the access token, the refresh token and the granted scopes.
+    fn clearTokens(self: *Client) void {
+        common.replaceOwned(self.gpa, &self.token, null) catch unreachable;
+        common.replaceOwned(self.gpa, &self.refresh_token, null) catch unreachable;
         self.token_dpop = false;
+        self.expires_at = null;
         for (self.granted_scopes.items) |s| self.gpa.free(s);
         self.granted_scopes.clearRetainingCapacity();
     }
@@ -250,6 +270,7 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(ptr));
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        self.renewIfDue(arena);
         const t = self.token orelse return null;
         return common.credentialsFor(arena, self.options.dpop, self.token_dpop, t, method, url);
     }
@@ -264,8 +285,24 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(ptr));
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        self.renewIfDue(arena);
         const t = self.token orelse return null;
         return arena.dupe(u8, t) catch null;
+    }
+
+    /// Refresh the access token when it expires within the margin. When the refresh fails, the
+    /// client keeps the old token until it expires. The caller holds the lock.
+    fn renewIfDue(self: *Client, arena: Allocator) void {
+        const exp = self.expires_at orelse return;
+        if (self.token == null or self.refresh_token == null or self.registration == null) return;
+        if (self.resource == null or self.token_endpoint == null) return;
+        const time = common.now(self.io, self.options.clock);
+        if (time +| self.options.refresh_margin_seconds < exp) return;
+        self.clearFailure();
+        _ = self.refresh(arena) catch |e| {
+            log.warn("the refresh of the access token failed: {t}", .{e});
+            if (time >= exp) common.replaceOwned(self.gpa, &self.token, null) catch unreachable;
+        };
     }
 
     fn providerChallenge(ptr: *anyopaque, arena: Allocator, server_url: []const u8, status: u16, www_authenticate: ?[]const u8, attempt: u8) anyerror!void {
@@ -282,6 +319,10 @@ pub const Client = struct {
 
     /// Obtain a token for `server_url` after a challenge. `attempt` starts at 1 for the first
     /// challenge of a request. Returns the bearer token, owned by the client.
+    ///
+    /// When the client has a refresh token and the challenge is not a step-up, the client
+    /// refreshes the access token first. When the server refuses the refresh token, the client
+    /// runs the authorization code flow.
     pub fn handleChallenge(self: *Client, arena: Allocator, server_url: []const u8, status: u16, www_authenticate: ?[]const u8, attempt: u8) Error![]const u8 {
         if (attempt > self.options.max_step_up_attempts) return error.TooManyAttempts;
         self.lock.lockUncancelable(self.io);
@@ -300,13 +341,7 @@ pub const Client = struct {
         const resource = prm.resource;
         if (prm.authorization_servers.len == 0) return error.NoAuthorizationServer;
         const issuer = prm.authorization_servers[0];
-        if (self.issuer == null or !std.mem.eql(u8, self.issuer.?, issuer)) {
-            // A new authorization server: nothing from the old one may be reused.
-            self.clearCredentials();
-            if (self.issuer) |i| self.gpa.free(i);
-            self.issuer = null;
-            self.issuer = try self.gpa.dupe(u8, issuer);
-        }
+        try self.selectServer(issuer, resource);
         const meta = try self.fetcher.authorizationServer(arena, issuer);
         if (!std.mem.eql(u8, meta.issuer, issuer)) return error.IssuerMismatch;
         const authorization_endpoint = meta.authorization_endpoint orelse return error.NoAuthorizationServerMetadata;
@@ -314,9 +349,18 @@ pub const Client = struct {
         try common.requireHttps(self.options.allow_http, meta.token_endpoint);
         if (!listContains(meta.code_challenge_methods_supported, "S256")) return error.PkceUnsupported;
         try meta.checkDpop(self.options.dpop);
+        try common.replaceOwned(self.gpa, &self.token_endpoint, meta.token_endpoint);
 
         // Registration.
         if (self.registration == null) try self.register(arena, meta);
+
+        // A refresh gets a new access token without the user. A step-up needs a new grant with
+        // more scopes, and a refresh never widens the scope.
+        if (!step_up and self.refresh_token != null) switch (try self.refresh(arena)) {
+            .refreshed => return self.token.?,
+            .grant_refused => {},
+            .client_refused => try self.register(arena, meta),
+        };
         const reg = self.registration.?;
 
         // Scopes: the challenge, else the resource metadata, else none. A step-up keeps what
@@ -377,16 +421,8 @@ pub const Client = struct {
         try formField(bw, "redirect_uri", self.options.redirect_uri, false);
         try formField(bw, "code_verifier", verifier, false);
         try formField(bw, "resource", resource, false);
-        if (reg.auth_method != .client_secret_basic) try formField(bw, "client_id", reg.client_id, false);
-        if (reg.auth_method == .client_secret_post) try formField(bw, "client_secret", reg.client_secret orelse "", false);
         var extra: std.ArrayList(http.Header) = .empty;
-        if (reg.auth_method == .client_secret_basic) {
-            const pair = try std.mem.concat(arena, u8, &.{ reg.client_id, ":", reg.client_secret orelse "" });
-            const enc = std.base64.standard.Encoder;
-            const out = try arena.alloc(u8, enc.calcSize(pair.len));
-            _ = enc.encode(out, pair);
-            try extra.append(arena, .{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Basic ", out }) });
-        }
+        try clientAuthentication(arena, reg, bw, &extra);
         const reply = switch (try self.fetcher.tokenRequest(arena, meta.token_endpoint, body.written(), extra.items, self.options.dpop)) {
             .ok => |r| r,
             .failed => |f| {
@@ -394,22 +430,109 @@ pub const Client = struct {
                 return error.TokenRequestFailed;
             },
         };
+        // A new grant replaces the refresh token of the old grant, also with none.
+        try self.keepTokens(reply, scope_text orelse "", false);
+        return self.token.?;
+    }
 
-        // Store.
-        if (self.token) |t| {
-            std.crypto.secureZero(u8, t);
-            self.gpa.free(t);
+    /// Add the client authentication of the registration to a token request.
+    fn clientAuthentication(arena: Allocator, reg: Registered, form: *Io.Writer, headers: *std.ArrayList(http.Header)) Allocator.Error!void {
+        if (reg.auth_method != .client_secret_basic) try formField(form, "client_id", reg.client_id, false);
+        if (reg.auth_method == .client_secret_post) try formField(form, "client_secret", reg.client_secret orelse "", false);
+        if (reg.auth_method == .client_secret_basic) {
+            const pair = try std.mem.concat(arena, u8, &.{ reg.client_id, ":", reg.client_secret orelse "" });
+            const enc = std.base64.standard.Encoder;
+            const out = try arena.alloc(u8, enc.calcSize(pair.len));
+            _ = enc.encode(out, pair);
+            try headers.append(arena, .{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Basic ", out }) });
         }
-        self.token = null;
-        self.token = try self.gpa.dupe(u8, reply.access_token);
+    }
+
+    /// Keep the tokens of a token response. `requested_scope` is the scope of the request, or
+    /// null for a refresh. Without a new refresh token, a refresh keeps the old one.
+    fn keepTokens(self: *Client, reply: common.TokenResponse, requested_scope: ?[]const u8, refreshing: bool) Allocator.Error!void {
+        const time = common.now(self.io, self.options.clock);
+        try common.replaceOwned(self.gpa, &self.token, reply.access_token);
         // RFC 9449 section 5: an authorization server without DPoP gives a bearer token.
         self.token_dpop = self.options.dpop != null and common.isDpopTokenType(reply.token_type);
+        self.expires_at = if (reply.expires_in) |s| time +| s else null;
+        // OAuth 2.1 section 4.3.1: a new refresh token replaces the old one.
+        if (reply.refresh_token != null or !refreshing) try common.replaceOwned(self.gpa, &self.refresh_token, reply.refresh_token);
+        // RFC 6749 section 5.1: without `scope`, the granted scope is the requested scope. A
+        // refresh without `scope` keeps the scope of the grant.
+        const granted = reply.scope orelse requested_scope orelse return;
         for (self.granted_scopes.items) |s| self.gpa.free(s);
         self.granted_scopes.clearRetainingCapacity();
-        const granted = reply.scope orelse scope_text orelse "";
         var it = std.mem.tokenizeScalar(u8, granted, ' ');
-        while (it.next()) |s| try self.granted_scopes.append(self.gpa, try self.gpa.dupe(u8, s));
-        return self.token.?;
+        while (it.next()) |s| {
+            const copy = try self.gpa.dupe(u8, s);
+            errdefer self.gpa.free(copy);
+            try self.granted_scopes.append(self.gpa, copy);
+        }
+    }
+
+    /// Use the issuer and the resource of a challenge. A new authorization server discards
+    /// everything of the old one. A new resource discards the tokens, because a token is for one
+    /// resource (RFC 8707).
+    fn selectServer(self: *Client, issuer: []const u8, resource: []const u8) Allocator.Error!void {
+        if (self.issuer == null or !std.mem.eql(u8, self.issuer.?, issuer)) {
+            self.clearCredentials();
+            try common.replaceOwned(self.gpa, &self.issuer, issuer);
+        }
+        if (self.resource == null or !std.mem.eql(u8, self.resource.?, resource)) {
+            self.clearTokens();
+            try common.replaceOwned(self.gpa, &self.resource, resource);
+        }
+    }
+
+    // -- Refresh ---------------------------------------------------------------------------------
+
+    const RefreshOutcome = enum {
+        refreshed,
+        /// The server refused the refresh token. The client discarded the tokens.
+        grant_refused,
+        /// The server refused the client. The client discarded the registration and the tokens.
+        client_refused,
+    };
+
+    /// Get a new access token with the refresh token (RFC 6749 section 6). The request has the
+    /// `resource` and the granted scope, never a wider scope. It has the client authentication
+    /// of the code exchange and a DPoP proof when `dpop` is set. The caller holds the lock.
+    fn refresh(self: *Client, arena: Allocator) Error!RefreshOutcome {
+        const reg = self.registration orelse return error.TokenRequestFailed;
+        const refresh_token = self.refresh_token orelse return error.TokenRequestFailed;
+        const resource = self.resource orelse return error.TokenRequestFailed;
+        const endpoint = self.token_endpoint orelse return error.TokenRequestFailed;
+        var body: Io.Writer.Allocating = .init(arena);
+        const bw = &body.writer;
+        try formField(bw, "grant_type", "refresh_token", true);
+        try formField(bw, "refresh_token", refresh_token, false);
+        try formField(bw, "resource", resource, false);
+        if (self.granted_scopes.items.len > 0) try formField(bw, "scope", try std.mem.join(arena, " ", self.granted_scopes.items), false);
+        var extra: std.ArrayList(http.Header) = .empty;
+        try clientAuthentication(arena, reg, bw, &extra);
+        const result = try self.fetcher.tokenRequest(arena, endpoint, body.written(), extra.items, self.options.dpop);
+        std.crypto.secureZero(u8, body.written());
+        switch (result) {
+            .ok => |reply| {
+                try self.keepTokens(reply, null, true);
+                return .refreshed;
+            },
+            .failed => |f| {
+                try self.recordFailure(.refresh, f.status, f.code, f.description);
+                const code = f.code orelse return error.TokenRequestFailed;
+                if (std.mem.eql(u8, code, "invalid_client")) {
+                    self.clearCredentials();
+                    return .client_refused;
+                }
+                const refused = [_][]const u8{ "invalid_grant", "unauthorized_client", "unsupported_grant_type", "invalid_scope" };
+                if (listContains(&refused, code)) {
+                    self.clearTokens();
+                    return .grant_refused;
+                }
+                return error.TokenRequestFailed;
+            },
+        }
     }
 
     // -- Registration --------------------------------------------------------------------------

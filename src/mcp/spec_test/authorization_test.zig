@@ -19,6 +19,8 @@ const Entry = struct {
     target: []u8,
     authorization: ?[]u8,
     body: []u8,
+    /// The `DPoP` header of the request.
+    dpop: ?[]u8 = null,
 
     fn path(self: Entry) []const u8 {
         const end = std.mem.indexOfScalar(u8, self.target, '?') orelse self.target.len;
@@ -55,6 +57,18 @@ const Mock = struct {
     iss: ?[]const u8 = null,
     /// Answer the authorization request with an error response.
     deny: bool = false,
+    /// Issue a refresh token with each grant.
+    refresh: bool = false,
+    /// Give a new refresh token with each refresh, and make the old one invalid.
+    rotate: bool = true,
+    /// Refuse each refresh with `invalid_grant`.
+    refuse_refresh: bool = false,
+    /// The `expires_in` of each token.
+    expires_in: i64 = 3600,
+    /// The valid refresh token is `ref-{refresh_serial}`. Zero: none is valid.
+    refresh_serial: u32 = 0,
+    /// The authorization server of the protected resource metadata. Null names this mock.
+    authorization_server: ?[]const u8 = null,
 
     fn start(self: *Mock) !void {
         var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -69,6 +83,7 @@ const Mock = struct {
         for (self.entries.items) |e| {
             self.gpa.free(e.target);
             if (e.authorization) |a| self.gpa.free(a);
+            if (e.dpop) |d| self.gpa.free(d);
             self.gpa.free(e.body);
         }
         self.entries.deinit(self.gpa);
@@ -87,13 +102,14 @@ const Mock = struct {
         }
     }
 
-    fn record(self: *Mock, method: http.Method, target: []const u8, authorization: ?[]const u8, body: []const u8) !void {
+    fn record(self: *Mock, method: http.Method, target: []const u8, authorization: ?[]const u8, proof: ?[]const u8, body: []const u8) !void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         try self.entries.append(self.gpa, .{
             .method = method,
             .target = try self.gpa.dupe(u8, target),
             .authorization = if (authorization) |a| try self.gpa.dupe(u8, a) else null,
+            .dpop = if (proof) |d| try self.gpa.dupe(u8, d) else null,
             .body = try self.gpa.dupe(u8, body),
         });
     }
@@ -126,18 +142,20 @@ const Mock = struct {
         const method = request.head.method;
         const target = try arena.dupe(u8, request.head.target);
         var authorization: ?[]const u8 = null;
+        var proof: ?[]const u8 = null;
         var it = request.iterateHeaders();
-        while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
-            authorization = try arena.dupe(u8, h.value);
-        };
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "authorization")) authorization = try arena.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "dpop")) proof = try arena.dupe(u8, h.value);
+        }
         var body_buf: [4096]u8 = undefined;
         const body = try request.readerExpectNone(&body_buf).allocRemaining(arena, .limited(1 << 20));
-        try self.record(method, target, authorization, body);
+        try self.record(method, target, authorization, proof, body);
 
         const path = (Entry{ .method = method, .target = target, .authorization = null, .body = &.{} }).path();
         const json_type: []const http.Header = &.{.{ .name = "content-type", .value = "application/json" }};
         if (std.mem.eql(u8, path, "/.well-known/oauth-protected-resource/mcp")) {
-            const doc = try std.fmt.allocPrint(arena, "{{\"resource\":\"{s}/mcp\",\"authorization_servers\":[\"{s}\"]{s}}}", .{ self.base, self.base, self.prm_extra });
+            const doc = try std.fmt.allocPrint(arena, "{{\"resource\":\"{s}/mcp\",\"authorization_servers\":[\"{s}\"]{s}}}", .{ self.base, self.authorization_server orelse self.base, self.prm_extra });
             return request.respond(doc, .{ .keep_alive = false, .extra_headers = json_type });
         }
         if (std.mem.eql(u8, path, "/.well-known/oauth-authorization-server")) {
@@ -163,20 +181,36 @@ const Mock = struct {
             return request.respond("", .{ .status = .found, .keep_alive = false, .extra_headers = &.{.{ .name = "location", .value = aw.written() }} });
         }
         if (std.mem.eql(u8, path, "/token")) {
+            const grant = (try formValue(arena, body, "grant_type")) orelse "";
+            const refreshing = std.mem.eql(u8, grant, "refresh_token");
             self.lock.lockUncancelable(self.io);
+            if (refreshing) {
+                const want = try std.fmt.allocPrint(arena, "ref-{d}", .{self.refresh_serial});
+                const got = (try formValue(arena, body, "refresh_token")) orelse "";
+                if (self.refuse_refresh or self.refresh_serial == 0 or !std.mem.eql(u8, got, want)) {
+                    self.lock.unlock(self.io);
+                    return request.respond("{\"error\":\"invalid_grant\"}", .{ .status = .bad_request, .keep_alive = false, .extra_headers = json_type });
+                }
+            }
+            const new_refresh = self.refresh and (!refreshing or self.rotate);
+            if (new_refresh) self.refresh_serial += 1;
             self.tokens_issued += 1;
             const n = self.tokens_issued;
+            const r = self.refresh_serial;
             self.lock.unlock(self.io);
-            // No `refresh_token`: the authorization server decides not to issue one.
-            const doc = try std.fmt.allocPrint(arena, "{{\"access_token\":\"tok-{d}\",\"token_type\":\"Bearer\",\"expires_in\":3600}}", .{n});
+            // Without `refresh`, the token has no `refresh_token`: the authorization server
+            // decides not to issue one.
+            const refresh_field = if (new_refresh) try std.fmt.allocPrint(arena, ",\"refresh_token\":\"ref-{d}\"", .{r}) else "";
+            const doc = try std.fmt.allocPrint(arena, "{{\"access_token\":\"tok-{d}\",\"token_type\":\"{s}\",\"expires_in\":{d}{s}}}", .{ n, if (proof != null) "DPoP" else "Bearer", self.expires_in, refresh_field });
             return request.respond(doc, .{ .keep_alive = false, .extra_headers = json_type });
         }
         if (std.mem.eql(u8, path, "/mcp")) {
             self.lock.lockUncancelable(self.io);
             const n = self.tokens_issued;
             self.lock.unlock(self.io);
-            const expected = try std.fmt.allocPrint(arena, "Bearer tok-{d}", .{n});
-            if (n == 0 or authorization == null or !std.mem.eql(u8, authorization.?, expected)) {
+            const expected = try std.fmt.allocPrint(arena, " tok-{d}", .{n});
+            const scheme_ok = authorization != null and (std.mem.startsWith(u8, authorization.?, "Bearer ") or std.mem.startsWith(u8, authorization.?, "DPoP "));
+            if (n == 0 or !scheme_ok or !std.mem.endsWith(u8, authorization.?, expected)) {
                 const www = try std.fmt.allocPrint(arena, "Bearer resource_metadata=\"{s}/.well-known/oauth-protected-resource/mcp\"{s}", .{ self.base, self.challenge_extra });
                 return request.respond("{\"error\":\"invalid_token\"}", .{ .status = .unauthorized, .keep_alive = false, .extra_headers = &.{ .{ .name = "www-authenticate", .value = www }, .{ .name = "content-type", .value = "application/json" } } });
             }
@@ -402,6 +436,172 @@ test "oauth client refuses authorization server endpoints without https" {
     try std.testing.expectEqual(@as(usize, 0), (try mock.requests(arena, "/register")).len);
     try std.testing.expectEqual(@as(usize, 0), (try mock.requests(arena, "/authorize")).len);
     try std.testing.expectEqual(@as(usize, 0), (try mock.requests(arena, "/token")).len);
+}
+
+// -- Refresh tokens -----------------------------------------------------------------------------
+
+/// The clock of the refresh tests, in Unix seconds. A test moves it forward.
+var test_time: i64 = 1_000_000;
+
+fn testNow() i64 {
+    return test_time;
+}
+
+fn grantOf(arena: Allocator, entry: Entry) ![]const u8 {
+    return (try formValue(arena, entry.body, "grant_type")) orelse "";
+}
+
+test "oauth client refreshes the access token before it expires and keeps the rotated refresh token" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    test_time = 1_000_000;
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true, .clock = testNow });
+    defer oauth.deinit();
+    const server_url = try mock.serverUrl(arena);
+    const transport = try mcp.transport.HttpClient.init(io, gpa, .{ .url = server_url, .auth = &oauth });
+    defer transport.deinit();
+    var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(transport.transport());
+
+    _ = try client.callTool(arena, "t", null, .{});
+    try std.testing.expectEqualStrings("ref-1", oauth.refresh_token.?);
+    try std.testing.expectEqual(test_time + 3600, oauth.expires_at.?);
+    // 30 seconds before the expiry is within the margin of 60 seconds. The next request gets a
+    // new token first.
+    test_time += 3600 - 30;
+    _ = try client.callTool(arena, "t", null, .{});
+    test_time += 3600 - 30;
+    _ = try client.callTool(arena, "t", null, .{});
+
+    const tok = try mock.requests(arena, "/token");
+    try std.testing.expectEqual(3, tok.len);
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/authorize")).len);
+    try std.testing.expectEqualStrings("authorization_code", try grantOf(arena, tok[0]));
+    for (tok[1..], [_][]const u8{ "ref-1", "ref-2" }) |t, want| {
+        try std.testing.expectEqualStrings("refresh_token", try grantOf(arena, t));
+        try std.testing.expectEqualStrings(want, (try formValue(arena, t.body, "refresh_token")).?);
+        try std.testing.expectEqualStrings(server_url, (try formValue(arena, t.body, "resource")).?);
+        try std.testing.expectEqualStrings("dyn-client", (try formValue(arena, t.body, "client_id")).?);
+    }
+    // Each rotation replaced the refresh token, and each request used the newest access token.
+    try std.testing.expectEqualStrings("ref-3", oauth.refresh_token.?);
+    const posts = try mock.requests(arena, "/mcp");
+    try std.testing.expectEqual(4, posts.len);
+    try std.testing.expectEqualStrings("Bearer tok-3", posts[3].authorization.?);
+}
+
+test "oauth client runs the authorization code flow when the server refuses the refresh token" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true });
+    defer oauth.deinit();
+    const server_url = try mock.serverUrl(arena);
+
+    try std.testing.expectEqualStrings("tok-1", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    // The server revokes the grant. The next challenge tries the refresh token, then the code flow.
+    mock.refuse_refresh = true;
+    try std.testing.expectEqualStrings("tok-2", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ", error=\"invalid_token\""), 1));
+
+    const tok = try mock.requests(arena, "/token");
+    try std.testing.expectEqual(3, tok.len);
+    try std.testing.expectEqualStrings("refresh_token", try grantOf(arena, tok[1]));
+    try std.testing.expectEqualStrings("authorization_code", try grantOf(arena, tok[2]));
+    try std.testing.expectEqual(2, (try mock.requests(arena, "/authorize")).len);
+    // The registration stays, and the new grant has its own refresh token.
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/register")).len);
+    try std.testing.expectEqualStrings("ref-2", oauth.refresh_token.?);
+    const failure = (try oauth.lastFailure(arena)).?;
+    try std.testing.expectEqual(OAuthClient.Failure.Step.refresh, failure.step);
+    try std.testing.expectEqualStrings("invalid_grant", failure.code.?);
+}
+
+test "oauth client does not use the refresh token for a step-up" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true });
+    defer oauth.deinit();
+    const server_url = try mock.serverUrl(arena);
+
+    _ = try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ", scope=\"files:read\""), 1);
+    _ = try oauth.handleChallenge(arena, server_url, 403, try mock.challenge(arena, ", error=\"insufficient_scope\", scope=\"files:write\""), 1);
+    for (try mock.requests(arena, "/token")) |t| try std.testing.expectEqualStrings("authorization_code", try grantOf(arena, t));
+    const authz = try mock.requests(arena, "/authorize");
+    try std.testing.expectEqual(2, authz.len);
+    try std.testing.expectEqualStrings("files:read files:write", (try formValue(arena, authz[1].query(), "scope")).?);
+}
+
+test "oauth client never asks for a wider scope with a refresh token" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true });
+    defer oauth.deinit();
+    const server_url = try mock.serverUrl(arena);
+
+    _ = try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ", scope=\"files:read\""), 1);
+    // A 401 that names more scopes is not a step-up. The refresh asks for the granted scope only.
+    _ = try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ", error=\"invalid_token\", scope=\"files:read files:write\""), 1);
+    const tok = try mock.requests(arena, "/token");
+    try std.testing.expectEqual(2, tok.len);
+    try std.testing.expectEqualStrings("refresh_token", try grantOf(arena, tok[1]));
+    try std.testing.expectEqualStrings("files:read", (try formValue(arena, tok[1].body, "scope")).?);
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/authorize")).len);
+    try std.testing.expectEqual(1, oauth.granted_scopes.items.len);
+}
+
+test "oauth client sends a DPoP proof with the refresh token" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var prover: mcp.auth.DpopProver = try .generate(io, gpa);
+    defer prover.deinit();
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true, .dpop = &prover });
+    defer oauth.deinit();
+    const server_url = try mock.serverUrl(arena);
+
+    _ = try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1);
+    try std.testing.expect(oauth.token_dpop);
+    try std.testing.expectEqualStrings("tok-2", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ", error=\"invalid_token\""), 1));
+    try std.testing.expect(oauth.token_dpop);
+
+    const tok = try mock.requests(arena, "/token");
+    try std.testing.expectEqual(2, tok.len);
+    try std.testing.expectEqualStrings("refresh_token", try grantOf(arena, tok[1]));
+    const token_url = try std.mem.concat(arena, u8, &.{ mock.base, "/token" });
+    const time = Io.Clock.Timestamp.now(io, .real).raw.toSeconds();
+    for (tok) |t| {
+        const proof = try mcp.auth.dpop.verifyProof(arena, t.dpop.?, .{ .method = "POST", .uri = token_url }, .{}, time);
+        try std.testing.expectEqualStrings(prover.jkt, proof.jkt);
+    }
 }
 
 // -- Server side --------------------------------------------------------------------------------
