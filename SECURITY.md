@@ -18,4 +18,4 @@ Only the newest release receives security fixes.
 
 ## Security design
 
-The wiki page `Threat-Model` maps each security requirement of the MCP specification to a module and a test. The defaults of the SDK are secure: the HTTP server binds to `127.0.0.1`, validates the `Origin` header, and seals multi round-trip request state with AES-256-GCM.
+The wiki page `Threat-Model` maps each security requirement of the MCP specification to a module and a test. The file `docs/security/tls-review.md` records the internal review of the TLS code and its findings. It is also the package for an external reviewer. The defaults of the SDK are secure: the HTTP server binds to `127.0.0.1`, validates the `Origin` header, and seals multi round-trip request state with AES-256-GCM.
