@@ -112,8 +112,8 @@ pub const Responder = struct {
 };
 
 /// Which binding delivered the request. Some rules are transport specific (for example
-/// `notifications/cancelled` exists only on stdio and on the Unix socket).
-pub const Kind = enum { stdio, memory, streamable_http, grpc, unix_socket };
+/// `notifications/cancelled` exists only on stdio, on the Unix socket and on WebSocket).
+pub const Kind = enum { stdio, memory, streamable_http, grpc, unix_socket, websocket };
 
 /// Where a request comes from, apart from its authorization principal. The rate limits of the
 /// server use it as the caller of a request without a principal.

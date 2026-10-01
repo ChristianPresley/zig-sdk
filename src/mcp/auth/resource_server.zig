@@ -241,6 +241,13 @@ pub const ResourceServer = struct {
         return .{ .ok = principal };
     }
 
+    /// A `401` challenge with the error `invalid_token`, for a transport that refuses a token
+    /// after its own check. `dpop_scheme` selects the `DPoP` challenge. The WebSocket server
+    /// uses it for a token that expired before the upgrade.
+    pub fn invalidToken(self: *const ResourceServer, arena: Allocator, dpop_scheme: bool, description: []const u8) Allocator.Error!Challenge {
+        return self.challenge(arena, if (dpop_scheme) .dpop else .bearer, 401, "invalid_token", description);
+    }
+
     /// The scheme of a challenge that is not for one scheme.
     fn primaryScheme(self: *const ResourceServer) Scheme {
         const policy = self.dpop orelse return .bearer;

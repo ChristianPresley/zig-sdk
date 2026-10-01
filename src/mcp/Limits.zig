@@ -22,6 +22,32 @@ unix_socket: struct {
     max_connections: u32 = 64,
 } = .{},
 
+/// Limits of the WebSocket transport. The server and the client obey the size and time
+/// limits. The upgrade request obeys `http.max_head_bytes`.
+websocket: struct {
+    /// Maximum bytes of one message after the join of its fragments. Overflow: the endpoint
+    /// closes the connection with the code 1009.
+    max_message_bytes: usize = 4 << 20,
+    /// Maximum payload bytes of one frame. Overflow: the endpoint closes the connection with
+    /// the code 1009.
+    max_frame_bytes: usize = 4 << 20,
+    /// Maximum open connections of the WebSocket server, with the connections that are in
+    /// the handshake. Overflow: the server closes the new connection at once.
+    max_connections: u32 = 256,
+    /// Maximum requests in flight on one connection. Overflow: the server answers the new
+    /// request with the error `-32603`, and the connection stays open.
+    max_in_flight_requests: u32 = 256,
+    /// An endpoint sends a ping when no frame came from the peer for this time. Zero
+    /// disables the pings.
+    ping_interval: Io.Duration = .fromSeconds(30),
+    /// An endpoint closes the connection with the code 1001 when no frame came from the peer
+    /// for this time. Zero disables the timeout.
+    idle_timeout: Io.Duration = .fromSeconds(90),
+    /// The time for the TLS handshake and the upgrade request of a new connection.
+    /// Overflow: the server closes the connection without a response.
+    handshake_timeout: Io.Duration = .fromSeconds(10),
+} = .{},
+
 http: struct {
     /// Maximum request body bytes. Overflow: HTTP 413.
     max_body_bytes: usize = 4 << 20,
@@ -195,6 +221,9 @@ test "defaults are sane" {
     const l: Limits = .{};
     try std.testing.expect(l.stdio.max_line_bytes > l.http.max_body_bytes);
     try std.testing.expectEqual(64, l.json_max_depth);
+    // A peer that answers each ping never reaches the idle timeout.
+    try std.testing.expect(l.websocket.idle_timeout.nanoseconds > 2 * l.websocket.ping_interval.nanoseconds);
+    try std.testing.expect(l.websocket.max_frame_bytes <= l.websocket.max_message_bytes);
 }
 
 test "rate limits are off by default" {

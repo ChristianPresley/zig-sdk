@@ -67,6 +67,8 @@ test {
     _ = @import("mcp/util/rate_limit.zig");
     _ = @import("mcp/util/wake.zig");
     _ = @import("mcp/transport/unix_test.zig");
+    _ = @import("mcp/transport/ws_frame.zig");
+    _ = @import("mcp/transport/websocket_test.zig");
     _ = @import("tls/tls.zig");
     _ = @import("mcp/spec_test/base_protocol_test.zig");
     _ = @import("mcp/spec_test/transports_test.zig");

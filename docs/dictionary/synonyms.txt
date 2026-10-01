@@ -17,7 +17,8 @@ blacklist -> denylist
 filesystem -> file system
 subprocess -> child process
 subprocesses -> child processes
-websocket -> (not a transport of the protocol: name stdio, Streamable HTTP or gRPC)
+web socket -> WebSocket
+websockets -> WebSocket connections
 json schema draft 2020-12 -> JSON Schema 2020-12
 lib -> library
 repo -> repository

@@ -7,6 +7,8 @@ pub const memory = @import("transport/memory.zig");
 pub const stdio = @import("transport/stdio.zig");
 /// The stdio framing over a Unix domain socket, with many connections.
 pub const unix = @import("transport/unix.zig");
+/// MCP on WebSocket connections (RFC 6455): one JSON-RPC message in each text message.
+pub const websocket = @import("transport/websocket.zig");
 pub const http = @import("transport/http.zig");
 pub const HttpClient = @import("transport/http_client.zig").Client;
 pub const sse = @import("transport/sse.zig");
