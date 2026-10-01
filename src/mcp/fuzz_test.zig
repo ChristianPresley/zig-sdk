@@ -233,3 +233,105 @@ fn tlsParsers(_: void, smith: *Smith) anyerror!void {
 test "fuzz: TLS message, DER, PEM and key parsers" {
     try std.testing.fuzz({}, tlsParsers, .{ .corpus = &.{ "\x03\x03" ++ "\x00" ** 32 ++ "\x00\x00\x02\x13\x01\x01\x00\x00\x00", "0\x82\x01\x00", "0\x82\x04\xa4\x02\x01\x00\x02\x82\x01\x01\x00", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n" } });
 }
+
+fn recordLayer(_: void, smith: *Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    const Connection = tls.Connection;
+    const secret = [_]u8{7} ** 32;
+
+    // The sender: messages from the input, with flushes and a padding policy from the input.
+    var unused_in: std.Io.Reader = .fixed("");
+    var sink: std.Io.Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    var send_read: [Connection.min_read_buffer_len]u8 = undefined;
+    var send_write: [1024]u8 = undefined;
+    var sender: Connection = .init(&unused_in, &sink.writer, .server, &send_read, &send_write, false);
+    defer sender.deinit();
+    sender.write_keys = tls.suites.DirectionKeys.init(.AES_128_GCM_SHA256, secret);
+    sender.handshake_complete = true;
+    const policy: tls.Padding = switch (smith.valueRangeAtMostWithHash(u8, 0, 2, 0x2001)) {
+        0 => .none,
+        1 => .{ .block = smith.valueWithHash(u16, 0x2002) },
+        else => .{ .random = smith.valueWithHash(u16, 0x2003) },
+    };
+    try sender.setPadding(std.testing.io, policy);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(gpa);
+    var msg_buf: [max_input]u8 = undefined;
+    while (expected.items.len < 64 << 10 and !smith.eosWithHash(0x2004)) {
+        const msg = input(smith, &msg_buf, 0x2005);
+        try sender.writer.writeAll(msg);
+        try expected.appendSlice(gpa, msg);
+        if (smith.boolWeightedWithHash(1, 1, 0x2006)) try sender.writer.flush();
+    }
+    try sender.writer.flush();
+    try sender.end();
+    const wire = sink.written();
+
+    // An optional change of one byte: the receiver must fail without a crash.
+    const changed = wire.len > 0 and smith.boolWeightedWithHash(3, 1, 0x2007);
+    if (changed) wire[smith.indexWithHash(wire.len, 0x2008)] ^= smith.valueRangeAtMostWithHash(u8, 1, 255, 0x2009);
+
+    // The receiver: the stream gives pieces of a size from the input, and the reads mix lines,
+    // short reads and the buffered data, as the HTTP and MCP readers do.
+    var input_buf: [Connection.min_input_buffer_len]u8 = undefined;
+    const calls = [_]std.testing.Reader.Call{.{ .buffer = wire }};
+    var stream: std.testing.Reader = .init(&input_buf, &calls);
+    stream.artificial_limit = .limited(smith.valueRangeAtMostWithHash(u16, 1, 20_000, 0x200a));
+    var receive_sink: std.Io.Writer.Allocating = .init(gpa);
+    defer receive_sink.deinit();
+    var receive_read: [Connection.min_read_buffer_len]u8 = undefined;
+    var receive_write: [64]u8 = undefined;
+    var receiver: Connection = .init(&stream.interface, &receive_sink.writer, .client, &receive_read, &receive_write, false);
+    defer receiver.deinit();
+    receiver.read_keys = tls.suites.DirectionKeys.init(.AES_128_GCM_SHA256, secret);
+    receiver.handshake_complete = true;
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    var short_buf: [4096]u8 = undefined;
+    while (true) {
+        switch (smith.valueRangeAtMostWithHash(u8, 0, 2, 0x200b)) {
+            0 => if (receiver.reader.peekDelimiterInclusive('\n')) |line| {
+                try got.appendSlice(gpa, line);
+                receiver.reader.toss(line.len);
+            } else |e| switch (e) {
+                error.StreamTooLong => {
+                    const all = receiver.reader.buffered();
+                    try got.appendSlice(gpa, all);
+                    receiver.reader.toss(all.len);
+                },
+                error.EndOfStream => break,
+                error.ReadFailed => break,
+            },
+            1 => {
+                const len = smith.valueRangeAtMostWithHash(u16, 1, short_buf.len, 0x200c);
+                const n = receiver.reader.readSliceShort(short_buf[0..len]) catch break;
+                if (n == 0) break;
+                try got.appendSlice(gpa, short_buf[0..n]);
+            },
+            else => {
+                const all = receiver.reader.buffered();
+                if (all.len == 0) {
+                    receiver.reader.fillMore() catch break;
+                    continue;
+                }
+                try got.appendSlice(gpa, all);
+                receiver.reader.toss(all.len);
+            },
+        }
+    }
+    try got.appendSlice(gpa, receiver.reader.buffered());
+    if (!changed) {
+        if (receiver.read_err) |e| return e;
+        try std.testing.expect(receiver.eof());
+        try std.testing.expectEqualSlices(u8, expected.items, got.items);
+    } else {
+        // What arrives before the changed record is a prefix of the sent data.
+        try std.testing.expect(got.items.len <= expected.items.len);
+        try std.testing.expectEqualSlices(u8, expected.items[0..got.items.len], got.items);
+    }
+}
+
+test "fuzz: TLS record layer with padding, partial input and one changed byte" {
+    try std.testing.fuzz({}, recordLayer, .{ .corpus = &.{ "", "hello\nover tls\n", "\x01\x00\x10" ++ "a" ** 64 ++ "\n" } });
+}
