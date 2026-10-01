@@ -319,13 +319,13 @@ fn handleStreamInner(conn: *Conn, stream: *Stream) !void {
     const text = messages.decodeJsonRpcMessage(payload) catch return trailersOnly(stream, arena, .invalid_argument, "The message is not a JsonRpcMessage", null, null);
     const msg = jsonrpc.Message.parse(arena, text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Syntax => return trailersOnly(stream, arena, .invalid_argument, "Parse error", errors.parseError("Parse error"), null),
-        error.Invalid, error.InvalidId => return trailersOnly(stream, arena, .invalid_argument, "Invalid Request", errors.invalidRequest("Invalid Request"), null),
+        error.Syntax => return rpcErrorOnly(stream, arena, errors.parseError("Parse error"), null),
+        error.Invalid, error.InvalidId => return rpcErrorOnly(stream, arena, errors.invalidRequest("Invalid Request"), null),
     };
     switch (msg) {
         // A notification is accepted and dropped, as on Streamable HTTP.
         .notification => return trailersOnly(stream, arena, .ok, null, null, null),
-        .response, .error_response => return trailersOnly(stream, arena, .invalid_argument, "Clients must not send responses", errors.invalidRequest("Clients must not send responses"), null),
+        .response, .error_response => return rpcErrorOnly(stream, arena, errors.invalidRequest("Clients must not send responses"), null),
         .request => |req| try handleRequest(conn, stream, arena, env, deadline, req, principal),
     }
 }
@@ -337,13 +337,13 @@ fn handleRequest(conn: *Conn, stream: *Stream, arena: Allocator, env: envelope.H
     if (try envelope.verify(arena, env, req.method, req.params, schema)) |rejection| {
         if (env.protocol_version == null and std.mem.eql(u8, req.method, "initialize")) {
             const err = try errors.unsupportedProtocolVersion(arena, &version.supported_versions, "unknown");
-            return trailersOnly(stream, arena, .invalid_argument, err.message, err, req.id);
+            return rpcErrorOnly(stream, arena, err, req.id);
         }
-        return trailersOnly(stream, arena, .invalid_argument, rejection.message, errors.headerMismatch(rejection.message), req.id);
+        return rpcErrorOnly(stream, arena, errors.headerMismatch(rejection.message), req.id);
     }
     if (!std.mem.eql(u8, env.protocol_version.?, version.version)) {
         const err = try errors.unsupportedProtocolVersion(arena, &version.supported_versions, env.protocol_version.?);
-        return trailersOnly(stream, arena, .invalid_argument, err.message, err, req.id);
+        return rpcErrorOnly(stream, arena, err, req.id);
     }
 
     var token: Transport.CancelToken = .{};
@@ -419,6 +419,12 @@ pub fn trailersOnly(stream: *Stream, arena: Allocator, code: status.Code, messag
         try list.append(arena, .{ .name = header_error_bin, .value = encoder.encode(out, aw.written()) });
     }
     try stream.sendHeaders(list.items, true);
+}
+
+/// End the call with headers only for a JSON-RPC error that the server finds before the
+/// handler runs. The status comes from the error code.
+fn rpcErrorOnly(stream: *Stream, arena: Allocator, err: errors.RpcError, id: ?RequestId) !void {
+    return trailersOnly(stream, arena, status.forJsonRpcCode(err.code), err.message, err, id);
 }
 
 fn challenge(stream: *Stream, arena: Allocator, c: resource_server.Challenge) !void {
