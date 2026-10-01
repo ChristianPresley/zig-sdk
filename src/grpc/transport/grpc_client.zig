@@ -50,7 +50,7 @@ pub const Channel = struct {
     link: ?*Link = null,
 
     /// One connection with its buffers.
-    const Link = struct {
+    pub const Link = struct {
         stream: Io.net.Stream,
         in_buf: []u8,
         out_buf: []u8,
@@ -287,7 +287,8 @@ pub const Channel = struct {
         _ = stream.waitEnd() catch return error.WriteFailed;
     }
 
-    fn acquireLink(self: *Channel) ConnectError!*Link {
+    /// The current connection. The function opens a new one when the connection is gone.
+    pub fn acquireLink(self: *Channel) ConnectError!*Link {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         return self.ensureLinkLocked();

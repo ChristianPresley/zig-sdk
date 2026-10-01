@@ -7,3 +7,5 @@
 - A JSON-RPC error that ends a call before any message travels in the trailers: `grpc-status`, `grpc-message`, `mcp-error-code` and `mcp-error-bin`.
 
 The SDK does not generate code from this file. The message has one `bytes` field, and `src/grpc/protobuf/messages.zig` encodes and decodes it by hand. The file is for other implementations.
+
+The server can also serve the typed binding: the service `model_context_protocol.Mcp` of the Google Cloud proto files for MCP. A copy of these files is in `test/fixtures/google_mcp_grpc_proto/`. The encoders and decoders of its messages in `src/grpc/protobuf/mcp_messages.zig` are hand-written too.

@@ -1,5 +1,7 @@
-//! The gRPC transport of the SDK: a JSON-RPC tunnel over HTTP/2 with its own protobuf,
-//! HPACK, HTTP/2 and gRPC layers. Nothing in `mcp` imports this module.
+//! The gRPC transport of the SDK over HTTP/2, with its own protobuf, HPACK, HTTP/2 and gRPC
+//! layers. It has two bindings: the JSON-RPC tunnel of `proto/mcp_zig_transport_v1.proto` and
+//! the typed service of the Google Cloud proto files for MCP. Nothing in `mcp` imports this
+//! module.
 const std = @import("std");
 
 pub const protobuf = struct {
@@ -35,10 +37,15 @@ pub const grpc = struct {
 
 pub const server = @import("grpc/transport/grpc_server.zig");
 pub const client = @import("grpc/transport/grpc_client.zig");
-/// The gRPC server transport for an `mcp.Server`.
+pub const typed_server = @import("grpc/transport/typed_server.zig");
+pub const typed_client = @import("grpc/transport/typed_client.zig");
+/// The gRPC server transport for an `mcp.Server`. Set `bindings.typed` to serve the typed
+/// service too.
 pub const Server = server.Server;
-/// The gRPC client transport: a channel to one server.
+/// The gRPC client transport: a channel to one server on the tunnel.
 pub const Channel = client.Channel;
+/// The client transport of the typed binding.
+pub const TypedChannel = typed_client.TypedChannel;
 
 test {
     std.testing.refAllDecls(@This());
@@ -57,6 +64,7 @@ test {
     _ = grpc.timeout;
     _ = @import("grpc/http2/connection_test.zig");
     _ = @import("grpc/grpc_test.zig");
+    _ = @import("grpc/typed_test.zig");
     _ = @import("grpc/fuzz_test.zig");
     _ = @import("grpc/spec_test/authorization_test.zig");
 }

@@ -1,6 +1,7 @@
 //! The gRPC server transport: one HTTP/2 listener, one `Call` per JSON-RPC request. The
 //! request metadata mirrors the Streamable HTTP headers. A JSON-RPC error that ends a call
-//! before any message travels in the trailers.
+//! before any message travels in the trailers. With `bindings.typed`, the listener also
+//! serves the typed service of `typed_server.zig`.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -22,6 +23,9 @@ const lpm = @import("../grpc/lpm.zig");
 const status = @import("../grpc/status.zig");
 const timeout = @import("../grpc/timeout.zig");
 const messages = @import("../protobuf/messages.zig");
+const codec = @import("../protobuf/codec.zig");
+const service = @import("../typed/service.zig");
+const typed_server = @import("typed_server.zig");
 
 const log = std.log.scoped(.mcp_grpc);
 
@@ -29,6 +33,15 @@ pub const call_path = "/mcp.zig.transport.v1.Mcp/Call";
 pub const content_type = "application/grpc+proto";
 pub const header_error_code = "mcp-error-code";
 pub const header_error_bin = "mcp-error-bin";
+
+/// The services that the server answers. A call to a service that is off ends with
+/// `UNIMPLEMENTED`.
+pub const Bindings = struct {
+    /// The JSON-RPC tunnel `mcp.zig.transport.v1.Mcp`.
+    tunnel: bool = true,
+    /// The typed service `model_context_protocol.Mcp` of the Google Cloud proto files.
+    typed: bool = false,
+};
 
 pub const Options = struct {
     /// Address to bind. The default is loopback only.
@@ -42,6 +55,11 @@ pub const Options = struct {
     max_message_bytes: usize = 4 << 20,
     /// Open connections. Overflow: the accept loop waits.
     max_connections: u32 = 256,
+    /// The services of the server. The default is the tunnel only.
+    bindings: Bindings = .{},
+    /// The nesting depth and the element count of a request message of the typed binding.
+    /// Overflow: `INVALID_ARGUMENT`.
+    typed_limits: codec.Limits = .{},
 };
 
 pub const Server = struct {
@@ -251,7 +269,9 @@ fn handleStreamInner(conn: *Conn, stream: *Stream) !void {
     const ct = Connection.findHeader(headers, "content-type") orelse "";
     if (!std.mem.eql(u8, method, "POST")) return respondHttp(stream, "405");
     if (!std.ascii.startsWithIgnoreCase(ct, "application/grpc")) return respondHttp(stream, "415");
-    if (!std.mem.eql(u8, path, call_path)) return trailersOnly(stream, arena, .unimplemented, "Unknown service or method", null, null);
+    const typed_rpc: ?service.Rpc = if (self.options.bindings.typed) service.Rpc.fromPath(path) else null;
+    const tunnel_call = self.options.bindings.tunnel and std.mem.eql(u8, path, call_path);
+    if (!tunnel_call and typed_rpc == null) return trailersOnly(stream, arena, .unimplemented, "Unknown service or method", null, null);
     if (Connection.findHeader(headers, "grpc-encoding")) |encoding| {
         if (!std.mem.eql(u8, encoding, "identity")) return trailersOnly(stream, arena, .unimplemented, "Compression is not supported", null, null);
     }
@@ -268,6 +288,7 @@ fn handleStreamInner(conn: *Conn, stream: *Stream) !void {
             .challenge => |c| return challenge(stream, arena, c),
         }
     }
+    if (typed_rpc) |rpc| return typed_server.handleCall(self, stream, arena, headers, rpc, principal);
 
     // The mirrored request metadata.
     var env: envelope.Headers = .{};
@@ -383,7 +404,7 @@ fn respondHttp(stream: *Stream, status_text: []const u8) !void {
 }
 
 /// End the call with headers only: a status, and with `err` the JSON-RPC error as well.
-fn trailersOnly(stream: *Stream, arena: Allocator, code: status.Code, message_text: ?[]const u8, err: ?errors.RpcError, id: ?RequestId) !void {
+pub fn trailersOnly(stream: *Stream, arena: Allocator, code: status.Code, message_text: ?[]const u8, err: ?errors.RpcError, id: ?RequestId) !void {
     var list: std.ArrayList(Header) = .empty;
     try list.append(arena, .{ .name = ":status", .value = "200" });
     try list.append(arena, .{ .name = "content-type", .value = content_type });
