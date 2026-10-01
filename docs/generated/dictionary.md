@@ -523,6 +523,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | AES | Advanced Encryption Standard |
 | ALPN | application-layer protocol negotiation (RFC 7301) |
 | CA | certificate authority |
+| CRL | certificate revocation list (RFC 5280 section 5) |
 | CVE | an entry in the Common Vulnerabilities and Exposures list |
 | DER | Distinguished Encoding Rules of ASN.1 |
 | DPoP | Demonstrating Proof of Possession, the sender constraint of OAuth access tokens (RFC 9449) |
@@ -533,6 +534,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | HMAC | hash-based message authentication code |
 | HS256 | HMAC with SHA-256 |
 | IV | initialization vector |
+| OCSP | Online Certificate Status Protocol (RFC 6960) |
 | PEM | the text form of keys and certificates (RFC 7468) |
 | PS256 | RSA-PSS with SHA-256 |
 | PSS | the probabilistic signature scheme of RSA |

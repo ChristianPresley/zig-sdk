@@ -8,3 +8,4 @@ test/fixtures/** linguist-vendored
 docs/generated/** linguist-generated
 *.png binary
 *.wav binary
+test/fixtures/tls/der/** binary
