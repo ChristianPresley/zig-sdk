@@ -178,6 +178,25 @@ jobs:
           --requirements 2026-07-28
           --expected-failures conformance/expected-failures-server.yml
           --output-dir conformance-results/server
+      # The suite runs the extension and pending scenarios but does not score them, so their
+      # failures do not change its exit code. Run each one alone against the unscored baseline.
+      - name: Run the scenarios that the suite does not score against the server
+        run: |
+          set -euo pipefail
+          scenarios=(
+            tasks-lifecycle tasks-capability-negotiation tasks-wire-fields
+            tasks-request-state-removal tasks-mrtr-input tasks-request-headers
+            tasks-dispatch-and-envelope tasks-status-notifications tasks-required-task-error
+            tasks-mrtr-composition json-schema-2020-12 http-header-validation
+            http-custom-header-server-validation
+          )
+          for scenario in "${scenarios[@]}"; do
+            npx --yes @modelcontextprotocol/conformance@0.2.0-alpha.11 server \
+              --url http://127.0.0.1:3000/mcp \
+              --scenario "$scenario" --spec-version 2026-07-28 --force \
+              --expected-failures conformance/expected-failures-unscored.yml \
+              --output-dir conformance-results/server-unscored
+          done
       - name: Stop the everything server
         if: always()
         run: kill "$(cat server.pid)" || true
@@ -190,6 +209,22 @@ jobs:
           --timeout 60000
           --expected-failures conformance/expected-failures-client.yml
           --output-dir conformance-results/client
+      - name: Run the scenarios that the suite does not score against the client
+        run: |
+          set -euo pipefail
+          scenarios=(
+            auth/client-credentials-jwt auth/client-credentials-basic
+            auth/enterprise-managed-authorization auth/dpop auth/dpop-nonce auth/wif-jwt-bearer
+            json-schema-2020-12-preservation
+          )
+          for scenario in "${scenarios[@]}"; do
+            npx --yes @modelcontextprotocol/conformance@0.2.0-alpha.11 client \
+              --command ./zig-out/bin/mcp-conformance-client \
+              --scenario "$scenario" --spec-version 2026-07-28 --force \
+              --timeout 60000 \
+              --expected-failures conformance/expected-failures-unscored.yml \
+              --output-dir conformance-results/client-unscored
+          done
       - uses: actions/upload-artifact@v7
         if: always()
         with:
