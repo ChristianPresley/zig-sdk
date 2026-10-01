@@ -129,7 +129,7 @@ jobs:
         run: |
           set -euo pipefail
           deps="$(mktemp -d)"
-          npm install --prefix "$deps" --no-save --no-audit --no-fund @grpc/grpc-js@^1.14.0 @grpc/proto-loader@^0.8.0
+          npm install --prefix "$deps" --no-save --no-audit --no-fund @grpc/grpc-js@1.14.5 @grpc/proto-loader@0.8.1
           node .github/interop/grpc_typed_peer.mjs 50051 "$deps"
       - name: Call the server with curl over HTTP/2 prior knowledge
         run: |
