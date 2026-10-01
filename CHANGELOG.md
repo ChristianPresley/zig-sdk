@@ -4,6 +4,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-30
+
 ### Added
 
 - `limits.listen_ack_timeout` (10 s): the client waits this time for the acknowledgment of a `subscriptions/listen` stream. Then it cancels the stream, and the request returns `error.Timeout`. Zero disables the limit. All client transports obey it through `Transport.Exchange.first_frame_timeout`.
@@ -156,6 +158,7 @@ All notable changes to this project are recorded in this file. The format follow
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ChristianPresley/zig-sdk/releases/tag/v0.1.0

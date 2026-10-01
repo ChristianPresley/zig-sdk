@@ -1,6 +1,6 @@
 .{
     .name = .mcp,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0xa19bc83940b1a7d5, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

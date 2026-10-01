@@ -9,7 +9,7 @@ This library gives you an MCP server and an MCP client in Zig 0.16.0. It has no 
 `examples/consumer/` is a project that depends on the SDK with `b.dependency("mcp", ...)`. A released consumer fetches a tag:
 
 ```bash
-zig fetch --save-exact git+https://github.com/ChristianPresley/zig-sdk#v0.2.0
+zig fetch --save-exact git+https://github.com/ChristianPresley/zig-sdk#v0.3.0
 ```
 
 ## Status
@@ -26,7 +26,7 @@ The project is in development. The [Roadmap](https://github.com/ChristianPresley
 1. Fetch the package with the exact tag:
 
 ```bash
-zig fetch --save-exact git+https://github.com/ChristianPresley/zig-sdk#v0.2.0
+zig fetch --save-exact git+https://github.com/ChristianPresley/zig-sdk#v0.3.0
 ```
 
 2. Import the `mcp` module in your `build.zig`:
