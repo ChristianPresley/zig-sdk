@@ -133,6 +133,14 @@ fn field(o: ObjectMap, key: []const u8) ?Value {
     return if (v == .null) null else v;
 }
 
+/// The count of the optional values in the tuple `values` that are not null. The messages
+/// mark a choice with "exactly one of these fields", not with a `oneof`.
+fn countSet(values: anytype) u8 {
+    var n: u8 = 0;
+    inline for (values) |v| n += @intFromBool(v != null);
+    return n;
+}
+
 fn contains(comptime list: []const []const u8, key: []const u8) bool {
     inline for (list) |item| if (std.mem.eql(u8, item, key)) return true;
     return false;
@@ -270,7 +278,8 @@ fn stringArray(cx: *Context, list: []const []const u8) Error!Value {
 /// 0.3 and not as 0.30000001192092896.
 fn f32Json(cx: *Context, x: f32) Error!Value {
     if (!std.math.isFinite(x)) return cx.fail(error.Invalid, "a float that is not finite", .{});
-    var buf: [64]u8 = undefined;
+    // The decimal text of the smallest subnormal float has 47 characters.
+    var buf: [128]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "{d}", .{x}) catch unreachable;
     return .{ .float = std.fmt.parseFloat(f64, text) catch unreachable };
 }
@@ -434,8 +443,7 @@ fn mediaToPb(cx: *Context, o: ObjectMap) Error!pb.ImageContent {
 }
 
 fn contentJson(cx: *Context, c: Content) Error!Value {
-    const kinds = @intFromBool(c.text != null) + @intFromBool(c.image != null) + @intFromBool(c.audio != null) +
-        @intFromBool(c.embedded_resource != null) + @intFromBool(c.resource_link != null);
+    const kinds = countSet(.{ c.text, c.image, c.audio, c.embedded_resource, c.resource_link });
     if (kinds != 1) return cx.fail(error.Invalid, "a content block with {d} kinds", .{kinds});
     var obj: Obj = .{ .cx = cx };
     if (c.text) |t| {
@@ -715,7 +723,7 @@ fn inputRequestsJson(cx: *Context, entries: []const pb.InputRequestEntry) Error!
 }
 
 fn inputRequestJson(cx: *Context, r: pb.InputRequest) Error!Value {
-    const kinds = @intFromBool(r.elicit_request != null) + @intFromBool(r.sampling_create_message != null) + @intFromBool(r.list_roots_request != null);
+    const kinds = countSet(.{ r.elicit_request, r.sampling_create_message, r.list_roots_request });
     if (kinds != 1) return cx.fail(error.Invalid, "an input request with {d} kinds", .{kinds});
     var obj: Obj = .{ .cx = cx };
     if (r.elicit_request) |e| {
@@ -780,7 +788,7 @@ fn inputResponsesJson(cx: *Context, entries: []const pb.InputResponseEntry) Erro
 }
 
 fn inputResponseJson(cx: *Context, r: pb.InputResponse) Error!Value {
-    const kinds = @intFromBool(r.elicit_result != null) + @intFromBool(r.sampling_create_message_result != null) + @intFromBool(r.root_list_result != null);
+    const kinds = countSet(.{ r.elicit_result, r.sampling_create_message_result, r.root_list_result });
     if (kinds != 1) return cx.fail(error.Invalid, "an input response with {d} kinds", .{kinds});
     var obj: Obj = .{ .cx = cx };
     if (r.elicit_result) |e| {
@@ -1064,7 +1072,7 @@ fn titledOptions(cx: *Context, v: Value, e: *Prim.EnumSchema) Error!void {
 }
 
 fn primitiveJson(cx: *Context, p: Prim) Error!Value {
-    const kinds = @intFromBool(p.string_schema != null) + @intFromBool(p.number_schema != null) + @intFromBool(p.boolean_schema != null) + @intFromBool(p.enum_schema != null);
+    const kinds = countSet(.{ p.string_schema, p.number_schema, p.boolean_schema, p.enum_schema });
     if (kinds != 1) return cx.fail(error.Invalid, "a property schema with {d} kinds", .{kinds});
     var obj: Obj = .{ .cx = cx };
     if (p.string_schema) |s| {
@@ -1684,6 +1692,45 @@ test "invalid messages give Invalid with a reason" {
     try std.testing.expectEqualStrings("the data of an image or audio block is not base64 text", cx.reason);
     // Malformed protobuf is a decode error, not a conversion error.
     try std.testing.expectError(error.Truncated, decodeRequest(&cx, .list_tools, &.{ 0x0a, 0x05 }));
+}
+
+test "a choice with two members gives Invalid" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cx: Context = .{ .arena = arena };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    try codec.encode(pb.CallToolResponse, gpa, &out, .{ .content = &.{.{ .text = .{}, .image = .{} }} }, .{});
+    try std.testing.expectError(error.Invalid, decodeResponse(&cx, .call_tool, out.items));
+    try std.testing.expectEqualStrings("a content block with 2 kinds", cx.reason);
+
+    out.clearRetainingCapacity();
+    try codec.encode(pb.ListToolsResponse, gpa, &out, .{ .common = .{
+        .result_type = .input_required,
+        .input_requests = &.{.{ .key = "k", .value = .{ .list_roots_request = .{}, .elicit_request = .{} } }},
+    } }, .{});
+    try std.testing.expectError(error.Invalid, decodeResponse(&cx, .list_tools, out.items));
+    try std.testing.expectEqualStrings("an input request with 2 kinds", cx.reason);
+
+    out.clearRetainingCapacity();
+    try codec.encode(pb.ListToolsRequest, gpa, &out, .{ .common = .{
+        .input_responses = &.{.{ .key = "k", .value = .{ .root_list_result = .{}, .elicit_result = .{} } }},
+    } }, .{});
+    try std.testing.expectError(error.Invalid, decodeRequest(&cx, .list_tools, out.items));
+    try std.testing.expectEqualStrings("an input response with 2 kinds", cx.reason);
+
+    out.clearRetainingCapacity();
+    try codec.encode(pb.ListToolsResponse, gpa, &out, .{ .common = .{
+        .result_type = .input_required,
+        .input_requests = &.{.{ .key = "k", .value = .{ .elicit_request = .{
+            .requested_schema = &.{.{ .key = "p", .value = .{ .string_schema = .{}, .boolean_schema = .{} } }},
+        } } }},
+    } }, .{});
+    try std.testing.expectError(error.Invalid, decodeResponse(&cx, .list_tools, out.items));
+    try std.testing.expectEqualStrings("a property schema with 2 kinds", cx.reason);
 }
 
 test "the lossy parts of the mapping" {
