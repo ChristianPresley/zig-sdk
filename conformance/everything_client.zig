@@ -4,9 +4,10 @@
 //! The suite passes `MCP_CONFORMANCE_CONTEXT` (JSON) with scenario data and expects a silent
 //! exit code 0 when the scenario ran.
 //!
-//! The scenarios `auth/client-credentials-*` use `ClientCredentials`, and the scenario
-//! `auth/enterprise-managed-authorization` uses `EnterpriseClient`. All other `auth/*`
-//! scenarios use `OAuthClient`.
+//! The scenarios `auth/client-credentials-*` use `ClientCredentials`, the scenario
+//! `auth/enterprise-managed-authorization` uses `EnterpriseClient`, and the scenario
+//! `auth/wif-jwt-bearer` uses `WorkloadIdentity`. All other `auth/*` scenarios use
+//! `OAuthClient`. The scenarios `auth/dpop` and `auth/dpop-nonce` give it a DPoP key.
 const std = @import("std");
 const mcp = @import("mcp");
 const types = mcp.types;
@@ -152,7 +153,17 @@ pub fn main(init: std.process.Init) !u8 {
         pre_registered[0] = .{ .client_id = client_id, .client_secret = json.getString(ctx, "client_secret") };
         registration = .{ .pre_registered = &pre_registered };
     };
-    var oauth: mcp.auth.OAuthClient = .init(io, gpa, .{ .registration = registration, .allow_http = true, .authorize = .headless_redirect });
+    // The DPoP scenarios: a new key for each run.
+    var prover: ?mcp.auth.DpopProver = null;
+    defer if (prover) |*p| p.deinit();
+    const dpop_scenario = std.mem.startsWith(u8, scenario, "auth/dpop");
+    if (dpop_scenario) prover = try .generate(io, gpa);
+    var oauth: mcp.auth.OAuthClient = .init(io, gpa, .{
+        .registration = registration,
+        .allow_http = true,
+        .authorize = .headless_redirect,
+        .dpop = if (prover) |*p| p else null,
+    });
     defer oauth.deinit();
     var capabilities: types.ClientCapabilities = .{ .roots = .{}, .sampling = .{}, .elicitation = .{ .form = .{ .object = .empty }, .url = .{ .object = .empty } } };
 
@@ -164,6 +175,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer if (client_credentials) |*c| c.deinit();
     var enterprise: ?mcp.auth.EnterpriseClient = null;
     defer if (enterprise) |*e| e.deinit();
+    var workload: ?mcp.auth.WorkloadIdentity = null;
+    defer if (workload) |*w| w.deinit();
     if (std.mem.startsWith(u8, scenario, "auth/client-credentials-")) {
         const ctx = context orelse return missingContext(scenario);
         const client_id = json.getString(ctx, "client_id") orelse return missingContext(scenario);
@@ -197,6 +210,15 @@ pub fn main(init: std.process.Init) !u8 {
         });
         provider = enterprise.?.provider();
         capabilities = try mcp.auth.withExtension(arena, capabilities, mcp.auth.enterprise.extension_id);
+    } else if (std.mem.eql(u8, scenario, "auth/wif-jwt-bearer")) {
+        // The workload JWT that the platform issued. The extension needs no client ID.
+        const ctx = context orelse return missingContext(scenario);
+        const assertion = json.getString(ctx, "valid_jwt") orelse return missingContext(scenario);
+        workload = .init(io, gpa, .{ .assertion = .{ .static = assertion }, .allow_http = true });
+        provider = workload.?.provider();
+        capabilities = try mcp.auth.withExtension(arena, capabilities, mcp.auth.workload_identity.extension_id);
+    } else if (dpop_scenario) {
+        capabilities = try mcp.auth.withExtension(arena, capabilities, mcp.auth.dpop.extension_id);
     }
 
     const http = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url, .auth_provider = provider });

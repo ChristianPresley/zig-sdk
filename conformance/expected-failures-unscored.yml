@@ -1,0 +1,16 @@
+# Known failures of the scenarios that the suite runs but does not score. The CI job runs each
+# of these scenarios alone with this baseline. An entry names one check of one scenario.
+#
+# The check wire-schema-valid validates each tools/call result against the CallToolResult
+# schema of the core specification, which requires content. A CreateTaskResult of the Tasks
+# extension has no content. A listed check that passes makes the job fail.
+server:
+  - tasks-lifecycle:wire-schema-valid
+  - tasks-capability-negotiation:wire-schema-valid
+  - tasks-wire-fields:wire-schema-valid
+  - tasks-request-state-removal:wire-schema-valid
+  - tasks-mrtr-input:wire-schema-valid
+  - tasks-request-headers:wire-schema-valid
+  - tasks-dispatch-and-envelope:wire-schema-valid
+  - tasks-mrtr-composition:wire-schema-valid
+client: []
