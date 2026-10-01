@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const http = std.http;
 const common = @import("common.zig");
 const jwt = @import("jwt.zig");
+const dpop = @import("dpop.zig");
 
 /// The identifier of the extension in the `extensions` capability.
 pub const extension_id = "io.modelcontextprotocol/oauth-client-credentials";
@@ -27,6 +28,8 @@ pub const ClientCredentials = struct {
     resource: ?[]u8 = null,
     scope: ?[]u8 = null,
     token: ?[]u8 = null,
+    /// The token is DPoP-bound: requests carry it with the DPoP scheme and a proof.
+    token_dpop: bool = false,
     /// Unix seconds. Null when the server gave no `expires_in`.
     expires_at: ?i64 = null,
     /// The `error` code of the last failed token request, if the server sent one.
@@ -47,6 +50,8 @@ pub const ClientCredentials = struct {
         max_document_bytes: usize = 1 << 20,
         /// The clock for token lifetimes and assertions. Null uses the real clock.
         clock: common.Clock = null,
+        /// Request DPoP-bound tokens with this key (RFC 9449). Null requests bearer tokens.
+        dpop: ?*dpop.Prover = null,
     };
 
     pub const Error = error{
@@ -71,6 +76,8 @@ pub const ClientCredentials = struct {
         EntropyUnavailable,
         /// The token endpoint refused the request. `last_error` has the error code.
         TokenRequestFailed,
+        /// The authorization server lists DPoP algorithms without the algorithm of the key.
+        DpopAlgorithmUnsupported,
     };
 
     pub fn init(io: Io, gpa: Allocator, options: Options) ClientCredentials {
@@ -95,6 +102,7 @@ pub const ClientCredentials = struct {
         for (self.signing_algs.items) |s| self.gpa.free(s);
         self.signing_algs.clearRetainingCapacity();
         self.expires_at = null;
+        self.token_dpop = false;
     }
 
     /// The interface for the `auth_provider` option of the HTTP client transport.
@@ -102,7 +110,27 @@ pub const ClientCredentials = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: common.Provider.VTable = .{ .token = providerToken, .handle_challenge = providerChallenge };
+    const vtable: common.Provider.VTable = .{
+        .token = providerToken,
+        .handle_challenge = providerChallenge,
+        .credentials = providerCredentials,
+        .dpop_nonce = providerNonce,
+    };
+
+    fn providerCredentials(ptr: *anyopaque, arena: Allocator, method: []const u8, url: []const u8) ?common.Credentials {
+        const self: *ClientCredentials = @ptrCast(@alignCast(ptr));
+        const t = self.currentToken(arena) orelse return null;
+        self.lock.lockUncancelable(self.io);
+        const bound = self.token_dpop;
+        self.lock.unlock(self.io);
+        return common.credentialsFor(arena, self.options.dpop, bound, t, method, url);
+    }
+
+    fn providerNonce(ptr: *anyopaque, url: []const u8, nonce: []const u8) void {
+        const self: *ClientCredentials = @ptrCast(@alignCast(ptr));
+        const p = self.options.dpop orelse return;
+        p.rememberNonce(url, nonce) catch {};
+    }
 
     fn providerToken(ptr: *anyopaque, arena: Allocator) ?[]const u8 {
         const self: *ClientCredentials = @ptrCast(@alignCast(ptr));
@@ -149,6 +177,7 @@ pub const ClientCredentials = struct {
         if (!std.mem.eql(u8, meta.issuer, issuer)) return error.IssuerMismatch;
         if (!self.options.allow_http and !std.mem.startsWith(u8, meta.token_endpoint, "https://")) return error.InsecureEndpoint;
         if (meta.grant_types_supported.len > 0 and !common.listContains(meta.grant_types_supported, "client_credentials")) return error.GrantTypeUnsupported;
+        try meta.checkDpop(self.options.dpop);
 
         var held: std.ArrayList([]const u8) = .empty;
         if (self.scope) |s| {
@@ -183,7 +212,7 @@ pub const ClientCredentials = struct {
         }, w, &headers);
         try common.formField(w, "resource", self.resource.?, false);
         if (self.scope) |s| try common.formField(w, "scope", s, false);
-        switch (try self.fetcher.tokenRequest(arena, self.token_endpoint.?, form.written(), headers.items)) {
+        switch (try self.fetcher.tokenRequest(arena, self.token_endpoint.?, form.written(), headers.items, self.options.dpop)) {
             .failed => |f| {
                 try common.replaceOwned(self.gpa, &self.last_error, f.code);
                 return error.TokenRequestFailed;
@@ -191,6 +220,7 @@ pub const ClientCredentials = struct {
             .ok => |reply| {
                 try common.replaceOwned(self.gpa, &self.last_error, null);
                 try common.replaceOwned(self.gpa, &self.token, reply.access_token);
+                self.token_dpop = self.options.dpop != null and common.isDpopTokenType(reply.token_type);
                 self.expires_at = if (reply.expires_in) |s| time +| s else null;
                 if (reply.scope) |granted| try common.replaceOwned(self.gpa, &self.scope, granted);
             },

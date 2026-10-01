@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const http = std.http;
 const json = @import("../json.zig");
 const common = @import("common.zig");
+const dpop = @import("dpop.zig");
 
 const log = std.log.scoped(.mcp_auth);
 
@@ -26,6 +27,8 @@ pub const Client = struct {
     issuer: ?[]u8 = null,
     registration: ?Registered = null,
     token: ?[]u8 = null,
+    /// The token is DPoP-bound: requests carry it with the DPoP scheme and a proof.
+    token_dpop: bool = false,
     /// Scopes granted with the current token (space separated list kept as a slice list).
     granted_scopes: std.ArrayList([]u8) = .empty,
     /// The issuer of the first authorization server that used pre-registered credentials
@@ -93,6 +96,12 @@ pub const Client = struct {
         /// only, production needs https.
         allow_http: bool = false,
         max_document_bytes: usize = 1 << 20,
+        /// Request DPoP-bound tokens with this key (RFC 9449). The token request and each
+        /// request to the MCP server carry a proof. Null requests bearer tokens.
+        dpop: ?*dpop.Prover = null,
+        /// Send `dpop_bound_access_tokens` in dynamic client registration: the authorization
+        /// server must then refuse token requests without a proof. It needs `dpop`.
+        dpop_bound_access_tokens: bool = false,
     };
 
     const Registered = struct {
@@ -150,6 +159,8 @@ pub const Client = struct {
         TokenRequestFailed,
         HttpFailed,
         InvalidChallenge,
+        /// The authorization server lists DPoP algorithms without the algorithm of the key.
+        DpopAlgorithmUnsupported,
     };
 
     pub fn init(io: Io, gpa: Allocator, options: Options) Client {
@@ -179,6 +190,7 @@ pub const Client = struct {
             self.gpa.free(t);
             self.token = null;
         }
+        self.token_dpop = false;
         for (self.granted_scopes.items) |s| self.gpa.free(s);
         self.granted_scopes.clearRetainingCapacity();
     }
@@ -227,7 +239,26 @@ pub const Client = struct {
         return .{ .ptr = self, .vtable = &provider_vtable };
     }
 
-    const provider_vtable: common.Provider.VTable = .{ .token = providerToken, .handle_challenge = providerChallenge };
+    const provider_vtable: common.Provider.VTable = .{
+        .token = providerToken,
+        .handle_challenge = providerChallenge,
+        .credentials = providerCredentials,
+        .dpop_nonce = providerNonce,
+    };
+
+    fn providerCredentials(ptr: *anyopaque, arena: Allocator, method: []const u8, url: []const u8) ?common.Credentials {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        const t = self.token orelse return null;
+        return common.credentialsFor(arena, self.options.dpop, self.token_dpop, t, method, url);
+    }
+
+    fn providerNonce(ptr: *anyopaque, url: []const u8, nonce: []const u8) void {
+        const self: *Client = @ptrCast(@alignCast(ptr));
+        const p = self.options.dpop orelse return;
+        p.rememberNonce(url, nonce) catch {};
+    }
 
     fn providerToken(ptr: *anyopaque, arena: Allocator) ?[]const u8 {
         const self: *Client = @ptrCast(@alignCast(ptr));
@@ -282,6 +313,7 @@ pub const Client = struct {
         try common.requireHttps(self.options.allow_http, authorization_endpoint);
         try common.requireHttps(self.options.allow_http, meta.token_endpoint);
         if (!listContains(meta.code_challenge_methods_supported, "S256")) return error.PkceUnsupported;
+        try meta.checkDpop(self.options.dpop);
 
         // Registration.
         if (self.registration == null) try self.register(arena, meta);
@@ -323,6 +355,8 @@ pub const Client = struct {
         try formField(w, "code_challenge_method", "S256", false);
         try formField(w, "resource", resource, false);
         if (scope_text) |s| try formField(w, "scope", s, false);
+        // RFC 9449 section 10: bind the authorization code to the DPoP key.
+        if (self.options.dpop) |p| try formField(w, "dpop_jkt", p.jkt, false);
         const redirect = try self.obtainRedirect(arena, url.written());
         const params = try common.parseQuery(arena, redirect);
         const code = params.get("code") orelse return error.AuthorizationFailed;
@@ -353,7 +387,7 @@ pub const Client = struct {
             _ = enc.encode(out, pair);
             try extra.append(arena, .{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Basic ", out }) });
         }
-        const reply = switch (try self.fetcher.tokenRequest(arena, meta.token_endpoint, body.written(), extra.items)) {
+        const reply = switch (try self.fetcher.tokenRequest(arena, meta.token_endpoint, body.written(), extra.items, self.options.dpop)) {
             .ok => |r| r,
             .failed => |f| {
                 try self.recordFailure(.token, f.status, f.code, f.description);
@@ -368,6 +402,8 @@ pub const Client = struct {
         }
         self.token = null;
         self.token = try self.gpa.dupe(u8, reply.access_token);
+        // RFC 9449 section 5: an authorization server without DPoP gives a bearer token.
+        self.token_dpop = self.options.dpop != null and common.isDpopTokenType(reply.token_type);
         for (self.granted_scopes.items) |s| self.gpa.free(s);
         self.granted_scopes.clearRetainingCapacity();
         const granted = reply.scope orelse scope_text orelse "";
@@ -430,9 +466,10 @@ pub const Client = struct {
         // Ask for a public client unless only secret methods are offered.
         const wanted = chooseAuthMethod(meta.token_endpoint_auth_methods_supported, !listContains(meta.token_endpoint_auth_methods_supported, "none"));
         var body: Io.Writer.Allocating = .init(arena);
+        const dpop_bound = self.options.dpop != null and self.options.dpop_bound_access_tokens;
         body.writer.print(
-            "{{\"client_name\":{f},\"redirect_uris\":[{f}],\"grant_types\":[\"authorization_code\",\"refresh_token\"],\"response_types\":[\"code\"],\"token_endpoint_auth_method\":\"{s}\",\"application_type\":\"{s}\"}}",
-            .{ std.json.fmt(self.options.client_name, .{}), std.json.fmt(self.options.redirect_uri, .{}), @tagName(wanted), @tagName(self.options.application_type) },
+            "{{\"client_name\":{f},\"redirect_uris\":[{f}],\"grant_types\":[\"authorization_code\",\"refresh_token\"],\"response_types\":[\"code\"],\"token_endpoint_auth_method\":\"{s}\",\"application_type\":\"{s}\"{s}}}",
+            .{ std.json.fmt(self.options.client_name, .{}), std.json.fmt(self.options.redirect_uri, .{}), @tagName(wanted), @tagName(self.options.application_type), if (dpop_bound) ",\"dpop_bound_access_tokens\":true" else "" },
         ) catch return error.OutOfMemory;
         const reply = self.fetcher.fetch(arena, .POST, endpoint, body.written(), "application/json", &.{}) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,

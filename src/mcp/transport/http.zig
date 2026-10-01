@@ -274,6 +274,8 @@ const Head = struct {
     origin: ?[]const u8 = null,
     host: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
+    /// The values of the `DPoP` headers.
+    dpop: []const []const u8 = &.{},
     content_length: ?u64 = null,
     envelope_headers: envelope.Headers = .{},
 };
@@ -287,6 +289,7 @@ fn copyHead(arena: Allocator, request: *http.Server.Request) !Head {
         .content_length = request.head.content_length,
     };
     var params: std.ArrayList(envelope.Headers.Param) = .empty;
+    var proofs: std.ArrayList([]const u8) = .empty;
     var it = request.iterateHeaders();
     while (it.next()) |h| {
         var name_buf: [128]u8 = undefined;
@@ -298,6 +301,7 @@ fn copyHead(arena: Allocator, request: *http.Server.Request) !Head {
         if (std.mem.eql(u8, name, "origin")) head.origin = value;
         if (std.mem.eql(u8, name, "host")) head.host = value;
         if (std.mem.eql(u8, name, "authorization")) head.authorization = value;
+        if (std.mem.eql(u8, name, "dpop")) try proofs.append(arena, value);
         if (std.mem.eql(u8, name, envelope.header_protocol_version)) head.envelope_headers.protocol_version = value;
         if (std.mem.eql(u8, name, envelope.header_method)) head.envelope_headers.method = value;
         if (std.mem.eql(u8, name, envelope.header_name)) head.envelope_headers.name = value;
@@ -306,6 +310,7 @@ fn copyHead(arena: Allocator, request: *http.Server.Request) !Head {
         }
     }
     head.envelope_headers.params = params.items;
+    head.dpop = proofs.items;
     return head;
 }
 
@@ -368,17 +373,21 @@ fn handleRequest(self: *Server, request: *http.Server.Request, socket: *Io.net.S
     // Authorization comes before any look at the body.
     var principal: ?*resource_server.Principal = null;
     if (self.options.auth) |auth| {
-        switch (try auth.authorize(arena, head.authorization)) {
+        switch (try auth.authorizeRequest(arena, .{ .authorization = head.authorization, .dpop = head.dpop, .method = @tagName(head.method) })) {
             .ok => |p| {
                 const owned = try arena.create(resource_server.Principal);
                 owned.* = p;
                 principal = owned;
             },
             .challenge => |c| {
+                var buf: [3]http.Header = undefined;
+                var headers: std.ArrayList(http.Header) = .empty;
+                try headers.appendSlice(arena, c.headers(&buf));
+                try headers.append(arena, .{ .name = "content-type", .value = "application/json" });
                 try request.respond(c.body, .{
                     .status = @enumFromInt(c.status),
                     .keep_alive = request.head.keep_alive,
-                    .extra_headers = &.{ .{ .name = "www-authenticate", .value = c.www_authenticate }, .{ .name = "content-type", .value = "application/json" } },
+                    .extra_headers = headers.items,
                 });
                 return true;
             },

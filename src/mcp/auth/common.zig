@@ -8,11 +8,12 @@ const Value = std.json.Value;
 const http = std.http;
 const json = @import("../json.zig");
 const jwt = @import("jwt.zig");
+const dpop = @import("dpop.zig");
 
 // -- Provider ------------------------------------------------------------------------------------
 
-/// Gives bearer tokens to the HTTP client transport and answers `401` and `403` challenges.
-/// `OAuthClient`, `ClientCredentials` and `EnterpriseClient` each supply one.
+/// Gives access tokens to the HTTP client transport and answers `401` and `403` challenges.
+/// `OAuthClient`, `ClientCredentials`, `EnterpriseClient` and `WorkloadIdentity` each supply one.
 pub const Provider = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -24,6 +25,13 @@ pub const Provider = struct {
         /// Get a token after a challenge. `attempt` starts at 1 for the first challenge of a
         /// request.
         handle_challenge: *const fn (ptr: *anyopaque, arena: Allocator, server_url: []const u8, status: u16, www_authenticate: ?[]const u8, attempt: u8) anyerror!void,
+        /// Optional. The credentials of one request with the HTTP `method` to `url`, in
+        /// `arena`. A provider with a DPoP-bound token gives the DPoP scheme and a proof here.
+        /// Null uses `token` with the Bearer scheme.
+        credentials: ?*const fn (ptr: *anyopaque, arena: Allocator, method: []const u8, url: []const u8) ?Credentials = null,
+        /// Optional. Receives the `DPoP-Nonce` header of a response from `url`. Null for a
+        /// provider without DPoP.
+        dpop_nonce: ?*const fn (ptr: *anyopaque, url: []const u8, nonce: []const u8) void = null,
     };
 
     pub fn token(self: Provider, arena: Allocator) ?[]const u8 {
@@ -33,7 +41,56 @@ pub const Provider = struct {
     pub fn handleChallenge(self: Provider, arena: Allocator, server_url: []const u8, status: u16, www_authenticate: ?[]const u8, attempt: u8) anyerror!void {
         return self.vtable.handle_challenge(self.ptr, arena, server_url, status, www_authenticate, attempt);
     }
+
+    /// The credentials of one request, or null when the provider has no token.
+    pub fn credentials(self: Provider, arena: Allocator, method: []const u8, url: []const u8) ?Credentials {
+        if (self.vtable.credentials) |f| return f(self.ptr, arena, method, url);
+        const t = self.token(arena) orelse return null;
+        return .{ .scheme = .bearer, .token = t };
+    }
+
+    /// True when the provider can use DPoP nonces.
+    pub fn acceptsDpopNonce(self: Provider) bool {
+        return self.vtable.dpop_nonce != null;
+    }
+
+    /// Give the `DPoP-Nonce` of a response from `url` to the provider.
+    pub fn rememberDpopNonce(self: Provider, url: []const u8, nonce: []const u8) void {
+        if (self.vtable.dpop_nonce) |f| f(self.ptr, url, nonce);
+    }
 };
+
+/// The credentials of one request.
+pub const Credentials = struct {
+    scheme: Scheme,
+    token: []const u8,
+    /// The DPoP proof of the request. Only the scheme `dpop` has one.
+    proof: ?[]const u8 = null,
+
+    pub const Scheme = enum { bearer, dpop };
+
+    /// The value of the `Authorization` header, in `arena`.
+    pub fn authorization(self: Credentials, arena: Allocator) Allocator.Error![]const u8 {
+        return std.mem.concat(arena, u8, &.{ if (self.scheme == .dpop) "DPoP " else "Bearer ", self.token });
+    }
+};
+
+/// The credentials of a provider for one request. A DPoP-bound token gets the DPoP scheme and
+/// a proof with the hash of the token. Without a proof, the function gives null: a DPoP-bound
+/// token never goes out as a bearer token.
+pub fn credentialsFor(arena: Allocator, prover: ?*dpop.Prover, dpop_bound: bool, token: []const u8, method: []const u8, url: []const u8) ?Credentials {
+    const t = arena.dupe(u8, token) catch return null;
+    if (!dpop_bound) return .{ .scheme = .bearer, .token = t };
+    const p = prover orelse return null;
+    const proof = p.proof(arena, method, url, token) catch return null;
+    return .{ .scheme = .dpop, .token = t, .proof = proof };
+}
+
+/// True when a token response names a DPoP-bound token. The comparison ignores case.
+pub fn isDpopTokenType(token_type: ?[]const u8) bool {
+    const t = token_type orelse return false;
+    return std.ascii.eqlIgnoreCase(t, dpop.token_type);
+}
 
 /// A source of Unix seconds. Null uses the real clock of the `Io`.
 pub const Clock = ?*const fn () i64;
@@ -45,47 +102,110 @@ pub fn now(io: Io, clock: Clock) i64 {
 
 // -- Challenges ----------------------------------------------------------------------------------
 
+/// The parameters of the `Bearer` and `DPoP` challenges of a response. The parameters of the
+/// `Bearer` challenge win. The `DPoP` challenge fills the parameters that the `Bearer` challenge
+/// does not have.
 pub const Challenge = struct {
     scheme_is_bearer: bool = false,
+    /// The response has a `DPoP` challenge (RFC 9449 section 7.1).
+    scheme_is_dpop: bool = false,
     resource_metadata: ?[]const u8 = null,
     scope: ?[]const u8 = null,
     err: ?[]const u8 = null,
+    /// The `error` of the `DPoP` challenge, for example `use_dpop_nonce`.
+    dpop_err: ?[]const u8 = null,
+    /// The `algs` of the `DPoP` challenge: the proof algorithms that the server accepts.
+    dpop_algs: ?[]const u8 = null,
 
     /// True for a `403` or an `insufficient_scope` error: the client needs more scopes.
     pub fn isStepUp(self: Challenge, status: u16) bool {
-        return status == 403 or (self.err != null and std.mem.eql(u8, self.err.?, "insufficient_scope"));
+        const insufficient = "insufficient_scope";
+        if (status == 403) return true;
+        if (self.err) |e| if (std.mem.eql(u8, e, insufficient)) return true;
+        if (self.dpop_err) |e| if (std.mem.eql(u8, e, insufficient)) return true;
+        return false;
+    }
+
+    /// True when the server wants a proof with a new nonce (RFC 9449 section 9).
+    pub fn wantsDpopNonce(self: Challenge) bool {
+        const e = self.dpop_err orelse return false;
+        return std.mem.eql(u8, e, "use_dpop_nonce");
     }
 };
 
-/// Parse a `WWW-Authenticate` value. The parser knows only the `Bearer` scheme.
+/// Parse a `WWW-Authenticate` value with one or more challenges (RFC 9110 section 11.6.1). The
+/// parser reads the `Bearer` and `DPoP` challenges and ignores other schemes. Join the values of
+/// more than one header with a comma.
 pub fn parseChallenge(arena: Allocator, header: []const u8) Allocator.Error!Challenge {
     var c: Challenge = .{};
-    var rest = std.mem.trim(u8, header, " \t");
-    if (rest.len < 6 or !std.ascii.eqlIgnoreCase(rest[0..6], "Bearer")) return c;
-    c.scheme_is_bearer = true;
-    rest = rest[6..];
+    var dpop_part: Challenge = .{};
+    const Current = enum { none, bearer, dpop, other };
+    var current: Current = .none;
+    var rest = header;
     while (true) {
         rest = std.mem.trimStart(u8, rest, " \t,");
         if (rest.len == 0) break;
-        const eq = std.mem.indexOfScalar(u8, rest, '=') orelse break;
-        const key = std.mem.trim(u8, rest[0..eq], " \t");
-        rest = rest[eq + 1 ..];
+        const name_end = std.mem.indexOfAny(u8, rest, " \t,=") orelse rest.len;
+        const name = rest[0..name_end];
+        rest = rest[name_end..];
+        const after_space = std.mem.trimStart(u8, rest, " \t");
+        if (name.len == 0) {
+            // A stray `=` or a quote: skip one character.
+            rest = rest[1..];
+            continue;
+        }
+        if (after_space.len == 0 or after_space[0] != '=' or isToken68End(after_space)) {
+            // A scheme name, or the token68 of the scheme.
+            if (after_space.len > 0 and after_space[0] == '=') {
+                rest = std.mem.trimStart(u8, after_space, "=");
+                continue;
+            }
+            current = if (std.ascii.eqlIgnoreCase(name, "Bearer")) .bearer else if (std.ascii.eqlIgnoreCase(name, "DPoP")) .dpop else .other;
+            if (current == .bearer) c.scheme_is_bearer = true;
+            if (current == .dpop) c.scheme_is_dpop = true;
+            continue;
+        }
+        // An auth parameter: `name=token` or `name="quoted string"`.
+        rest = std.mem.trimStart(u8, after_space[1..], " \t");
         var value: []const u8 = undefined;
         if (rest.len > 0 and rest[0] == '"') {
-            const end = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse rest.len;
-            value = rest[1..end];
-            rest = if (end < rest.len) rest[end + 1 ..] else "";
+            var out: std.ArrayList(u8) = .empty;
+            var i: usize = 1;
+            while (i < rest.len and rest[i] != '"') : (i += 1) {
+                if (rest[i] == '\\' and i + 1 < rest.len) i += 1;
+                try out.append(arena, rest[i]);
+            }
+            value = out.items;
+            rest = if (i < rest.len) rest[i + 1 ..] else "";
         } else {
-            const end = std.mem.indexOfScalar(u8, rest, ',') orelse rest.len;
-            value = std.mem.trim(u8, rest[0..end], " \t");
+            const end = std.mem.indexOfAny(u8, rest, ", \t") orelse rest.len;
+            value = try arena.dupe(u8, rest[0..end]);
             rest = rest[end..];
         }
-        const owned = try arena.dupe(u8, value);
-        if (std.ascii.eqlIgnoreCase(key, "resource_metadata")) c.resource_metadata = owned;
-        if (std.ascii.eqlIgnoreCase(key, "scope")) c.scope = owned;
-        if (std.ascii.eqlIgnoreCase(key, "error")) c.err = owned;
+        const target: *Challenge = switch (current) {
+            .bearer => &c,
+            .dpop => &dpop_part,
+            .none, .other => continue,
+        };
+        if (std.ascii.eqlIgnoreCase(name, "resource_metadata")) target.resource_metadata = value;
+        if (std.ascii.eqlIgnoreCase(name, "scope")) target.scope = value;
+        if (std.ascii.eqlIgnoreCase(name, "error")) target.err = value;
+        if (std.ascii.eqlIgnoreCase(name, "algs")) target.dpop_algs = value;
     }
+    if (c.resource_metadata == null) c.resource_metadata = dpop_part.resource_metadata;
+    if (c.scope == null) c.scope = dpop_part.scope;
+    if (c.err == null) c.err = dpop_part.err;
+    c.dpop_err = dpop_part.err;
+    c.dpop_algs = dpop_part.dpop_algs;
     return c;
+}
+
+/// True when `text` starts with the `=` signs at the end of a token68. Only spaces, a comma
+/// or the end follow these signs.
+fn isToken68End(text: []const u8) bool {
+    const after = std.mem.trimStart(u8, text, "=");
+    const next = std.mem.trimStart(u8, after, " \t");
+    return next.len == 0 or next[0] == ',';
 }
 
 /// The scope of a token request, or null for none. `configured` wins. Else the challenge
@@ -140,6 +260,16 @@ pub const ServerMetadata = struct {
     authorization_grant_profiles_supported: []const []const u8 = &.{},
     authorization_response_iss_parameter_supported: ?bool = null,
     client_id_metadata_document_supported: bool = false,
+    /// The proof algorithms of DPoP (RFC 9449 section 5.1). Empty when the server does not say.
+    dpop_signing_alg_values_supported: []const []const u8 = &.{},
+
+    /// Return `error.DpopAlgorithmUnsupported` when the server lists proof algorithms and the
+    /// algorithm of `prover` is not one of them.
+    pub fn checkDpop(self: ServerMetadata, prover: ?*const dpop.Prover) error{DpopAlgorithmUnsupported}!void {
+        const p = prover orelse return;
+        if (self.dpop_signing_alg_values_supported.len == 0) return;
+        if (!listContains(self.dpop_signing_alg_values_supported, @tagName(p.algorithm()))) return error.DpopAlgorithmUnsupported;
+    }
 };
 
 /// A token response (RFC 6749 section 5.1, RFC 8693 section 2.2).
@@ -161,6 +291,8 @@ pub const TokenFailure = struct {
     /// The `error` code of the response, for example `invalid_grant`.
     code: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    /// The `DPoP-Nonce` header of the response.
+    dpop_nonce: ?[]const u8 = null,
 };
 
 pub const TokenResult = union(enum) {
@@ -182,7 +314,13 @@ pub const Fetcher = struct {
         self.http_client.deinit();
     }
 
-    pub const Reply = struct { status: u16, body: []u8, location: ?[]const u8 };
+    pub const Reply = struct {
+        status: u16,
+        body: []u8,
+        location: ?[]const u8,
+        /// The `DPoP-Nonce` header of the response.
+        dpop_nonce: ?[]const u8 = null,
+    };
 
     pub fn fetch(self: *Fetcher, arena: Allocator, method: http.Method, url: []const u8, body: ?[]const u8, content_type: ?[]const u8, extra: []const http.Header) !Reply {
         const uri = try std.Uri.parse(url);
@@ -204,10 +342,15 @@ pub const Fetcher = struct {
         var response = try req.receiveHead(&redirect_buf);
         const status: u16 = @intFromEnum(response.head.status);
         const location: ?[]const u8 = if (response.head.location) |l| try arena.dupe(u8, l) else null;
+        var nonce: ?[]const u8 = null;
+        var it = response.head.iterateHeaders();
+        while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, dpop.nonce_header_name)) {
+            nonce = try arena.dupe(u8, h.value);
+        };
         var transfer: [4096]u8 = undefined;
         const reader = response.reader(&transfer);
         const text = try reader.allocRemaining(arena, .limited(self.max_document_bytes));
-        return .{ .status = status, .body = text, .location = location };
+        return .{ .status = status, .body = text, .location = location, .dpop_nonce = nonce };
     }
 
     /// Protected resource metadata (RFC 9728): the URL of the challenge, else the
@@ -266,23 +409,49 @@ pub const Fetcher = struct {
                 .authorization_grant_profiles_supported = try stringList(arena, tree, "authorization_grant_profiles_supported"),
                 .authorization_response_iss_parameter_supported = boolField(tree, "authorization_response_iss_parameter_supported"),
                 .client_id_metadata_document_supported = boolField(tree, "client_id_metadata_document_supported") orelse false,
+                .dpop_signing_alg_values_supported = try stringList(arena, tree, "dpop_signing_alg_values_supported"),
             };
         }
         return error.NoAuthorizationServerMetadata;
     }
 
-    /// POST a form to a token endpoint and parse the answer.
-    pub fn tokenRequest(self: *Fetcher, arena: Allocator, token_endpoint: []const u8, form: []const u8, extra: []const http.Header) Allocator.Error!TokenResult {
+    /// POST a form to a token endpoint and parse the answer. With `prover`, the request carries a
+    /// DPoP proof (RFC 9449 section 5). When the server answers `use_dpop_nonce` with a nonce,
+    /// the function keeps the nonce and sends the request one more time with a new proof.
+    pub fn tokenRequest(self: *Fetcher, arena: Allocator, token_endpoint: []const u8, form: []const u8, extra: []const http.Header, prover: ?*dpop.Prover) Allocator.Error!TokenResult {
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var headers: std.ArrayList(http.Header) = .empty;
+            try headers.appendSlice(arena, extra);
+            if (prover) |p| {
+                const proof = p.proof(arena, "POST", token_endpoint, null) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return .{ .failed = .{ .status = 0, .code = "dpop_proof_failed" } },
+                };
+                try headers.append(arena, .{ .name = dpop.header_name, .value = proof });
+            }
+            const result = try self.tokenRequestOnce(arena, token_endpoint, form, headers.items, prover);
+            const with_dpop = prover orelse return result;
+            if (attempt > 0 or result != .failed) return result;
+            const code = result.failed.code orelse return result;
+            if (!std.mem.eql(u8, code, "use_dpop_nonce") or result.failed.dpop_nonce == null) return result;
+            try with_dpop.rememberNonce(token_endpoint, result.failed.dpop_nonce.?);
+        }
+    }
+
+    fn tokenRequestOnce(self: *Fetcher, arena: Allocator, token_endpoint: []const u8, form: []const u8, extra: []const http.Header, prover: ?*dpop.Prover) Allocator.Error!TokenResult {
         const reply = self.fetch(arena, .POST, token_endpoint, form, "application/x-www-form-urlencoded", extra) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .failed = .{ .status = 0 } },
         };
+        if (prover) |p| if (reply.dpop_nonce) |n| if (reply.status == 200) try p.rememberNonce(token_endpoint, n);
         const tree = json.parseTree(arena, reply.body) catch return .{ .failed = .{ .status = reply.status } };
         if (tree != .object) return .{ .failed = .{ .status = reply.status } };
         if (reply.status != 200) return .{ .failed = .{
             .status = reply.status,
             .code = json.getString(tree, "error"),
             .description = json.getString(tree, "error_description"),
+            .dpop_nonce = reply.dpop_nonce,
         } };
         const access_token = json.getString(tree, "access_token") orelse return .{ .failed = .{ .status = reply.status } };
         return .{ .ok = .{
@@ -642,6 +811,29 @@ test "challenge parsing" {
     try std.testing.expectEqualStrings("https://s.example/.well-known/oauth-protected-resource/mcp", c.resource_metadata.?);
     const basic = try parseChallenge(arena, "Basic realm=x");
     try std.testing.expect(!basic.scheme_is_bearer);
+    try std.testing.expect(basic.resource_metadata == null);
+
+    // A DPoP challenge alone, as the DPoP extension sends it.
+    const d = try parseChallenge(arena, "DPoP error=\"use_dpop_nonce\", resource_metadata=\"https://s/.well-known/oauth-protected-resource/mcp\"");
+    try std.testing.expect(d.scheme_is_dpop and !d.scheme_is_bearer);
+    try std.testing.expect(d.wantsDpopNonce());
+    try std.testing.expectEqualStrings("https://s/.well-known/oauth-protected-resource/mcp", d.resource_metadata.?);
+
+    // Two challenges in one value: the Bearer parameters win, and DPoP fills the rest.
+    const both = try parseChallenge(arena, "Negotiate abc==, Bearer realm=\"r\", scope=\"a b\", DPoP algs=\"ES256 PS256\", error=invalid_token, resource_metadata=\"https://s/m\"");
+    try std.testing.expect(both.scheme_is_bearer and both.scheme_is_dpop);
+    try std.testing.expectEqualStrings("a b", both.scope.?);
+    try std.testing.expectEqualStrings("https://s/m", both.resource_metadata.?);
+    try std.testing.expectEqualStrings("invalid_token", both.err.?);
+    try std.testing.expectEqualStrings("ES256 PS256", both.dpop_algs.?);
+    try std.testing.expect(!both.wantsDpopNonce());
+    try std.testing.expect((try parseChallenge(arena, "DPoP error=\"insufficient_scope\"")).isStepUp(401));
+
+    // Escapes in a quoted string, and parameters of another scheme do not count.
+    const esc = try parseChallenge(arena, "Basic resource_metadata=\"x\", Bearer scope=\"a\\\"b\"");
+    try std.testing.expectEqualStrings("a\"b", esc.scope.?);
+    try std.testing.expect(esc.resource_metadata == null);
+    _ = try parseChallenge(arena, "=,\"\",Bearer=, ,DPoP");
 }
 
 test "resource coverage" {

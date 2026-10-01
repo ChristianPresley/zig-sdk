@@ -1,6 +1,8 @@
-//! The authorization extensions end to end. An MCP client with `ClientCredentials` or
-//! `EnterpriseClient` calls the loopback MCP server. A fake authorization server and a fake
-//! IdP issue the tokens. The fake authorization server checks ID-JAGs with `IdJagValidator`.
+//! The authorization extensions end to end. An MCP client with `ClientCredentials`,
+//! `EnterpriseClient` or `WorkloadIdentity` calls the loopback MCP server. A fake authorization
+//! server and a fake IdP issue the tokens. The fake authorization server checks ID-JAGs with
+//! `IdJagValidator`, workload JWTs with `WorkloadJwtValidator` and DPoP proofs with
+//! `dpop.verifyProof`.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -12,6 +14,8 @@ const types = mcp.types;
 const jwt = mcp.auth.jwt;
 const common = mcp.auth.common;
 const enterprise = mcp.auth.enterprise;
+const dpop = mcp.auth.dpop;
+const workload_identity = mcp.auth.workload_identity;
 const HttpServer = mcp.transport.http.Server;
 const HttpClient = mcp.transport.HttpClient;
 
@@ -31,7 +35,17 @@ fn now(io: Io) i64 {
 /// A fake authorization server and IdP on one loopback port. The authorization server issuer
 /// is the origin. The IdP issuer is the origin with the path `/idp`.
 const FakeAuth = struct {
-    const Mode = enum { client_secret_basic, private_key_jwt, enterprise };
+    const Mode = enum {
+        client_secret_basic,
+        private_key_jwt,
+        enterprise,
+        /// Client credentials with DPoP-bound tokens. The token endpoint requires a nonce.
+        dpop,
+        /// Workload identity federation. The issuer of the workload JWTs is another fake.
+        workload,
+        /// An issuer of workload JWTs: OpenID Connect Discovery and a JWK set.
+        oidc,
+    };
 
     io: Io,
     mode: Mode,
@@ -50,6 +64,13 @@ const FakeAuth = struct {
     idp_key: jwt.SigningKey,
     token_requests: u32 = 0,
     exchange_requests: u32 = 0,
+    /// The nonces of the token endpoint in the mode `dpop`.
+    nonce_issuer: dpop.NonceIssuer = undefined,
+    nonce_challenges: u32 = 0,
+    /// The validator of workload JWTs in the mode `workload`.
+    workload_validator: ?*const workload_identity.WorkloadJwtValidator = null,
+    /// The JWK set of the mode `oidc`.
+    jwks: []const u8 = "",
     /// The first problem that a check found, for the test to report.
     failure: ?[]const u8 = null,
 
@@ -65,6 +86,7 @@ const FakeAuth = struct {
             .base = undefined,
             .idp_issuer = undefined,
             .idp_key = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{5} ** 32) },
+            .nonce_issuer = try .init(io),
         };
         var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
         self.listener = try address.listen(io, .{ .reuse_address = true });
@@ -107,35 +129,52 @@ const FakeAuth = struct {
         var request = try server.receiveHead();
         const target = try arena.dupe(u8, request.head.target);
         var authorization: ?[]const u8 = null;
+        var proof: ?[]const u8 = null;
         var it = request.iterateHeaders();
-        while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
-            authorization = try arena.dupe(u8, h.value);
-        };
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "authorization")) authorization = try arena.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "dpop")) proof = try arena.dupe(u8, h.value);
+        }
         var body: []const u8 = "";
         if (request.head.method == .POST) {
             var body_buf: [1024]u8 = undefined;
             body = try request.readerExpectNone(&body_buf).allocRemaining(arena, .limited(1 << 16));
         }
-        const reply = try self.route(arena, target, authorization, body);
+        const reply = try self.route(arena, target, authorization, proof, body);
+        var headers: std.ArrayList(http.Header) = .empty;
+        try headers.append(arena, .{ .name = "content-type", .value = "application/json" });
+        if (reply.dpop_nonce) |n| try headers.append(arena, .{ .name = "dpop-nonce", .value = n });
         try request.respond(reply.body, .{
             .status = reply.status,
             .keep_alive = false,
-            .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+            .extra_headers = headers.items,
         });
     }
 
-    const Reply = struct { status: http.Status = .ok, body: []const u8 };
+    const Reply = struct { status: http.Status = .ok, body: []const u8, dpop_nonce: ?[]const u8 = null };
 
-    fn route(self: *FakeAuth, arena: Allocator, target: []const u8, authorization: ?[]const u8, body: []const u8) !Reply {
+    fn route(self: *FakeAuth, arena: Allocator, target: []const u8, authorization: ?[]const u8, proof: ?[]const u8, body: []const u8) !Reply {
+        if (self.mode == .oidc) {
+            if (std.mem.eql(u8, target, "/wl/.well-known/openid-configuration")) {
+                return .{ .body = try std.fmt.allocPrint(arena, "{{\"issuer\":\"{s}/wl\",\"jwks_uri\":\"{s}/wl/jwks\"}}", .{ self.base, self.base }) };
+            }
+            if (std.mem.eql(u8, target, "/wl/jwks")) return .{ .body = self.jwks };
+            return .{ .status = .not_found, .body = "{}" };
+        }
         if (std.mem.eql(u8, target, "/.well-known/oauth-authorization-server")) {
             const methods = switch (self.mode) {
-                .client_secret_basic, .enterprise => "[\"client_secret_basic\"]",
+                .client_secret_basic, .enterprise, .dpop => "[\"client_secret_basic\"]",
                 .private_key_jwt => "[\"private_key_jwt\"]",
+                .workload, .oidc => "[\"none\"]",
             };
-            const grant = if (self.mode == .enterprise) enterprise.grant_type_jwt_bearer else "client_credentials";
+            const grant = switch (self.mode) {
+                .enterprise, .workload => enterprise.grant_type_jwt_bearer,
+                else => "client_credentials",
+            };
+            const dpop_algs = if (self.mode == .dpop) ",\"dpop_signing_alg_values_supported\":[\"ES256\",\"EdDSA\"]" else "";
             return .{ .body = try std.fmt.allocPrint(arena,
-                \\{{"issuer":"{s}","token_endpoint":"{s}/token","token_endpoint_auth_methods_supported":{s},"token_endpoint_auth_signing_alg_values_supported":["ES256"],"grant_types_supported":["{s}"],"authorization_grant_profiles_supported":["{s}"]}}
-            , .{ self.base, self.base, methods, grant, enterprise.grant_profile }) };
+                \\{{"issuer":"{s}","token_endpoint":"{s}/token","token_endpoint_auth_methods_supported":{s},"token_endpoint_auth_signing_alg_values_supported":["ES256"],"grant_types_supported":["{s}"],"authorization_grant_profiles_supported":["{s}"]{s}}}
+            , .{ self.base, self.base, methods, grant, enterprise.grant_profile, dpop_algs }) };
         }
         if (std.mem.eql(u8, target, "/.well-known/oauth-authorization-server/idp")) {
             return .{ .body = try std.fmt.allocPrint(arena,
@@ -144,7 +183,7 @@ const FakeAuth = struct {
         }
         const form = try common.parseForm(arena, body);
         if (std.mem.eql(u8, target, "/idp/token")) return self.idpToken(arena, form);
-        if (std.mem.eql(u8, target, "/token")) return self.asToken(arena, form, authorization);
+        if (std.mem.eql(u8, target, "/token")) return self.asToken(arena, form, authorization, proof);
         return .{ .status = .not_found, .body = "{}" };
     }
 
@@ -169,15 +208,47 @@ const FakeAuth = struct {
 
     /// Issue an access token for the MCP server, as an HS256 JWT.
     fn accessToken(self: *FakeAuth, arena: Allocator, subject: []const u8, scope: ?[]const u8) !Reply {
-        const t = now(self.io);
-        const payload = try std.fmt.allocPrint(arena, "{{\"sub\":{f},\"aud\":{f},\"exp\":{d},\"scope\":{f}}}", .{ std.json.fmt(subject, .{}), std.json.fmt(self.resource, .{}), t + 3600, std.json.fmt(scope orelse "", .{}) });
-        const token = try jwt.signHs256(arena, payload, rs_secret, null);
-        return .{ .body = try std.fmt.allocPrint(arena, "{{\"access_token\":\"{s}\",\"token_type\":\"Bearer\",\"expires_in\":{d}}}", .{ token, self.expires_in }) };
+        return self.boundAccessToken(arena, subject, scope, null);
     }
 
-    fn asToken(self: *FakeAuth, arena: Allocator, form: std.StringHashMapUnmanaged([]const u8), authorization: ?[]const u8) !Reply {
+    /// Issue an access token. With `jkt`, the token is DPoP-bound to that key.
+    fn boundAccessToken(self: *FakeAuth, arena: Allocator, subject: []const u8, scope: ?[]const u8, jkt: ?[]const u8) !Reply {
+        const t = now(self.io);
+        const cnf = if (jkt) |k| try std.fmt.allocPrint(arena, ",\"cnf\":{{\"jkt\":\"{s}\"}}", .{k}) else "";
+        const payload = try std.fmt.allocPrint(arena, "{{\"sub\":{f},\"aud\":{f},\"exp\":{d},\"scope\":{f}{s}}}", .{ std.json.fmt(subject, .{}), std.json.fmt(self.resource, .{}), t + 3600, std.json.fmt(scope orelse "", .{}), cnf });
+        const token = try jwt.signHs256(arena, payload, rs_secret, null);
+        return .{ .body = try std.fmt.allocPrint(arena, "{{\"access_token\":\"{s}\",\"token_type\":\"{s}\",\"expires_in\":{d}}}", .{ token, if (jkt != null) "DPoP" else "Bearer", self.expires_in }) };
+    }
+
+    fn asToken(self: *FakeAuth, arena: Allocator, form: std.StringHashMapUnmanaged([]const u8), authorization: ?[]const u8, proof: ?[]const u8) !Reply {
         self.token_requests += 1;
         switch (self.mode) {
+            .oidc => return .{ .status = .not_found, .body = "{}" },
+            .dpop => {
+                if (!self.expect(form, "grant_type", "client_credentials")) return oauthError("invalid_grant");
+                if (!try self.checkBasic(arena, authorization, cc_client_id, cc_client_secret)) return oauthError("invalid_client");
+                const token_url = try std.fmt.allocPrint(arena, "{s}/token", .{self.base});
+                const checked = dpop.verifyProof(arena, proof orelse "", .{ .method = "POST", .uri = token_url }, .{ .nonce = &self.nonce_issuer }, now(self.io)) catch |e| {
+                    if (e == error.UseNonce) {
+                        self.nonce_challenges += 1;
+                        const buf = try arena.create([dpop.NonceIssuer.encoded_len]u8);
+                        return .{ .status = .bad_request, .body = "{\"error\":\"use_dpop_nonce\"}", .dpop_nonce = try self.nonce_issuer.issue(self.io, buf, now(self.io)) };
+                    }
+                    self.fail(@errorName(e));
+                    return .{ .status = .bad_request, .body = "{\"error\":\"invalid_dpop_proof\"}" };
+                };
+                return self.boundAccessToken(arena, cc_client_id, form.get("scope"), checked.jkt);
+            },
+            .workload => {
+                if (!self.expect(form, "grant_type", workload_identity.grant_type)) return oauthError("invalid_grant");
+                if (!self.expect(form, "resource", self.resource)) return oauthError("invalid_grant");
+                if (!self.expect(form, "client_id", null)) return oauthError("invalid_client");
+                if (authorization != null) self.fail("client authentication");
+                const grant = self.workload_validator.?.validate(arena, form.get("assertion") orelse "", now(self.io)) catch |e| {
+                    return .{ .status = .bad_request, .body = try workload_identity.errorResponse(arena, e) };
+                };
+                return self.accessToken(arena, grant.subject, form.get("scope"));
+            },
             .client_secret_basic => {
                 if (!self.expect(form, "grant_type", "client_credentials")) return oauthError("invalid_grant");
                 if (!self.expect(form, "resource", self.resource)) return oauthError("invalid_grant");
@@ -263,6 +334,11 @@ const McpFixture = struct {
     authorization_servers: [1][]const u8,
 
     fn start(self: *McpFixture, auth: *FakeAuth) !void {
+        return self.startWith(auth, null);
+    }
+
+    /// Start the server. With `policy`, the server accepts DPoP-bound tokens.
+    fn startWith(self: *McpFixture, auth: *FakeAuth, policy: ?*const mcp.auth.DpopPolicy) !void {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
         self.server = try mcp.Server.init(gpa, io, .{
@@ -283,6 +359,7 @@ const McpFixture = struct {
             .authorization_servers = &self.authorization_servers,
             .scopes_supported = &.{"mcp:read"},
             .verifier = self.jv.verifier(),
+            .dpop = policy,
         };
         auth.resource = self.url;
         self.future = try io.concurrent(serveIgnoringErrors, .{&self.transport});
@@ -427,6 +504,127 @@ test "enterprise-managed authorization: token exchange, JWT bearer grant and val
     try std.testing.expectError(error.TokenRequestFailed, wrong.handleChallenge(arena, fixture.url, 401, null, 1));
 }
 
+test "DPoP: client credentials with DPoP-bound tokens and nonces at both servers" {
+    var auth: FakeAuth = undefined;
+    try auth.start(.dpop);
+    defer auth.stop();
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const rs_nonces: dpop.NonceIssuer = try .init(io);
+    const policy: mcp.auth.DpopPolicy = .{ .required = true, .io = io, .verify = .{ .nonce = &rs_nonces } };
+    var fixture: McpFixture = undefined;
+    try fixture.startWith(&auth, &policy);
+    defer fixture.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var prover: dpop.Prover = try .generate(io, gpa);
+    defer prover.deinit();
+    var cc: mcp.auth.ClientCredentials = .init(io, gpa, .{
+        .client = .{ .client_secret = .{ .client_id = cc_client_id, .client_secret = cc_client_secret } },
+        .allow_http = true,
+        .dpop = &prover,
+    });
+    defer cc.deinit();
+    const ext = mcp.auth.client_credentials.extension_id;
+    // The token request gets a nonce challenge, and the MCP request gets one too.
+    try std.testing.expectEqualStrings(cc_client_id, try fixture.whoamiWith(arena, cc.provider(), ext));
+    try std.testing.expect(cc.token_dpop);
+    try std.testing.expectEqual(2, auth.token_requests);
+    try std.testing.expectEqual(1, auth.nonce_challenges);
+    // The second call uses the token and the nonce that the client holds.
+    try std.testing.expectEqualStrings(cc_client_id, try fixture.whoamiWith(arena, cc.provider(), ext));
+    try std.testing.expectEqual(2, auth.token_requests);
+    if (auth.failure) |f| std.debug.print("fake authorization server: {s}\n", .{f});
+    try std.testing.expect(auth.failure == null);
+
+    // The token without the key: a client without DPoP cannot use it.
+    const stolen = cc.token.?;
+    const transport = try HttpClient.init(io, gpa, .{ .url = fixture.url, .extra_headers = &.{.{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "DPoP ", stolen }) }} });
+    defer transport.deinit();
+    var thief: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "thief", .version = "1" } });
+    defer thief.deinit();
+    thief.connect(transport.transport());
+    try std.testing.expectError(error.InvalidResponse, thief.callTool(arena, "whoami", null, .{}));
+
+    // A key with an algorithm that the authorization server does not list.
+    const P384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+    var p384: dpop.Prover = try .init(io, gpa, .{ .es384 = try P384.KeyPair.generateDeterministic([_]u8{9} ** 48) });
+    defer p384.deinit();
+    var unsupported: mcp.auth.ClientCredentials = .init(io, gpa, .{
+        .client = .{ .client_secret = .{ .client_id = cc_client_id, .client_secret = cc_client_secret } },
+        .allow_http = true,
+        .dpop = &p384,
+    });
+    defer unsupported.deinit();
+    try std.testing.expectError(error.DpopAlgorithmUnsupported, unsupported.handleChallenge(arena, fixture.url, 401, null, 1));
+}
+
+test "workload identity: a workload JWT as a grant, with keys from OpenID Connect Discovery" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var issuer: FakeAuth = undefined;
+    try issuer.start(.oidc);
+    defer issuer.stop();
+    var auth: FakeAuth = undefined;
+    try auth.start(.workload);
+    defer auth.stop();
+    var fixture: McpFixture = undefined;
+    try fixture.start(&auth);
+    defer fixture.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The issuer of the workload JWTs and its JWK set.
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{22} ** 32) };
+    const jwk = try jwt.publicJwk(arena, &key);
+    issuer.jwks = try std.fmt.allocPrint(arena, "{{\"keys\":[{s},\"kid\":\"wl1\",\"use\":\"sig\"}}]}}", .{jwk[0 .. jwk.len - 1]});
+    const issuer_url = try std.fmt.allocPrint(arena, "{s}/wl", .{issuer.base});
+    const token_url = try std.fmt.allocPrint(arena, "{s}/token", .{auth.base});
+    var discovery: workload_identity.KeyDiscovery = .init(io, gpa, .{ .allow_http = true });
+    defer discovery.deinit();
+    const trusted = [_]workload_identity.TrustedIssuer{.{ .issuer = issuer_url }};
+    const validator: workload_identity.WorkloadJwtValidator = .{ .audiences = &.{token_url}, .trusted_issuers = &trusted, .discovery = &discovery };
+    auth.workload_validator = &validator;
+
+    const t = now(io);
+    const subject = "spiffe://example.org/ns/default/sa/agent";
+    const claims = "{{\"iss\":\"{s}\",\"sub\":\"{s}\",\"aud\":\"{s}\",\"jti\":\"{s}\",\"exp\":{d},\"iat\":{d}}}";
+    const good = try jwt.sign(arena, &key, try std.fmt.allocPrint(arena, claims, .{ issuer_url, subject, token_url, "w1", t + 300, t }), .{ .kid = "wl1" });
+    var wi: mcp.auth.WorkloadIdentity = .init(io, gpa, .{ .assertion = .{ .static = good }, .allow_http = true });
+    defer wi.deinit();
+    const ext = workload_identity.extension_id;
+    try std.testing.expectEqualStrings(subject, try fixture.whoamiWith(arena, wi.provider(), ext));
+    try std.testing.expectEqualStrings(subject, try fixture.whoamiWith(arena, wi.provider(), ext));
+    try std.testing.expectEqual(1, auth.token_requests);
+    if (auth.failure) |f| std.debug.print("fake authorization server: {s}\n", .{f});
+    try std.testing.expect(auth.failure == null);
+
+    // A JWT for another audience: the server refuses it, and the client does not send it again.
+    const wrong = try jwt.sign(arena, &key, try std.fmt.allocPrint(arena, claims, .{ issuer_url, subject, "https://other.example/token", "w2", t + 300, t }), .{ .kid = "wl1" });
+    var refused: mcp.auth.WorkloadIdentity = .init(io, gpa, .{ .assertion = .{ .static = wrong }, .allow_http = true });
+    defer refused.deinit();
+    try std.testing.expectError(error.TokenRequestFailed, refused.handleChallenge(arena, fixture.url, 401, null, 1));
+    try std.testing.expectEqualStrings("invalid_grant", refused.last_error.?);
+    try std.testing.expectEqual(2, auth.token_requests);
+    try std.testing.expectError(error.AssertionRefused, refused.handleChallenge(arena, fixture.url, 401, null, 1));
+    try std.testing.expectEqual(2, auth.token_requests);
+
+    // A JWT from a file that the platform rotates. The file ends with a line break.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fresh = try jwt.sign(arena, &key, try std.fmt.allocPrint(arena, claims, .{ issuer_url, subject, token_url, "w3", t + 300, t }), .{ .kid = "wl1" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = try std.mem.concat(arena, u8, &.{ fresh, "\n" }) });
+    const path = try tmp.dir.realPathFileAlloc(io, "token", arena);
+    var from_file: mcp.auth.WorkloadIdentity = .init(io, gpa, .{ .assertion = .{ .file = path }, .allow_http = true });
+    defer from_file.deinit();
+    try std.testing.expectEqualStrings(subject, try fixture.whoamiWith(arena, from_file.provider(), ext));
+    try std.testing.expectEqual(3, auth.token_requests);
+}
+
 test "id-jag validation rules" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -490,10 +688,12 @@ test "id-jag validation rules" {
 test "the server advertises the authorization extensions" {
     var server = try mcp.Server.init(std.testing.allocator, std.testing.io, .{
         .info = .{ .name = "s", .version = "1" },
-        .authorization_extensions = .{ .client_credentials = true, .enterprise_managed = true },
+        .authorization_extensions = .{ .client_credentials = true, .enterprise_managed = true, .dpop = true, .workload_identity = true },
     });
     defer server.deinit();
     const ext = server.options.capabilities.extensions.?.object;
     try std.testing.expect(ext.get(mcp.auth.client_credentials.extension_id) != null);
     try std.testing.expect(ext.get(enterprise.extension_id) != null);
+    try std.testing.expect(ext.get(dpop.extension_id) != null);
+    try std.testing.expect(ext.get(workload_identity.extension_id) != null);
 }

@@ -1,9 +1,13 @@
 //! The resource server side of MCP authorization: protected resource metadata, bearer token
-//! checks and the `WWW-Authenticate` challenges the specification mandates.
+//! checks and the `WWW-Authenticate` challenges the specification mandates. With a DPoP policy,
+//! the server also accepts DPoP-bound tokens and checks their proofs (RFC 9449).
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const json = @import("../json.zig");
+const dpop = @import("dpop.zig");
+const jwt_mod = @import("jwt.zig");
 
 /// Who the token stands for. Handlers read it through the request context.
 pub const Principal = struct {
@@ -13,6 +17,10 @@ pub const Principal = struct {
     client_id: ?[]const u8 = null,
     scopes: []const []const u8 = &.{},
     expires_at: ?i64 = null,
+    /// The `jkt` of the `cnf` claim: the JWK thumbprint of the DPoP key of the token (RFC
+    /// 9449 section 6). Null for a token without a binding. A verifier that reads tokens
+    /// with `cnf` must set it, else the server cannot refuse a bound token with the Bearer scheme.
+    confirmation: ?[]const u8 = null,
     /// All claims, for application checks.
     claims: ?Value = null,
 };
@@ -56,8 +64,64 @@ fn scopeFound(hierarchy: []const ScopeRule, held: []const []const u8, needed: []
 pub const Challenge = struct {
     status: u16,
     www_authenticate: []const u8,
+    /// A second `WWW-Authenticate` header: the DPoP challenge, when the server accepts both
+    /// schemes and the request had no token.
+    www_authenticate_extra: ?[]const u8 = null,
+    /// The `DPoP-Nonce` header, for the error `use_dpop_nonce`.
+    dpop_nonce: ?[]const u8 = null,
     body: []const u8,
+
+    /// The response headers of the challenge, without `content-type`.
+    pub fn headers(self: *const Challenge, buf: *[3]std.http.Header) []std.http.Header {
+        var n: usize = 0;
+        buf[n] = .{ .name = "www-authenticate", .value = self.www_authenticate };
+        n += 1;
+        if (self.www_authenticate_extra) |w| {
+            buf[n] = .{ .name = "www-authenticate", .value = w };
+            n += 1;
+        }
+        if (self.dpop_nonce) |v| {
+            buf[n] = .{ .name = "dpop-nonce", .value = v };
+            n += 1;
+        }
+        return buf[0..n];
+    }
 };
+
+/// How the resource server accepts DPoP-bound tokens (RFC 9449 and the DPoP extension of MCP).
+pub const DpopPolicy = struct {
+    /// Refuse bearer tokens. Without it, the server accepts both schemes.
+    required: bool = false,
+    /// The checks of each proof. Set `verify.nonce` to require a nonce of the server in each
+    /// proof. Set `verify.replay` to refuse a proof that the server saw before.
+    verify: dpop.VerifyOptions = .{},
+    /// The source of random bytes for new nonces.
+    io: Io,
+    /// The clock of the proof checks. Null uses the real clock of `io`.
+    clock: ?*const fn () i64 = null,
+
+    fn now(self: *const DpopPolicy) i64 {
+        if (self.clock) |f| return f();
+        return Io.Clock.Timestamp.now(self.io, .real).raw.toSeconds();
+    }
+
+    /// The `algs` of the DPoP challenge and of the metadata.
+    fn algorithms(self: *const DpopPolicy) []const jwt_mod.Algorithm {
+        return self.verify.algorithms;
+    }
+};
+
+/// The parts of an HTTP request that the authorization needs.
+pub const Request = struct {
+    /// The `Authorization` header.
+    authorization: ?[]const u8 = null,
+    /// The values of the `DPoP` headers. A request with a DPoP-bound token must have exactly one.
+    dpop: []const []const u8 = &.{},
+    /// The HTTP method, for the `htm` claim of a proof.
+    method: []const u8 = "POST",
+};
+
+const Scheme = enum { bearer, dpop };
 
 pub const Decision = union(enum) {
     ok: Principal,
@@ -77,6 +141,9 @@ pub const ResourceServer = struct {
     /// satisfies a need for each scope that it implies.
     scope_hierarchy: []const ScopeRule = &.{},
     verifier: TokenVerifier,
+    /// Accept DPoP-bound tokens with this policy. Null accepts bearer tokens only. The `htu` of
+    /// each proof must be `resource`, so `resource` must be the URI that clients send requests to.
+    dpop: ?*const DpopPolicy = null,
 
     /// True when the principal has the scope `needed`, or a broader scope that implies it.
     /// Handlers can call it for the scopes of one operation.
@@ -94,6 +161,18 @@ pub const ResourceServer = struct {
             w.print("{f}", .{std.json.fmt(as, .{})}) catch return error.OutOfMemory;
         }
         w.writeAll("],\"bearer_methods_supported\":[\"header\"]") catch return error.OutOfMemory;
+        if (self.dpop) |policy| {
+            // RFC 9728 section 2.
+            w.writeAll(",\"dpop_signing_alg_values_supported\":[") catch return error.OutOfMemory;
+            var first = true;
+            for (policy.algorithms()) |a| {
+                if (!a.isAsymmetric()) continue;
+                w.print("{s}\"{t}\"", .{ if (first) "" else ",", a }) catch return error.OutOfMemory;
+                first = false;
+            }
+            w.writeByte(']') catch return error.OutOfMemory;
+            if (policy.required) w.writeAll(",\"dpop_bound_access_tokens_required\":true") catch return error.OutOfMemory;
+        }
         if (self.scopes_supported.len > 0) {
             w.writeAll(",\"scopes_supported\":[") catch return error.OutOfMemory;
             for (self.scopes_supported, 0..) |s, i| {
@@ -106,28 +185,96 @@ pub const ResourceServer = struct {
         return aw.toOwnedSlice();
     }
 
-    /// Decide about one request from its `Authorization` header.
+    /// Decide about one request from its `Authorization` header. A DPoP-bound token needs
+    /// `authorizeRequest`, which also gets the `DPoP` header.
     pub fn authorize(self: *const ResourceServer, arena: Allocator, authorization: ?[]const u8) Allocator.Error!Decision {
-        const header = authorization orelse return .{ .challenge = try self.challenge(arena, 401, null, null) };
-        if (header.len < 7 or !std.ascii.eqlIgnoreCase(header[0..7], "Bearer ")) {
-            return .{ .challenge = try self.challenge(arena, 400, "invalid_request", "The Authorization header must carry a bearer token") };
+        return self.authorizeRequest(arena, .{ .authorization = authorization });
+    }
+
+    /// Decide about one request from its `Authorization` and `DPoP` headers.
+    pub fn authorizeRequest(self: *const ResourceServer, arena: Allocator, req: Request) Allocator.Error!Decision {
+        // Without a token, the server names each scheme that it accepts.
+        const header = req.authorization orelse return .{ .challenge = try self.challengeAll(arena) };
+        const scheme: Scheme = if (startsWithScheme(header, "Bearer")) .bearer else if (startsWithScheme(header, "DPoP")) .dpop else {
+            return .{ .challenge = try self.challenge(arena, self.primaryScheme(), 400, "invalid_request", "The Authorization header must carry a bearer token or a DPoP-bound token") };
+        };
+        if (scheme == .dpop and self.dpop == null) {
+            return .{ .challenge = try self.challenge(arena, .bearer, 400, "invalid_request", "The server accepts bearer tokens only") };
         }
-        const token = std.mem.trim(u8, header[7..], " \t");
-        if (token.len == 0) return .{ .challenge = try self.challenge(arena, 400, "invalid_request", "The bearer token is empty") };
+        if (scheme == .bearer) if (self.dpop) |policy| if (policy.required) {
+            return .{ .challenge = try self.challenge(arena, .dpop, 401, "invalid_token", "The server accepts DPoP-bound tokens only") };
+        };
+        const token = std.mem.trim(u8, header[std.mem.indexOfScalar(u8, header, ' ').? + 1 ..], " \t");
+        if (token.len == 0) return .{ .challenge = try self.challenge(arena, scheme, 400, "invalid_request", "The access token is empty") };
+        if (scheme == .dpop and req.dpop.len != 1) {
+            return .{ .challenge = try self.challenge(arena, .dpop, 401, "invalid_dpop_proof", "The request must have exactly one DPoP header") };
+        }
         const principal = self.verifier.call(arena, token) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidToken => return .{ .challenge = try self.challenge(arena, 401, "invalid_token", "The access token is not valid") },
+            error.InvalidToken => return .{ .challenge = try self.challenge(arena, scheme, 401, "invalid_token", "The access token is not valid") },
         };
+        switch (scheme) {
+            // RFC 9449 section 7.2: a DPoP-bound token never counts as a bearer token.
+            .bearer => if (principal.confirmation != null) {
+                return .{ .challenge = try self.challenge(arena, if (self.dpop != null) .dpop else .bearer, 401, "invalid_token", "The access token is DPoP-bound and needs the DPoP scheme") };
+            },
+            .dpop => {
+                const policy = self.dpop.?;
+                const jkt = principal.confirmation orelse {
+                    return .{ .challenge = try self.challenge(arena, .dpop, 401, "invalid_token", "The access token is not DPoP-bound") };
+                };
+                _ = dpop.verifyProof(arena, req.dpop[0], .{
+                    .method = req.method,
+                    .uri = self.resource,
+                    .access_token = token,
+                    .jkt = jkt,
+                }, policy.verify, policy.now()) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.UseNonce => return .{ .challenge = try self.nonceChallenge(arena, policy) },
+                    else => return .{ .challenge = try self.challenge(arena, .dpop, 401, "invalid_dpop_proof", dpop.describe(e)) },
+                };
+            },
+        }
         for (self.required_scopes) |needed| {
-            if (!self.hasScope(&principal, needed)) return .{ .challenge = try self.challenge(arena, 403, "insufficient_scope", "The token lacks a required scope") };
+            if (!self.hasScope(&principal, needed)) return .{ .challenge = try self.challenge(arena, scheme, 403, "insufficient_scope", "The token lacks a required scope") };
         }
         return .{ .ok = principal };
     }
 
-    fn challenge(self: *const ResourceServer, arena: Allocator, status: u16, err: ?[]const u8, description: ?[]const u8) Allocator.Error!Challenge {
+    /// The scheme of a challenge that is not for one scheme.
+    fn primaryScheme(self: *const ResourceServer) Scheme {
+        const policy = self.dpop orelse return .bearer;
+        return if (policy.required) .dpop else .bearer;
+    }
+
+    /// A `401` without an error that names each accepted scheme.
+    fn challengeAll(self: *const ResourceServer, arena: Allocator) Allocator.Error!Challenge {
+        var c = try self.challenge(arena, self.primaryScheme(), 401, null, null);
+        if (self.dpop) |policy| if (!policy.required) {
+            c.www_authenticate_extra = try self.challengeValue(arena, .dpop, null, null);
+        };
+        return c;
+    }
+
+    /// A `401` with the error `use_dpop_nonce` and a new nonce (RFC 9449 section 9).
+    fn nonceChallenge(self: *const ResourceServer, arena: Allocator, policy: *const DpopPolicy) Allocator.Error!Challenge {
+        var c = try self.challenge(arena, .dpop, 401, "use_dpop_nonce", "The server requires a DPoP nonce");
+        if (policy.verify.nonce) |issuer| {
+            const buf = try arena.create([dpop.NonceIssuer.encoded_len]u8);
+            c.dpop_nonce = issuer.issue(policy.io, buf, policy.now()) catch null;
+        }
+        return c;
+    }
+
+    fn challenge(self: *const ResourceServer, arena: Allocator, scheme: Scheme, status: u16, err: ?[]const u8, description: ?[]const u8) Allocator.Error!Challenge {
+        const body = try std.fmt.allocPrint(arena, "{{\"error\":{f},\"error_description\":{f}}}", .{ std.json.fmt(err orelse "unauthorized", .{}), std.json.fmt(description orelse "Authorization is required", .{}) });
+        return .{ .status = status, .www_authenticate = try self.challengeValue(arena, scheme, err, description), .body = body };
+    }
+
+    fn challengeValue(self: *const ResourceServer, arena: Allocator, scheme: Scheme, err: ?[]const u8, description: ?[]const u8) Allocator.Error![]const u8 {
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
-        w.writeAll("Bearer") catch return error.OutOfMemory;
+        w.writeAll(if (scheme == .dpop) "DPoP" else "Bearer") catch return error.OutOfMemory;
         var first = true;
         if (err) |e| {
             w.print(" error=\"{s}\"", .{e}) catch return error.OutOfMemory;
@@ -146,8 +293,17 @@ pub const ResourceServer = struct {
             }
             w.writeByte('"') catch return error.OutOfMemory;
         }
-        const body = try std.fmt.allocPrint(arena, "{{\"error\":{f},\"error_description\":{f}}}", .{ std.json.fmt(err orelse "unauthorized", .{}), std.json.fmt(description orelse "Authorization is required", .{}) });
-        return .{ .status = status, .www_authenticate = try aw.toOwnedSlice(), .body = body };
+        if (scheme == .dpop) if (self.dpop) |policy| {
+            w.writeAll(", algs=\"") catch return error.OutOfMemory;
+            var first_alg = true;
+            for (policy.algorithms()) |a| {
+                if (!a.isAsymmetric()) continue;
+                w.print("{s}{t}", .{ if (first_alg) "" else " ", a }) catch return error.OutOfMemory;
+                first_alg = false;
+            }
+            w.writeByte('"') catch return error.OutOfMemory;
+        };
+        return aw.toOwnedSlice();
     }
 };
 
@@ -186,10 +342,23 @@ pub const JwtVerifier = struct {
             .client_id = claims.client_id,
             .scopes = claims.scopes,
             .expires_at = claims.expires_at,
+            .confirmation = confirmationOf(claims.payload),
             .claims = claims.payload,
         };
     }
 };
+
+/// The `jkt` member of the `cnf` claim (RFC 9449 section 6.1), or null.
+pub fn confirmationOf(payload: Value) ?[]const u8 {
+    if (payload != .object) return null;
+    const cnf = payload.object.get("cnf") orelse return null;
+    return json.getString(cnf, "jkt");
+}
+
+/// True when `header` starts with `scheme` and a space. The comparison ignores case.
+fn startsWithScheme(header: []const u8, scheme: []const u8) bool {
+    return header.len > scheme.len and std.ascii.eqlIgnoreCase(header[0..scheme.len], scheme) and header[scheme.len] == ' ';
+}
 
 test "challenges and decisions" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -275,6 +444,103 @@ test "scope hierarchy" {
     const cycle = [_]ScopeRule{ .{ .scope = "a", .implies = &.{"b"} }, .{ .scope = "b", .implies = &.{"a"} } };
     try std.testing.expect(!scopeSatisfied(&cycle, &.{"c"}, "a"));
     try std.testing.expect(scopeSatisfied(&cycle, &.{"b"}, "a"));
+}
+
+test "DPoP: bound tokens, proofs, nonces and the downgrade to bearer" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    const jwt = @import("jwt.zig");
+    const secret = "resource-server-test-secret-32b!";
+    const keys = [_]jwt.Key{.{ .alg = .HS256, .material = .{ .secret = secret } }};
+    var jv: JwtVerifier = .{ .options = .{ .keys = &keys, .audience = "https://rs.example/mcp" }, .clock = .{ .fixed = fixedNow } };
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    var prover: dpop.Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{31} ** 32) });
+    defer prover.deinit();
+    prover.clock = fixedNow;
+    const issuer: dpop.NonceIssuer = try .init(io);
+    var policy: DpopPolicy = .{ .io = io, .clock = fixedNow };
+    var rs: ResourceServer = .{
+        .resource = "https://rs.example/mcp",
+        .resource_metadata_url = "https://rs.example/.well-known/oauth-protected-resource/mcp",
+        .authorization_servers = &.{"https://as.example"},
+        .verifier = jv.verifier(),
+        .dpop = &policy,
+    };
+    const bound_payload = try std.fmt.allocPrint(arena, "{{\"sub\":\"alice\",\"aud\":\"https://rs.example/mcp\",\"exp\":2000,\"cnf\":{{\"jkt\":\"{s}\"}}}}", .{prover.jkt});
+    const bound = try jwt.signHs256(arena, bound_payload, secret, null);
+    const plain = try jwt.signHs256(arena, "{\"sub\":\"bob\",\"aud\":\"https://rs.example/mcp\",\"exp\":2000}", secret, null);
+    const dpop_auth = try std.mem.concat(arena, u8, &.{ "DPoP ", bound });
+
+    // The metadata names the proof algorithms.
+    const doc = try json.parseTree(arena, try rs.metadataJson(arena));
+    try std.testing.expect(doc.object.get("dpop_signing_alg_values_supported") != null);
+    try std.testing.expect(doc.object.get("dpop_bound_access_tokens_required") == null);
+
+    // Without a token, both schemes appear.
+    const none = (try rs.authorizeRequest(arena, .{})).challenge;
+    try std.testing.expect(std.mem.startsWith(u8, none.www_authenticate, "Bearer "));
+    try std.testing.expect(std.mem.startsWith(u8, none.www_authenticate_extra.?, "DPoP resource_metadata="));
+    try std.testing.expect(std.mem.indexOf(u8, none.www_authenticate_extra.?, "algs=\"ES256 ES384 EdDSA RS256 PS256\"") != null);
+
+    // A good proof.
+    const proof = try prover.proof(arena, "POST", "https://rs.example/mcp", bound);
+    const ok = try rs.authorizeRequest(arena, .{ .authorization = dpop_auth, .dpop = &.{proof} });
+    try std.testing.expectEqualStrings("alice", ok.ok.subject.?);
+    try std.testing.expectEqualStrings(prover.jkt, ok.ok.confirmation.?);
+
+    // The bound token as a bearer token: refused.
+    const downgrade = (try rs.authorizeRequest(arena, .{ .authorization = try std.mem.concat(arena, u8, &.{ "Bearer ", bound }) })).challenge;
+    try std.testing.expectEqual(401, downgrade.status);
+    try std.testing.expect(std.mem.startsWith(u8, downgrade.www_authenticate, "DPoP error=\"invalid_token\""));
+    // A token without a binding is still a good bearer token.
+    try std.testing.expectEqualStrings("bob", (try rs.authorizeRequest(arena, .{ .authorization = try std.mem.concat(arena, u8, &.{ "Bearer ", plain }) })).ok.subject.?);
+    // A token without a binding with the DPoP scheme: refused.
+    const plain_proof = try prover.proof(arena, "POST", "https://rs.example/mcp", plain);
+    const unbound = (try rs.authorizeRequest(arena, .{ .authorization = try std.mem.concat(arena, u8, &.{ "DPoP ", plain }), .dpop = &.{plain_proof} })).challenge;
+    try std.testing.expect(std.mem.indexOf(u8, unbound.www_authenticate, "invalid_token") != null);
+
+    // A missing proof, two proofs, a proof for another URI and a proof of another key.
+    const missing = (try rs.authorizeRequest(arena, .{ .authorization = dpop_auth })).challenge;
+    try std.testing.expect(std.mem.indexOf(u8, missing.www_authenticate, "invalid_dpop_proof") != null);
+    const two = (try rs.authorizeRequest(arena, .{ .authorization = dpop_auth, .dpop = &.{ proof, proof } })).challenge;
+    try std.testing.expect(std.mem.indexOf(u8, two.www_authenticate, "invalid_dpop_proof") != null);
+    const wrong_uri = try prover.proof(arena, "POST", "https://rs.example/other", bound);
+    try std.testing.expect(std.mem.indexOf(u8, (try rs.authorizeRequest(arena, .{ .authorization = dpop_auth, .dpop = &.{wrong_uri} })).challenge.www_authenticate, "invalid_dpop_proof") != null);
+    var thief: dpop.Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{32} ** 32) });
+    defer thief.deinit();
+    thief.clock = fixedNow;
+    const stolen = try thief.proof(arena, "POST", "https://rs.example/mcp", bound);
+    try std.testing.expect(std.mem.indexOf(u8, (try rs.authorizeRequest(arena, .{ .authorization = dpop_auth, .dpop = &.{stolen} })).challenge.www_authenticate, "invalid_dpop_proof") != null);
+
+    // With a nonce: the first proof gets `use_dpop_nonce` and a nonce, the next proof works.
+    policy.verify.nonce = &issuer;
+    const challenge = (try rs.authorizeRequest(arena, .{ .authorization = dpop_auth, .dpop = &.{proof} })).challenge;
+    try std.testing.expectEqual(401, challenge.status);
+    try std.testing.expect(std.mem.startsWith(u8, challenge.www_authenticate, "DPoP error=\"use_dpop_nonce\""));
+    var buf: [3]std.http.Header = undefined;
+    const hs = challenge.headers(&buf);
+    try std.testing.expectEqual(2, hs.len);
+    try std.testing.expectEqualStrings("dpop-nonce", hs[1].name);
+    try prover.rememberNonce("https://rs.example/mcp", challenge.dpop_nonce.?);
+    const with_nonce = try prover.proof(arena, "POST", "https://rs.example/mcp", bound);
+    try std.testing.expectEqualStrings("alice", (try rs.authorizeRequest(arena, .{ .authorization = dpop_auth, .dpop = &.{with_nonce} })).ok.subject.?);
+
+    // DPoP only: bearer tokens get a DPoP challenge.
+    policy.required = true;
+    const only = (try rs.authorizeRequest(arena, .{ .authorization = try std.mem.concat(arena, u8, &.{ "Bearer ", plain }) })).challenge;
+    try std.testing.expect(std.mem.startsWith(u8, only.www_authenticate, "DPoP error=\"invalid_token\""));
+    const required_none = (try rs.authorizeRequest(arena, .{})).challenge;
+    try std.testing.expect(std.mem.startsWith(u8, required_none.www_authenticate, "DPoP "));
+    try std.testing.expect(required_none.www_authenticate_extra == null);
+    const required_doc = try json.parseTree(arena, try rs.metadataJson(arena));
+    try std.testing.expect(required_doc.object.get("dpop_bound_access_tokens_required").?.bool);
+
+    // A server without DPoP refuses the scheme and a bound bearer token.
+    rs.dpop = null;
+    try std.testing.expectEqual(400, (try rs.authorizeRequest(arena, .{ .authorization = dpop_auth, .dpop = &.{proof} })).challenge.status);
+    try std.testing.expectEqual(401, (try rs.authorize(arena, try std.mem.concat(arena, u8, &.{ "Bearer ", bound }))).challenge.status);
 }
 
 fn fixedNow() i64 {

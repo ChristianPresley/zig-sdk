@@ -18,7 +18,9 @@ const methods = @import("../protocol/methods.zig");
 const version = @import("../protocol/version.zig");
 const message = @import("../jsonrpc/message.zig");
 const OAuthClient = @import("../auth/oauth_client.zig").Client;
-const AuthProvider = @import("../auth/common.zig").Provider;
+const auth_common = @import("../auth/common.zig");
+const AuthProvider = auth_common.Provider;
+const dpop = @import("../auth/dpop.zig");
 
 const log = std.log.scoped(.mcp_http_client);
 
@@ -185,8 +187,9 @@ pub const Client = struct {
         try headers.append(arena, .{ .name = "accept", .value = "application/json, text/event-stream" });
         try headers.append(arena, .{ .name = "content-type", .value = "application/json" });
         try headers.append(arena, .{ .name = "accept-encoding", .value = "identity" });
-        if (self.authProvider()) |auth| if (auth.token(arena)) |token| {
-            try headers.append(arena, .{ .name = "authorization", .value = try std.mem.concat(arena, u8, &.{ "Bearer ", token }) });
+        if (self.authProvider()) |auth| if (auth.credentials(arena, "POST", self.url)) |c| {
+            try headers.append(arena, .{ .name = "authorization", .value = try c.authorization(arena) });
+            if (c.proof) |p| try headers.append(arena, .{ .name = dpop.header_name, .value = p });
         };
         try headers.append(arena, .{ .name = envelope.header_protocol_version, .value = version.version });
         try headers.append(arena, .{ .name = envelope.header_method, .value = method_name });
@@ -199,17 +202,36 @@ pub const Client = struct {
         return null;
     }
 
-    const Challenge = struct { status: u16, www_authenticate: ?[]const u8 };
+    const Challenge = struct {
+        status: u16,
+        /// The values of all `WWW-Authenticate` headers, joined with a comma.
+        www_authenticate: ?[]const u8,
+        /// The `DPoP-Nonce` header of the response.
+        dpop_nonce: ?[]const u8 = null,
+    };
+
+    /// The largest number of new proofs with a new nonce for one request.
+    const max_nonce_retries = 2;
 
     /// Send the request. Answer authorization challenges until the attempt limit.
     fn perform(self: *Client, arena: Allocator, ex: *Transport.Exchange) Transport.ExchangeError!void {
         var attempt: u8 = 0;
+        var nonce_retries: u8 = 0;
         while (true) {
             const challenge = (try self.performOnce(arena, ex)) orelse return;
             const auth = self.authProvider() orelse {
                 ex.http_status = challenge.status;
                 return error.HttpStatus;
             };
+            // RFC 9449 section 9: the server wants a proof with its nonce. The token is good,
+            // so send the request again with a new proof and do not get a new token.
+            if (challenge.dpop_nonce != null and auth.acceptsDpopNonce() and nonce_retries < max_nonce_retries) {
+                const parsed = try auth_common.parseChallenge(arena, challenge.www_authenticate orelse "");
+                if (parsed.wantsDpopNonce()) {
+                    nonce_retries += 1;
+                    continue;
+                }
+            }
             attempt += 1;
             auth.handleChallenge(arena, self.url, challenge.status, challenge.www_authenticate, attempt) catch |e| {
                 log.warn("the authorization provider failed for status {d}: {t}", .{ challenge.status, e });
@@ -242,14 +264,20 @@ pub const Client = struct {
         conn.send("POST", self.target.path, self.target.host_header, headers.items, ex.frame) catch return error.WriteFailed;
         const response = conn.receiveHead() catch return error.ReadFailed;
         ex.http_status = @intFromEnum(response.head.status);
+        var nonce: ?[]const u8 = null;
+        var www: ?[]const u8 = null;
+        var it = response.head.iterateHeaders();
+        while (it.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, dpop.nonce_header_name)) nonce = try arena.dupe(u8, h.value);
+            if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate")) {
+                www = if (www) |prev| try std.mem.concat(arena, u8, &.{ prev, ", ", h.value }) else try arena.dupe(u8, h.value);
+            }
+        }
+        // RFC 9449 section 8.2 and 9: a server can give a new nonce with any response.
+        if (nonce) |n| if (self.authProvider()) |auth| auth.rememberDpopNonce(self.url, n);
         if (ex.http_status == 401 or ex.http_status == 403) {
-            var www: ?[]const u8 = null;
-            var it = response.head.iterateHeaders();
-            while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate")) {
-                www = try arena.dupe(u8, h.value);
-            };
             _ = conn.bodyReader(&response).discardRemaining() catch {};
-            return .{ .status = ex.http_status, .www_authenticate = www };
+            return .{ .status = ex.http_status, .www_authenticate = www, .dpop_nonce = nonce };
         }
         const content_type = response.head.content_type orelse "";
         const is_json = std.ascii.startsWithIgnoreCase(content_type, "application/json");

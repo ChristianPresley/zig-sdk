@@ -405,13 +405,16 @@ fn challenge(stream: *Stream, arena: Allocator, c: resource_server.Challenge) !v
         403 => .permission_denied,
         else => .invalid_argument,
     };
-    try stream.sendHeaders(&.{
+    var buf: [3]std.http.Header = undefined;
+    var headers: std.ArrayList(Header) = .empty;
+    try headers.appendSlice(arena, &.{
         .{ .name = ":status", .value = "200" },
         .{ .name = "content-type", .value = content_type },
         .{ .name = "grpc-status", .value = code.wire() },
         .{ .name = "grpc-message", .value = try status.encodeMessage(arena, "Authorization required") },
-        .{ .name = "www-authenticate", .value = c.www_authenticate },
-    }, true);
+    });
+    for (c.headers(&buf)) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
+    try stream.sendHeaders(headers.items, true);
 }
 
 /// The responder of one call.

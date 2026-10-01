@@ -17,11 +17,19 @@ pub const ClientCredentials = client_credentials.ClientCredentials;
 pub const enterprise = @import("auth/enterprise.zig");
 pub const EnterpriseClient = enterprise.EnterpriseClient;
 pub const IdJagValidator = enterprise.IdJagValidator;
+/// DPoP (RFC 9449): access tokens that only the holder of a key can use.
+pub const dpop = @import("auth/dpop.zig");
+pub const DpopProver = dpop.Prover;
+/// Workload identity federation: a workload JWT as an authorization grant.
+pub const workload_identity = @import("auth/workload_identity.zig");
+pub const WorkloadIdentity = workload_identity.WorkloadIdentity;
+pub const WorkloadJwtValidator = workload_identity.WorkloadJwtValidator;
 pub const jwt = @import("auth/jwt.zig");
 pub const resource_server = @import("auth/resource_server.zig");
 pub const ResourceServer = resource_server.ResourceServer;
 pub const Principal = resource_server.Principal;
 pub const JwtVerifier = resource_server.JwtVerifier;
+pub const DpopPolicy = resource_server.DpopPolicy;
 
 /// Return a copy of `capabilities` that declares the extension `id` under `extensions`. The
 /// copy keeps the extensions that `capabilities` declares already. The new map is in `arena`.

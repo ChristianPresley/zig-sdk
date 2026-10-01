@@ -18,6 +18,7 @@ const http = std.http;
 const json = @import("../json.zig");
 const common = @import("common.zig");
 const jwt = @import("jwt.zig");
+const dpop = @import("dpop.zig");
 
 /// The identifier of the extension in the `extensions` capability.
 pub const extension_id = "io.modelcontextprotocol/enterprise-managed-authorization";
@@ -68,6 +69,8 @@ pub const EnterpriseClient = struct {
     grant_expires_at: ?i64 = null,
     /// The access token of the MCP authorization server and its expiry.
     token: ?[]u8 = null,
+    /// The token is DPoP-bound: requests carry it with the DPoP scheme and a proof.
+    token_dpop: bool = false,
     expires_at: ?i64 = null,
     /// The `error` code of the last failed token request, if the server sent one.
     last_error: ?[]u8 = null,
@@ -115,6 +118,9 @@ pub const EnterpriseClient = struct {
         max_document_bytes: usize = 1 << 20,
         /// The clock for token lifetimes and assertions. Null uses the real clock.
         clock: common.Clock = null,
+        /// Request DPoP-bound tokens from the MCP authorization server with this key (RFC
+        /// 9449). The token exchange at the IdP does not use DPoP. Null requests bearer tokens.
+        dpop: ?*dpop.Prover = null,
     };
 
     pub const Error = error{
@@ -140,6 +146,8 @@ pub const EnterpriseClient = struct {
         TokenExchangeFailed,
         /// The authorization server refused the ID-JAG. See `last_error`.
         TokenRequestFailed,
+        /// The authorization server lists DPoP algorithms without the algorithm of the key.
+        DpopAlgorithmUnsupported,
     };
 
     pub fn init(io: Io, gpa: Allocator, options: Options) EnterpriseClient {
@@ -164,6 +172,7 @@ pub const EnterpriseClient = struct {
         self.signing_algs.clearRetainingCapacity();
         self.grant_expires_at = null;
         self.expires_at = null;
+        self.token_dpop = false;
     }
 
     /// The interface for the `auth_provider` option of the HTTP client transport.
@@ -171,7 +180,27 @@ pub const EnterpriseClient = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: common.Provider.VTable = .{ .token = providerToken, .handle_challenge = providerChallenge };
+    const vtable: common.Provider.VTable = .{
+        .token = providerToken,
+        .handle_challenge = providerChallenge,
+        .credentials = providerCredentials,
+        .dpop_nonce = providerNonce,
+    };
+
+    fn providerCredentials(ptr: *anyopaque, arena: Allocator, method: []const u8, url: []const u8) ?common.Credentials {
+        const self: *EnterpriseClient = @ptrCast(@alignCast(ptr));
+        const t = self.currentToken(arena) orelse return null;
+        self.lock.lockUncancelable(self.io);
+        const bound = self.token_dpop;
+        self.lock.unlock(self.io);
+        return common.credentialsFor(arena, self.options.dpop, bound, t, method, url);
+    }
+
+    fn providerNonce(ptr: *anyopaque, url: []const u8, nonce: []const u8) void {
+        const self: *EnterpriseClient = @ptrCast(@alignCast(ptr));
+        const p = self.options.dpop orelse return;
+        p.rememberNonce(url, nonce) catch {};
+    }
 
     fn providerToken(ptr: *anyopaque, arena: Allocator) ?[]const u8 {
         const self: *EnterpriseClient = @ptrCast(@alignCast(ptr));
@@ -218,6 +247,7 @@ pub const EnterpriseClient = struct {
         if (!self.options.allow_http and !std.mem.startsWith(u8, meta.token_endpoint, "https://")) return error.InsecureEndpoint;
         if (meta.grant_types_supported.len > 0 and !common.listContains(meta.grant_types_supported, grant_type_jwt_bearer)) return error.GrantProfileUnsupported;
         if (self.options.require_grant_profile and !common.listContains(meta.authorization_grant_profiles_supported, grant_profile)) return error.GrantProfileUnsupported;
+        try meta.checkDpop(self.options.dpop);
 
         var held: std.ArrayList([]const u8) = .empty;
         if (self.scope) |s| {
@@ -288,7 +318,7 @@ pub const EnterpriseClient = struct {
             .auth_methods_supported = if (idp_meta) |m| m.token_endpoint_auth_methods_supported else &.{},
             .signing_algs_supported = if (idp_meta) |m| m.token_endpoint_auth_signing_alg_values_supported else &.{},
         }, w, &headers);
-        switch (try self.fetcher.tokenRequest(arena, idp_endpoint, form.written(), headers.items)) {
+        switch (try self.fetcher.tokenRequest(arena, idp_endpoint, form.written(), headers.items, null)) {
             .failed => |f| {
                 try common.replaceOwned(self.gpa, &self.last_error, f.code);
                 return error.TokenExchangeFailed;
@@ -319,7 +349,7 @@ pub const EnterpriseClient = struct {
             .auth_methods_supported = self.auth_methods.items,
             .signing_algs_supported = self.signing_algs.items,
         }, w, &headers);
-        switch (try self.fetcher.tokenRequest(arena, self.token_endpoint.?, form.written(), headers.items)) {
+        switch (try self.fetcher.tokenRequest(arena, self.token_endpoint.?, form.written(), headers.items, self.options.dpop)) {
             .failed => |f| {
                 try common.replaceOwned(self.gpa, &self.last_error, f.code);
                 return error.TokenRequestFailed;
@@ -327,6 +357,7 @@ pub const EnterpriseClient = struct {
             .ok => |reply| {
                 try common.replaceOwned(self.gpa, &self.last_error, null);
                 try common.replaceOwned(self.gpa, &self.token, reply.access_token);
+                self.token_dpop = self.options.dpop != null and common.isDpopTokenType(reply.token_type);
                 self.expires_at = if (reply.expires_in) |s| time +| s else null;
             },
         }

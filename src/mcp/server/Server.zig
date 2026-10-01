@@ -24,6 +24,8 @@ const mrtr = @import("mrtr.zig");
 const tasks = @import("tasks.zig");
 const client_credentials = @import("../auth/client_credentials.zig");
 const enterprise = @import("../auth/enterprise.zig");
+const dpop = @import("../auth/dpop.zig");
+const workload_identity = @import("../auth/workload_identity.zig");
 const skills = @import("skills.zig");
 const skills_proto = @import("../protocol/skills.zig");
 const apps = @import("apps.zig");
@@ -73,6 +75,10 @@ pub const Options = struct {
         client_credentials: bool = false,
         /// `io.modelcontextprotocol/enterprise-managed-authorization`.
         enterprise_managed: bool = false,
+        /// `io.modelcontextprotocol/auth/dpop`: the server accepts DPoP-bound tokens.
+        dpop: bool = false,
+        /// `io.modelcontextprotocol/auth/wif`: workload identity federation.
+        workload_identity: bool = false,
     } = .{},
     /// Enable the Skills extension. The server then advertises it under `extensions` and
     /// declares the `resources` capability. Register skills with `addSkill`.
@@ -243,6 +249,8 @@ pub fn init(gpa: Allocator, io: Io, options: Options) InitError!Server {
     if (options.apps != null) try server.advertiseExtension(apps.extension_id, .{ .object = .empty });
     if (options.authorization_extensions.client_credentials) try server.advertiseExtension(client_credentials.extension_id, .{ .object = .empty });
     if (options.authorization_extensions.enterprise_managed) try server.advertiseExtension(enterprise.extension_id, .{ .object = .empty });
+    if (options.authorization_extensions.dpop) try server.advertiseExtension(dpop.extension_id, .{ .object = .empty });
+    if (options.authorization_extensions.workload_identity) try server.advertiseExtension(workload_identity.extension_id, .{ .object = .empty });
     return server;
 }
 

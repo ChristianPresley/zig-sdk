@@ -17,7 +17,19 @@ const Ed25519 = std.crypto.sign.Ed25519;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// The JWS algorithms. `EdDSA` is Ed25519 only.
-pub const Algorithm = enum { HS256, ES256, ES384, EdDSA, RS256, PS256 };
+pub const Algorithm = enum {
+    HS256,
+    ES256,
+    ES384,
+    EdDSA,
+    RS256,
+    PS256,
+
+    /// True for an algorithm with a public key. HS256 is the only symmetric algorithm.
+    pub fn isAsymmetric(self: Algorithm) bool {
+        return self != .HS256;
+    }
+};
 
 /// A verification key. `kid` is optional. `alg` restricts the key to one algorithm.
 pub const Key = struct {
@@ -391,6 +403,8 @@ pub const SignOptions = struct {
     kid: ?[]const u8 = null,
     /// The `typ` header. Null omits it.
     typ: ?[]const u8 = "JWT",
+    /// The `jwk` header: a JSON object as text, for example from `publicJwk`. Null omits it.
+    jwk: ?[]const u8 = null,
 };
 
 pub const SignError = error{ OutOfMemory, SigningFailed };
@@ -403,6 +417,7 @@ pub fn sign(arena: Allocator, key: *const SigningKey, payload_json: []const u8, 
     w.print("{{\"alg\":\"{t}\"", .{key.algorithm()}) catch return error.OutOfMemory;
     if (options.typ) |t| w.print(",\"typ\":{f}", .{std.json.fmt(t, .{})}) catch return error.OutOfMemory;
     if (options.kid) |k| w.print(",\"kid\":{f}", .{std.json.fmt(k, .{})}) catch return error.OutOfMemory;
+    if (options.jwk) |k| w.print(",\"jwk\":{s}", .{k}) catch return error.OutOfMemory;
     w.writeByte('}') catch return error.OutOfMemory;
     const input = try std.mem.concat(arena, u8, &.{ try encodeSegment(arena, header.written()), ".", try encodeSegment(arena, payload_json) });
     const signature: []const u8 = switch (key.*) {
@@ -469,39 +484,124 @@ pub fn parseJwks(arena: Allocator, text: []const u8) JwksError![]Key {
     for (list.array.items) |jwk| {
         if (jwk != .object) continue;
         if (json.getString(jwk, "use")) |use| if (!std.mem.eql(u8, use, "sig")) continue;
-        const kid = json.getString(jwk, "kid");
-        const alg_text = json.getString(jwk, "alg");
-        const alg: ?Algorithm = if (alg_text) |t| std.meta.stringToEnum(Algorithm, t) orelse continue else null;
+        const alg: ?Algorithm = if (json.getString(jwk, "alg")) |t| std.meta.stringToEnum(Algorithm, t) orelse continue else null;
         const kty = json.getString(jwk, "kty") orelse continue;
-        if (std.mem.eql(u8, kty, "EC")) {
-            const crv = json.getString(jwk, "crv") orelse continue;
-            const want: Algorithm, const size: usize = if (std.mem.eql(u8, crv, "P-256")) .{ .ES256, 32 } else if (std.mem.eql(u8, crv, "P-384")) .{ .ES384, 48 } else continue;
-            if (alg != null and alg.? != want) continue;
-            const x = jwkBytes(arena, jwk, "x") orelse continue;
-            const y = jwkBytes(arena, jwk, "y") orelse continue;
-            if (x.len != size or y.len != size) continue;
-            const point = try std.mem.concat(arena, u8, &.{ "\x04", x, y });
-            try out.append(arena, .{ .kid = kid, .alg = want, .material = if (want == .ES256) .{ .p256 = point } else .{ .p384 = point } });
-        } else if (std.mem.eql(u8, kty, "OKP")) {
-            const crv = json.getString(jwk, "crv") orelse continue;
-            if (!std.mem.eql(u8, crv, "Ed25519")) continue;
-            if (alg != null and alg.? != .EdDSA) continue;
-            const x = jwkBytes(arena, jwk, "x") orelse continue;
-            if (x.len != Ed25519.PublicKey.encoded_length) continue;
-            try out.append(arena, .{ .kid = kid, .alg = .EdDSA, .material = .{ .ed25519 = x } });
-        } else if (std.mem.eql(u8, kty, "RSA")) {
-            const n = jwkBytes(arena, jwk, "n") orelse continue;
-            const e = jwkBytes(arena, jwk, "e") orelse continue;
-            if (alg) |a| {
-                if (a != .RS256 and a != .PS256) continue;
-                try out.append(arena, .{ .kid = kid, .alg = a, .material = .{ .rsa = .{ .n = n, .e = e } } });
-            } else {
-                try out.append(arena, .{ .kid = kid, .alg = .RS256, .material = .{ .rsa = .{ .n = n, .e = e } } });
-                try out.append(arena, .{ .kid = kid, .alg = .PS256, .material = .{ .rsa = .{ .n = n, .e = e } } });
-            }
+        if (std.mem.eql(u8, kty, "RSA") and alg == null) {
+            // An RSA key without `alg` can verify both RSA algorithms.
+            const rs = try parseJwk(arena, jwk, .RS256) orelse continue;
+            try out.append(arena, rs);
+            var ps = rs;
+            ps.alg = .PS256;
+            try out.append(arena, ps);
+            continue;
         }
+        if (try parseJwk(arena, jwk, alg)) |key| try out.append(arena, key);
     }
     return out.items;
+}
+
+/// Read one public JWK object into a verification key. `alg` is the algorithm that the key must
+/// have, or null to take it from the key type: ES256, ES384, EdDSA, else RS256 for RSA. Returns
+/// null for a key that the SDK does not support, for a key with another `alg`, and for a key with
+/// a bad size. The key is in `arena`.
+pub fn parseJwk(arena: Allocator, jwk: Value, alg: ?Algorithm) Allocator.Error!?Key {
+    if (jwk != .object) return null;
+    const kid = json.getString(jwk, "kid");
+    if (json.getString(jwk, "alg")) |t| {
+        const declared = std.meta.stringToEnum(Algorithm, t) orelse return null;
+        if (alg != null and alg.? != declared) return null;
+    }
+    const kty = json.getString(jwk, "kty") orelse return null;
+    if (std.mem.eql(u8, kty, "EC")) {
+        const crv = json.getString(jwk, "crv") orelse return null;
+        const want: Algorithm, const size: usize = if (std.mem.eql(u8, crv, "P-256")) .{ .ES256, 32 } else if (std.mem.eql(u8, crv, "P-384")) .{ .ES384, 48 } else return null;
+        if (alg != null and alg.? != want) return null;
+        const x = jwkBytes(arena, jwk, "x") orelse return null;
+        const y = jwkBytes(arena, jwk, "y") orelse return null;
+        if (x.len != size or y.len != size) return null;
+        const point = try std.mem.concat(arena, u8, &.{ "\x04", x, y });
+        return .{ .kid = kid, .alg = want, .material = if (want == .ES256) .{ .p256 = point } else .{ .p384 = point } };
+    }
+    if (std.mem.eql(u8, kty, "OKP")) {
+        const crv = json.getString(jwk, "crv") orelse return null;
+        if (!std.mem.eql(u8, crv, "Ed25519")) return null;
+        if (alg != null and alg.? != .EdDSA) return null;
+        const x = jwkBytes(arena, jwk, "x") orelse return null;
+        if (x.len != Ed25519.PublicKey.encoded_length) return null;
+        return .{ .kid = kid, .alg = .EdDSA, .material = .{ .ed25519 = x } };
+    }
+    if (std.mem.eql(u8, kty, "RSA")) {
+        const declared: ?Algorithm = if (json.getString(jwk, "alg")) |t| std.meta.stringToEnum(Algorithm, t) else null;
+        const want: Algorithm = alg orelse declared orelse .RS256;
+        if (want != .RS256 and want != .PS256) return null;
+        const n = jwkBytes(arena, jwk, "n") orelse return null;
+        const e = jwkBytes(arena, jwk, "e") orelse return null;
+        return .{ .kid = kid, .alg = want, .material = .{ .rsa = .{ .n = n, .e = e } } };
+    }
+    return null;
+}
+
+/// True when the JWK object has a member of a private or symmetric key: `d`, `p`, `q`,
+/// `dp`, `dq`, `qi`, `oth` or `k`.
+pub fn jwkHasPrivateMembers(jwk: Value) bool {
+    if (jwk != .object) return false;
+    for ([_][]const u8{ "d", "p", "q", "dp", "dq", "qi", "oth", "k" }) |name| {
+        if (jwk.object.get(name) != null) return true;
+    }
+    return false;
+}
+
+/// The public key of `key` as a JWK object in JSON text, without `kid`, `alg` and `use`. The
+/// members have the lexicographic order of RFC 7638 section 3. An HS256 key has no public key
+/// and gives `error.SymmetricKey`. The text is in `arena`.
+pub fn publicJwk(arena: Allocator, key: *const SigningKey) error{ OutOfMemory, SymmetricKey }![]u8 {
+    return switch (key.*) {
+        .hs256 => error.SymmetricKey,
+        .es256 => |kp| ecJwk(arena, "P-256", &kp.public_key.toUncompressedSec1()),
+        .es384 => |kp| ecJwk(arena, "P-384", &kp.public_key.toUncompressedSec1()),
+        .eddsa => |kp| std.fmt.allocPrint(arena, "{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{s}\"}}", .{try encodeSegment(arena, &kp.public_key.toBytes())}),
+        inline .rs256, .ps256 => |*k| std.fmt.allocPrint(arena, "{{\"e\":\"{s}\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{
+            try encodeSegment(arena, std.mem.trimStart(u8, k.publicExponent(), "\x00")),
+            try encodeSegment(arena, std.mem.trimStart(u8, k.modulus(), "\x00")),
+        }),
+    };
+}
+
+fn ecJwk(arena: Allocator, crv: []const u8, point: []const u8) Allocator.Error![]u8 {
+    const size = (point.len - 1) / 2;
+    return std.fmt.allocPrint(arena, "{{\"crv\":\"{s}\",\"kty\":\"EC\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{
+        crv,
+        try encodeSegment(arena, point[1 .. 1 + size]),
+        try encodeSegment(arena, point[1 + size ..]),
+    });
+}
+
+/// The JWK SHA-256 thumbprint of RFC 7638 in base64url: the hash of the required members of the
+/// key type in lexicographic order. Returns null for a JWK without the required members or with
+/// an unknown key type.
+pub fn jwkThumbprint(arena: Allocator, jwk: Value) Allocator.Error!?[]u8 {
+    if (jwk != .object) return null;
+    const kty = json.getString(jwk, "kty") orelse return null;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    const names: []const []const u8 = if (std.mem.eql(u8, kty, "EC"))
+        &.{ "crv", "kty", "x", "y" }
+    else if (std.mem.eql(u8, kty, "OKP"))
+        &.{ "crv", "kty", "x" }
+    else if (std.mem.eql(u8, kty, "RSA"))
+        &.{ "e", "kty", "n" }
+    else
+        return null;
+    w.writeByte('{') catch return error.OutOfMemory;
+    for (names, 0..) |name, i| {
+        const value = json.getString(jwk, name) orelse return null;
+        if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
+        w.print("\"{s}\":{f}", .{ name, std.json.fmt(value, .{}) }) catch return error.OutOfMemory;
+    }
+    w.writeByte('}') catch return error.OutOfMemory;
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(aw.written(), &digest, .{});
+    return try encodeSegment(arena, &digest);
 }
 
 fn jwkBytes(arena: Allocator, jwk: Value, name: []const u8) ?[]u8 {

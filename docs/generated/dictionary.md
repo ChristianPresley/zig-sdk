@@ -524,6 +524,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | CA | certificate authority |
 | CVE | an entry in the Common Vulnerabilities and Exposures list |
 | DER | Distinguished Encoding Rules of ASN.1 |
+| DPoP | Demonstrating Proof of Possession, the sender constraint of OAuth access tokens (RFC 9449) |
 | ASN.1 | Abstract Syntax Notation One |
 | ECDSA | elliptic curve digital signature algorithm |
 | ES256 | ECDSA with P-256 and SHA-256 |
@@ -539,6 +540,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | SEC1 | the elliptic curve private key format of SECG |
 | SHA | Secure Hash Algorithm |
 | SNI | server name indication |
+| SPIFFE | Secure Production Identity Framework for Everyone, a standard for workload identities |
 | TLS | Transport Layer Security |
 | CRT | the Chinese remainder theorem form of an RSA private key |
 | EMSA-PSS | the encoding method of RSASSA-PSS (RFC 8017) |
