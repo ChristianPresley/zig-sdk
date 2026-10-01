@@ -1,5 +1,6 @@
-//! Routes the frames that a client reads from one newline-delimited byte stream to the
-//! requests in flight. The stdio client and the Unix socket client use it.
+//! Routes the frames that a client reads from one connection to the requests in flight. The
+//! stdio client and the Unix socket client read a newline-delimited byte stream. The
+//! WebSocket client gives each message to `Router.deliver`.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -131,13 +132,20 @@ pub const Router = struct {
                 error.LineTooLong, error.InvalidUtf8, error.ControlCharacter => continue,
                 else => return,
             };
-            const msg = jsonrpc.Message.parse(arena, line) catch continue;
-            switch (msg) {
-                .response => |r| self.route(r.id, line),
-                .error_response => |e| if (e.id) |id| self.route(id, line),
-                .notification => |n| self.routeNotification(arena, n, line, on_notification, userdata),
-                .request => {}, // servers do not send requests in this revision
-            }
+            self.deliver(arena, line, on_notification, userdata);
+        }
+    }
+
+    /// Route one complete frame to the request that it belongs to. The router copies the
+    /// frame. It drops a frame that is not a JSON-RPC message and a request, because servers
+    /// do not send requests in this revision. `arena` holds the parsed message only.
+    pub fn deliver(self: *Router, arena: Allocator, frame: []const u8, on_notification: ?NotificationFn, userdata: ?*anyopaque) void {
+        const msg = jsonrpc.Message.parse(arena, frame) catch return;
+        switch (msg) {
+            .response => |r| self.route(r.id, frame),
+            .error_response => |e| if (e.id) |id| self.route(id, frame),
+            .notification => |n| self.routeNotification(arena, n, frame, on_notification, userdata),
+            .request => {},
         }
     }
 };

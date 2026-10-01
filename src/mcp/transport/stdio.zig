@@ -20,17 +20,26 @@ const Router = router_mod.Router;
 const log = std.log.scoped(.mcp_stdio);
 
 /// Serves one MCP server over a reader/writer pair (normally stdin/stdout). The Unix socket
-/// transport runs one of these for each connection.
+/// transport runs one of these for each connection. The WebSocket transport also runs one for
+/// each connection: it gives each message to `receive`, and `sink` writes each frame.
 pub const Server = struct {
     io: Io,
     gpa: Allocator,
     server: *McpServer,
     limits: Limits,
-    out: *Io.Writer,
+    /// The output of the line framing. Null when `sink` writes the frames.
+    out: ?*Io.Writer,
+    /// Writes each frame in place of the line framing on `out`.
+    sink: ?Sink = null,
     /// The binding that the handlers see in `RequestContext.kind`.
     kind: Transport.Kind = .stdio,
+    /// Transport data that each request gets in `Inbound.context`, for example the
+    /// authorization principal of a WebSocket connection.
+    context: ?*anyopaque = null,
     /// What `run` does with the requests in flight when the input ends.
     on_close: OnClose = .shutdown_subscriptions,
+    /// What a new request gets when the limit of requests in flight is full.
+    when_full: WhenFull = .wait,
     /// When set, `run` reads no more frames after the flag becomes true.
     stop: ?*const std.atomic.Value(bool) = null,
     /// The caller of the requests of this peer for the rate limits of the server. `init` gives
@@ -41,6 +50,9 @@ pub const Server = struct {
     in_flight_lock: Io.Mutex = .init,
     group: Io.Group = .init,
     permits: Io.Semaphore,
+    /// False after `stopAdmission`. Then the server drops each new request. Guarded by
+    /// `in_flight_lock`.
+    admitting: bool = true,
     closed: bool = false,
 
     /// The action at the end of the input.
@@ -53,8 +65,25 @@ pub const Server = struct {
         cancel_requests,
     };
 
+    /// The action for a new request when the limit of requests in flight is full.
+    pub const WhenFull = union(enum) {
+        /// The reader waits for one of the `limits.max_in_flight_requests` permits.
+        wait,
+        /// The server answers a new request with the error `-32603` when this number of
+        /// requests runs. The reader does not wait, so it still reads cancellations.
+        reject: u32,
+    };
+
+    /// Writes one serialized JSON-RPC message.
+    pub const Sink = struct {
+        ptr: *anyopaque,
+        write: *const fn (ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void,
+    };
+
     /// The cancellation reason of the requests of a peer that closed its connection.
     pub const connection_closed_reason = "connection closed";
+    /// The message of the error for a request above the limit of `WhenFull.reject`.
+    pub const too_many_requests_message = "The connection has too many requests in flight";
 
     const Slot = struct {
         owner: *Server,
@@ -80,8 +109,61 @@ pub const Server = struct {
         };
     }
 
+    /// A server that writes each frame through `sink`, without the line framing. The caller
+    /// gives each message of the peer to `receive`.
+    pub fn initSink(io: Io, gpa: Allocator, server: *McpServer, sink: Sink) Server {
+        var s: Server = .init(io, gpa, server, undefined);
+        s.out = null;
+        s.sink = sink;
+        return s;
+    }
+
     pub fn deinit(self: *Server) void {
         self.in_flight.deinit(self.gpa);
+    }
+
+    fn newSlot(self: *Server) Allocator.Error!*Slot {
+        const slot = try self.gpa.create(Slot);
+        slot.* = .{ .owner = self, .arena = .init(self.gpa) };
+        return slot;
+    }
+
+    /// Process one complete message of the peer. The function copies `text`. A request runs
+    /// in its own task. A message that is not valid JSON-RPC gets an error response.
+    pub fn receive(self: *Server, text: []const u8) !void {
+        const slot = try self.newSlot();
+        const line = slot.arena.allocator().dupe(u8, text) catch {
+            self.destroySlot(slot);
+            return error.OutOfMemory;
+        };
+        try self.dispatch(slot, line);
+    }
+
+    /// Drop each request that arrives from now on. The requests in flight continue.
+    pub fn stopAdmission(self: *Server) void {
+        self.in_flight_lock.lockUncancelable(self.io);
+        defer self.in_flight_lock.unlock(self.io);
+        self.admitting = false;
+    }
+
+    /// Wait for the requests in flight, at most `grace`. Then cancel the tasks that remain
+    /// and wait for their end. After this call the server writes no more frames. Call
+    /// `stopAdmission` before this function.
+    pub fn awaitInFlight(self: *Server, grace: Io.Duration) void {
+        const io = self.io;
+        const deadline = Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = grace, .clock = .awake });
+        while (self.inFlightCount() > 0) {
+            if (Io.Clock.Timestamp.now(io, .awake).durationTo(deadline).raw.nanoseconds <= 0) break;
+            io.sleep(.fromMilliseconds(5), .awake) catch break;
+        }
+        if (self.inFlightCount() > 0) self.group.cancel(io) else self.group.await(io) catch {};
+        self.closed = true;
+    }
+
+    fn inFlightCount(self: *Server) usize {
+        self.in_flight_lock.lockUncancelable(self.io);
+        defer self.in_flight_lock.unlock(self.io);
+        return self.in_flight.items.len;
     }
 
     /// Read frames from `in` until end of stream, then drain in-flight requests.
@@ -89,8 +171,7 @@ pub const Server = struct {
         var line_reader: framer.Framer = .{ .reader = in, .max_line_bytes = self.limits.stdio.max_line_bytes };
         while (true) {
             if (self.stop) |s| if (s.load(.acquire)) break;
-            const slot = try self.gpa.create(Slot);
-            slot.* = .{ .owner = self, .arena = .init(self.gpa) };
+            const slot = try self.newSlot();
             const arena = slot.arena.allocator();
             const line = line_reader.next(arena) catch |e| switch (e) {
                 error.EndOfStream => {
@@ -111,65 +192,114 @@ pub const Server = struct {
                     self.destroySlot(slot);
                     break;
                 },
-                error.OutOfMemory => return error.OutOfMemory,
-            };
-            slot.message = jsonrpc.Message.parse(arena, line) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Syntax => {
+                error.OutOfMemory => {
                     self.destroySlot(slot);
-                    try self.writeFrameError(null, errors.parseError("Parse error"));
-                    continue;
-                },
-                error.Invalid => {
-                    // The line and the recovered id are in the arena of the slot. Free the
-                    // slot only after the error response is out.
-                    defer self.destroySlot(slot);
-                    try self.writeFrameError(recoverId(arena, line), errors.invalidRequest("Invalid Request"));
-                    continue;
-                },
-                error.InvalidId => {
-                    self.destroySlot(slot);
-                    try self.writeFrameError(null, errors.invalidRequest("Invalid Request: id must be a string or an integer"));
-                    continue;
+                    return error.OutOfMemory;
                 },
             };
-            switch (slot.message) {
-                .request => |req| {
-                    slot.id = req.id;
-                    slot.listen = std.mem.eql(u8, req.method, "subscriptions/listen");
-                    self.permits.waitUncancelable(self.io);
-                    self.track(slot);
-                    self.group.concurrent(self.io, runSlot, .{slot}) catch {
-                        self.untrack(slot);
-                        self.permits.post(self.io);
-                        try self.writeFrameError(req.id, errors.internalError("Server busy"));
-                        self.destroySlot(slot);
-                    };
-                },
-                .notification => |n| {
-                    self.handleNotification(arena, n);
-                    self.destroySlot(slot);
-                },
-                .response, .error_response => {
-                    log.warn("ignored a response sent by the client", .{});
-                    self.destroySlot(slot);
-                },
-            }
+            try self.dispatch(slot, line);
         }
         switch (self.on_close) {
             .shutdown_subscriptions => self.server.shutdownSubscriptions(self.io),
-            .cancel_requests => self.cancelInFlight(connection_closed_reason),
+            .cancel_requests => self.cancelAll(connection_closed_reason, false),
         }
         self.group.await(self.io) catch {};
         self.closed = true;
     }
 
-    /// Cancel every request in flight that has no cancel signal yet.
-    fn cancelInFlight(self: *Server, reason: []const u8) void {
+    /// Parse one message in the arena of `slot` and process it. The function owns `slot`.
+    fn dispatch(self: *Server, slot: *Slot, line: []const u8) !void {
+        const arena = slot.arena.allocator();
+        slot.message = jsonrpc.Message.parse(arena, line) catch |e| switch (e) {
+            error.OutOfMemory => {
+                self.destroySlot(slot);
+                return error.OutOfMemory;
+            },
+            error.Syntax => {
+                self.destroySlot(slot);
+                try self.writeFrameError(null, errors.parseError("Parse error"));
+                return;
+            },
+            error.Invalid => {
+                // The line and the recovered id are in the arena of the slot. Free the
+                // slot only after the error response is out.
+                defer self.destroySlot(slot);
+                try self.writeFrameError(recoverId(arena, line), errors.invalidRequest("Invalid Request"));
+                return;
+            },
+            error.InvalidId => {
+                self.destroySlot(slot);
+                try self.writeFrameError(null, errors.invalidRequest("Invalid Request: id must be a string or an integer"));
+                return;
+            },
+        };
+        switch (slot.message) {
+            .request => |req| {
+                slot.id = req.id;
+                slot.listen = std.mem.eql(u8, req.method, "subscriptions/listen");
+                try self.start(slot, req.id);
+            },
+            .notification => |n| {
+                self.handleNotification(arena, n);
+                self.destroySlot(slot);
+            },
+            .response, .error_response => {
+                log.warn("ignored a response sent by the client", .{});
+                self.destroySlot(slot);
+            },
+        }
+    }
+
+    /// Start the task of a request, or answer it when the limit is full. The admission and
+    /// the start happen under `in_flight_lock`, so `stopAdmission` sees every started task.
+    fn start(self: *Server, slot: *Slot, id: RequestId) !void {
+        if (self.when_full == .wait) self.permits.waitUncancelable(self.io);
+        const Outcome = enum { started, stopped, full, failed };
+        self.in_flight_lock.lockUncancelable(self.io);
+        const outcome: Outcome = outcome: {
+            if (!self.admitting) break :outcome .stopped;
+            switch (self.when_full) {
+                .wait => {},
+                .reject => |limit| if (self.in_flight.items.len >= limit) break :outcome .full,
+            }
+            self.in_flight.append(self.gpa, slot) catch {};
+            self.group.concurrent(self.io, runSlot, .{slot}) catch {
+                self.removeLocked(slot);
+                break :outcome .failed;
+            };
+            break :outcome .started;
+        };
+        self.in_flight_lock.unlock(self.io);
+        switch (outcome) {
+            .started => {},
+            .stopped => {
+                self.releasePermit();
+                self.destroySlot(slot);
+            },
+            .full => {
+                defer self.destroySlot(slot);
+                try self.writeFrameError(id, errors.internalError(too_many_requests_message));
+            },
+            .failed => {
+                self.releasePermit();
+                defer self.destroySlot(slot);
+                try self.writeFrameError(id, errors.internalError("Server busy"));
+            },
+        }
+    }
+
+    fn releasePermit(self: *Server) void {
+        if (self.when_full == .wait) self.permits.post(self.io);
+    }
+
+    /// Cancel every request in flight that has no cancel signal yet. With `by_server`, the
+    /// requests end as at a server shutdown: a listen stream then ends with its result.
+    pub fn cancelAll(self: *Server, reason: []const u8, by_server: bool) void {
         self.in_flight_lock.lockUncancelable(self.io);
         defer self.in_flight_lock.unlock(self.io);
         for (self.in_flight.items) |slot| {
-            if (!slot.token.isCancelled()) slot.token.cancel(self.io, reason);
+            if (slot.token.isCancelled()) continue;
+            if (by_server) slot.token.shutdown(self.io, reason) else slot.token.cancel(self.io, reason);
         }
     }
 
@@ -196,15 +326,13 @@ pub const Server = struct {
         }
     }
 
-    fn track(self: *Server, slot: *Slot) void {
-        self.in_flight_lock.lockUncancelable(self.io);
-        defer self.in_flight_lock.unlock(self.io);
-        self.in_flight.append(self.gpa, slot) catch {};
-    }
-
     fn untrack(self: *Server, slot: *Slot) void {
         self.in_flight_lock.lockUncancelable(self.io);
         defer self.in_flight_lock.unlock(self.io);
+        self.removeLocked(slot);
+    }
+
+    fn removeLocked(self: *Server, slot: *Slot) void {
         for (self.in_flight.items, 0..) |s, i| {
             if (s == slot) {
                 _ = self.in_flight.swapRemove(i);
@@ -222,7 +350,7 @@ pub const Server = struct {
         const self = slot.owner;
         defer {
             self.untrack(slot);
-            self.permits.post(self.io);
+            self.releasePermit();
             self.destroySlot(slot);
         }
         self.server.handle(self.io, .{
@@ -232,6 +360,7 @@ pub const Server = struct {
             .responder = .{ .ptr = slot, .vtable = &slot_vtable },
             .cancel = &slot.token,
             .peer = self.peer,
+            .context = self.context,
         });
     }
 
@@ -275,9 +404,10 @@ pub const Server = struct {
 
     fn writeFrame(self: *Server, io: Io, frame: []const u8) Transport.SendError!void {
         if (self.closed) return error.Closed;
+        if (self.sink) |s| return s.write(s.ptr, io, frame);
         self.out_lock.lockUncancelable(io);
         defer self.out_lock.unlock(io);
-        framer.writeFrame(self.out, frame) catch return error.WriteFailed;
+        framer.writeFrame(self.out.?, frame) catch return error.WriteFailed;
     }
 
     fn writeFrameError(self: *Server, id: ?RequestId, err: errors.RpcError) !void {

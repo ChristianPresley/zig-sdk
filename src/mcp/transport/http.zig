@@ -159,23 +159,35 @@ pub const Server = struct {
     }
 
     fn originAllowed(self: *Server, origin: []const u8) bool {
-        if (self.options.allowed_origins.len > 0) {
-            for (self.options.allowed_origins) |o| if (std.ascii.eqlIgnoreCase(o, origin)) return true;
-            return false;
-        }
-        return isLoopbackOrigin(origin);
+        return originInList(self.options.allowed_origins, origin);
     }
 
     fn hostAllowed(self: *Server, host: []const u8) bool {
-        const name = stripPort(host);
-        if (self.options.allowed_hosts.len > 0) {
-            for (self.options.allowed_hosts) |h| if (std.ascii.eqlIgnoreCase(stripPort(h), name)) return true;
-            return false;
-        }
-        if (isLoopbackName(name)) return true;
-        return std.ascii.eqlIgnoreCase(name, self.options.address);
+        return hostInList(self.options.allowed_hosts, self.options.address, host);
     }
 };
+
+/// The `Origin` check of DNS rebinding protection. True when `origin` is in `allowed`. An
+/// empty `allowed` accepts loopback origins only. The WebSocket server uses it too.
+pub fn originInList(allowed: []const []const u8, origin: []const u8) bool {
+    if (allowed.len > 0) {
+        for (allowed) |o| if (std.ascii.eqlIgnoreCase(o, origin)) return true;
+        return false;
+    }
+    return isLoopbackOrigin(origin);
+}
+
+/// The `Host` check of DNS rebinding protection. True when the name of `host` is in `allowed`.
+/// An empty `allowed` accepts loopback names and `bound_address`. The port does not count.
+pub fn hostInList(allowed: []const []const u8, bound_address: []const u8, host: []const u8) bool {
+    const name = stripPort(host);
+    if (allowed.len > 0) {
+        for (allowed) |h| if (std.ascii.eqlIgnoreCase(stripPort(h), name)) return true;
+        return false;
+    }
+    if (isLoopbackName(name)) return true;
+    return std.ascii.eqlIgnoreCase(name, bound_address);
+}
 
 fn stripPort(host: []const u8) []const u8 {
     if (host.len > 0 and host[0] == '[') {
