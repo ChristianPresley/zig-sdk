@@ -90,6 +90,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("conformance-client", "Build the conformance everything client").dependOn(&b.addInstallArtifact(conformance_client, .{}).step);
+    const conformance_as = b.addExecutable(.{
+        .name = "mcp-conformance-authorization-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("conformance/authorization_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mcp", .module = mcp }},
+        }),
+    });
+    b.step("conformance-authorization-server", "Build the conformance authorization server").dependOn(&b.addInstallArtifact(conformance_as, .{}).step);
 
     // Autodocs.
     const docs_obj = b.addObject(.{

@@ -269,6 +269,38 @@ jobs:
               --expected-failures conformance/expected-failures-unscored.yml \
               --output-dir conformance-results/client-unscored
           done
+      - run: zig build conformance-authorization-server -Doptimize=ReleaseSafe
+      - name: Start the fixture authorization server
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/mcp-conformance-authorization-server --port 3100 > authorization-server.log 2>&1 &
+          echo $! > authorization-server.pid
+          for i in $(seq 1 50); do
+            if curl -s --max-time 2 -o /dev/null http://127.0.0.1:3100/.well-known/oauth-authorization-server; then exit 0; fi
+            sleep 0.2
+          done
+          echo "authorization server did not start" >&2
+          cat authorization-server.log >&2
+          exit 1
+      # The suite prints the authorization URL and waits for the redirect to its callback. The
+      # loop opens the URL like a browser: curl follows the redirect to the callback.
+      - name: Run the authorization server scenarios against the fixture
+        run: |
+          set -euo pipefail
+          npx --yes @modelcontextprotocol/conformance@0.2.0-alpha.11 authorization \
+            --url http://127.0.0.1:3100 --client-id conformance-client --port 3101 \
+            --output-dir conformance-results/authorization 2>&1 |
+            while IFS= read -r line; do
+              printf '%s\n' "$line"
+              case "$line" in
+                "http://127.0.0.1:3100/authorize?"*)
+                  curl -s -L --retry 3 --retry-connrefused --max-time 10 -o /dev/null "$line" &
+                  ;;
+              esac
+            done
+      - name: Stop the fixture authorization server
+        if: always()
+        run: kill "$(cat authorization-server.pid)" || true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -276,3 +308,4 @@ jobs:
           path: |
             conformance-results
             server.log
+            authorization-server.log
