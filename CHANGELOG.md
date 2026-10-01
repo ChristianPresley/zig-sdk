@@ -31,6 +31,11 @@ All notable changes to this project are recorded in this file. The format follow
 - The HTTP server cancels a request when the client disconnects. Progress notifications have a rate limit of `limits.max_progress_rate_per_s` on both sides.
 - `RequestOptions.max_total_timeout`. A request without a timeout gets `limits.request_timeout` (60 s).
 - `OAuthClient.Options.application_type`, `OAuthClient.lastFailure`, `ResourceServer.scope_hierarchy` and `Principal.issuer`.
+- DPoP (RFC 9449) for the DPoP extension of MCP (`mcp.auth.dpop`). `DpopProver` makes a proof for each request and keeps the nonces of each server. The option `dpop` of `OAuthClient`, `ClientCredentials`, `EnterpriseClient` and `WorkloadIdentity` requests DPoP-bound tokens. The HTTP client transport sends `Authorization: DPoP` with a new proof and answers `use_dpop_nonce`. `OAuthClient` sends `dpop_jkt` and can register with `dpop_bound_access_tokens`.
+- `ResourceServer.dpop` (`DpopPolicy`) accepts DPoP-bound tokens: the checks of RFC 9449 section 4.3 with a window of 5 minutes, the `cnf.jkt` binding, optional nonces without state (`dpop.NonceIssuer`) and an optional replay check. The server refuses a DPoP-bound token with the Bearer scheme. `ResourceServer.authorizeRequest` takes the `DPoP` headers. `Principal.confirmation` has the `jkt`.
+- Workload identity federation (`mcp.auth.WorkloadIdentity`): a workload JWT from a value, a file or a callback goes to the token endpoint as a JWT bearer grant without client registration. The client does not send a refused JWT again. `WorkloadJwtValidator` and `KeyDiscovery` (OpenID Connect Discovery) check workload JWTs for an application with its own authorization server.
+- `Server.Options.authorization_extensions` has `dpop` and `workload_identity`. The conformance client passes `auth/dpop`, `auth/dpop-nonce` and `auth/wif-jwt-bearer`.
+- The CI job `conformance` runs each scenario that the suite does not score alone, with the per-check baseline `conformance/expected-failures-unscored.yml`. A failure of these scenarios now makes the job fail.
 
 ### Changed
 
@@ -50,6 +55,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ### Fixed
 
+- A JWT with an `exp`, `nbf` or `iat` claim near the limit of `i64`, or with a large float value, could stop the process in Debug and ReleaseSafe. The checks now use saturating arithmetic, and a float claim outside the range of `i64` does not count. The same applies to `expires_in` of a token response. A DPoP proof is a JWT that the client signs, so this fix matters for servers with DPoP.
+- `parseChallenge` read only one `Bearer` challenge. It now reads more than one challenge in a value, the `DPoP` scheme and escapes in quoted strings, and the HTTP client joins the values of all `WWW-Authenticate` headers.
 - `zig build test --fuzz` did not compile on Zig 0.16.0, because the fuzz path of the test runner of the toolchain gives a `builtin.StackTrace` to `std.debug.writeStackTrace`. The option `-Dfuzz` makes a copy of the runner with `std.debug.writeErrorReturnTrace` in that call. It also builds the tests with the LLVM backend, because the self-hosted backend of Debug builds emits no coverage table for the fuzzer. The nightly `fuzz` job uses the option.
 - The HPACK decoder read freed memory when a literal with incremental indexing had the name of a dynamic entry that the new entry evicts. RFC 7541 section 4.4 permits this case. The decoder now copies the name before the eviction. The fuzz job found this defect.
 - The TLS parsers of the CertificateRequest and Certificate messages had an integer overflow for a context length of 253 to 255 or a certificate length near 16 MiB. In Debug and ReleaseSafe a peer could stop the process. The parsers now give `decode_error`. The fuzz job found this defect.

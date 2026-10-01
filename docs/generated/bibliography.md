@@ -203,6 +203,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-30
 - Note: SEP-1046. JWT client authentication (RFC 7523 section 2.2) recommended, client secret allowed.
 
+### MCP-EXT-AUTH-DPOP
+
+- Title: DPoP Profile for MCP (draft extension)
+- Author: P. Kasselman
+- Publisher: GitHub (modelcontextprotocol/ext-auth, branch pieterkas-dpop-extension)
+- Date: draft, 2026-01-09
+- URL: <https://github.com/modelcontextprotocol/ext-auth/blob/pieterkas-dpop-extension/specification/draft/dpop-extension.mdx>
+- Accessed: 2026-09-30
+- Note: RFC 9449 without MCP-specific claims; iat window of plus or minus 5 minutes; stateless replay protection with an encrypted timestamp nonce. Names no extension identifier; the conformance suite uses io.modelcontextprotocol/auth/dpop.
+
 ### MCP-EXT-AUTH-ENTERPRISE
 
 - Title: Enterprise-Managed Authorization extension (io.modelcontextprotocol/enterprise-managed-authorization)
@@ -212,6 +222,16 @@ This page lists every source that the wiki, the README and the design documents 
 - URL: <https://github.com/modelcontextprotocol/ext-auth/blob/main/specification/stable/enterprise-managed-authorization.mdx>
 - Accessed: 2026-09-30
 - Note: SEP-990. RFC 8693 token exchange at the IdP for an ID-JAG, then the RFC 7523 JWT bearer grant at the MCP authorization server.
+
+### MCP-EXT-AUTH-WIF
+
+- Title: Workload Identity Federation (draft extension)
+- Author: P. Kasselman
+- Publisher: GitHub (modelcontextprotocol/ext-auth, branch pieterkas-wif-extension)
+- Date: draft, 2026-01-12
+- URL: <https://github.com/modelcontextprotocol/ext-auth/blob/pieterkas-wif-extension/specification/draft/workload-identity-federation.mdx>
+- Accessed: 2026-09-30
+- Note: RFC 7523 JWT bearer grant with a platform-issued workload JWT; issuer keys through OpenID Connect Discovery. Names no extension identifier; the conformance suite uses io.modelcontextprotocol/auth/wif.
 
 ### MCP-EXT-OVERVIEW
 
@@ -428,6 +448,24 @@ This page lists every source that the wiki, the README and the design documents 
 - Publisher: modelcontextprotocol.io
 - Date: created 2025-11-21, Final
 - URL: <https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp>
+- Accessed: 2026-09-30
+
+### MCP-SEP-1932
+
+- Title: SEP-1932: DPoP Profile for MCP
+- Author: P. Kasselman
+- Publisher: GitHub (modelcontextprotocol/modelcontextprotocol pull request 1932)
+- Date: draft, open
+- URL: <https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1932>
+- Accessed: 2026-09-30
+
+### MCP-SEP-1933
+
+- Title: SEP-1933: Workload Identity Federation
+- Author: P. Kasselman
+- Publisher: GitHub (modelcontextprotocol/modelcontextprotocol pull request 1933)
+- Date: draft, open
+- URL: <https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1933>
 - Accessed: 2026-09-30
 
 ### MCP-SEP-2243
@@ -948,6 +986,16 @@ This page lists every source that the wiki, the README and the design documents 
 - URL: <https://www.rfc-editor.org/rfc/rfc7636.html>
 - Accessed: 2026-09-29
 
+### RFC7638
+
+- Title: JSON Web Key (JWK) Thumbprint
+- Author: M. Jones, N. Sakimura
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: September 2015
+- URL: <https://www.rfc-editor.org/rfc/rfc7638.html>
+- Accessed: 2026-09-30
+- Note: The example of section 3.1 is a test vector of the SDK.
+
 ### RFC8414
 
 - Title: OAuth 2.0 Authorization Server Metadata
@@ -983,6 +1031,16 @@ This page lists every source that the wiki, the README and the design documents 
 - Date: March 2022
 - URL: <https://www.rfc-editor.org/rfc/rfc9207.html>
 - Accessed: 2026-09-29
+
+### RFC9449
+
+- Title: OAuth 2.0 Demonstrating Proof of Possession (DPoP)
+- Author: D. Fett, B. Campbell, J. Bradley, T. Lodderstedt, M. Jones, D. Waite
+- Publisher: IETF / RFC Editor (Proposed Standard)
+- Date: September 2023
+- URL: <https://www.rfc-editor.org/rfc/rfc9449.html>
+- Accessed: 2026-09-30
+- Note: Proof JWT syntax (section 4.2), checks (4.3), token requests (5), cnf.jkt (6), the DPoP scheme (7), nonces (8, 9), dpop_jkt (10).
 
 ### RFC9728
 
