@@ -111,6 +111,52 @@ test "https discover through the std tls client" {
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"supportedVersions\":[\"2026-07-28\"]") != null);
 }
 
+test "a partial head and then a full record do not stop the https server" {
+    // Regression: the TLS reader buffer held the partial head, and the decrypted full record
+    // did not fit after it. An assert stopped the process.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = .blank();
+    try f.start("test/fixtures/tls/pem/p256.crt", "test/fixtures/tls/pem/p256.key");
+    defer f.stop();
+    {
+        const address = Io.net.IpAddress.parse("127.0.0.1", f.port()) catch unreachable;
+        var stream = try address.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        var in_buf: [tls.Connection.min_input_buffer_len]u8 = undefined;
+        var out_buf: [tls.Connection.min_output_buffer_len]u8 = undefined;
+        var reader = stream.reader(io, &in_buf);
+        var writer = stream.writer(io, &out_buf);
+        var read_buf: [tls.Connection.min_read_buffer_len]u8 = undefined;
+        var write_buf: [1024]u8 = undefined;
+        var conn = try tls.connect(&reader.interface, &writer.interface, .{
+            .io = io,
+            .host = "localhost",
+            .trust = .self_signed,
+            .alpn = &.{"http/1.1"},
+            .read_buffer = &read_buf,
+            .write_buffer = &write_buf,
+            .allow_truncation_attacks = true,
+        });
+        defer conn.deinit();
+        // One record with the start of a head, without its end.
+        try conn.writer.writeAll("POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\nx-filler: " ++ "a" ** 260);
+        try conn.writer.flush();
+        // One full record that continues the same header line.
+        const filler = [_]u8{'a'} ** std.crypto.tls.max_ciphertext_inner_record_len;
+        try conn.writer.writeAll(&filler);
+        try conn.writer.flush();
+        // The head is too long for the server: it answers 431 and closes.
+        const reply = try conn.reader.allocRemaining(gpa, .limited(1 << 16));
+        defer gpa.free(reply);
+        try std.testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 431"));
+    }
+    // The server still answers requests.
+    const reply = try postWithStdClient(gpa, io, f.port(), discover_body);
+    defer gpa.free(reply);
+    try std.testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200"));
+}
+
 /// Run a command and return its stdout, or null when the tool is not installed.
 fn runTool(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) !?[]u8 {
     const result = std.process.run(gpa, io, .{ .argv = argv, .stdout_limit = .limited(1 << 20), .stderr_limit = .limited(1 << 20) }) catch |e| switch (e) {

@@ -14,7 +14,8 @@ const codec = @import("handshake/codec.zig");
 
 const Connection = @This();
 
-/// The encrypted stream from the peer. Its buffer must hold one full record.
+/// The encrypted stream from the peer. Its buffer must hold one full record. The connection
+/// decrypts each record in place in this buffer, so the buffer must be writable.
 input: *Reader,
 /// The encrypted stream to the peer. Its buffer must hold one full record.
 output: *Writer,
@@ -44,8 +45,15 @@ alpn_len: u8 = 0,
 server_name_buf: [255]u8 = undefined,
 server_name_len: u8 = 0,
 plaintext_ccs_seen: u8 = 0,
+/// Decrypted application data that did not fit into the `reader` buffer. It points into the
+/// buffer of `input`. The connection reads no record from `input` while this data remains.
+pending: []u8 = &.{},
 
 pub const Role = enum { server, client };
+
+/// The largest inner plaintext of an encrypted record: 2^14 bytes of content and the content
+/// type byte (RFC 8446 section 5.4). Padding does not change this limit.
+pub const max_inner_plaintext_len = tls.max_ciphertext_inner_record_len + 1;
 
 pub const min_input_buffer_len = tls.max_ciphertext_record_len;
 pub const min_output_buffer_len = tls.max_ciphertext_record_len;
@@ -125,9 +133,10 @@ pub fn eof(self: *const Connection) bool {
 
 // -- Reading records -------------------------------------------------------------------------
 
-/// Read one record. The function decrypts an encrypted record into the `reader` buffer after
-/// its end. The data that it returns is valid until the next read.
+/// Read one record. The function decrypts an encrypted record in place in the buffer of
+/// `input`. The data that it returns is valid until the next read from `input`.
 pub fn readRecord(self: *Connection) RecordError!Record {
+    std.debug.assert(self.pending.len == 0);
     const input = self.input;
     const header = input.peek(tls.record_header_len) catch |e| switch (e) {
         error.EndOfStream => return error.TlsConnectionTruncated,
@@ -174,17 +183,22 @@ pub fn readRecord(self: *Connection) RecordError!Record {
         inline else => |*keys| {
             const S = @TypeOf(keys.*).Suite;
             const tag_len = S.AEAD.tag_length;
-            if (len < tag_len + 1) return error.TlsBadRecordMac;
+            if (len < tag_len) return error.TlsBadRecordMac;
             const ciphertext = body[0 .. len - tag_len];
+            // The inner plaintext has the length of the ciphertext. With its padding, it must
+            // not exceed 2^14 + 1 bytes (section 5.4).
+            if (ciphertext.len > max_inner_plaintext_len) return error.TlsRecordOverflow;
             const tag = body[len - tag_len ..][0..tag_len].*;
-            rebaseReader(&self.reader, ciphertext.len);
-            const out = self.reader.buffer[self.reader.end..][0..ciphertext.len];
+            // Every AEAD of `suites` reads each block before it writes the same block, so the
+            // plaintext can replace the ciphertext. A test in `suites.zig` guards this.
+            const out = ciphertext;
             S.AEAD.decrypt(out, ciphertext, tag, &ad, keys.nonce(), keys.key) catch return error.TlsBadRecordMac;
             keys.seq = std.math.add(u64, keys.seq, 1) catch return error.TlsSequenceOverflow;
+            // Remove the padding: the last byte that is not zero is the content type. An
+            // inner plaintext without such a byte is an unexpected message (section 5.4).
             var n = out.len;
             while (n > 0 and out[n - 1] == 0) n -= 1;
             if (n == 0) return error.TlsUnexpectedMessage;
-            if (n - 1 > tls.max_ciphertext_inner_record_len) return error.TlsRecordOverflow;
             const inner: tls.ContentType = @enumFromInt(out[n - 1]);
             switch (inner) {
                 .alert, .handshake, .application_data => {},
@@ -195,31 +209,53 @@ pub fn readRecord(self: *Connection) RecordError!Record {
     }
 }
 
-fn rebaseReader(r: *Reader, capacity: usize) void {
-    if (r.buffer.len - r.end >= capacity) return;
-    const data = r.buffer[r.seek..r.end];
-    @memmove(r.buffer[0..data.len], data);
-    r.seek = 0;
-    r.end = data.len;
-    std.debug.assert(r.buffer.len - r.end >= capacity);
+/// Copy pending data into the free space of the `reader` buffer. The function first moves
+/// unread data to the start of the buffer when the free space at its end is too small.
+/// Returns false when the buffer has no free space.
+fn deliverPending(c: *Connection) bool {
+    const r = &c.reader;
+    if (r.buffer.len - r.end < c.pending.len and r.seek > 0) {
+        const unread = r.buffer[r.seek..r.end];
+        @memmove(r.buffer[0..unread.len], unread);
+        r.seek = 0;
+        r.end = unread.len;
+    }
+    const n = @min(c.pending.len, r.buffer.len - r.end);
+    if (n == 0) return false;
+    @memcpy(r.buffer[r.end..][0..n], c.pending[0..n]);
+    r.end += n;
+    c.pending = c.pending[n..];
+    return true;
 }
 
 fn stream(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-    _ = w;
-    _ = limit;
     const c: *Connection = @alignCast(@fieldParentPtr("reader", r));
-    return readIndirect(c);
+    if (c.pending.len == 0) try readIndirect(c);
+    if (c.pending.len == 0 or deliverPending(c)) return 0;
+    // The buffer is full of unread data. Give the new data to `w`.
+    const n = try w.write(limit.slice(c.pending));
+    c.pending = c.pending[n..];
+    return n;
 }
 
 fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
-    _ = data;
     const c: *Connection = @alignCast(@fieldParentPtr("reader", r));
-    return readIndirect(c);
+    if (c.pending.len == 0) try readIndirect(c);
+    if (c.pending.len == 0 or deliverPending(c)) return 0;
+    // The buffer is full of unread data. Give the new data to `data`.
+    var total: usize = 0;
+    for (data) |buf| {
+        const n = @min(buf.len, c.pending.len);
+        @memcpy(buf[0..n], c.pending[0..n]);
+        c.pending = c.pending[n..];
+        total += n;
+    }
+    return total;
 }
 
-/// Decrypt one record into the reader buffer. Application data advances the buffer end.
-/// This function processes other content and gives no bytes for it.
-fn readIndirect(c: *Connection) Reader.Error!usize {
+/// Read and decrypt one record. Application data goes to `pending`. This function processes
+/// other content and gives no data for it.
+fn readIndirect(c: *Connection) Reader.Error!void {
     if (c.received_close_notify) return error.EndOfStream;
     const rec = c.readRecord() catch |e| switch (e) {
         error.ReadFailed => return error.ReadFailed,
@@ -233,10 +269,7 @@ fn readIndirect(c: *Connection) Reader.Error!usize {
         else => |err| return failRead(c, err),
     };
     switch (rec.content_type) {
-        .application_data => {
-            c.reader.end += rec.data.len;
-            return 0;
-        },
+        .application_data => c.pending = rec.data,
         .alert => {
             if (rec.data.len != 2) return failRead(c, error.TlsDecodeError);
             const alert: tls.Alert = .{ .level = @enumFromInt(rec.data[0]), .description = @enumFromInt(rec.data[1]) };
@@ -246,16 +279,13 @@ fn readIndirect(c: *Connection) Reader.Error!usize {
                     c.received_close_notify = true;
                     return error.EndOfStream;
                 },
-                .user_canceled => return 0,
+                .user_canceled => {},
                 else => return failRead(c, error.TlsAlert),
             }
         },
-        .handshake => {
-            c.handlePostHandshake(rec.data) catch |e| switch (e) {
-                error.WriteFailed => return error.ReadFailed,
-                else => |err| return failRead(c, err),
-            };
-            return 0;
+        .handshake => c.handlePostHandshake(rec.data) catch |e| switch (e) {
+            error.WriteFailed => return error.ReadFailed,
+            else => |err| return failRead(c, err),
         },
         else => return failRead(c, error.TlsUnexpectedMessage),
     }
@@ -487,4 +517,161 @@ test "encrypted record round trip" {
     try std.testing.expectEqualStrings("hello over tls", line[0..n]);
     try std.testing.expect(p.eof());
     try std.testing.expectEqual(1, p.read_keys.AES_128_GCM_SHA256.seq); // rotated after key_update, then one record
+}
+
+/// Append one encrypted record with the inner plaintext `content`, `content_type` and
+/// `padding` zero bytes to `wire`. The keys move to the next sequence number.
+fn appendTestRecord(comptime S: type, gpa: std.mem.Allocator, keys: *suites.TrafficKeys(S), wire: *std.ArrayList(u8), content: []const u8, content_type: tls.ContentType, padding: usize) !void {
+    const inner_len = content.len + 1 + padding;
+    const inner = try gpa.alloc(u8, inner_len);
+    defer gpa.free(inner);
+    @memcpy(inner[0..content.len], content);
+    inner[content.len] = @intFromEnum(content_type);
+    @memset(inner[content.len + 1 ..], 0);
+    try appendSealedRecord(S, gpa, keys, wire, inner);
+}
+
+/// Append one encrypted record with the raw inner plaintext `inner` to `wire`.
+fn appendSealedRecord(comptime S: type, gpa: std.mem.Allocator, keys: *suites.TrafficKeys(S), wire: *std.ArrayList(u8), inner: []const u8) !void {
+    const len = inner.len + S.AEAD.tag_length;
+    const start = wire.items.len;
+    try wire.resize(gpa, start + tls.record_header_len + len);
+    const rec = wire.items[start..];
+    rec[0] = @intFromEnum(tls.ContentType.application_data);
+    std.mem.writeInt(u16, rec[1..3], @intFromEnum(tls.ProtocolVersion.tls_1_2), .big);
+    std.mem.writeInt(u16, rec[3..5], @intCast(len), .big);
+    const body = rec[tls.record_header_len..];
+    S.AEAD.encrypt(body[0..inner.len], body[inner.len..][0..S.AEAD.tag_length], inner, rec[0..tls.record_header_len], keys.nonce(), keys.key);
+    keys.seq += 1;
+}
+
+test "a record that does not fit after unread data arrives in order" {
+    // Regression: the decrypted record went into the free space of the reader buffer after
+    // the unread data, and a full record did not fit there. Lines through
+    // `peekDelimiterInclusive` keep unread data in the buffer, as an HTTP head does.
+    const gpa = std.testing.allocator;
+    const S = suites.Suite.Type(.AES_128_GCM_SHA256);
+    const secret = [_]u8{5} ** S.digest_length;
+    var keys: suites.TrafficKeys(S) = .fromSecret(secret);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(gpa);
+
+    const full = tls.max_ciphertext_inner_record_len;
+    var big: [full]u8 = undefined;
+    var parts: [6][]const u8 = undefined;
+    // A few hundred bytes without a line end.
+    parts[0] = "a" ** 300;
+    // A full record with a line end inside.
+    @memset(&big, 'b');
+    big[16000] = '\n';
+    parts[1] = try gpa.dupe(u8, &big);
+    defer gpa.free(parts[1]);
+    // A short record with the largest padding.
+    parts[2] = "d" ** 100;
+    // A full record with a line end inside.
+    @memset(&big, 'e');
+    big[15000] = '\n';
+    parts[3] = try gpa.dupe(u8, &big);
+    defer gpa.free(parts[3]);
+    // A short record, then a full record without a line end: the buffer becomes full.
+    parts[4] = "f" ** 300;
+    @memset(&big, 'g');
+    parts[5] = try gpa.dupe(u8, &big);
+    defer gpa.free(parts[5]);
+    for (parts, 0..) |part, i| {
+        const padding: usize = if (i == 2) max_inner_plaintext_len - part.len - 1 else 0;
+        try appendTestRecord(S, gpa, &keys, &wire, part, .application_data, padding);
+        try expected.appendSlice(gpa, part);
+    }
+    try appendTestRecord(S, gpa, &keys, &wire, &tls.close_notify_alert, .alert, 0);
+
+    // The input stream gives the records in pieces of an odd size.
+    var input_buf: [min_input_buffer_len]u8 = undefined;
+    const calls = [_]std.testing.Reader.Call{.{ .buffer = wire.items }};
+    var input: std.testing.Reader = .init(&input_buf, &calls);
+    input.artificial_limit = .limited(997);
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    var read_buf: [min_read_buffer_len]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
+    var p: Connection = .init(&input.interface, &sink.writer, .server, &read_buf, &write_buf, false);
+    defer p.deinit();
+    p.read_keys = suites.DirectionKeys.init(.AES_128_GCM_SHA256, secret);
+    p.handshake_complete = true;
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    var too_long: usize = 0;
+    while (true) {
+        if (p.reader.peekDelimiterInclusive('\n')) |line| {
+            try got.appendSlice(gpa, line);
+            p.reader.toss(line.len);
+        } else |e| switch (e) {
+            error.StreamTooLong => {
+                // The buffer is full and has no line end. Take all of it and go on.
+                too_long += 1;
+                const all = p.reader.buffered();
+                try got.appendSlice(gpa, all);
+                p.reader.toss(all.len);
+            },
+            error.EndOfStream => break,
+            error.ReadFailed => return p.read_err.?,
+        }
+    }
+    try got.appendSlice(gpa, p.reader.buffered());
+    try std.testing.expectEqual(1, too_long);
+    try std.testing.expect(p.eof());
+    try std.testing.expectEqual(expected.items.len, got.items.len);
+    try std.testing.expect(std.mem.eql(u8, expected.items, got.items));
+}
+
+test "the receive path removes padding and refuses bad inner plaintexts" {
+    const gpa = std.testing.allocator;
+    const S = suites.Suite.Type(.CHACHA20_POLY1305_SHA256);
+    const secret = [_]u8{6} ** S.digest_length;
+    const Case = struct { inner: []const u8, want: anyerror![]const u8 };
+    var max_padded: [max_inner_plaintext_len]u8 = @splat(0);
+    max_padded[0] = 'x';
+    max_padded[1] = @intFromEnum(tls.ContentType.application_data);
+    var over: [max_inner_plaintext_len + 1]u8 = @splat(0);
+    over[0] = 'x';
+    over[1] = @intFromEnum(tls.ContentType.application_data);
+    const cases = [_]Case{
+        // Padding after the content type goes away.
+        .{ .inner = "ok\x17\x00\x00\x00", .want = "ok" },
+        // The largest inner plaintext: one content byte and the most padding.
+        .{ .inner = &max_padded, .want = "x" },
+        // Only zeros: no content type (RFC 8446 section 5.4).
+        .{ .inner = &([_]u8{0} ** 32), .want = error.TlsUnexpectedMessage },
+        // No inner plaintext at all.
+        .{ .inner = "", .want = error.TlsUnexpectedMessage },
+        // One byte more than 2^14 + 1, also when the extra bytes are padding.
+        .{ .inner = &over, .want = error.TlsRecordOverflow },
+        // A content type that is not allowed in an encrypted record.
+        .{ .inner = "x\x14", .want = error.TlsUnexpectedMessage },
+    };
+    for (cases) |case| {
+        var keys: suites.TrafficKeys(S) = .fromSecret(secret);
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(gpa);
+        try appendSealedRecord(S, gpa, &keys, &wire, case.inner);
+        var input: Reader = .fixed(wire.items);
+        var sink: Writer.Allocating = .init(gpa);
+        defer sink.deinit();
+        var read_buf: [min_read_buffer_len]u8 = undefined;
+        var write_buf: [64]u8 = undefined;
+        var p: Connection = .init(&input, &sink.writer, .client, &read_buf, &write_buf, false);
+        defer p.deinit();
+        p.read_keys = suites.DirectionKeys.init(.CHACHA20_POLY1305_SHA256, secret);
+        p.handshake_complete = true;
+        if (case.want) |want| {
+            const rec = try p.readRecord();
+            try std.testing.expectEqual(tls.ContentType.application_data, rec.content_type);
+            try std.testing.expectEqualStrings(want, rec.data);
+        } else |want_err| {
+            try std.testing.expectError(want_err, p.readRecord());
+        }
+    }
 }

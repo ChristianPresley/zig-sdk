@@ -208,6 +208,32 @@ test "key schedule matches RFC 8448 section 3 handshake secrets" {
     try std.testing.expectEqualSlices(u8, &hex("5d313eb2671276ee13000b30"), &keys.iv);
 }
 
+test "every suite AEAD decrypts in place" {
+    // The record layer decrypts a record in place in the input buffer. This test fails when a
+    // change of an AEAD in std breaks decryption into the same slice.
+    const gpa = std.testing.allocator;
+    const lengths = [_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1000, 4103, tls.max_ciphertext_inner_record_len + 1 };
+    inline for (comptime std.enums.values(Suite)) |suite| {
+        const A = Suite.Type(suite).AEAD;
+        var key: [A.key_length]u8 = undefined;
+        var nonce: [A.nonce_length]u8 = undefined;
+        for (&key, 0..) |*b, i| b.* = @truncate(i *% 7 +% 1);
+        for (&nonce, 0..) |*b, i| b.* = @truncate(i *% 13 +% 2);
+        const ad = "\x17\x03\x03\x00\x00";
+        for (lengths) |len| {
+            const plain = try gpa.alloc(u8, len);
+            defer gpa.free(plain);
+            for (plain, 0..) |*b, i| b.* = @truncate(i *% 31 +% 3);
+            const buf = try gpa.alloc(u8, len);
+            defer gpa.free(buf);
+            var tag: [A.tag_length]u8 = undefined;
+            A.encrypt(buf, &tag, plain, ad, nonce, key);
+            try A.decrypt(buf, buf, tag, ad, nonce, key);
+            try std.testing.expectEqualSlices(u8, plain, buf);
+        }
+    }
+}
+
 fn hex(comptime s: []const u8) [s.len / 2]u8 {
     var out: [s.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, s) catch unreachable;
