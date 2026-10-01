@@ -1,5 +1,6 @@
 //! The X.509 extensions that chain validation needs and `std.crypto.Certificate` does not
-//! expose: basic constraints and key usage (RFC 5280 section 4.2.1).
+//! expose: basic constraints, key usage and the subject alternative name (RFC 5280
+//! section 4.2.1).
 const std = @import("std");
 const der = @import("der.zig");
 
@@ -160,15 +161,87 @@ pub fn keyUsage(cert: []const u8) der.Error!?KeyUsage {
     };
 }
 
+/// The `GeneralNames` sequence of the subject alternative name, or null when absent.
+pub fn subjectAltNames(cert: []const u8) der.Error!?der.Element {
+    const value = (try findExtension(cert, oid_subject_alt_name)) orelse return null;
+    return try (try der.parseExact(value)).expect(der.tag_sequence);
+}
+
 /// True when the subject alternative name of the certificate lists this IP address.
 pub fn hasIpAddress(cert: []const u8, address: []const u8) der.Error!bool {
-    const value = (try findExtension(cert, oid_subject_alt_name)) orelse return false;
-    const names = try (try der.parseExact(value)).expect(der.tag_sequence);
+    const names = (try subjectAltNames(cert)) orelse return false;
     var it = names.children();
     while (try it.next()) |name| {
         if (name.tag == 0x87 and std.mem.eql(u8, name.content, address)) return true;
     }
     return false;
+}
+
+/// True when a `dNSName` of the subject alternative name matches `host`. The function
+/// never reads the common name of the subject (RFC 9525 section 6.3).
+pub fn hasDnsName(cert: []const u8, host: []const u8) der.Error!bool {
+    const names = (try subjectAltNames(cert)) orelse return false;
+    var it = names.children();
+    while (try it.next()) |name| {
+        if (name.tag == 0x82 and matchesHostName(name.content, host)) return true;
+    }
+    return false;
+}
+
+/// Compare a DNS name of a certificate with a host name, without regard to case. The
+/// rules of RFC 6125 section 6.4.3 apply to a wildcard. A wildcard is the complete
+/// leftmost label, it matches one label, and at least two labels follow it.
+pub fn matchesHostName(pattern_in: []const u8, host_in: []const u8) bool {
+    const pattern = std.mem.trimEnd(u8, pattern_in, ".");
+    const host = std.mem.trimEnd(u8, host_in, ".");
+    if (pattern.len == 0 or host.len == 0) return false;
+    if (std.mem.findScalar(u8, host, '*') != null) return false;
+    if (!std.mem.startsWith(u8, pattern, "*.")) {
+        if (std.mem.findScalar(u8, pattern, '*') != null) return false; // a partial wildcard
+        return std.ascii.eqlIgnoreCase(pattern, host);
+    }
+    const suffix = pattern[2..];
+    if (std.mem.findScalar(u8, suffix, '*') != null) return false;
+    // Refuse "*.com": a wildcard needs two or more labels after it.
+    if (!validLabels(suffix) or std.mem.findScalar(u8, suffix, '.') == null) return false;
+    const dot = std.mem.findScalar(u8, host, '.') orelse return false;
+    if (dot == 0) return false; // the wildcard matches one complete label, not an empty one
+    return std.ascii.eqlIgnoreCase(host[dot + 1 ..], suffix);
+}
+
+/// True when `name` has no empty label.
+fn validLabels(name: []const u8) bool {
+    var labels = std.mem.splitScalar(u8, name, '.');
+    while (labels.next()) |label| if (label.len == 0) return false;
+    return true;
+}
+
+test "host name matching follows RFC 6125 and refuses broad wildcards" {
+    try std.testing.expect(matchesHostName("example.com", "example.com"));
+    try std.testing.expect(matchesHostName("Example.COM", "example.com"));
+    try std.testing.expect(matchesHostName("example.com.", "example.com"));
+    try std.testing.expect(matchesHostName("example.com", "example.com."));
+    try std.testing.expect(!matchesHostName("example.com", "www.example.com"));
+    try std.testing.expect(matchesHostName("*.example.com", "www.example.com"));
+    try std.testing.expect(matchesHostName("*.Example.com", "WWW.example.COM"));
+    try std.testing.expect(!matchesHostName("*.example.com", "example.com"));
+    try std.testing.expect(!matchesHostName("*.example.com", "a.b.example.com"));
+    try std.testing.expect(!matchesHostName("*.example.com", ".example.com"));
+    // Partial and inner wildcards.
+    try std.testing.expect(!matchesHostName("w*.example.com", "www.example.com"));
+    try std.testing.expect(!matchesHostName("*w.example.com", "www.example.com"));
+    try std.testing.expect(!matchesHostName("www.*.com", "www.example.com"));
+    try std.testing.expect(!matchesHostName("*.*.com", "www.example.com"));
+    // Wildcards that cover a top-level domain or everything.
+    try std.testing.expect(!matchesHostName("*", "localhost"));
+    try std.testing.expect(!matchesHostName("*.", "localhost"));
+    try std.testing.expect(!matchesHostName("*.com", "example.com"));
+    try std.testing.expect(!matchesHostName("*.localhost", "a.localhost"));
+    try std.testing.expect(!matchesHostName("*..com", "a..com"));
+    // The host itself never has a wildcard.
+    try std.testing.expect(!matchesHostName("*.example.com", "*.example.com"));
+    try std.testing.expect(!matchesHostName("", ""));
+    try std.testing.expect(!matchesHostName("example.com", ""));
 }
 
 test "basic constraints and key usage of the fixtures" {

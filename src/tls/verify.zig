@@ -72,7 +72,7 @@ pub fn verifyChain(certs: []const []const u8, host: ?[]const u8, trust: Trust, n
         },
         else => {},
     }
-    if (host) |h| try verifyHost(certs[0], leaf_parsed, h);
+    if (host) |h| try verifyHost(certs[0], h);
     switch (trust) {
         .self_signed => {
             pss.verifyCertificate(leaf_parsed, leaf_parsed, now_sec) catch |e| return mapVerify(e);
@@ -129,7 +129,11 @@ fn requireCa(cert: []const u8, below: usize) Error!void {
     if (ku) |usage| if (!usage.key_cert_sign) return error.TlsCertificateNotCa;
 }
 
-fn verifyHost(cert: []const u8, parsed: Certificate.Parsed, host: []const u8) Error!void {
+/// Check the host against the subject alternative name of the leaf: an IP address against
+/// an `iPAddress` entry, a DNS name against a `dNSName` entry. The common name of the
+/// subject never counts. A name constraint of a CA does not cover the common name, so it
+/// cannot limit that name.
+fn verifyHost(cert: []const u8, host: []const u8) Error!void {
     if (std.Io.net.IpAddress.parse(host, 0)) |address| {
         const bytes: []const u8 = switch (address) {
             .ip4 => |a| &a.bytes,
@@ -139,10 +143,8 @@ fn verifyHost(cert: []const u8, parsed: Certificate.Parsed, host: []const u8) Er
         if (!found) return error.TlsCertificateHostMismatch;
         return;
     } else |_| {}
-    parsed.verifyHostName(host) catch |e| switch (e) {
-        error.CertificateHostMismatch => return error.TlsCertificateHostMismatch,
-        error.CertificateFieldHasInvalidLength => return error.TlsCertificateInvalid,
-    };
+    const found = x509.hasDnsName(cert, host) catch return error.TlsCertificateInvalid;
+    if (!found) return error.TlsCertificateHostMismatch;
 }
 
 fn mapVerify(e: Certificate.Parsed.VerifyError) Error {
@@ -314,4 +316,21 @@ test "chains and CertificateVerify signatures with RSA-PSS keys" {
     // An rsaEncryption key does not accept the rsa_pss_pss schemes.
     const rsa = try verifyChain(&.{rsa_leaf}, "localhost", .self_signed, now);
     try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&rsa, .rsa_pss_pss_sha256, sig, message));
+}
+
+test "the host name check ignores the common name" {
+    const gpa = std.testing.allocator;
+    // The CA signs this leaf. Its common name is "localhost" and it has no subject
+    // alternative name.
+    const cn_only = try loadDer(gpa, "test/fixtures/tls/pem/cn-only.crt");
+    defer gpa.free(cn_only);
+    const ca = try loadDer(gpa, "test/fixtures/tls/pem/ca.crt");
+    defer gpa.free(ca);
+    var set: CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addDer(ca);
+    const now: i64 = 1_800_000_000;
+    try std.testing.expectError(error.TlsCertificateHostMismatch, verifyChain(&.{cn_only}, "localhost", .{ .ca_set = &set }, now));
+    // Without a host the chain itself is good.
+    _ = try verifyChain(&.{cn_only}, null, .{ .ca_set = &set }, now);
 }
