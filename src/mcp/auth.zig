@@ -1,5 +1,5 @@
 //! Authorization: the OAuth 2.1 client of the HTTP client transport, the authorization
-//! extensions, and the resource server helpers of the HTTP server.
+//! extensions, the resource server helpers of the HTTP server, and an authorization server.
 const std = @import("std");
 const types = @import("protocol/types.zig");
 
@@ -30,6 +30,13 @@ pub const ResourceServer = resource_server.ResourceServer;
 pub const Principal = resource_server.Principal;
 pub const JwtVerifier = resource_server.JwtVerifier;
 pub const DpopPolicy = resource_server.DpopPolicy;
+/// The OAuth 2.1 authorization server for MCP deployments.
+pub const authorization_server = @import("auth/authorization_server.zig");
+pub const AuthorizationServer = authorization_server.AuthorizationServer;
+/// The storage interface of the authorization server and its memory store.
+pub const authorization_store = @import("auth/authorization_store.zig");
+/// The fetcher of client ID metadata documents and of the JWK sets of clients.
+pub const client_metadata = @import("auth/client_metadata.zig");
 
 /// Return a copy of `capabilities` that declares the extension `id` under `extensions`. The
 /// copy keeps the extensions that `capabilities` declares already. The new map is in `arena`.
@@ -48,6 +55,7 @@ pub fn withExtension(arena: std.mem.Allocator, capabilities: types.ClientCapabil
 test {
     std.testing.refAllDecls(@This());
     _ = @import("auth/extensions_test.zig");
+    _ = @import("auth/authorization_server_test.zig");
 }
 
 test "declare an extension" {
