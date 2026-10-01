@@ -36,6 +36,7 @@ All notable changes to this project are recorded in this file. The format follow
 - Workload identity federation (`mcp.auth.WorkloadIdentity`): a workload JWT from a value, a file or a callback goes to the token endpoint as a JWT bearer grant without client registration. The client does not send a refused JWT again. `WorkloadJwtValidator` and `KeyDiscovery` (OpenID Connect Discovery) check workload JWTs for an application with its own authorization server.
 - `Server.Options.authorization_extensions` has `dpop` and `workload_identity`. The conformance client passes `auth/dpop`, `auth/dpop-nonce` and `auth/wif-jwt-bearer`.
 - The CI job `conformance` runs each scenario that the suite does not score alone, with the per-check baseline `conformance/expected-failures-unscored.yml`. A failure of these scenarios now makes the job fail.
+- Rate limits for each caller (`limits.rate_limits`): a token bucket for the tool calls of each caller, one for all tool calls together, one for the log messages of each caller, and `ToolDef.rate_limit` for one tool. The caller is the principal, else the IP address (an IPv6 /64 network), else the connection. A refused tool call gets error `-31429` with `data.retryAfterMs`, and on HTTP with a JSON response also status 429 with `Retry-After`. The server drops log messages over the limit and later sends one summary with the count. The limits are off by default. The table of callers has at most `max_callers` entries. `Server.rateLimitStats` gives the counters.
 
 ### Changed
 
@@ -55,6 +56,7 @@ All notable changes to this project are recorded in this file. The format follow
 
 ### Fixed
 
+- The limits `uri_template.max_template_bytes` and `uri_template.max_uri_bytes` had no effect. A longer template now fails at registration with `error.InvalidUriTemplate`, and a longer URI matches no template.
 - A JWT with an `exp`, `nbf` or `iat` claim near the limit of `i64`, or with a large float value, could stop the process in Debug and ReleaseSafe. The checks now use saturating arithmetic, and a float claim outside the range of `i64` does not count. The same applies to `expires_in` of a token response. A DPoP proof is a JWT that the client signs, so this fix matters for servers with DPoP.
 - `parseChallenge` read only one `Bearer` challenge. It now reads more than one challenge in a value, the `DPoP` scheme and escapes in quoted strings, and the HTTP client joins the values of all `WWW-Authenticate` headers.
 - `zig build test --fuzz` did not compile on Zig 0.16.0, because the fuzz path of the test runner of the toolchain gives a `builtin.StackTrace` to `std.debug.writeStackTrace`. The option `-Dfuzz` makes a copy of the runner with `std.debug.writeErrorReturnTrace` in that call. It also builds the tests with the LLVM backend, because the self-hosted backend of Debug builds emits no coverage table for the fuzzer. The nightly `fuzz` job uses the option.
