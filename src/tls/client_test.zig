@@ -13,6 +13,10 @@ const Echo = struct {
     alpn_len: u8 = 0,
     /// The group the server negotiated.
     group: u16 = 0,
+    /// The suite the server negotiated.
+    suite: ?tls.Suite = null,
+    /// Echo a second line after a key update in each direction.
+    key_update: bool = false,
     result: anyerror!void = {},
     alert: std.crypto.tls.Alert = undefined,
 
@@ -41,6 +45,7 @@ const Echo = struct {
         });
         defer conn.deinit();
         self.group = conn.group;
+        self.suite = conn.suite;
         if (conn.alpn()) |a| {
             @memcpy(self.alpn_buf[0..a.len], a);
             self.alpn_len = @intCast(a.len);
@@ -48,6 +53,17 @@ const Echo = struct {
         const line = try conn.reader.takeDelimiterExclusive('\n');
         try conn.writer.print("echo: {s}\n", .{line});
         try conn.writer.flush();
+        if (self.key_update) {
+            // The client sends a key update before its second line. The first read left the
+            // line end in the buffer.
+            conn.reader.toss(1);
+            const before = trafficSecret(&conn.read_keys);
+            const again = try conn.reader.takeDelimiterExclusive('\n');
+            if (std.mem.eql(u8, &before, &trafficSecret(&conn.read_keys))) return error.TestNoKeyUpdate;
+            try conn.updateKeys();
+            try conn.writer.print("echo: {s}\n", .{again});
+            try conn.writer.flush();
+        }
         _ = conn.reader.takeDelimiterExclusive('\n') catch |e| switch (e) {
             error.EndOfStream => {},
             else => return e,
@@ -55,6 +71,16 @@ const Echo = struct {
         try conn.end();
     }
 };
+
+/// A copy of the traffic secret of `keys`. A key update changes it.
+fn trafficSecret(keys: *const tls.suites.DirectionKeys) [64]u8 {
+    var out: [64]u8 = @splat(0);
+    switch (keys.*) {
+        .none => {},
+        inline else => |*k| @memcpy(out[0..k.secret.len], &k.secret),
+    }
+    return out;
+}
 
 fn fixture(buf: []u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "test/fixtures/tls/pem/{s}", .{name}) catch unreachable;
@@ -72,13 +98,19 @@ const ClientSetup = struct {
     alpn: []const []const u8 = &.{},
     groups: []const tls.key_share.Group = tls.key_share.default_groups,
     identity: ?*const tls.CertChain = null,
+    cipher_suites: []const tls.Suite = tls.suites.default_suites,
     /// The group both sides must negotiate.
     expect_group: ?tls.key_share.Group = null,
+    /// The suite both sides must negotiate.
+    expect_suite: ?tls.Suite = null,
+    /// Send a second line after a key update. The server answers with a key update too.
+    key_update: bool = false,
 };
 
 const ServerSetup = struct {
     alpn: []const []const u8 = &.{},
     groups: []const tls.key_share.Group = tls.key_share.default_groups,
+    cipher_suites: []const tls.Suite = tls.suites.default_suites,
     client_auth: tls.server.ClientAuth = .none,
     client_trust: ?tls.Trust = null,
 };
@@ -88,9 +120,17 @@ const ServerSetup = struct {
 fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, client_setup: ClientSetup, echo_out: *Echo, expect_alpn: ?[]const u8) !void {
     const chains = [_]*const tls.CertChain{chain};
     echo_out.* = .{
-        .server = try tls.Server.init(.{ .chains = &chains, .alpn = server_setup.alpn, .groups = server_setup.groups, .client_auth = server_setup.client_auth, .client_trust = server_setup.client_trust }),
+        .server = try tls.Server.init(.{
+            .chains = &chains,
+            .alpn = server_setup.alpn,
+            .groups = server_setup.groups,
+            .cipher_suites = server_setup.cipher_suites,
+            .client_auth = server_setup.client_auth,
+            .client_trust = server_setup.client_trust,
+        }),
         .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
         .io = io,
+        .key_update = client_setup.key_update,
     };
     defer echo_out.listener.deinit(io);
     const port = echo_out.listener.socket.address.getPort();
@@ -113,6 +153,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
         .trust = client_setup.trust,
         .alpn = client_setup.alpn,
         .groups = client_setup.groups,
+        .cipher_suites = client_setup.cipher_suites,
         .identity = client_setup.identity,
         .read_buffer = &read_buf,
         .write_buffer = &write_buf,
@@ -129,7 +170,20 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
     try writer.interface.flush();
     const line = try conn.reader.takeDelimiterExclusive('\n');
     try std.testing.expectEqualStrings("echo: hello", line);
+    if (client_setup.key_update) {
+        const before = trafficSecret(&conn.read_keys);
+        try conn.updateKeys();
+        try conn.writer.writeAll("again\n");
+        try conn.writer.flush();
+        // The first read left the line end in the buffer.
+        conn.reader.toss(1);
+        const again = try conn.reader.takeDelimiterExclusive('\n');
+        try std.testing.expectEqualStrings("echo: again", again);
+        // The key update of the server changed the read keys of the client.
+        try std.testing.expect(!std.mem.eql(u8, &before, &trafficSecret(&conn.read_keys)));
+    }
     if (client_setup.expect_group) |g| try std.testing.expectEqual(g.wire(), conn.group);
+    if (client_setup.expect_suite) |s| try std.testing.expectEqual(s, conn.suite.?);
     if (expect_alpn) |want| {
         try std.testing.expectEqualStrings(want, conn.alpn() orelse "");
     } else {
@@ -140,6 +194,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
     future.await(io);
     try echo_out.result;
     if (client_setup.expect_group) |g| try std.testing.expectEqual(g.wire(), echo_out.group);
+    if (client_setup.expect_suite) |s| try std.testing.expectEqual(s, echo_out.suite.?);
 }
 
 test "handshake with every self-signed key type" {
@@ -280,51 +335,50 @@ test "mutual authentication with client certificates" {
     try roundTrip(io, &server_chain, .{ .client_auth = .required, .client_trust = .self_signed }, .{ .trust = .self_signed, .identity = &rsa_identity }, &echo, null);
 }
 
-test "every cipher suite negotiates with the SDK client" {
+test "every cipher suite negotiates with the SDK client, with a key update" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
     defer chain.deinit();
-    for (tls.suites.default_suites) |suite| {
-        const chains = [_]*const tls.CertChain{&chain};
-        var echo: Echo = .{
-            .server = try tls.Server.init(.{ .chains = &chains, .cipher_suites = &.{suite} }),
-            .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
-            .io = io,
-        };
-        defer echo.listener.deinit(io);
-        const port = echo.listener.socket.address.getPort();
-        var future = try io.concurrent(Echo.serve, .{&echo});
-        defer _ = future.cancel(io);
-        const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-        var stream = try address.connect(io, .{ .mode = .stream });
-        defer stream.close(io);
-        var in_buf: [tls.Connection.min_input_buffer_len]u8 = undefined;
-        var out_buf: [tls.Connection.min_output_buffer_len]u8 = undefined;
-        var reader = stream.reader(io, &in_buf);
-        var writer = stream.writer(io, &out_buf);
-        var read_buf: [tls.Connection.min_read_buffer_len]u8 = undefined;
-        var write_buf: [1024]u8 = undefined;
-        var conn = try tls.connect(&reader.interface, &writer.interface, .{
-            .io = io,
-            .host = "localhost",
+    var echo: Echo = undefined;
+    // The AEGIS suites need the option on both sides.
+    for (std.enums.values(tls.Suite)) |suite| {
+        try roundTrip(io, &chain, .{ .cipher_suites = &.{suite} }, .{
             .trust = .self_signed,
-            .read_buffer = &read_buf,
-            .write_buffer = &write_buf,
-            .allow_truncation_attacks = true,
-        });
-        defer conn.deinit();
-        try std.testing.expectEqual(suite, conn.suite.?);
-        try conn.writer.writeAll("suite\n");
-        try conn.writer.flush();
-        try writer.interface.flush();
-        const line = try conn.reader.takeDelimiterExclusive('\n');
-        try std.testing.expectEqualStrings("echo: suite", line);
-        try conn.end();
-        try writer.interface.flush();
-        future.await(io);
-        try echo.result;
+            .cipher_suites = tls.suites.default_suites_with_aegis,
+            .expect_suite = suite,
+            .key_update = true,
+        }, &echo, null);
     }
+    // A P-384 chain and a HelloRetryRequest with each AEGIS suite.
+    var p384 = try loadChain(gpa, io, "p384.crt", "p384.key");
+    defer p384.deinit();
+    for ([_]tls.Suite{ .AEGIS_128L_SHA256, .AEGIS_256_SHA512 }) |suite| {
+        try roundTrip(io, &p384, .{ .cipher_suites = &.{suite}, .groups = &.{.secp384r1} }, .{
+            .trust = .self_signed,
+            .cipher_suites = &.{ .AES_128_GCM_SHA256, suite },
+            .groups = &.{ .x25519, .secp384r1 },
+            .expect_suite = suite,
+            .expect_group = .secp384r1,
+        }, &echo, null);
+    }
+}
+
+test "AEGIS is off by default in the client and the server" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer chain.deinit();
+    var echo: Echo = undefined;
+    // A server with AEGIS first still finds a default suite of a default client.
+    try roundTrip(io, &chain, .{ .cipher_suites = tls.suites.default_suites_with_aegis }, .{ .trust = .self_signed, .expect_suite = tls.suites.default_suites[0] }, &echo, null);
+    // A default server does not take AEGIS from a client that offers it first.
+    try roundTrip(io, &chain, .{}, .{ .trust = .self_signed, .cipher_suites = &.{ .AEGIS_128L_SHA256, .AEGIS_256_SHA512, .CHACHA20_POLY1305_SHA256 }, .expect_suite = .CHACHA20_POLY1305_SHA256 }, &echo, null);
+    // AEGIS on both sides: the server preference wins.
+    try roundTrip(io, &chain, .{ .cipher_suites = &.{ .AEGIS_256_SHA512, .AEGIS_128L_SHA256 } }, .{ .trust = .self_signed, .cipher_suites = tls.suites.default_suites_with_aegis, .expect_suite = .AEGIS_256_SHA512 }, &echo, null);
+    // A client with only AEGIS and a default server: no common suite.
+    try std.testing.expectError(error.TlsAlert, roundTrip(io, &chain, .{}, .{ .trust = .self_signed, .cipher_suites = &.{.AEGIS_128L_SHA256} }, &echo, null));
+    try std.testing.expectError(error.TlsHandshakeFailure, echo.result);
 }
 
 /// True when OpenSSL runs on this machine. The tests skip LibreSSL: its `s_server` has no `-rev`.

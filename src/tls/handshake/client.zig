@@ -30,6 +30,8 @@ pub const Options = struct {
     trust: Trust,
     /// Application protocols in preference order. Empty sends no ALPN extension.
     alpn: []const []const u8 = &.{},
+    /// Cipher suites in preference order. The default has no AEGIS suite. To offer AEGIS
+    /// too, use `suites.default_suites_with_aegis` or a list of your own.
     cipher_suites: []const Suite = suites.default_suites,
     /// Groups in preference order. The client sends a key share for the first group. When
     /// the first group is a hybrid group, the client also sends a key share for the first
@@ -621,6 +623,32 @@ test "certificate request with a long context is a decode error" {
     try std.testing.expectError(error.DecodeError, CertificateRequest.parse(&body));
     body[0] = 0xfe;
     try std.testing.expectError(error.DecodeError, CertificateRequest.parse(&body));
+}
+
+test "the default client hello offers no AEGIS suite" {
+    const io = std.testing.io;
+    var read_buf: [1]u8 = undefined;
+    var write_buf: [1]u8 = undefined;
+    var options: Options = .{ .io = io, .host = "localhost", .trust = .self_signed, .read_buffer = &read_buf, .write_buffer = &write_buf };
+    var shares: Shares = .{};
+    defer shares.wipe();
+    try shares.generate(io, &.{.x25519});
+    var buf: [client_hello_buffer_len]u8 = undefined;
+    const session_id = [_]u8{0} ** 32;
+    {
+        const hello = try codec.ClientHello.parse(clientHello(&buf, [_]u8{1} ** 32, &session_id, options, shares.slice(), null)[4..]);
+        for (suites.default_suites) |s| try std.testing.expect(hello.offersSuite(s.wire()));
+        try std.testing.expect(!hello.offersSuite(Suite.AEGIS_128L_SHA256.wire()));
+        try std.testing.expect(!hello.offersSuite(Suite.AEGIS_256_SHA512.wire()));
+    }
+    // The option adds both AEGIS suites.
+    options.cipher_suites = suites.default_suites_with_aegis;
+    {
+        const hello = try codec.ClientHello.parse(clientHello(&buf, [_]u8{1} ** 32, &session_id, options, shares.slice(), null)[4..]);
+        for (suites.default_suites) |s| try std.testing.expect(hello.offersSuite(s.wire()));
+        try std.testing.expect(hello.offersSuite(Suite.AEGIS_128L_SHA256.wire()));
+        try std.testing.expect(hello.offersSuite(Suite.AEGIS_256_SHA512.wire()));
+    }
 }
 
 test "server name eligibility" {

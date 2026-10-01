@@ -35,6 +35,9 @@ pub const Config = struct {
     alpn: []const []const u8 = &.{},
     /// Reject clients that do not negotiate an application protocol.
     require_alpn: bool = false,
+    /// Cipher suites in preference order. The server takes the first one that the client
+    /// offers. The default has no AEGIS suite. To accept AEGIS too, use
+    /// `suites.default_suites_with_aegis` or a list of your own.
     cipher_suites: []const Suite = suites.default_suites,
     /// Groups in preference order. A hybrid group that the client supports wins, even when
     /// it costs a HelloRetryRequest. Among the other groups, a group with a client key share

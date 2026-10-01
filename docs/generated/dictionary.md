@@ -519,6 +519,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | ECMA | Ecma International, the publisher of ECMA-262 |
 | BSD | the Berkeley Software Distribution family of operating systems |
 | AEAD | authenticated encryption with associated data |
+| AEGIS | a family of AEAD algorithms on the AES round function (draft-irtf-cfrg-aegis-aead) |
 | AES | Advanced Encryption Standard |
 | ALPN | application-layer protocol negotiation (RFC 7301) |
 | CA | certificate authority |

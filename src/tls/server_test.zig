@@ -133,53 +133,79 @@ test "handshake and echo with the std client for every key type" {
     }
 }
 
+/// One echo between the std client and an SDK server with `config`. The std client offers
+/// every TLS 1.3 suite, the AEGIS suites first. Returns the name of the suite that the std
+/// client negotiated.
+fn stdClientEcho(io: Io, config: tls.server.Config, message: []const u8) ![]const u8 {
+    var echo: Echo = .{
+        .server = try tls.Server.init(config),
+        .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
+        .io = io,
+    };
+    defer echo.listener.deinit(io);
+    const port = echo.listener.socket.address.getPort();
+    var future = try io.concurrent(Echo.serve, .{&echo});
+    defer _ = future.cancel(io);
+    const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
+    var stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var in_buf: [StdClient.min_buffer_len]u8 = undefined;
+    var out_buf: [StdClient.min_buffer_len]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+    var writer = stream.writer(io, &out_buf);
+    var entropy: [StdClient.Options.entropy_len]u8 = undefined;
+    try io.randomSecure(&entropy);
+    var read_buf: [tls.Connection.min_read_buffer_len]u8 = undefined;
+    var write_buf: [1024]u8 = undefined;
+    var client = try StdClient.init(&reader.interface, &writer.interface, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+        .read_buffer = &read_buf,
+        .write_buffer = &write_buf,
+        .entropy = &entropy,
+        .realtime_now = Io.Clock.real.now(io),
+        .allow_truncation_attacks = true,
+    });
+    const suite = @tagName(client.application_cipher);
+    try client.writer.print("{s}\n", .{message});
+    try client.writer.flush();
+    try writer.interface.flush();
+    const line = try client.reader.takeDelimiterExclusive('\n');
+    try std.testing.expect(std.mem.startsWith(u8, line, "echo: "));
+    try std.testing.expectEqualStrings(message, line["echo: ".len..]);
+    try client.end();
+    try writer.interface.flush();
+    future.await(io);
+    try echo.result;
+    return suite;
+}
+
 test "every cipher suite negotiates" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
     defer chain.deinit();
-    for (tls.suites.default_suites) |suite| {
-        const chains = [_]*const tls.CertChain{&chain};
-        var echo: Echo = .{
-            .server = try tls.Server.init(.{ .chains = &chains, .cipher_suites = &.{suite} }),
-            .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
-            .io = io,
-        };
-        defer echo.listener.deinit(io);
-        const port = echo.listener.socket.address.getPort();
-        var future = try io.concurrent(Echo.serve, .{&echo});
-        defer _ = future.cancel(io);
-        const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-        var stream = try address.connect(io, .{ .mode = .stream });
-        defer stream.close(io);
-        var in_buf: [StdClient.min_buffer_len]u8 = undefined;
-        var out_buf: [StdClient.min_buffer_len]u8 = undefined;
-        var reader = stream.reader(io, &in_buf);
-        var writer = stream.writer(io, &out_buf);
-        var entropy: [StdClient.Options.entropy_len]u8 = undefined;
-        try io.randomSecure(&entropy);
-        var read_buf: [tls.Connection.min_read_buffer_len]u8 = undefined;
-        var write_buf: [1024]u8 = undefined;
-        var client = try StdClient.init(&reader.interface, &writer.interface, .{
-            .host = .no_verification,
-            .ca = .no_verification,
-            .read_buffer = &read_buf,
-            .write_buffer = &write_buf,
-            .entropy = &entropy,
-            .realtime_now = Io.Clock.real.now(io),
-            .allow_truncation_attacks = true,
-        });
-        try std.testing.expectEqualStrings(@tagName(suite), @tagName(client.application_cipher));
-        try client.writer.writeAll("suite\n");
-        try client.writer.flush();
-        try writer.interface.flush();
-        const line = try client.reader.takeDelimiterExclusive('\n');
-        try std.testing.expectEqualStrings("echo: suite", line);
-        try client.end();
-        try writer.interface.flush();
-        future.await(io);
-        try echo.result;
+    const chains = [_]*const tls.CertChain{&chain};
+    // The AEGIS suites too: the std client is a second implementation of them.
+    for (std.enums.values(tls.Suite)) |suite| {
+        const got = try stdClientEcho(io, .{ .chains = &chains, .cipher_suites = &.{suite} }, "suite");
+        try std.testing.expectEqualStrings(@tagName(suite), got);
     }
+}
+
+test "AEGIS is off by default and on with the option" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var chain = try loadChain(gpa, io, "p256.crt", "p256.key");
+    defer chain.deinit();
+    const chains = [_]*const tls.CertChain{&chain};
+    // The std client offers AEGIS first. The default server takes its own first choice.
+    const default = try stdClientEcho(io, .{ .chains = &chains }, "default");
+    try std.testing.expectEqualStrings(@tagName(tls.suites.default_suites[0]), default);
+    try std.testing.expect(std.mem.indexOf(u8, default, "AEGIS") == null);
+    // With the AEGIS list, the server takes the first suite of that list.
+    const with_aegis = try stdClientEcho(io, .{ .chains = &chains, .cipher_suites = tls.suites.default_suites_with_aegis }, "aegis");
+    try std.testing.expectEqualStrings(@tagName(tls.suites.default_suites_with_aegis[0]), with_aegis);
 }
 
 test "a TLS 1.2 client hello is refused with protocol_version" {
