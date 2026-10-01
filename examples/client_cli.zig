@@ -2,16 +2,23 @@
 //! tools or calls one. The modes are `stdio` (a server process), `http` (Streamable HTTP),
 //! `unix` (a Unix domain socket) and `ws` (WebSocket with a `ws` or `wss` URL).
 //!
+//! With `--oauth`, the HTTP client answers authorization challenges with `OAuthClient`. The
+//! client keeps its registration and its tokens in the keychain of the host. Thus the next run
+//! needs no new sign-in. A host without a keychain uses encrypted files in the home directory
+//! when the environment variable `MCP_TOKEN_KEY` has a key of 64 hexadecimal digits. Else the
+//! tokens stay in memory.
+//!
 //! Usage:
 //!   client_cli stdio <command> [args...] -- list
 //!   client_cli stdio <command> [args...] -- call <tool> [json-arguments]
-//!   client_cli http <url> -- list
-//!   client_cli http <url> -- call <tool> [json-arguments]
+//!   client_cli http <url> [--oauth] -- list
+//!   client_cli http <url> [--oauth] -- call <tool> [json-arguments]
 //!   client_cli unix <path> -- list
 //!   client_cli unix <path> -- call <tool> [json-arguments]
 //!   client_cli ws <url> -- list
 //!   client_cli ws <url> -- call <tool> [json-arguments]
 const std = @import("std");
+const builtin = @import("builtin");
 const mcp = @import("mcp");
 
 pub fn main(init: std.process.Init) !void {
@@ -33,13 +40,25 @@ pub fn main(init: std.process.Init) !void {
     defer if (unix_client) |c| c.deinit();
     var ws_client: ?*mcp.transport.websocket.Client = null;
     defer if (ws_client) |c| c.deinit();
+    var tokens: TokenStore = .none;
+    defer tokens.deinit();
+    var oauth: ?mcp.auth.OAuthClient = null;
+    defer if (oauth) |*o| o.deinit();
     var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "client_cli", .version = "0.1.0" } });
     defer client.deinit();
     if (std.mem.eql(u8, mode, "stdio")) {
         stdio_client = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = args[2..separator] });
         client.connect(stdio_client.?.transport());
     } else if (std.mem.eql(u8, mode, "http")) {
-        http_client = try mcp.transport.HttpClient.init(io, gpa, .{ .url = args[2] });
+        if (separator > 3 and std.mem.eql(u8, args[3], "--oauth")) {
+            tokens = .open(io, gpa, init.environ_map);
+            oauth = .init(io, gpa, .{
+                .client_name = "client_cli",
+                .authorize = .{ .callback = .{ .userdata = @constCast(&io), .open = askForRedirect } },
+                .storage = tokens.storage(),
+            });
+        }
+        http_client = try mcp.transport.HttpClient.init(io, gpa, .{ .url = args[2], .auth = if (oauth) |*o| o else null });
         client.connect(http_client.?.transport());
     } else if (std.mem.eql(u8, mode, "unix")) {
         unix_client = try mcp.transport.unix.Client.connect(io, gpa, .{ .path = args[2] });
@@ -82,7 +101,62 @@ pub fn main(init: std.process.Init) !void {
     return usage();
 }
 
+/// The token storage of the example: the keychain of the host, else encrypted files, else none.
+const TokenStore = union(enum) {
+    keychain: mcp.auth.KeychainTokenStorage,
+    files: mcp.auth.FileTokenStorage,
+    none,
+
+    fn open(io: std.Io, gpa: std.mem.Allocator, env: *const std.process.Environ.Map) TokenStore {
+        if (mcp.auth.KeychainTokenStorage.init(io, gpa, .{ .service = "zig-sdk client_cli", .environ_map = env })) |keychain| {
+            return .{ .keychain = keychain };
+        } else |e| std.log.info("no keychain ({t}), the tokens go to files or stay in memory", .{e});
+        // `FileTokenStorage` needs a key of the application. A real application keeps it in a
+        // safe location. This example reads it from the environment.
+        const hex = env.get("MCP_TOKEN_KEY") orelse return .none;
+        var key: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &key);
+        if (hex.len != 64) return .none;
+        _ = std.fmt.hexToBytes(&key, hex) catch return .none;
+        const home = env.get(if (builtin.os.tag == .windows) "LOCALAPPDATA" else "HOME") orelse return .none;
+        const dir = std.fs.path.join(gpa, &.{ home, ".mcp-client-cli-tokens" }) catch return .none;
+        defer gpa.free(dir);
+        const files = mcp.auth.FileTokenStorage.init(io, gpa, .{ .dir = dir, .key = key }) catch |e| {
+            std.log.warn("no token files in {s}: {t}", .{ dir, e });
+            return .none;
+        };
+        return .{ .files = files };
+    }
+
+    fn storage(self: *TokenStore) ?mcp.auth.TokenStorage {
+        return switch (self.*) {
+            .keychain => |*k| k.storage(),
+            .files => |*f| f.storage(),
+            .none => null,
+        };
+    }
+
+    fn deinit(self: *TokenStore) void {
+        switch (self.*) {
+            .keychain => |*k| k.deinit(),
+            .files => |*f| f.deinit(),
+            .none => {},
+        }
+    }
+};
+
+/// Show the authorization URL and read the redirect URL that the user pastes. The SDK never
+/// opens a browser.
+fn askForRedirect(userdata: ?*anyopaque, arena: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
+    const io: *const std.Io = @ptrCast(@alignCast(userdata.?));
+    std.debug.print("Open this URL in a browser and sign in:\n{s}\nThen paste the address of the last page here:\n", .{url});
+    var buf: [8192]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(io.*, &buf);
+    const line = try stdin.interface.takeDelimiterExclusive('\n');
+    return arena.dupe(u8, std.mem.trim(u8, line, " \t\r"));
+}
+
 fn usage() error{InvalidArguments} {
-    std.log.err("usage: client_cli (stdio <command> [args...] | http <url> | unix <path> | ws <url>) -- (list | call <tool> [json-arguments])", .{});
+    std.log.err("usage: client_cli (stdio <command> [args...] | http <url> [--oauth] | unix <path> | ws <url>) -- (list | call <tool> [json-arguments])", .{});
     return error.InvalidArguments;
 }
