@@ -480,6 +480,10 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | --- | --- |
 | API | application programming interface |
 | ASCII | the 7-bit character set of RFC 20 |
+| CR | carriage return, the ASCII control character 0x0D |
+| DEL | delete, the ASCII control character 0x7F |
+| LF | line feed, the ASCII control character 0x0A |
+| NUL | null, the ASCII control character 0x00 |
 | CIMD | client ID metadata document, a client registration method of MCP |
 | DCR | dynamic client registration (RFC 7591) |
 | DNS | Domain Name System |

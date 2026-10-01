@@ -196,9 +196,9 @@ pub const Connection = struct {
     }
 };
 
-/// Check the parts of a request head against the rules of RFC 9110 and RFC 9112: the method
-/// and each field name are tokens, the target and the host are visible ASCII, and no field
-/// value has CR, LF or another control character.
+/// Check the parts of a request head against RFC 9110 and RFC 9112. The method and each field
+/// name must be tokens. The target and the host must be visible ASCII. A field value must not
+/// have CR, LF or another control character.
 pub fn checkHead(method: []const u8, target: []const u8, host: []const u8, headers: []const Header) error{InvalidRequestHead}!void {
     if (!http_syntax.isToken(method) or !http_syntax.isVisibleAscii(target) or !http_syntax.isVisibleAscii(host)) return error.InvalidRequestHead;
     for (headers) |h| if (!http_syntax.isToken(h.name) or !http_syntax.isFieldValue(h.value)) return error.InvalidRequestHead;

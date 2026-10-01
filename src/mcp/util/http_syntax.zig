@@ -21,7 +21,7 @@ pub fn isToken(s: []const u8) bool {
 }
 
 /// True when `s` is a field value (RFC 9110 section 5.5): visible ASCII, space, horizontal
-/// tab and `obs-text`. CR, LF, NUL, the other control characters and DEL are not permitted.
+/// tab and `obs-text`. The rule does not permit CR, LF, NUL, DEL and the other control characters.
 pub fn isFieldValue(s: []const u8) bool {
     for (s) |c| switch (c) {
         '\t', ' '...'~', 0x80...0xff => {},
