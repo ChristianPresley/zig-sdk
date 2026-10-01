@@ -4,18 +4,19 @@ const Io = std.Io;
 
 pub const Error = error{InvalidTimeout};
 
-/// Parse a header value into a duration.
+/// Parse a header value into a duration. A duration longer than the range of `Io.Duration`
+/// becomes the longest duration: eight digits of hours do not fit in 64 bits of nanoseconds.
 pub fn parse(text: []const u8) Error!Io.Duration {
     if (text.len < 2 or text.len > 9) return error.InvalidTimeout;
     const digits = text[0 .. text.len - 1];
     for (digits) |c| if (!std.ascii.isDigit(c)) return error.InvalidTimeout;
     const value = std.fmt.parseInt(u64, digits, 10) catch return error.InvalidTimeout;
     const ns: u64 = switch (text[text.len - 1]) {
-        'H' => value * std.time.ns_per_hour,
-        'M' => value * std.time.ns_per_min,
-        'S' => value * std.time.ns_per_s,
-        'm' => value * std.time.ns_per_ms,
-        'u' => value * std.time.ns_per_us,
+        'H' => value *| std.time.ns_per_hour,
+        'M' => value *| std.time.ns_per_min,
+        'S' => value *| std.time.ns_per_s,
+        'm' => value *| std.time.ns_per_ms,
+        'u' => value *| std.time.ns_per_us,
         'n' => value,
         else => return error.InvalidTimeout,
     };
@@ -56,6 +57,11 @@ test "parse and format" {
     try std.testing.expectError(error.InvalidTimeout, parse("m"));
     try std.testing.expectError(error.InvalidTimeout, parse("123456789S"));
     try std.testing.expectError(error.InvalidTimeout, parse("10x"));
+    // The largest values of each unit: the hours saturate instead of an overflow.
+    try std.testing.expectEqual(std.math.maxInt(i64), (try parse("99999999H")).nanoseconds);
+    try std.testing.expectEqual(std.math.maxInt(i64), (try parse("9999999H")).nanoseconds);
+    try std.testing.expectEqual(99_999_999 * std.time.ns_per_min, (try parse("99999999M")).nanoseconds);
+    try std.testing.expectEqual(99_999_999, (try parse("99999999n")).nanoseconds);
     var buf: [9]u8 = undefined;
     try std.testing.expectEqualStrings("30S", format(&buf, .fromSeconds(30)));
     try std.testing.expectEqualStrings("50m", format(&buf, .fromMilliseconds(50)));
