@@ -7,6 +7,7 @@ const tls = crypto.tls;
 const Certificate = crypto.Certificate;
 const CaSet = @import("CaSet.zig");
 const pss = @import("pss.zig");
+const der = @import("der.zig");
 const x509 = @import("x509.zig");
 
 /// How the SDK verifies the peer certificate.
@@ -103,9 +104,8 @@ pub fn verifyChain(certs: []const []const u8, trust: Trust, options: ChainOption
             var current = leaf_parsed;
             var index: usize = 0;
             while (true) {
-                if (findAnchor(trust, current.issuer())) |anchor| {
-                    pss.verifyCertificate(current, anchor, now_sec) catch |e| return mapVerify(e);
-                    try requireCa(anchor.certificate.buffer[anchor.certificate.index..], index, .anchor);
+                if (try issuingAnchor(trust, current, now_sec)) |anchor| {
+                    try requireCa(anchor.der, index, .anchor);
                     return leaf;
                 }
                 index += 1;
@@ -127,13 +127,41 @@ fn parse(bytes: []const u8) !Certificate.Parsed {
     return pss.parseCertificate(.{ .buffer = bytes, .index = 0 });
 }
 
-fn findAnchor(trust: Trust, issuer_name: []const u8) ?Certificate.Parsed {
+/// A trust anchor: the parsed certificate and its exact DER bytes.
+const Anchor = struct {
+    parsed: Certificate.Parsed,
+    der: []const u8,
+};
+
+/// The anchor that signs `child`: its subject is the issuer name of `child`, and its key
+/// verifies the signature of `child`. A CA set can have two anchors with one name, for
+/// example a root with a new key. Thus the function tries each of them. Null
+/// when no anchor has the name. When anchors have the name but none verifies `child`,
+/// the function returns the error of the first one.
+fn issuingAnchor(trust: Trust, child: Certificate.Parsed, now_sec: i64) Error!?Anchor {
     switch (trust) {
-        .ca_set => |set| return set.findIssuer(issuer_name),
+        .ca_set => |set| {
+            var first_error: ?Error = null;
+            for (set.certs.items) |bytes| {
+                const cert: Certificate = .{ .buffer = bytes, .index = 0 };
+                const parsed = pss.parseCertificate(cert) catch continue;
+                if (!std.mem.eql(u8, parsed.subject(), child.issuer())) continue;
+                pss.verifyCertificate(child, parsed, now_sec) catch |e| {
+                    if (first_error == null) first_error = mapVerify(e);
+                    continue;
+                };
+                return .{ .parsed = parsed, .der = bytes };
+            }
+            if (first_error) |e| return e;
+            return null;
+        },
         .bundle => |bundle| {
-            const index = bundle.find(issuer_name) orelse return null;
+            const index = bundle.find(child.issuer()) orelse return null;
             const cert: Certificate = .{ .buffer = bundle.bytes.items, .index = index };
-            return cert.parse() catch null;
+            const parsed = pss.parseCertificate(cert) catch return null;
+            const element = der.parse(bundle.bytes.items[index..]) catch return null;
+            pss.verifyCertificate(child, parsed, now_sec) catch |e| return mapVerify(e);
+            return .{ .parsed = parsed, .der = element.raw };
         },
         else => return null,
     }
@@ -453,4 +481,23 @@ test "an intermediate needs basic constraints with cA, an anchor can lack them" 
     defer leaf_anchor.deinit();
     try leaf_anchor.addDer(leaf);
     try std.testing.expectError(error.TlsCertificateNotCa, serverChain(&.{bad}, "localhost", .{ .ca_set = &leaf_anchor }, test_now));
+}
+
+test "every anchor with the issuer name gets a try" {
+    const gpa = std.testing.allocator;
+    const leaf = try loadDer(gpa, "test/fixtures/tls/pem/chain-leaf.crt");
+    defer gpa.free(leaf);
+    const ca = try loadDer(gpa, "test/fixtures/tls/pem/ca.crt");
+    defer gpa.free(ca);
+    // The same name as ca.crt and a different key.
+    const rekeyed = try loadDer(gpa, "test/fixtures/tls/pem/ca-rekeyed.crt");
+    defer gpa.free(rekeyed);
+    var set: CaSet = .init(gpa);
+    defer set.deinit();
+    try set.addDer(rekeyed);
+    try std.testing.expectError(error.TlsCertificateNotVerified, serverChain(&.{leaf}, "localhost", .{ .ca_set = &set }, test_now));
+    try set.addDer(ca);
+    _ = try serverChain(&.{leaf}, "localhost", .{ .ca_set = &set }, test_now);
+    // The time error of the leaf comes first when no anchor verifies it.
+    try std.testing.expectError(error.TlsCertificateExpired, serverChain(&.{leaf}, "localhost", .{ .ca_set = &set }, test_now + 400 * 365 * 86400));
 }
