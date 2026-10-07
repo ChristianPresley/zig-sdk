@@ -127,11 +127,17 @@ pub const Client = struct {
         /// private CA or the CA of a test server. The bundle must stay valid and unchanged
         /// until `deinit`. The HTTP client transport can use the same bundle in its `tls`
         /// option: `.{ .trust = .{ .bundle = &bundle } }`.
+        ///
+        /// With a bundle, the TLS client of the SDK verifies the servers, as in the HTTP
+        /// client transport. Thus these servers must offer TLS 1.3. The client then never uses
+        /// the CA store of the system, also on Windows. See `auth.common.Fetcher.ca_bundle`.
+        /// For the CA store of the system and a private CA, load the store with
+        /// `std.crypto.Certificate.Bundle.rescan` and add the private CA to it.
         ca_bundle: ?*const std.crypto.Certificate.Bundle = null,
         /// The HTTP proxy of the same requests, as `HttpClient.Options.proxy`. Give the HTTP
         /// client transport the same value, thus both use one proxy. The default reads no
-        /// environment, thus the client connects directly. Through a proxy, the TLS client of
-        /// std speaks to the server through a `CONNECT` tunnel with the trust of `ca_bundle`.
+        /// environment, thus the client connects directly. Through a proxy, the TLS client
+        /// speaks to the server through a `CONNECT` tunnel with the trust of `ca_bundle`.
         proxy: proxy.Config = .{ .environment = null },
         max_document_bytes: usize = 1 << 20,
         /// Request DPoP-bound tokens with this key (RFC 9449). The token request and each

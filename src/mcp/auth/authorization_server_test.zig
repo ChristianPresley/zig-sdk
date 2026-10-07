@@ -521,6 +521,49 @@ test "authorization code flow over HTTPS with the CA of the ca_bundle option" {
     try std.testing.expectEqualStrings(who, try world.call(arena, oauth.provider(), null));
 }
 
+test "the fetcher verifies a server against its ca_bundle only, and the HTTP client of std never gets the bundle" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var world: World = undefined;
+    try world.start(.{ .https = true });
+    defer world.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const url = try std.fmt.allocPrint(arena, "{s}/jwks", .{world.issuer});
+    const bytes = world.ca_bundle.bytes.items;
+    const certs = world.ca_bundle.map.count();
+
+    var fetcher: common.Fetcher = .init(io, gpa, 1 << 16, false);
+    defer fetcher.deinit();
+    fetcher.ca_bundle = &world.ca_bundle;
+    try std.testing.expectEqual(200, (try fetcher.fetch(arena, .GET, url, null, null, &.{})).status);
+    // The HTTP client of std has no bundle, and it did not load the CA store of the system.
+    try std.testing.expectEqual(0, fetcher.http_client.ca_bundle.bytes.items.len);
+    try std.testing.expect(fetcher.http_client.now == null);
+    // On Windows, the TLS client of std replaces the bundle of its HTTP client with the CA
+    // store of the system, and frees the old bundle. Do the same here: the bundle of the
+    // option stays valid, and `World.stop` frees it one time.
+    var replaced: std.crypto.Certificate.Bundle = .empty;
+    std.mem.swap(std.crypto.Certificate.Bundle, &fetcher.http_client.ca_bundle, &replaced);
+    replaced.deinit(gpa);
+    try std.testing.expectEqual(200, (try fetcher.fetch(arena, .GET, url, null, null, &.{})).status);
+    try std.testing.expectEqual(bytes.ptr, world.ca_bundle.bytes.items.ptr);
+    try std.testing.expectEqual(bytes.len, world.ca_bundle.bytes.items.len);
+    try std.testing.expectEqual(certs, world.ca_bundle.map.count());
+
+    // A bundle without the test CA: the TLS handshake fails. The fetcher does not use the CA
+    // store of the system then.
+    var other: std.crypto.Certificate.Bundle = .empty;
+    defer other.deinit(gpa);
+    try other.addCertsFromFilePath(gpa, io, Io.Clock.real.now(io), Io.Dir.cwd(), "test/fixtures/tls/pem/rev-root.crt");
+    var refusing: common.Fetcher = .init(io, gpa, 1 << 16, false);
+    defer refusing.deinit();
+    refusing.ca_bundle = &other;
+    try std.testing.expectError(error.TlsFailed, refusing.fetch(arena, .GET, url, null, null, &.{}));
+    try std.testing.expectEqual(0, refusing.http_client.ca_bundle.bytes.items.len);
+}
+
 /// The `host:port` part of an `https` URL, in `arena`.
 fn authority(arena: Allocator, url: []const u8) ![]const u8 {
     const rest = url["https://".len..];
@@ -544,8 +587,8 @@ test "authorization code flow over HTTPS through a CONNECT proxy" {
     const through: mcp.transport.proxy.Config = .{ .explicit = .{ .url = p.url(&proxy_buf, "agent:s3cret"), .loopback = true } };
 
     // The fetcher of the OAuth client and the HTTP client transport use the same proxy. The
-    // discovery, the registration, the authorization and the token request go through it with
-    // the std TLS client, and the MCP requests with the SDK TLS client.
+    // discovery, the registration, the authorization, the token request and the MCP requests
+    // go through it. The SDK TLS client verifies each server against the bundle.
     world.proxy = through;
     var oauth: mcp.auth.OAuthClient = .init(io, gpa, .{ .ca_bundle = &world.ca_bundle, .proxy = through });
     defer oauth.deinit();
@@ -565,6 +608,16 @@ test "authorization code flow over HTTPS through a CONNECT proxy" {
     try std.testing.expectEqual(200, jwks.status);
     try std.testing.expectEqual(2, (try jwt.parseJwks(arena, jwks.body)).len);
     try std.testing.expectEqual(tunnels + 1, p.tunnels.load(.monotonic));
+
+    // Without the bundle, the TLS client of std speaks through the tunnel with the CA store of
+    // the system, which does not have the test CA.
+    var system: common.Fetcher = .init(io, gpa, 1 << 16, false);
+    defer system.deinit();
+    system.proxy = through;
+    if (system.fetch(arena, .GET, try std.fmt.allocPrint(arena, "{s}/jwks", .{world.issuer}), null, null, &.{})) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqual(tunnels + 2, p.tunnels.load(.monotonic));
 
     // A proxy that refuses the tunnel: the fetch fails with `error.ProxyRefused`, and the
     // client finds no metadata.
