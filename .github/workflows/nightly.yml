@@ -59,7 +59,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
-      - run: zig build test -Doptimize=ReleaseSafe --summary all
+      # For --test-timeout, see the test job in ci.yml.
+      - run: zig build test -Doptimize=ReleaseSafe --summary all --test-timeout 10m
 
   bench-smoke:
     name: bench-smoke

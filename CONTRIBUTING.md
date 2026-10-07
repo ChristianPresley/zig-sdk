@@ -28,6 +28,8 @@ If you send a pull request, the maintainer applies your change as a signed commi
 3. Run `zig build lint-docs` when you changed prose.
 4. Run `zig build census` when you changed the protocol types.
 
+On Windows, add `--test-timeout 10m` to `zig build test`, as CI does. With Zig 0.16.0, a process that the build runner starts at the same time can keep the output pipes of a test binary open. Without the option, the build runner then fails the step 60 seconds after the last test with `test runner failed to respond`.
+
 ## Prose
 
 All prose uses the project profile of ASD-STE100 Simplified Technical English. The profile is in `docs/style/ste-profile.md`. The project dictionary is in `docs/dictionary/`.

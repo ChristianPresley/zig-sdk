@@ -38,7 +38,8 @@ jobs:
       - uses: ./.github/actions/setup-zig
       - run: zig build fmt census
       - run: zig build lint-docs -- --strict --string-literals
-      - run: zig build test -Doptimize=ReleaseSafe --summary all
+      # For --test-timeout, see the test job in ci.yml.
+      - run: zig build test -Doptimize=ReleaseSafe --summary all --test-timeout 10m
       - run: zig build examples conformance-server conformance-client
 
   publish:

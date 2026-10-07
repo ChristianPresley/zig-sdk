@@ -67,7 +67,12 @@ jobs:
         with:
           path: ${{ runner.temp }}/zig-global-cache
           key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
-      - run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+      # With Zig 0.16.0 on Windows, a process that the build runner starts at the same time can
+      # inherit the output pipes of a test binary. After the last test, the build runner waits
+      # for the end of these pipes until that process exits. Without --test-timeout, it fails the
+      # step after 60 s with "test runner failed to respond". The option makes this wait 10 min.
+      # Also a test that hangs then fails after 10 min with its name.
+      - run: zig build test -Doptimize=${{ matrix.optimize }} --summary all --test-timeout 10m
       - run: zig build examples -Doptimize=${{ matrix.optimize }}
 
   cross:
