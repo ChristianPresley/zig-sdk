@@ -4,6 +4,18 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- `http2.Connection.Stream.stopWaits`: stops the waits on a stream without a reset. Each wait on the stream then gives `error.Canceled` when it must block. Use it, not `Future.cancel`, to stop a task that waits on the stream. In Zig 0.16.0, the condition of std can lose a cancel that comes together with a wake-up. The task then waits until the stream gets a reset or the connection ends.
+- `client.CallStream`: the stream of a gRPC call that runs in its own task. The tunnel and typed channels reset the stream with `CallStream.stop` to stop the call.
+
+### Fixed
+
+- After a call, the gRPC server stops the task that watches the stream for a reset with `Stream.stopWaits`. Before, it canceled the task. When a frame came on the connection at the same time, the cancel could get lost. The handler of the call then waited until the client reset the stream or closed the connection. Until then, the stream counted against `max_concurrent_streams`.
+- When a gRPC call stops for its deadline or for a cancel, the tunnel and typed channels reset the stream of the call before they wait for its task. Before, they only canceled the task. When the cancel got lost, the call waited until the server answered or the connection ended.
+- `http2.Connection` sends the reset for a header block over `max_header_list_size` after it unlocks the connection, as on the other paths. Before, the read task held the connection lock while it waited for the write lock. A task that sent the headers of a new stream at the same time held the write lock and waited for the connection lock. Thus the connection stopped.
+- A stream that gets a `cancel` from another task before its headers go out gets no id, and `sendHeaders` gives `error.StreamReset`. Before, the headers went out after the cancel. The cancel sent no reset, because the stream had no id at that time. Thus the server kept the stream open until the connection ended.
+
 ## [0.4.0] - 2026-10-07
 
 ### Added
