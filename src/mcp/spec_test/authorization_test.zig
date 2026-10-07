@@ -842,6 +842,8 @@ const Rotation = struct {
     key: mcp.auth.token_storage.Key,
     access_token: []const u8,
     expires_at: i64,
+    /// The client ID of the registration of the other process.
+    client_id: []const u8 = "dyn-client",
     /// The DPoP key of the tokens of the other process. Null for bearer tokens.
     dpop_jkt: ?[]const u8 = null,
     armed: std.atomic.Value(bool) = .init(true),
@@ -861,7 +863,7 @@ const Rotation = struct {
         mock.lock.unlock(mock.io);
         const refresh_token = std.fmt.bufPrint(&self.refresh_buf, "ref-{d}", .{serial}) catch unreachable;
         self.storage.save(std.testing.allocator, self.key, .{
-            .registration = .{ .client_id = "dyn-client" },
+            .registration = .{ .client_id = self.client_id },
             .access_token = self.access_token,
             .expires_at = self.expires_at,
             .refresh_token = refresh_token,
@@ -1033,6 +1035,90 @@ test "oauth client keeps its registration and refresh token when a record of ano
     }
     try std.testing.expectEqual(1, (try mock.requests(arena, "/register")).len);
     try std.testing.expectEqual(1, (try mock.requests(arena, "/authorize")).len);
+}
+
+/// Expect a stored record with this client ID and this access token.
+fn expectRecord(storage: mcp.auth.TokenStorage, key: mcp.auth.token_storage.Key, client_id: []const u8, access_token: []const u8) !void {
+    var record = (try storage.load(std.testing.allocator, key)) orelse return error.TestExpectedRecord;
+    defer record.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(client_id, record.registration.?.client_id);
+    try std.testing.expectEqualStrings(access_token, record.access_token.?);
+}
+
+test "oauth client deletes the stored record after a refused client only when no other client changed the record" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
+    const file_key = [_]u8{0x5f} ** 32;
+    const server_url = try mock.serverUrl(arena);
+    const key = try dynamicKey(arena, mock.base, server_url);
+    test_time = 1_000_000;
+    var files: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer files.deinit();
+    var other: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer other.deinit();
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = files.storage(), .clock = testNow });
+    defer oauth.deinit();
+    try std.testing.expectEqualStrings("tok-1", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    const expired = try mock.challenge(arena, ", error=\"invalid_token\"");
+
+    // The server refuses the client for the refresh. Meanwhile, the other process refreshed
+    // with the same client ID. The client takes the new token of the record. It does not
+    // register again, and the record stays.
+    test_time += 7200;
+    mock.refuse_client = true;
+    var rotation: Rotation = .{ .storage = other.storage(), .key = key, .access_token = "tok-other", .expires_at = test_time + 3600 };
+    mock.on_token = rotation.hook();
+    try std.testing.expectEqualStrings("tok-other", try oauth.handleChallenge(arena, server_url, 401, expired, 1));
+    try std.testing.expect(rotation.saved.load(.acquire));
+    try expectRecord(files.storage(), key, "dyn-client", "tok-other");
+
+    // Again, but the other process registered again and has another client ID. The client
+    // takes that registration with the tokens.
+    test_time += 7200;
+    rotation.access_token = "tok-other-2";
+    rotation.client_id = "other-client";
+    rotation.expires_at = test_time + 3600;
+    rotation.armed.store(true, .release);
+    try std.testing.expectEqualStrings("tok-other-2", try oauth.handleChallenge(arena, server_url, 401, expired, 1));
+    try std.testing.expectEqualStrings("other-client", oauth.registration.?.client_id);
+    try expectRecord(files.storage(), key, "other-client", "tok-other-2");
+
+    // Again before a request, but the tokens of the other process are for another DPoP key.
+    // The client cannot use them, and discards its refused registration and tokens. The record
+    // of the other process stays.
+    test_time += 7200;
+    rotation.access_token = "tok-other-3";
+    rotation.client_id = "third-client";
+    rotation.dpop_jkt = "jkt-of-another-key";
+    rotation.expires_at = test_time + 3600;
+    rotation.saved.store(false, .release);
+    rotation.armed.store(true, .release);
+    try std.testing.expect(oauth.provider().token(arena) == null);
+    try std.testing.expect(rotation.saved.load(.acquire));
+    try std.testing.expect(oauth.registration == null);
+    try expectRecord(files.storage(), key, "third-client", "tok-other-3");
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/register")).len);
+
+    // The client takes the stored registration for a new grant. When the server refuses the
+    // client for the next refresh and no other client changed the record, the record goes.
+    mock.refuse_client = false;
+    try std.testing.expectEqualStrings("tok-2", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    try expectRecord(files.storage(), key, "third-client", "tok-2");
+    test_time += 7200;
+    mock.refuse_client = true;
+    try std.testing.expect(oauth.provider().token(arena) == null);
+    try std.testing.expect(!try hasRecord(files.storage(), key));
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/register")).len);
+    try std.testing.expectEqual(2, (try mock.requests(arena, "/authorize")).len);
 }
 
 // -- Server side --------------------------------------------------------------------------------
