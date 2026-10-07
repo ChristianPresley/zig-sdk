@@ -28,6 +28,11 @@ pub const Event = struct {
 /// Incremental parser. Feed bytes with `feed`, take events with `next`.
 pub const Parser = struct {
     gpa: Allocator,
+    /// Maximum bytes of the event that the parser reads, across all calls of `feed`. The bytes
+    /// are the line that the parser reads with its field name, and the data and the event type
+    /// of the event. Only the event that the parser reads counts, thus a stream of many small
+    /// events and comments has no limit. Overflow: `feed` returns `error.EventTooLarge`.
+    max_event_bytes: usize = 4 << 20,
     pending: std.ArrayList(u8) = .empty,
     data: std.ArrayList(u8) = .empty,
     event_type: std.ArrayList(u8) = .empty,
@@ -55,8 +60,16 @@ pub const Parser = struct {
         if (e.id) |id| self.gpa.free(id);
     }
 
-    /// Feed a chunk of bytes. Complete events become available through `next`.
-    pub fn feed(self: *Parser, bytes: []const u8) Allocator.Error!void {
+    /// The errors of `feed`.
+    pub const FeedError = Allocator.Error || error{
+        /// The event that the parser reads has more than `max_event_bytes`.
+        EventTooLarge,
+    };
+
+    /// Feed a chunk of bytes. Complete events become available through `next`. When an event
+    /// gets more than `max_event_bytes`, `feed` returns `error.EventTooLarge`. The events
+    /// before it stay available through `next`. Do not feed more bytes after an error.
+    pub fn feed(self: *Parser, bytes: []const u8) FeedError!void {
         var input = bytes;
         if (!self.bom_checked) {
             self.bom_checked = true;
@@ -72,9 +85,17 @@ pub const Parser = struct {
                 try self.processLine();
                 self.pending.clearRetainingCapacity();
             } else {
+                // The end of a line makes the event shorter: the data and the event type get
+                // fewer bytes than the line. Thus this check keeps the event in the limit.
+                if (self.eventBytes() >= self.max_event_bytes) return error.EventTooLarge;
                 try self.pending.append(self.gpa, c);
             }
         }
+    }
+
+    /// The bytes of the event that the parser reads.
+    fn eventBytes(self: *const Parser) usize {
+        return self.pending.items.len + self.data.items.len + self.event_type.items.len;
     }
 
     /// Take the next complete event. The caller owns the returned slices and frees them with
@@ -159,6 +180,60 @@ test "empty data produces no event" {
     defer p.release(e);
     try std.testing.expectEqualStrings("y", e.data);
     try std.testing.expectEqualStrings("7", e.id.?);
+}
+
+test "parser rejects an event over max_event_bytes that comes in many feeds" {
+    const gpa = std.testing.allocator;
+    var p: Parser = .init(gpa);
+    defer p.deinit();
+    p.max_event_bytes = 16;
+    // An event of 16 bytes is in the limit.
+    try p.feed("data: 0123456789\n\n");
+    // The event type counts: 8 bytes of type and the 8 bytes of "data: 01" are in the limit.
+    try p.feed("event: abcdefgh\ndata: 01\n\n");
+    try p.feed("data: 01234");
+    try p.feed("56789\n");
+    // The data has 11 bytes now ("0123456789\n"), thus the sixth byte of the next line is over
+    // the limit.
+    try std.testing.expectError(error.EventTooLarge, p.feed("data: x"));
+    // The complete events before the large event stay available.
+    const first = p.next().?;
+    defer p.release(first);
+    try std.testing.expectEqualStrings("0123456789", first.data);
+    const second = p.next().?;
+    defer p.release(second);
+    try std.testing.expectEqualStrings("abcdefgh", second.event);
+    try std.testing.expectEqualStrings("01", second.data);
+    try std.testing.expect(p.next() == null);
+
+    // The same event type with one more byte of data is over the limit.
+    var q: Parser = .init(gpa);
+    defer q.deinit();
+    q.max_event_bytes = 16;
+    try std.testing.expectError(error.EventTooLarge, q.feed("event: abcdefgh\ndata: 012"));
+}
+
+test "parser accepts many small events and comments with more bytes than max_event_bytes in total" {
+    const gpa = std.testing.allocator;
+    var p: Parser = .init(gpa);
+    defer p.deinit();
+    p.max_event_bytes = 32;
+    const count = 1000;
+    var got: usize = 0;
+    for (0..count) |i| {
+        var buf: [64]u8 = undefined;
+        const chunk = try std.fmt.bufPrint(&buf, ": keepalive\n\nevent: message\ndata: {d}\n\n", .{i});
+        // Two feeds for each chunk, thus the lines split across feeds.
+        try p.feed(chunk[0 .. chunk.len / 2]);
+        try p.feed(chunk[chunk.len / 2 ..]);
+        while (p.next()) |e| {
+            defer p.release(e);
+            var want: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{d}", .{got}), e.data);
+            got += 1;
+        }
+    }
+    try std.testing.expectEqual(count, got);
 }
 
 test "writer output" {

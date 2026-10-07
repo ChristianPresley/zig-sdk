@@ -48,11 +48,20 @@ fn sseParser(_: void, smith: *Smith) anyerror!void {
     const bytes = input(smith, &buf, 0x1002);
     var parser: sse.Parser = .init(std.testing.allocator);
     defer parser.deinit();
-    // Feed in two pieces to cover splits.
+    // Mostly a limit that the input cannot reach, sometimes a small limit for the overflow.
+    parser.max_event_bytes = smith.valueWeightedWithHash(u16, &.{ .value(u16, max_input, 3), .rangeAtMost(u16, 0, 64, 1) }, 0x100a);
+    // Feed in two pieces to cover splits. Stop at the first oversize event.
     const split = bytes.len / 2;
-    try parser.feed(bytes[0..split]);
-    try parser.feed(bytes[split..]);
-    while (parser.next()) |event| parser.release(event);
+    const fed: sse.Parser.FeedError!void = if (parser.feed(bytes[0..split])) parser.feed(bytes[split..]) else |e| e;
+    // Each event obeys the limit.
+    while (parser.next()) |event| {
+        defer parser.release(event);
+        try std.testing.expect(event.data.len < parser.max_event_bytes);
+    }
+    fed catch |e| switch (e) {
+        error.EventTooLarge => {},
+        error.OutOfMemory => return e,
+    };
 }
 
 test "fuzz: SSE parser" {

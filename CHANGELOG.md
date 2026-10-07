@@ -11,6 +11,7 @@ All notable changes to this project are recorded in this file. The format follow
 - `meta.sdk_owned_request_keys` and `meta.isSdkOwnedRequestKey`: the request keys that the SDK owns. They are the protocol version, the client information, the client capabilities, the log level, the subscription id and the progress token.
 - `RequestOptions.inline_notifications`: the reader task of the transport calls `on_progress`, `on_log` and `on_notification` of the request at once, before it routes the next frame. Thus a notification gets to its callback before the response of another request that the server wrote after it. An example is a `notifications/tools/list_changed` event of a listen stream and the `tools/call` result that caused it. The stdio, Unix socket and WebSocket transports obey the option, and the memory link, HTTP and gRPC ignore it. A callback must only copy, serialize and write the data, and must not send a request through the same client. `Transport.Exchange.inline_notifications` gives the option to the transports.
 - `stdio.Client.SpawnOptions.on_notification` and `stdio.Client.SpawnOptions.userdata`: the callback of the stdio client for each notification without a progress token and without a subscription id. An example is a log message of the server. `spawn` sets the callback before the reader task starts.
+- `sse.Parser.max_event_bytes` (4 MiB): the maximum bytes of the event that the SSE parser reads, across all calls of `feed`. The bytes are the line that the parser reads with its field name, and the data and the event type of the event. The events and comments before it do not count.
 
 ### Changed
 
@@ -19,6 +20,7 @@ All notable changes to this project are recorded in this file. The format follow
 - The client applies the progress rate limit before it parses a notification, when the method has no escape sequence. Thus it does not parse a progress notification over `limits.max_progress_rate_per_s`.
 - Breaking: the fields `on_notification` and `userdata` of `stdio.Client` are gone. Use the spawn options with the same names. The reader task starts in `spawn` and read the fields one time for each child process. Thus a callback that the caller set after `spawn` raced with the reader task. When the reader task was first, it dropped these notifications until a restart, also the log messages of the server.
 - Over the memory link, the callback of the acknowledgment of a listen stream runs while the server holds the lock of the stream. Thus the callback must not publish an event of the same server, for example with `Server.setToolEnabled`. The callbacks of the events already had this rule. Before, the server sent the acknowledgment without the lock.
+- Breaking: `sse.Parser.feed` returns the error set `sse.Parser.FeedError`, with the new error `error.EventTooLarge`. The parser returns it when an event gets more than `max_event_bytes`. The complete events before that event stay available through `next`. Before, `feed` returned only `error.OutOfMemory`, and an event had no limit.
 
 ### Fixed
 
@@ -28,6 +30,7 @@ All notable changes to this project are recorded in this file. The format follow
 - The memory link (`memory.ClientLink`) gives the frames of one request to the sink one at a time, as the stdio and HTTP transports do. Before, an event of a listen stream from the task that published it could get to the sink at the same time as another frame of the stream.
 - The doc comments of `memory.zig` tell the limits of `ClientLink`. It runs the handler of a request on the task of the caller, and only the cancel token of the caller ends an exchange. It does not obey `Exchange.timeout` and `Exchange.first_frame_timeout`. A callback of a listen stream must not publish an event of the same server. With these limits, you can use `ClientLink` in production. Before, the comment of the file said that its transports are for tests.
 - The entry of 0.3.0 for `limits.listen_ack_timeout` says that all client transports obey it. The memory link does not obey it.
+- The HTTP client transport applies `max_response_bytes` to each event of an SSE response, and not to the sum of the events. Thus keep-alive comments, progress notifications and log messages do not stop a long tool call or a listen stream. Before, the transport ended an SSE response with `error.ReadFailed` after `max_response_bytes` in total (4 MiB by default). Then the client returned `error.TransportFailed`. For example, a tool call with 50 progress notifications each second failed after approximately 11 minutes. An event over the limit and an `application/json` body over the limit still give `error.ReadFailed`.
 
 ## [0.3.0] - 2026-09-30
 

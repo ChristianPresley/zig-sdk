@@ -40,6 +40,11 @@ pub const Client = struct {
         url: []const u8,
         /// Headers added to every request, for example `authorization`.
         extra_headers: []const http.Header = &.{},
+        /// Maximum bytes of one message from the server: an `application/json` body, or one
+        /// event of an SSE response (`sse.Parser.max_event_bytes`). An SSE response has no
+        /// limit of its total bytes. Thus keep-alive comments, progress notifications and log
+        /// messages do not stop a long tool call or a listen stream. Overflow: the exchange
+        /// fails with `error.ReadFailed`.
         max_response_bytes: usize = 4 << 20,
         /// How often a request checks for cancellation and its deadline.
         poll_interval: Io.Duration = .fromMilliseconds(50),
@@ -288,9 +293,9 @@ pub const Client = struct {
             return null;
         }
         if (is_sse) {
-            var parser: sse.Parser = .init(self.gpa);
+            // The limit applies to each event and not to the stream.
+            var parser: sse.Parser = .{ .gpa = self.gpa, .max_event_bytes = self.options.max_response_bytes };
             defer parser.deinit();
-            var total: usize = 0;
             while (true) {
                 // Take the bytes that arrived, so that each event reaches the sink at once.
                 // `readVec` copies the buffered bytes and then waits to fill the rest of its
@@ -301,13 +306,16 @@ pub const Client = struct {
                 };
                 const bytes = body.buffered();
                 body.tossBuffered();
-                total += bytes.len;
-                if (total > self.options.max_response_bytes) return error.ReadFailed;
-                try parser.feed(bytes);
+                // The complete events before a large event go to the sink before the error.
+                const fed = parser.feed(bytes);
                 while (parser.next()) |event| {
                     defer parser.release(event);
                     try self.deliver(io, arena, ex, event.data);
                 }
+                fed catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.EventTooLarge => return error.ReadFailed,
+                };
             }
             return null;
         }

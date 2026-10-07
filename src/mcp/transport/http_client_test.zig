@@ -50,6 +50,37 @@ fn answerForm(ctx: *Client.HookContext, params: types.ElicitRequestFormParams) a
     return .{ .action = .accept, .content = try json.parseTree(ctx.arena, "{\"name\":\"Bob\"}") };
 }
 
+const ChattyArgs = struct { frames: u32 };
+
+// Sends `frames` progress notifications and `frames` log messages, then a short result.
+fn chatty(ctx: *mcp.RequestContext, args: ChattyArgs) anyerror!mcp.Outcome(types.CallToolResult) {
+    const total: f64 = @floatFromInt(args.frames);
+    for (0..args.frames) |i| {
+        try ctx.progress(@floatFromInt(i), total, null);
+        try ctx.logText(.info, "chatty", "frame {d}", .{i});
+    }
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "done", .{}) };
+}
+
+const BigArgs = struct { bytes: u32, progress: bool };
+
+// A result with a text of `bytes` bytes. With `progress`, one progress notification comes
+// first, thus the server answers with an SSE stream and not with a JSON body.
+fn big(ctx: *mcp.RequestContext, args: BigArgs) anyerror!mcp.Outcome(types.CallToolResult) {
+    if (args.progress) try ctx.progress(0, null, null);
+    const text = try ctx.arena.alloc(u8, args.bytes);
+    @memset(text, 'x');
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "{s}", .{text}) };
+}
+
+/// The settings that differ between the tests.
+const Setup = struct {
+    /// `HttpClient.Options.max_response_bytes`.
+    max_response_bytes: usize = 4 << 20,
+    /// The limits of the server and of the client.
+    limits: mcp.Limits = .{},
+};
+
 const Fixture = struct {
     server: mcp.Server,
     transport: HttpServer,
@@ -58,23 +89,35 @@ const Fixture = struct {
     client: Client,
 
     fn start(self: *Fixture, path: []const u8) !void {
+        try self.startWith(path, .{});
+    }
+
+    fn startWith(self: *Fixture, path: []const u8, setup: Setup) !void {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
-        self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "http-test", .version = "1" }, .mrtr = .{ .elicitation = true } });
+        self.server = try mcp.Server.init(gpa, io, .{
+            .info = .{ .name = "http-test", .version = "1" },
+            .mrtr = .{ .elicitation = true },
+            .capabilities = .{ .logging = .{ .object = .empty } },
+            .limits = setup.limits,
+        });
         try self.server.addTool(.{ .name = "add" }, add);
         try self.server.addTool(.{ .name = "test_headers" }, echoHeaders);
         try self.server.addToolJson(.{ .name = "ask_name" }, askName);
         try self.server.addToolJson(.{ .name = "slow" }, slow);
+        try self.server.addTool(.{ .name = "chatty" }, chatty);
+        try self.server.addTool(.{ .name = "big" }, big);
         self.transport = .init(io, gpa, &self.server, .{ .port = 0 });
         try self.transport.bind();
         self.future = try io.concurrent(serveIgnoringErrors, .{&self.transport});
         var url_buf: [64]u8 = undefined;
         const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ self.transport.bound_port, path });
-        self.http = try HttpClient.init(io, gpa, .{ .url = url });
+        self.http = try HttpClient.init(io, gpa, .{ .url = url, .max_response_bytes = setup.max_response_bytes });
         self.client = .init(gpa, io, .{
             .info = .{ .name = "cli", .version = "1" },
             .capabilities = .{ .elicitation = .{} },
             .hooks = .{ .elicit_form = answerForm },
+            .limits = setup.limits,
         });
         self.client.connect(self.http.transport());
     }
@@ -96,10 +139,16 @@ const Fixture = struct {
 
 const Recorder = struct {
     progress: u32 = 0,
+    logs: u32 = 0,
     fn onProgress(userdata: ?*anyopaque, params: types.ProgressNotificationParams) void {
         const self: *Recorder = @ptrCast(@alignCast(userdata.?));
         _ = params;
         self.progress += 1;
+    }
+    fn onLog(userdata: ?*anyopaque, params: types.LoggingMessageNotificationParams) void {
+        const self: *Recorder = @ptrCast(@alignCast(userdata.?));
+        _ = params;
+        self.logs += 1;
     }
 };
 
@@ -127,7 +176,7 @@ test "http client: json, sse, header mirroring and mrtr" {
     try std.testing.expect(diag.rpc_error == null);
     // After tools/list the headers are mirrored, including the base64 sentinel for the space.
     const tools = try f.client.listTools(arena, null, .{});
-    try std.testing.expectEqual(4, tools.tools.len);
+    try std.testing.expectEqual(6, tools.tools.len);
     const echoed = try f.client.callTool(arena, "test_headers", .{ .region = "us west", .priority = 7 }, .{});
     try std.testing.expectEqualStrings("us west/7", echoed.content[0].text.text);
 
@@ -138,6 +187,75 @@ test "http client: json, sse, header mirroring and mrtr" {
     // A timeout cancels the request.
     try std.testing.expectError(error.Timeout, f.client.callTool(arena, "slow", null, .{ .timeout = .fromMilliseconds(200) }));
 }
+
+test "http client: an SSE response with more than max_response_bytes of small events succeeds" {
+    var limits: mcp.Limits = .{};
+    limits.max_progress_rate_per_s = 1000;
+    var f: Fixture = undefined;
+    try f.startWith("/mcp", .{ .max_response_bytes = 4 << 10, .limits = limits });
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    // Each progress notification and each log message has more than 80 bytes. Thus the 400
+    // events have more than 32000 bytes, more than seven times the limit.
+    var rec: Recorder = .{};
+    const result = try f.client.callTool(arena_state.allocator(), "chatty", .{ .frames = 200 }, .{
+        .on_progress = Recorder.onProgress,
+        .on_log = Recorder.onLog,
+        .userdata = &rec,
+        .log_level = .info,
+    });
+    try std.testing.expectEqualStrings("done", result.content[0].text.text);
+    try std.testing.expectEqual(200, rec.progress);
+    try std.testing.expectEqual(200, rec.logs);
+}
+
+const FrameCounter = struct {
+    frames: u32 = 0,
+    fn onFrame(ptr: *anyopaque, io: Io, frame: []const u8) anyerror!void {
+        _ = io;
+        _ = frame;
+        const self: *FrameCounter = @ptrCast(@alignCast(ptr));
+        self.frames += 1;
+    }
+};
+
+test "http client: one SSE event over max_response_bytes ends the exchange with error.ReadFailed" {
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.startWith("/mcp", .{ .max_response_bytes = 4 << 10 });
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const transport = f.http.transport();
+    // The result has 8192 bytes of text, two times the limit. With `progress` it is the
+    // second event of an SSE stream. Without `progress` it is a JSON body.
+    for ([_]bool{ true, false }) |progress| {
+        const frame = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{{s},\"name\":\"big\",\"arguments\":{{\"bytes\":8192,\"progress\":{s}}}}}}}", .{ meta_progress, if (progress) "true" else "false" });
+        const tree = try json.parseTree(arena, frame);
+        var counter: FrameCounter = .{};
+        var token: mcp.transport.CancelToken = .{};
+        var ex: mcp.transport.Transport.Exchange = .{
+            .frame = frame,
+            .id = .{ .integer = 1 },
+            .method = "tools/call",
+            .params = tree.object.get("params"),
+            .sink = .{ .ptr = &counter, .on_frame = FrameCounter.onFrame },
+            .cancel = &token,
+        };
+        try std.testing.expectError(error.ReadFailed, transport.exchange(io, &ex));
+        // The progress notification before the large event gets to the sink.
+        try std.testing.expectEqual(@as(u32, if (progress) 1 else 0), counter.frames);
+    }
+    // The client does not send the call again, because `tools/call` is not idempotent and a
+    // frame arrived.
+    try std.testing.expectError(error.TransportFailed, f.client.callTool(arena, "big", .{ .bytes = 8192, .progress = true }, .{}));
+}
+
+const meta_progress =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":1}
+;
 
 test "http client: a wrong path is an http status without a message" {
     var f: Fixture = undefined;
