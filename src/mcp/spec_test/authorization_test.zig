@@ -986,6 +986,55 @@ test "oauth client removes refused tokens from the storage only when no other cl
     try std.testing.expectEqualStrings("jkt-of-another-key", record.dpop_jkt.?);
 }
 
+test "oauth client keeps its registration and refresh token when a record of another client ID has tokens of another DPoP key" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
+    const file_key = [_]u8{0x5e} ** 32;
+    const server_url = try mock.serverUrl(arena);
+    const key = try dynamicKey(arena, mock.base, server_url);
+    test_time = 1_000_000;
+    var files: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer files.deinit();
+    var other: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer other.deinit();
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = files.storage(), .clock = testNow });
+    defer oauth.deinit();
+    try std.testing.expectEqualStrings("tok-1", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+
+    // Another process with its own registration and its own DPoP key writes its record. The
+    // client cannot use these tokens. Before a request, it refreshes with its own refresh token
+    // and its own client ID.
+    test_time += 7200;
+    try other.storage().save(gpa, key, .{ .registration = .{ .client_id = "other-client" }, .access_token = "tok-other", .expires_at = test_time + 3600, .refresh_token = "ref-other", .dpop_bound = true, .dpop_jkt = "jkt-of-another-key" });
+    try std.testing.expectEqualStrings("tok-2", oauth.provider().token(arena) orelse "");
+    try std.testing.expectEqualStrings("dyn-client", oauth.registration.?.client_id);
+
+    // The same at a challenge.
+    test_time += 7200;
+    try other.storage().save(gpa, key, .{ .registration = .{ .client_id = "other-client" }, .access_token = "tok-other-2", .expires_at = test_time + 3600, .refresh_token = "ref-other-2", .dpop_bound = true, .dpop_jkt = "jkt-of-another-key" });
+    try std.testing.expectEqualStrings("tok-3", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ", error=\"invalid_token\""), 1));
+    try std.testing.expectEqualStrings("dyn-client", oauth.registration.?.client_id);
+
+    const tok = try mock.requests(arena, "/token");
+    try std.testing.expectEqual(3, tok.len);
+    for (tok[1..], [_][]const u8{ "ref-1", "ref-2" }) |t, want| {
+        try std.testing.expectEqualStrings("refresh_token", try grantOf(arena, t));
+        try std.testing.expectEqualStrings(want, (try formValue(arena, t.body, "refresh_token")).?);
+        try std.testing.expectEqualStrings("dyn-client", (try formValue(arena, t.body, "client_id")).?);
+    }
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/register")).len);
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/authorize")).len);
+}
+
 // -- Server side --------------------------------------------------------------------------------
 
 /// Accepts the token "read-only" with the scope `files:read`.

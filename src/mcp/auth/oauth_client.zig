@@ -600,20 +600,28 @@ pub const Client = struct {
     /// Returns false when the client cannot use the tokens. A record with another client ID
     /// than the pre-registered credentials is stale. A DPoP-bound token works only with the
     /// DPoP key of its request. The same applies to the refresh token of a public client. Thus
-    /// the client skips the tokens of another key.
+    /// the client skips the tokens of another key. It then takes the registration of the record
+    /// only when it has no registration, and keeps its own tokens.
     fn takeRecord(self: *Client, issuer: []const u8, record: token_storage.Record) Allocator.Error!bool {
-        if (record.registration) |r| switch (self.options.registration) {
-            .pre_registered => |list| if (!std.mem.eql(u8, configuredClientId(list, issuer) orelse "", r.client_id)) return false,
-            else => if (self.registration == null or !std.mem.eql(u8, self.registration.?.client_id, r.client_id)) {
-                const id = try self.gpa.dupe(u8, r.client_id);
-                errdefer self.gpa.free(id);
-                const secret: ?[]u8 = if (r.client_secret) |s| try self.gpa.dupe(u8, s) else null;
-                self.clearCredentials();
-                self.registration = .{ .client_id = id, .client_secret = secret, .auth_method = r.auth_method };
-            },
-        };
         const jkt: ?[]const u8 = if (self.options.dpop) |p| p.jkt else null;
         const same_key = if (record.dpop_jkt) |a| (jkt != null and std.mem.eql(u8, a, jkt.?)) else jkt == null;
+        if (record.registration) |r| switch (self.options.registration) {
+            .pre_registered => |list| if (!std.mem.eql(u8, configuredClientId(list, issuer) orelse "", r.client_id)) return false,
+            else => {
+                const other_id = if (self.registration) |own| !std.mem.eql(u8, own.client_id, r.client_id) else true;
+                // The tokens of the client are for its own registration. Thus the client takes
+                // another registration only with the tokens of the record, or when it has none.
+                if (other_id and (same_key or self.registration == null)) {
+                    const id = try self.gpa.dupe(u8, r.client_id);
+                    errdefer self.gpa.free(id);
+                    const secret: ?[]u8 = if (r.client_secret) |s| try self.gpa.dupe(u8, s) else null;
+                    // With the same key, the tokens of the record replace the tokens below. With
+                    // another key, the client has no registration to discard.
+                    if (same_key) self.clearCredentials();
+                    self.registration = .{ .client_id = id, .client_secret = secret, .auth_method = r.auth_method };
+                }
+            },
+        };
         if (!same_key) {
             log.info("the stored tokens are for another DPoP key", .{});
             return false;
