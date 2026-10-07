@@ -253,7 +253,8 @@ test "extra _meta entries reach the server and SDK-owned keys fail the request" 
     try std.testing.expectEqual(1, rec.progress);
 
     // A key that the SDK owns, or a key that breaks the grammar, fails the request before
-    // the client sends it.
+    // the client sends it. The specification allows an empty name after a prefix, thus the
+    // list does not have such a key.
     read_count.store(0, .monotonic);
     const refused = [_][]const u8{
         "io.modelcontextprotocol/logLevel",
@@ -263,7 +264,6 @@ test "extra _meta entries reach the server and SDK-owned keys fail the request" 
         "io.modelcontextprotocol/clientCapabilities",
         "io.modelcontextprotocol/subscriptionId",
         "bad key",
-        "com.example/",
         "1com.example/x",
     };
     for (refused) |key| {

@@ -160,8 +160,8 @@ pub const RequestOptions = struct {
     /// own entries after them, thus the entries of the SDK always have priority. The result
     /// cache ignores `_meta`.
     ///
-    /// Before the client sends the request, it checks each key. A key that breaks the key
-    /// grammar of the specification gives `error.InvalidMeta`. A key that the SDK owns
+    /// Before the client sends the request, it checks each key. A key that `meta.validateKey`
+    /// refuses gives `error.InvalidMeta`. A key that the SDK owns
     /// (`meta.sdk_owned_request_keys`) also gives `error.InvalidMeta`. Use `log_level` to set
     /// the log level. The client accepts the other keys under `io.modelcontextprotocol/`,
     /// because extensions define keys there.
@@ -210,8 +210,8 @@ pub const RequestError = error{
     /// The transport cannot send the request. For example, an argument for a mirrored
     /// header is an integer outside the safe range of JavaScript.
     InvalidRequest,
-    /// A key of `RequestOptions.meta` breaks the key grammar of `_meta`, or the SDK owns the
-    /// key. The client sends nothing.
+    /// `meta.validateKey` refuses a key of `RequestOptions.meta`, or the SDK owns the key. The
+    /// client sends nothing.
     InvalidMeta,
 };
 
@@ -998,8 +998,8 @@ fn contentMatches(self: *Client, arena: Allocator, form: types.ElicitRequestForm
     return report.valid;
 }
 
-/// Check the keys of `RequestOptions.meta`: each key obeys the key grammar, and the SDK does
-/// not own it.
+/// Check the keys of `RequestOptions.meta`: `meta.validateKey` accepts each key, and the SDK
+/// does not own it.
 fn checkExtraMeta(extra: ?std.json.ObjectMap) error{InvalidMeta}!void {
     const entries = extra orelse return;
     for (entries.keys()) |key| {
