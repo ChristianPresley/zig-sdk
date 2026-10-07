@@ -71,6 +71,14 @@ const Mock = struct {
     refresh_serial: u32 = 0,
     /// The authorization server of the protected resource metadata. Null names this mock.
     authorization_server: ?[]const u8 = null,
+    /// Runs in the task of the mock before it answers a token request. A test uses it to act as
+    /// another client while a request of the client under test is on its way.
+    on_token: ?Hook = null,
+
+    const Hook = struct {
+        ctx: *anyopaque,
+        run: *const fn (ctx: *anyopaque, mock: *Mock) void,
+    };
 
     fn start(self: *Mock) !void {
         var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -183,6 +191,7 @@ const Mock = struct {
             return request.respond("", .{ .status = .found, .keep_alive = false, .extra_headers = &.{.{ .name = "location", .value = aw.written() }} });
         }
         if (std.mem.eql(u8, path, "/token")) {
+            if (self.on_token) |hook| hook.run(hook.ctx, self);
             const grant = (try formValue(arena, body, "grant_type")) orelse "";
             const refreshing = std.mem.eql(u8, grant, "refresh_token");
             if (self.refuse_client) return request.respond("{\"error\":\"invalid_client\"}", .{ .status = .unauthorized, .keep_alive = false, .extra_headers = json_type });
@@ -763,6 +772,218 @@ test "oauth client skips stored tokens of another DPoP key and keeps the registr
     try std.testing.expectEqual(1, (try mock.requests(arena, "/register")).len);
     try std.testing.expectEqual(2, (try mock.requests(arena, "/authorize")).len);
     for (try mock.requests(arena, "/token")) |t| try std.testing.expectEqualStrings("authorization_code", try grantOf(arena, t));
+}
+
+test "oauth clients that share a file storage use the tokens that the other client refreshed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
+    const file_key = [_]u8{0x5b} ** 32;
+    const server_url = try mock.serverUrl(arena);
+    test_time = 1_000_000;
+
+    // Two processes with one token directory, for example two windows of an application.
+    var files_a: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer files_a.deinit();
+    var files_b: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer files_b.deinit();
+    var a: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = files_a.storage(), .clock = testNow });
+    defer a.deinit();
+    var b: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = files_b.storage(), .clock = testNow });
+    defer b.deinit();
+    try std.testing.expectEqualStrings("tok-1", try a.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    try std.testing.expectEqualStrings("tok-1", try b.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+
+    // Both tokens expire. A refreshes first, and the server rotates the refresh token. At its
+    // next challenge, B reads the record of A and sends no token request.
+    test_time += 7200;
+    const expired = try mock.challenge(arena, ", error=\"invalid_token\"");
+    try std.testing.expectEqualStrings("tok-2", try a.handleChallenge(arena, server_url, 401, expired, 1));
+    try std.testing.expectEqualStrings("tok-2", try b.handleChallenge(arena, server_url, 401, expired, 1));
+    try std.testing.expectEqual(2, (try mock.requests(arena, "/token")).len);
+
+    // Before a request, A refreshes again. Later B needs a token, and the token of A in the
+    // record expired too. Thus B refreshes with the refresh token of A. Then A takes the token
+    // of B.
+    test_time += 7200;
+    try std.testing.expectEqualStrings("tok-3", a.provider().token(arena).?);
+    test_time += 7200;
+    try std.testing.expectEqualStrings("tok-4", b.provider().token(arena).?);
+    try std.testing.expectEqualStrings("tok-4", a.provider().token(arena).?);
+
+    const tok = try mock.requests(arena, "/token");
+    try std.testing.expectEqual(4, tok.len);
+    for (tok[1..], [_][]const u8{ "ref-1", "ref-2", "ref-3" }) |t, want| {
+        try std.testing.expectEqualStrings("refresh_token", try grantOf(arena, t));
+        try std.testing.expectEqualStrings(want, (try formValue(arena, t.body, "refresh_token")).?);
+    }
+    // The server refused no refresh token, and the user saw the browser one time.
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/authorize")).len);
+    try std.testing.expect((try a.lastFailure(arena)) == null);
+    try std.testing.expect((try b.lastFailure(arena)) == null);
+    var record = (try files_a.storage().load(gpa, try dynamicKey(arena, mock.base, server_url))).?;
+    defer record.deinit(gpa);
+    try std.testing.expectEqualStrings("tok-4", record.access_token.?);
+    try std.testing.expectEqualStrings("ref-4", record.refresh_token.?);
+}
+
+/// Acts as another process with the same storage. Before the mock answers the next token
+/// request, it rotates the refresh token at the mock and writes new tokens to the storage.
+const Rotation = struct {
+    storage: mcp.auth.TokenStorage,
+    key: mcp.auth.token_storage.Key,
+    access_token: []const u8,
+    expires_at: i64,
+    /// The DPoP key of the tokens of the other process. Null for bearer tokens.
+    dpop_jkt: ?[]const u8 = null,
+    armed: std.atomic.Value(bool) = .init(true),
+    saved: std.atomic.Value(bool) = .init(false),
+    refresh_buf: [16]u8 = undefined,
+
+    fn hook(self: *Rotation) Mock.Hook {
+        return .{ .ctx = self, .run = run };
+    }
+
+    fn run(ctx: *anyopaque, mock: *Mock) void {
+        const self: *Rotation = @ptrCast(@alignCast(ctx));
+        if (!self.armed.swap(false, .acq_rel)) return;
+        mock.lock.lockUncancelable(mock.io);
+        mock.refresh_serial += 1;
+        const serial = mock.refresh_serial;
+        mock.lock.unlock(mock.io);
+        const refresh_token = std.fmt.bufPrint(&self.refresh_buf, "ref-{d}", .{serial}) catch unreachable;
+        self.storage.save(std.testing.allocator, self.key, .{
+            .registration = .{ .client_id = "dyn-client" },
+            .access_token = self.access_token,
+            .expires_at = self.expires_at,
+            .refresh_token = refresh_token,
+            .dpop_bound = self.dpop_jkt != null,
+            .dpop_jkt = self.dpop_jkt,
+        }) catch return;
+        self.saved.store(true, .release);
+    }
+};
+
+test "oauth client takes the tokens of another process that rotated the refresh token during the refresh" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
+    const file_key = [_]u8{0x5c} ** 32;
+    const server_url = try mock.serverUrl(arena);
+    const key = try dynamicKey(arena, mock.base, server_url);
+    test_time = 1_000_000;
+    var files: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer files.deinit();
+    var other: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer other.deinit();
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = files.storage(), .clock = testNow });
+    defer oauth.deinit();
+    try std.testing.expectEqualStrings("tok-1", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    const expired = try mock.challenge(arena, ", error=\"invalid_token\"");
+
+    // The other process refreshes while the request of the client is on its way. The server
+    // refuses the old refresh token of the client. The client takes the new token from the
+    // record, and the record stays as the other process wrote it.
+    test_time += 7200;
+    var rotation: Rotation = .{ .storage = other.storage(), .key = key, .access_token = "tok-other", .expires_at = test_time + 3600 };
+    mock.on_token = rotation.hook();
+    try std.testing.expectEqualStrings("tok-other", try oauth.handleChallenge(arena, server_url, 401, expired, 1));
+    try std.testing.expect(rotation.saved.load(.acquire));
+    try std.testing.expectEqualStrings("ref-2", oauth.refresh_token.?);
+    {
+        var record = (try files.storage().load(gpa, key)).?;
+        defer record.deinit(gpa);
+        try std.testing.expectEqualStrings("tok-other", record.access_token.?);
+        try std.testing.expectEqualStrings("ref-2", record.refresh_token.?);
+    }
+
+    // Again, but the new token of the other process expires within the refresh margin. The
+    // client sends one more refresh with the new refresh token.
+    test_time += 7200;
+    rotation.access_token = "tok-other-2";
+    rotation.expires_at = test_time + 30;
+    rotation.armed.store(true, .release);
+    try std.testing.expectEqualStrings("tok-2", try oauth.handleChallenge(arena, server_url, 401, expired, 1));
+
+    const tok = try mock.requests(arena, "/token");
+    try std.testing.expectEqual(4, tok.len);
+    for (tok[1..], [_][]const u8{ "ref-1", "ref-2", "ref-3" }) |t, want| {
+        try std.testing.expectEqualStrings(want, (try formValue(arena, t.body, "refresh_token")).?);
+    }
+    try std.testing.expectEqual(1, (try mock.requests(arena, "/authorize")).len);
+    var record = (try files.storage().load(gpa, key)).?;
+    defer record.deinit(gpa);
+    try std.testing.expectEqualStrings("tok-2", record.access_token.?);
+    try std.testing.expectEqualStrings("ref-4", record.refresh_token.?);
+}
+
+test "oauth client removes refused tokens from the storage only when no other client changed the record" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: Mock = .{ .gpa = gpa, .io = io, .refresh = true };
+    try mock.start();
+    defer mock.stop();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
+    const file_key = [_]u8{0x5d} ** 32;
+    const server_url = try mock.serverUrl(arena);
+    const key = try dynamicKey(arena, mock.base, server_url);
+    test_time = 1_000_000;
+    var files: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer files.deinit();
+    var other: mcp.auth.FileTokenStorage = try .init(io, gpa, .{ .dir = dir, .key = file_key });
+    defer other.deinit();
+    var oauth: OAuthClient = .init(io, gpa, .{ .allow_http = true, .storage = files.storage(), .clock = testNow });
+    defer oauth.deinit();
+    try std.testing.expectEqualStrings("tok-1", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+
+    // The server revokes the grant before a request. The record keeps the registration
+    // without the refused tokens.
+    test_time += 7200;
+    mock.refuse_refresh = true;
+    try std.testing.expect(oauth.provider().token(arena) == null);
+    {
+        var record = (try files.storage().load(gpa, key)).?;
+        defer record.deinit(gpa);
+        try std.testing.expectEqualStrings("dyn-client", record.registration.?.client_id);
+        try std.testing.expect(record.access_token == null and record.refresh_token == null);
+    }
+
+    // A new grant. Then another process with another DPoP key refreshes during the refresh of
+    // the client. The client cannot use the tokens of that record, and does not write over it.
+    mock.refuse_refresh = false;
+    try std.testing.expectEqualStrings("tok-2", try oauth.handleChallenge(arena, server_url, 401, try mock.challenge(arena, ""), 1));
+    test_time += 7200;
+    var rotation: Rotation = .{ .storage = other.storage(), .key = key, .access_token = "tok-other", .expires_at = test_time + 3600, .dpop_jkt = "jkt-of-another-key" };
+    mock.on_token = rotation.hook();
+    try std.testing.expect(oauth.provider().token(arena) == null);
+    try std.testing.expect(rotation.saved.load(.acquire));
+    try std.testing.expect(oauth.currentToken() == null);
+    var record = (try files.storage().load(gpa, key)).?;
+    defer record.deinit(gpa);
+    try std.testing.expectEqualStrings("tok-other", record.access_token.?);
+    try std.testing.expectEqualStrings("ref-3", record.refresh_token.?);
+    try std.testing.expectEqualStrings("jkt-of-another-key", record.dpop_jkt.?);
 }
 
 // -- Server side --------------------------------------------------------------------------------
