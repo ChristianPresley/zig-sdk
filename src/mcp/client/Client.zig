@@ -82,10 +82,12 @@ pub const Hooks = struct {
     /// List the roots. Required when `capabilities.roots` declares roots.
     list_roots: ?*const fn (ctx: *HookContext) anyerror![]const types.Root = null,
     /// Receives a notification that the transport routes to a request without its own
-    /// `on_notification`, when the notification is not progress or log. A notification that
-    /// belongs to no request goes to the `on_notification` option of the stdio, Unix socket
-    /// or WebSocket client transport. `method` and `params` are valid only during the call.
-    /// Copy the data that you keep. For a request with `RequestOptions.inline_notifications`,
+    /// `on_notification`, when the notification is not progress or log. The stdio, Unix socket
+    /// and WebSocket client transports route a notification only by its progress token or its
+    /// subscription id. A notification that has neither goes to the `on_notification` spawn
+    /// option of `stdio.Client`, or to the `on_notification` option of the Unix socket and
+    /// WebSocket clients. `method` and `params` are valid only during the call. Copy the data
+    /// that you keep. For a request with `RequestOptions.inline_notifications`,
     /// the hook runs on the reader task of the transport and has the same rules.
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
     /// Decode, sanitize or convert a checked icon image. The formats that need a decoder
@@ -121,9 +123,10 @@ pub const RequestOptions = struct {
     on_progress: ?*const fn (userdata: ?*anyopaque, params: types.ProgressNotificationParams) void = null,
     /// Receives the log messages that the transport routes to this request. The stdio, Unix
     /// socket and WebSocket transports route a notification only by its progress token or its
-    /// subscription id. A log message of the server has neither. Thus on these transports, log
-    /// messages go to the `on_notification` option of the transport and not to this callback.
-    /// `params` is valid only during the call.
+    /// subscription id. A log message of the server has neither. Thus on these transports, this
+    /// callback gets no log messages. They go to the `on_notification` spawn option of
+    /// `stdio.Client`, or to the `on_notification` option of the Unix socket and WebSocket
+    /// clients. `params` is valid only during the call.
     on_log: ?*const fn (userdata: ?*anyopaque, params: types.LoggingMessageNotificationParams) void = null,
     /// Receives each notification that the transport routes to this request, when the
     /// notification is not progress or log. `method` and `params` are valid only during the

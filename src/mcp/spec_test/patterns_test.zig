@@ -1137,11 +1137,9 @@ test "stdio client cancels requests with notifications/cancelled and keeps liste
     const io = std.testing.io;
     // The build installs the example before the tests run.
     Io.Dir.cwd().access(io, exampleServerPath(), .{}) catch return error.SkipZigTest;
-    const proc = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = &.{exampleServerPath()} });
-    defer proc.deinit();
     var orphans: Orphans = .{};
-    proc.on_notification = Orphans.record;
-    proc.userdata = &orphans;
+    const proc = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = &.{exampleServerPath()}, .on_notification = Orphans.record, .userdata = &orphans });
+    defer proc.deinit();
     var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
     defer client.deinit();
     client.connect(proc.transport());

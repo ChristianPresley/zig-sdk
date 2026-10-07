@@ -763,6 +763,55 @@ test "a long listen stream over stdio does not make the request arena larger" {
     try std.testing.expectEqual(short, long);
 }
 
+/// Counts the log messages that reach the `on_notification` spawn option of the stdio client
+/// and the `on_log` option of a request.
+const LogPaths = struct {
+    transport: std.atomic.Value(u32) = .init(0),
+    request: u32 = 0,
+
+    fn onTransport(userdata: ?*anyopaque, method: []const u8, params: ?Value) void {
+        const self: *LogPaths = @ptrCast(@alignCast(userdata.?));
+        _ = params;
+        if (std.mem.eql(u8, method, "notifications/message")) _ = self.transport.fetchAdd(1, .release);
+    }
+
+    fn onLog(userdata: ?*anyopaque, params: types.LoggingMessageNotificationParams) void {
+        const self: *LogPaths = @ptrCast(@alignCast(userdata.?));
+        _ = params;
+        self.request += 1;
+    }
+};
+
+test "a log message during a request reaches the on_notification spawn option of the stdio client" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The server writes a log message and then the response of the first request (id 1).
+    try tmp.dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"working\"}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n" });
+
+    // The spawn option is in place before the reader task starts.
+    var paths: LogPaths = .{};
+    const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{
+        .argv = replay_argv,
+        .cwd = .{ .dir = tmp.dir },
+        .on_notification = LogPaths.onTransport,
+        .userdata = &paths,
+    }) catch return error.SkipZigTest;
+    defer proc.deinit();
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(proc.transport());
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    _ = try client.callTool(arena_state.allocator(), "t", null, .{ .log_level = .info, .on_log = LogPaths.onLog, .userdata = &paths });
+    // The reader task gave the log message to the spawn option before it routed the response.
+    try std.testing.expectEqual(1, paths.transport.load(.acquire));
+    try std.testing.expectEqual(0, paths.request);
+}
+
 // -- Notifications on the reader task -----------------------------------------------------------
 
 /// A child that answers two lines. After the first line it writes the file `ack.jsonl` of its

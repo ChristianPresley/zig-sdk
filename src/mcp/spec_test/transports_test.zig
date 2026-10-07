@@ -1408,11 +1408,9 @@ test "stdio client routes listen notifications to their request by the subscript
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     Io.Dir.cwd().access(io, exampleServerPath(), .{}) catch return error.SkipZigTest;
-    const proc = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = &.{exampleServerPath()} });
-    defer proc.deinit();
     var recorder: ListenRecorder = .{};
-    proc.userdata = &recorder;
-    proc.on_notification = ListenRecorder.onUnrouted;
+    const proc = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = &.{exampleServerPath()}, .on_notification = ListenRecorder.onUnrouted, .userdata = &recorder });
+    defer proc.deinit();
     var client: Client = .init(gpa, io, .{ .info = .{ .name = "g2", .version = "1" } });
     defer client.deinit();
     client.connect(proc.transport());

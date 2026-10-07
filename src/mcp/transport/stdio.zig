@@ -11,7 +11,6 @@ const types = @import("../protocol/types.zig");
 const errors = @import("../protocol/errors.zig");
 const message = @import("../jsonrpc/message.zig");
 const json = @import("../json.zig");
-const Value = std.json.Value;
 const Limits = @import("../Limits.zig");
 const McpServer = @import("../server/Server.zig");
 const router_mod = @import("router.zig");
@@ -459,9 +458,6 @@ pub const Client = struct {
     /// Counts the restarts. A request that waits across a restart fails.
     generation: std.atomic.Value(u32) = .init(0),
     restarts: u32 = 0,
-    /// Receives notifications that belong to no request in flight.
-    on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
-    userdata: ?*anyopaque = null,
 
     pub const SpawnOptions = struct {
         /// The command. The slices must stay valid while the client lives (restarts reuse them).
@@ -479,6 +475,16 @@ pub const Client = struct {
         /// request that waited during the exit fails with `error.Closed`. The client
         /// re-issues idempotent requests.
         max_restarts: u32 = 0,
+        /// Receives each notification that has no progress token and no subscription id, for
+        /// example a log message of the server during a request. The router drops a
+        /// notification whose progress token or subscription id names no request in flight.
+        /// `spawn` starts the reader task, thus the client takes the function only here.
+        ///
+        /// The function runs on the reader task. It must not block: while it runs, the reader
+        /// task routes no frame, and `close` does not return. `method` and `params` are valid
+        /// only during the call.
+        on_notification: ?router_mod.NotificationFn = null,
+        userdata: ?*anyopaque = null,
     };
 
     const Pending = Router.Pending;
@@ -735,7 +741,7 @@ pub const Client = struct {
     }
 
     fn readUntilEof(self: *Client) void {
-        self.router.readUntilEof(&self.stdout_reader.interface, self.limits.stdio.max_line_bytes, self.on_notification, self.userdata);
+        self.router.readUntilEof(&self.stdout_reader.interface, self.limits.stdio.max_line_bytes, self.options.on_notification, self.options.userdata);
     }
 
     /// Reap the old process and spawn a new one. Returns false when the spawn failed.
