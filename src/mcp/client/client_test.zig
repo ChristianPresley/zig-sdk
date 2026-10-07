@@ -707,6 +707,47 @@ test "a long listen stream over the memory link does not make the request arena 
     try std.testing.expectEqual(error.Canceled, job.result.?);
 }
 
+test "a listen stream over the memory link returns its result after a server shutdown" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var server = try Server.init(gpa, io, .{ .info = .{ .name = "srv", .version = "1" }, .capabilities = .{ .resources = .{ .subscribe = true } } });
+    defer server.deinit();
+    var link: mcp.transport.memory.ClientLink = .init(io, gpa, &server);
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(link.transport());
+
+    var counter: UpdateCounter = .{};
+    var job: ListenJob = .{ .client = &client, .counter = &counter };
+    defer job.arena_state.deinit();
+    var future = try io.concurrent(ListenJob.run, .{&job});
+    var stopped = false;
+    defer if (!stopped) job.stop(&future);
+    try awaitCount(&counter.acks, 1);
+    // The shutdown fires the cancel token of the caller, because the link gives that token to
+    // the server. Before, the link then returned error.Canceled and dropped the result.
+    server.shutdownSubscriptions(io);
+    future.await(io);
+    stopped = true;
+    try std.testing.expect(job.result == null);
+}
+
+test "a response that the client cannot read over the memory link gives error.InvalidResponse without a retry" {
+    var f: Fixture = undefined;
+    // A result of `resources/read` nests 4 levels deep.
+    var limits: mcp.Limits = .{};
+    limits.json_max_depth = 3;
+    try f.init(.{ .info = .{ .name = "cli", .version = "1" }, .limits = limits });
+    defer f.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    read_count.store(0, .monotonic);
+    // Before, the link gave error.ReadFailed for a frame that the sink refused. The client
+    // then sent the request again, and returned error.TransportFailed.
+    try std.testing.expectError(error.InvalidResponse, f.client.readResource(arena_state.allocator(), "test://counted", .{ .retry = .force, .cache_mode = .bypass }));
+    try std.testing.expectEqual(1, read_count.load(.monotonic));
+}
+
 /// A child that reads one line, writes the file `events.jsonl` of its current directory to
 /// its standard output, and then reads one more line.
 const replay_argv: []const []const u8 = if (builtin.os.tag == .windows)

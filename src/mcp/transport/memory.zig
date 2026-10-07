@@ -111,7 +111,8 @@ pub const Harness = struct {
 ///   the request get to the sink on that task, also the acknowledgment of a listen stream.
 ///   The events of a listen stream get to the sink on the task that publishes them.
 /// - Only the cancel token of the caller ends an exchange. The server uses that token as the
-///   token of the request. Thus a server shutdown also fires it.
+///   token of the request. Thus a server shutdown also fires it. A listen stream that the
+///   server ends at its shutdown still returns its result, as on the other transports.
 /// - The link does not obey `Exchange.timeout` and `Exchange.first_frame_timeout`. Thus
 ///   `RequestOptions.timeout`, `limits.request_timeout` and `limits.listen_ack_timeout` have no
 ///   effect on it.
@@ -146,9 +147,23 @@ pub const ClientLink = struct {
         /// and `write_lock` of HTTP do. The events of a listen stream come from the task that
         /// publishes them, and the other frames from the task of the request.
         lock: Io.Mutex = .init,
-        /// Set under `lock`. `exchange` reads it after the server returns, when no other task
-        /// gives frames to the sink.
+        /// True after the sink refused a frame. Set under `lock`. `exchange` reads it after the
+        /// server returns, when no other task gives frames to the sink.
         failed: bool = false,
+        /// True after the final frame of the request reached the sink. Set under `lock`, and
+        /// read as `failed`.
+        finished: bool = false,
+
+        /// Give one frame to the sink. `final` is true for the response of the request.
+        fn forward(f: *Forward, io: Io, frame: []const u8, final: bool) Transport.SendError!void {
+            f.lock.lockUncancelable(io);
+            defer f.lock.unlock(io);
+            f.sink.deliver(io, frame) catch {
+                f.failed = true;
+                return error.Closed;
+            };
+            if (final) f.finished = true;
+        }
     };
 
     fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
@@ -168,8 +183,12 @@ pub const ClientLink = struct {
             .responder = .{ .ptr = &forward, .vtable = &forward_vtable },
             .cancel = ex.cancel,
         });
-        if (forward.failed) return error.ReadFailed;
-        if (ex.cancel.isCancelled()) return error.Canceled;
+        // The sink cannot read a frame, as on the other transports. The client then does not
+        // send the request again.
+        if (forward.failed) return error.InvalidFrame;
+        // A server shutdown fires the token of the caller too. A listen stream then ends with
+        // its result, and the result already reached the sink.
+        if (ex.cancel.isCancelled() and !(ex.cancel.server_shutdown and forward.finished)) return error.Canceled;
     }
 
     fn clientNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
@@ -199,16 +218,12 @@ pub const ClientLink = struct {
 
     fn forwardNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
         const f: *Forward = @ptrCast(@alignCast(ptr));
-        f.lock.lockUncancelable(io);
-        defer f.lock.unlock(io);
-        f.sink.deliver(io, frame) catch {
-            f.failed = true;
-            return error.Closed;
-        };
+        return f.forward(io, frame, false);
     }
 
     fn forwardFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
-        return forwardNotify(ptr, io, frame);
+        const f: *Forward = @ptrCast(@alignCast(ptr));
+        return f.forward(io, frame, true);
     }
 
     fn forwardAbort(ptr: *anyopaque, io: Io) void {
