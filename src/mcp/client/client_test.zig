@@ -524,6 +524,50 @@ test "a response that the check of the top-level keys does not find stays valid 
     try std.testing.expectEqualStrings("get", json.getString(result.structuredContent.?, "method").?);
 }
 
+/// Counts the `test/hostile` notifications that reach `RequestOptions.on_notification`.
+const HostileCounter = struct {
+    count: usize = 0,
+
+    fn onNotification(userdata: ?*anyopaque, method: []const u8, params: ?Value) void {
+        const self: *HostileCounter = @ptrCast(@alignCast(userdata.?));
+        _ = params;
+        if (std.mem.eql(u8, method, "test/hostile")) self.count += 1;
+    }
+};
+
+/// Give `count` copies of `notification` and then the response to the first request of a new
+/// client. Return the capacity of the request arena after the call.
+fn arenaAfterNotifications(notification: []const u8, count: usize) !usize {
+    const gpa = std.testing.allocator;
+    const frames = try gpa.alloc([]const u8, count + 1);
+    defer gpa.free(frames);
+    @memset(frames[0..count], notification);
+    frames[count] = "{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{\"resultType\":\"complete\",\"content\":[]}}";
+    var scripted: Scripted = .{ .frames = frames };
+    var client: Client = .init(gpa, std.testing.io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(scripted.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+
+    var counter: HostileCounter = .{};
+    _ = try client.callTool(arena_state.allocator(), "t", null, .{ .on_notification = HostileCounter.onNotification, .userdata = &counter });
+    try std.testing.expectEqual(count, counter.count);
+    return arena_state.queryCapacity();
+}
+
+test "a notification that the fallback check takes for a response does not make the request arena larger" {
+    // A top-level key with an escape sequence is too long for the buffer of the scanner, the
+    // "method" key has an escape sequence, and a value has the text "error". The fallback
+    // check of the router takes the frame for a response.
+    const head = "{\"jsonrpc\":\"2.0\",\"\\u0078" ++ "x" ** 80 ++ "\":0,\"\\u006dethod\":\"test/hostile\",\"params\":{\"progressToken\":";
+    const tail = ",\"note\":\"error\"}}";
+    try std.testing.expect(router.frameIsResponse(head ++ "1" ++ tail));
+    const short = try arenaAfterNotifications(head ++ "{id}" ++ tail, 10);
+    const long = try arenaAfterNotifications(head ++ "{id}" ++ tail, 2_000);
+    try std.testing.expectEqual(short, long);
+}
+
 /// Gives two more frames from the callback of the first notification. Then it checks that
 /// the parameters of the first notification did not change.
 const Nested = struct {

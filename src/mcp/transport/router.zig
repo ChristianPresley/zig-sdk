@@ -237,6 +237,18 @@ pub fn frameIsResponse(frame: []const u8) bool {
     return topLevelResponse(fba.allocator(), &scanner) catch fallbackIsResponse(frame);
 }
 
+/// True when the scanner reads the top-level keys of `frame` and they make it a response.
+/// A frame that the scanner cannot read in its fixed buffer gives false. The fallback check
+/// of `frameIsResponse` finds the text "result" or "error" also in a value of a
+/// notification. Use this check when a wrong "response" costs more than a wrong
+/// "not a response".
+pub fn frameIsResponseStrict(frame: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    var scanner: std.json.Scanner = .initCompleteInput(fba.allocator(), frame);
+    return topLevelResponse(fba.allocator(), &scanner) catch false;
+}
+
 fn topLevelResponse(fba: std.mem.Allocator, scanner: *std.json.Scanner) !bool {
     if (try scanner.next() != .object_begin) return error.NotAnObject;
     var found = false;
@@ -307,6 +319,20 @@ test "only top-level keys make a frame a response" {
     try std.testing.expect(frameIsResponse("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"x\"}}"));
     try std.testing.expect(!frameIsResponse("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"error\",\"data\":{\"error\":\"disk full\",\"result\":1}}}"));
     try std.testing.expect(!frameIsResponse("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"progress\":1,\"message\":\"\\\"error\\\"\"}}"));
+}
+
+test "the strict check gives false for a frame that the scanner cannot read" {
+    try std.testing.expect(frameIsResponseStrict("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"));
+    try std.testing.expect(frameIsResponseStrict("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"x\"}}"));
+    try std.testing.expect(!frameIsResponseStrict("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"error\",\"data\":{\"error\":\"disk full\",\"result\":1}}}"));
+    // A top-level key with an escape sequence is too long for the buffer of the scanner. The
+    // "method" key has an escape sequence too, and a value has the text "error". The fallback
+    // check takes this notification for a response, and the strict check does not.
+    const notification = "{\"jsonrpc\":\"2.0\",\"\\u0078" ++ "x" ** 80 ++ "\":0,\"\\u006dethod\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"error\"}}";
+    try std.testing.expect(frameIsResponse(notification));
+    try std.testing.expect(!frameIsResponseStrict(notification));
+    // A response that the scanner cannot read also gives false.
+    try std.testing.expect(!frameIsResponseStrict("{\"jsonrpc\":\"2.0\",\"\\u0078" ++ "x" ** 80 ++ "\":0,\"id\":1,\"result\":{}}"));
 }
 
 test "router routes responses by id and progress by token" {

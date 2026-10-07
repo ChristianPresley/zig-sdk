@@ -637,7 +637,10 @@ const Collector = struct {
         const self: *Collector = @ptrCast(@alignCast(ptr));
         _ = self.frames.fetchAdd(1, .monotonic);
         // The caller uses a response after the exchange, thus it goes into the request arena.
-        if (router.frameIsResponse(frame)) return self.handle(io, try self.parse(self.arena, frame), self.arena, false);
+        // The strict check only: the fallback check can take a notification for a response,
+        // and then each such notification makes the request arena larger. A response that
+        // the strict check does not find goes into the request arena below.
+        if (router.frameIsResponseStrict(frame)) return self.handle(io, try self.parse(self.arena, frame), self.arena, false);
 
         // A flood of progress does not reach the callback: the client drops the
         // notifications over `limits.max_progress_rate_per_s`. When the method has no escape
@@ -660,8 +663,8 @@ const Collector = struct {
 
         const msg = try self.parse(scratch, frame);
         return switch (msg) {
-            // The check of the top-level keys did not find this response. Parse it again into
-            // the request arena.
+            // The strict check of the top-level keys did not find this response. Parse it
+            // again into the request arena.
             .response, .error_response => self.handle(io, try self.parse(self.arena, frame), self.arena, false),
             else => self.handle(io, msg, scratch, progress_counted),
         };
