@@ -2,6 +2,7 @@
 //! of the HTTP client transport and the HTTP requests. It also has the discovery of metadata,
 //! the client authentication at a token endpoint, and the token responses.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
@@ -10,6 +11,8 @@ const json = @import("../json.zig");
 const jwt = @import("jwt.zig");
 const dpop = @import("dpop.zig");
 const http_syntax = @import("../util/http_syntax.zig");
+const http1 = @import("../transport/http1.zig");
+const proxy = @import("../transport/proxy.zig");
 
 const log = std.log.scoped(.mcp_auth);
 
@@ -312,6 +315,15 @@ pub const Fetcher = struct {
     /// system. The fetcher does not own the bundle. Set the field before the first request.
     /// With a bundle, only one task at a time can use the fetcher.
     ca_bundle: ?*const std.crypto.Certificate.Bundle = null,
+    /// The HTTP proxy of the requests, as `HttpClient.Options.proxy`. The default reads no
+    /// environment, thus the fetcher connects directly. Through a proxy, the fetcher asks for a
+    /// `CONNECT` tunnel to the server, also for an `http` URL. Then the TLS client of std speaks
+    /// to the server through the tunnel, with the same trust as a direct request. Set the field
+    /// before the first request.
+    proxy: proxy.Config = .{ .environment = null },
+
+    /// The `user-agent` of `std.http.Client`. A request through a tunnel sends the same value.
+    const user_agent = "zig/" ++ builtin.zig_version_string ++ " (std.http)";
 
     pub fn init(io: Io, gpa: Allocator, max_document_bytes: usize, allow_http: bool) Fetcher {
         return .{ .http_client = .{ .allocator = gpa, .io = io }, .max_document_bytes = max_document_bytes, .allow_http = allow_http };
@@ -332,6 +344,35 @@ pub const Fetcher = struct {
         self.http_client.now = Io.Clock.real.now(self.http_client.io);
     }
 
+    /// Make the CA bundle of the HTTP client ready for a TLS handshake through a tunnel, and
+    /// return the time for the certificate checks. Without `ca_bundle`, the function loads the
+    /// CA store of the system one time, as the HTTP client does for a direct request.
+    fn loadTrust(self: *Fetcher) !Io.Timestamp {
+        self.applyTrust();
+        const client = &self.http_client;
+        const io = client.io;
+        loaded: {
+            try client.ca_bundle_lock.lockShared(io);
+            defer client.ca_bundle_lock.unlockShared(io);
+            if (client.now == null) break :loaded;
+            return Io.Clock.real.now(io);
+        }
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(client.allocator);
+        const time = Io.Clock.real.now(io);
+        bundle.rescan(client.allocator, io, time) catch |e| switch (e) {
+            error.Canceled => return error.Canceled,
+            else => return error.CertificateBundleLoadFailure,
+        };
+        try client.ca_bundle_lock.lock(io);
+        defer client.ca_bundle_lock.unlock(io);
+        if (client.now == null) {
+            client.now = time;
+            std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+        }
+        return time;
+    }
+
     pub const Reply = struct {
         status: u16,
         body: []u8,
@@ -345,6 +386,12 @@ pub const Fetcher = struct {
         if (!http_syntax.isRequestUrl(url)) return error.InvalidUrl;
         for (extra) |h| if (!http_syntax.isToken(h.name) or !http_syntax.isFieldValue(h.value)) return error.InvalidHeader;
         const uri = try std.Uri.parse(url);
+        if (!self.proxy.alwaysDirect()) {
+            const target = try http1.Target.parse(arena, url);
+            if (try proxy.select(arena, self.proxy, target.host, target.port, target.secure)) |through| {
+                return self.fetchThrough(arena, through, target, method, body, content_type, extra);
+            }
+        }
         self.applyTrust();
         var req = try self.http_client.request(method, uri, .{
             .redirect_behavior = .unhandled,
@@ -372,6 +419,75 @@ pub const Fetcher = struct {
         var transfer: [4096]u8 = undefined;
         const reader = response.reader(&transfer);
         const text = try reader.allocRemaining(arena, .limited(self.max_document_bytes));
+        return .{ .status = status, .body = text, .location = location, .dpop_nonce = nonce };
+    }
+
+    /// One request through the `CONNECT` tunnel of `through`, on a new connection. For `https`,
+    /// the TLS client of std speaks to the server through the tunnel with the trust of `fetch`.
+    /// The request does not follow a redirect, as `fetch` does not. The fetcher does not set the
+    /// proxy fields of `std.http.Client`. In Zig 0.16.0, that client sends an `https` request
+    /// through a `CONNECT` tunnel without TLS, and it has no `NO_PROXY` match.
+    fn fetchThrough(self: *Fetcher, arena: Allocator, through: proxy.Proxy, target: http1.Target, method: http.Method, body: ?[]const u8, content_type: ?[]const u8, extra: []const http.Header) !Reply {
+        const TlsClient = std.crypto.tls.Client;
+        const client = &self.http_client;
+        const io = client.io;
+        const stream = try proxy.connect(io, through);
+        defer stream.close(io);
+        var socket_reader = stream.reader(io, try arena.alloc(u8, TlsClient.min_buffer_len + http1.max_head_len));
+        var socket_writer = stream.writer(io, try arena.alloc(u8, TlsClient.min_buffer_len));
+        try proxy.tunnel(&socket_reader.interface, &socket_writer.interface, through, target.host, target.port);
+
+        var in: *Io.Reader = &socket_reader.interface;
+        var out: *Io.Writer = &socket_writer.interface;
+        var tls_client: TlsClient = undefined;
+        if (target.secure) {
+            const time = try self.loadTrust();
+            var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
+            io.random(&entropy);
+            const name = if (std.mem.startsWith(u8, target.host, "[")) target.host[1 .. target.host.len - 1] else target.host;
+            tls_client = TlsClient.init(in, out, .{
+                .host = .{ .explicit = name },
+                .ca = .{ .bundle = .{ .gpa = client.allocator, .io = io, .lock = &client.ca_bundle_lock, .bundle = &client.ca_bundle } },
+                .read_buffer = try arena.alloc(u8, TlsClient.min_buffer_len + http1.max_head_len),
+                .write_buffer = try arena.alloc(u8, TlsClient.min_buffer_len),
+                .entropy = &entropy,
+                .realtime_now = time,
+                // HTTP delimits its messages, so a missing close_notify is an ordinary end.
+                .allow_truncation_attacks = true,
+            }) catch return error.TlsInitializationFailed;
+            in = &tls_client.reader;
+            out = &tls_client.writer;
+        }
+        defer if (target.secure) {
+            tls_client.end() catch {};
+            socket_writer.interface.flush() catch {};
+        };
+
+        var headers: std.ArrayList(http.Header) = .empty;
+        if (content_type) |ct| try headers.append(arena, .{ .name = "content-type", .value = ct });
+        try headers.append(arena, .{ .name = "accept-encoding", .value = "identity" });
+        try headers.append(arena, .{ .name = "user-agent", .value = user_agent });
+        try headers.appendSlice(arena, extra);
+        try http1.writeRequest(out, @tagName(method), target.path, target.host_header, headers.items, body orelse "");
+        try out.flush();
+        if (target.secure) try socket_writer.interface.flush();
+
+        var reader: http.Reader = .{ .in = in, .interface = undefined, .state = .ready, .max_head_len = http1.max_head_len };
+        const head = try http.Client.Response.Head.parse(try reader.receiveHead());
+        const status: u16 = @intFromEnum(head.status);
+        // The head is in the buffer of the reader until the body read.
+        const location: ?[]const u8 = if (head.location) |l| try arena.dupe(u8, l) else null;
+        var nonce: ?[]const u8 = null;
+        var it = head.iterateHeaders();
+        while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, dpop.nonce_header_name)) {
+            nonce = try arena.dupe(u8, h.value);
+        };
+        // RFC 9110 sections 15.3.5 and 15.4.5: a 204 or a 304 response has no content.
+        if (head.status == .no_content or head.status == .not_modified) {
+            return .{ .status = status, .body = try arena.alloc(u8, 0), .location = location, .dpop_nonce = nonce };
+        }
+        var transfer: [4096]u8 = undefined;
+        const text = try reader.bodyReader(&transfer, head.transfer_encoding, head.content_length).allocRemaining(arena, .limited(self.max_document_bytes));
         return .{ .status = status, .body = text, .location = location, .dpop_nonce = nonce };
     }
 

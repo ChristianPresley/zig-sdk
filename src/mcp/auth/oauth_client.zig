@@ -18,6 +18,7 @@ const json = @import("../json.zig");
 const common = @import("common.zig");
 const dpop = @import("dpop.zig");
 const token_storage = @import("token_storage.zig");
+const proxy = @import("../transport/proxy.zig");
 
 const log = std.log.scoped(.mcp_auth);
 
@@ -127,6 +128,11 @@ pub const Client = struct {
         /// until `deinit`. The HTTP client transport can use the same bundle in its `tls`
         /// option: `.{ .trust = .{ .bundle = &bundle } }`.
         ca_bundle: ?*const std.crypto.Certificate.Bundle = null,
+        /// The HTTP proxy of the same requests, as `HttpClient.Options.proxy`. Give the HTTP
+        /// client transport the same value, thus both use one proxy. The default reads no
+        /// environment, thus the client connects directly. Through a proxy, the TLS client of
+        /// std speaks to the server through a `CONNECT` tunnel with the trust of `ca_bundle`.
+        proxy: proxy.Config = .{ .environment = null },
         max_document_bytes: usize = 1 << 20,
         /// Request DPoP-bound tokens with this key (RFC 9449). The token request and each
         /// request to the MCP server carry a proof. Null requests bearer tokens.
@@ -212,6 +218,7 @@ pub const Client = struct {
     pub fn init(io: Io, gpa: Allocator, options: Options) Client {
         var fetcher: common.Fetcher = .init(io, gpa, options.max_document_bytes, options.allow_http);
         fetcher.ca_bundle = options.ca_bundle;
+        fetcher.proxy = options.proxy;
         return .{ .io = io, .gpa = gpa, .fetcher = fetcher, .options = options };
     }
 

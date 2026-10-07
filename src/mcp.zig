@@ -64,6 +64,7 @@ test {
     _ = @import("mcp/transport/https_test.zig");
     _ = @import("mcp/transport/http_client_test.zig");
     _ = @import("mcp/transport/http_auth_test.zig");
+    _ = @import("mcp/transport/proxy_test.zig");
     _ = @import("mcp/transport/router.zig");
     _ = @import("mcp/util/rate_limit.zig");
     _ = @import("mcp/util/http_syntax.zig");

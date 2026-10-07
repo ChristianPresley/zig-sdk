@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const http = std.http;
 const http1 = @import("http1.zig");
+const proxy = @import("proxy.zig");
 const tool_headers = @import("tool_headers.zig");
 const Transport = @import("Transport.zig");
 const envelope = @import("envelope.zig");
@@ -34,6 +35,9 @@ pub const Client = struct {
     options: Options,
     /// The system trust store, loaded for `https` URLs without an explicit `tls` option.
     system_bundle: ?std.crypto.Certificate.Bundle = null,
+    /// The proxy of each connection to the server, or null for a direct connection. `init`
+    /// selects it from `Options.proxy`.
+    route: ?proxy.Proxy = null,
     tool_headers: tool_headers.Map,
 
     pub const Options = struct {
@@ -56,11 +60,32 @@ pub const Client = struct {
         auth_provider: ?AuthProvider = null,
         /// The trust policy and identity for `https` URLs. Null uses the system trust store.
         tls: ?http1.TlsSetup = null,
+        /// The HTTP proxy of the connections. The client asks the proxy for a `CONNECT` tunnel to
+        /// the server, also for an `http` URL. The tunnel carries the TLS handshake and the
+        /// requests. A loopback host never gets a proxy from the environment. Set `.explicit`
+        /// for a proxy URL of the application, and `.none` for no proxy.
+        ///
+        /// By default, the client reads the proxy variables of the environment in
+        /// `environment`, such as `HTTPS_PROXY` and `NO_PROXY` (see `proxy`). The default
+        /// environment is null, thus the client connects directly. To use the environment of
+        /// the process, set `.{ .environment = init.environ_map }` with the `std.process.Init`
+        /// of `main`.
+        ///
+        /// `init` selects the proxy for the URL. A refused tunnel gives `error.WriteFailed` to
+        /// the exchange, and the log of the scope `mcp_proxy` has the status of the proxy.
+        proxy: proxy.Config = .{ .environment = null },
     };
 
     pub const TlsSetup = http1.TlsSetup;
 
-    pub const InitError = error{ OutOfMemory, InvalidUrl, TrustStoreUnavailable };
+    pub const InitError = error{
+        OutOfMemory,
+        InvalidUrl,
+        TrustStoreUnavailable,
+        /// The proxy URL of `Options.proxy` or of the environment does not use `http`, or it is
+        /// not a URL. The log of the scope `mcp_proxy` names its source.
+        InvalidProxy,
+    };
 
     pub fn init(io: Io, gpa: Allocator, options: Options) InitError!*Client {
         const self = try gpa.create(Client);
@@ -78,6 +103,7 @@ pub const Client = struct {
         const arena = self.arena_state.allocator();
         self.url = try arena.dupe(u8, options.url);
         self.target = try http1.Target.parse(arena, self.url);
+        self.route = try proxy.select(arena, options.proxy, self.target.host, self.target.port, self.target.secure);
         if (self.target.secure and options.tls == null) {
             var bundle: std.crypto.Certificate.Bundle = .empty;
             errdefer bundle.deinit(gpa);
@@ -94,10 +120,11 @@ pub const Client = struct {
         self.gpa.destroy(self);
     }
 
-    /// Open one connection to the server, with TLS for `https`.
-    fn open(self: *Client) http1.OpenError!*http1.Connection {
+    /// Open one connection to the server, with TLS for `https`, through the tunnel of the proxy
+    /// when there is one.
+    fn open(self: *Client) http1.TunnelError!*http1.Connection {
         const secure: ?http1.TlsSetup = if (!self.target.secure) null else self.options.tls orelse .{ .trust = .{ .bundle = &self.system_bundle.? } };
-        return http1.Connection.open(self.io, self.gpa, self.target.host, self.target.port, secure);
+        return http1.Connection.openThrough(self.io, self.gpa, self.route, self.target.host, self.target.port, secure);
     }
 
     pub fn transport(self: *Client) Transport.ClientTransport {
@@ -264,7 +291,8 @@ pub const Client = struct {
                 log.warn("TLS handshake with {s} failed", .{self.target.host});
                 return error.WriteFailed;
             },
-            error.ConnectFailed => return error.WriteFailed,
+            // A failure at the proxy has a warning in the scope `mcp_proxy`.
+            error.ConnectFailed, error.ProxyRefused => return error.WriteFailed,
         };
         defer conn.close();
         conn.send("POST", self.target.path, self.target.host_header, headers.items, ex.frame) catch return error.WriteFailed;

@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const http = std.http;
 const tls = @import("../../tls/tls.zig");
 const http_syntax = @import("../util/http_syntax.zig");
+const proxy = @import("proxy.zig");
 
 pub const Header = http.Header;
 
@@ -32,6 +33,14 @@ pub const OpenError = error{
     Canceled,
 };
 
+/// The errors of `Connection.openThrough`: the errors of `Connection.open`, and a proxy that
+/// refused the tunnel.
+pub const TunnelError = OpenError || error{
+    /// The proxy refused the tunnel, or it gave no HTTP answer. The log of the scope `mcp_proxy`
+    /// has the status.
+    ProxyRefused,
+};
+
 pub const max_head_len = 16 << 10;
 
 pub const Connection = struct {
@@ -55,6 +64,16 @@ pub const Connection = struct {
 
     /// Connect to `host:port`, with a TLS handshake when `secure` is set.
     pub fn open(io: Io, gpa: Allocator, host: []const u8, port: u16, secure: ?TlsSetup) OpenError!*Connection {
+        return openThrough(io, gpa, null, host, port, secure) catch |e| switch (e) {
+            error.ProxyRefused => unreachable,
+            else => |other| return other,
+        };
+    }
+
+    /// Connect to `host:port` through a `CONNECT` tunnel of `through`, or directly when it is
+    /// null. The tunnel then carries the TLS handshake when `secure` is set, and the requests,
+    /// to the server. Thus the proxy sees only the host and the port. See `proxy.select`.
+    pub fn openThrough(io: Io, gpa: Allocator, through: ?proxy.Proxy, host: []const u8, port: u16, secure: ?TlsSetup) TunnelError!*Connection {
         const self = try gpa.create(Connection);
         errdefer gpa.destroy(self);
         const in_buf = try gpa.alloc(u8, tls.Connection.min_input_buffer_len);
@@ -68,7 +87,7 @@ pub const Connection = struct {
         const transfer_buf = try gpa.alloc(u8, 8 << 10);
         errdefer gpa.free(transfer_buf);
 
-        const stream = connectStream(io, host, port) catch |e| switch (e) {
+        const stream = if (through) |p| try proxy.connect(io, p) else connectStream(io, host, port) catch |e| switch (e) {
             error.Canceled => return error.Canceled,
             else => return error.ConnectFailed,
         };
@@ -90,6 +109,12 @@ pub const Connection = struct {
         };
         self.socket_reader = self.stream.reader(io, self.in_buf);
         self.socket_writer = self.stream.writer(io, self.out_buf);
+        if (through) |p| proxy.tunnel(&self.socket_reader.interface, &self.socket_writer.interface, p, host, port) catch |e| switch (e) {
+            error.ProxyRefused => return error.ProxyRefused,
+            error.InvalidRequestHead => return error.ConnectFailed,
+            error.ReadFailed => return if (canceled(self.socket_reader.err)) error.Canceled else error.ConnectFailed,
+            error.WriteFailed => return if (canceled(self.socket_writer.err)) error.Canceled else error.ConnectFailed,
+        };
         if (secure) |setup| {
             var alert: std.crypto.tls.Alert = undefined;
             self.tls_conn = tls.connect(&self.socket_reader.interface, &self.socket_writer.interface, .{
@@ -119,6 +144,11 @@ pub const Connection = struct {
         }
         self.http_reader = .{ .in = self.reader, .interface = undefined, .state = .ready, .max_head_len = max_head_len };
         return self;
+    }
+
+    fn canceled(err: anytype) bool {
+        const e = err orelse return false;
+        return e == error.Canceled;
     }
 
     fn connectStream(io: Io, host: []const u8, port: u16) !Io.net.Stream {
@@ -152,20 +182,12 @@ pub const Connection = struct {
         return c.alpn();
     }
 
-    pub const SendError = Io.Writer.Error || error{InvalidRequestHead};
+    pub const SendError = RequestError;
 
     /// Send one request with a complete body. The connection closes after the response.
-    /// A GET request without a body has no `content-length` header. A part of the head with a
-    /// character that its rule does not permit gives `error.InvalidRequestHead`, and nothing
-    /// goes out.
+    /// See `writeRequest`.
     pub fn send(self: *Connection, method: []const u8, target: []const u8, host: []const u8, headers: []const Header, body: []const u8) SendError!void {
-        const w = self.writer;
-        try checkHead(method, target, host, headers);
-        try w.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\nconnection: close\r\n", .{ method, target, host });
-        if (body.len > 0 or !std.mem.eql(u8, method, "GET")) try w.print("content-length: {d}\r\n", .{body.len});
-        for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
-        try w.writeAll("\r\n");
-        try w.writeAll(body);
+        try writeRequest(self.writer, method, target, host, headers, body);
         try self.flush();
     }
 
@@ -195,6 +217,21 @@ pub const Connection = struct {
         return self.http_reader.bodyReader(self.transfer_buf, response.head.transfer_encoding, response.head.content_length);
     }
 };
+
+pub const RequestError = Io.Writer.Error || error{InvalidRequestHead};
+
+/// Write one request with a complete body to `w`, without a flush. The head has `host` and
+/// `connection: close`. A GET request without a body has no `content-length` header. A part of
+/// the head with a character that its rule does not permit gives `error.InvalidRequestHead`, and
+/// nothing goes out.
+pub fn writeRequest(w: *Io.Writer, method: []const u8, target: []const u8, host: []const u8, headers: []const Header, body: []const u8) RequestError!void {
+    try checkHead(method, target, host, headers);
+    try w.print("{s} {s} HTTP/1.1\r\nhost: {s}\r\nconnection: close\r\n", .{ method, target, host });
+    if (body.len > 0 or !std.mem.eql(u8, method, "GET")) try w.print("content-length: {d}\r\n", .{body.len});
+    for (headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+    try w.writeAll("\r\n");
+    try w.writeAll(body);
+}
 
 /// Check the parts of a request head against RFC 9110 and RFC 9112. The method and each field
 /// name must be tokens. The target and the host must be visible ASCII. A field value must not
@@ -255,6 +292,19 @@ test "url targets" {
     try std.testing.expectError(error.InvalidUrl, Target.parse(arena, "http:///nohost"));
     try std.testing.expectError(error.InvalidUrl, Target.parse(arena, "http://a/mcp\r\nx-injected: 1"));
     try std.testing.expectError(error.InvalidUrl, Target.parse(arena, "http://a%0d%0ax-injected:1/mcp"));
+}
+
+test "the request of writeRequest" {
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try writeRequest(&w, "GET", "/a?b=1", "as.example", &.{.{ .name = "accept", .value = "*/*" }}, "");
+    try std.testing.expectEqualStrings("GET /a?b=1 HTTP/1.1\r\nhost: as.example\r\nconnection: close\r\naccept: */*\r\n\r\n", w.buffered());
+    w = .fixed(&buf);
+    try writeRequest(&w, "POST", "/token", "as.example:8443", &.{}, "a=b");
+    try std.testing.expectEqualStrings("POST /token HTTP/1.1\r\nhost: as.example:8443\r\nconnection: close\r\ncontent-length: 3\r\n\r\na=b", w.buffered());
+    w = .fixed(&buf);
+    try std.testing.expectError(error.InvalidRequestHead, writeRequest(&w, "GET", "/", "a\r\nb", &.{}, ""));
+    try std.testing.expectEqual(0, w.buffered().len);
 }
 
 test "a request head with CR or LF in a part is refused" {

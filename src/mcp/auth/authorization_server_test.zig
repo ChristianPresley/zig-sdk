@@ -20,6 +20,7 @@ const AuthorizationServer = mcp.auth.AuthorizationServer;
 const HttpServer = mcp.transport.http.Server;
 const HttpClient = mcp.transport.HttpClient;
 const tls = mcp.tls;
+const TestProxy = @import("../transport/proxy_test.zig").TestProxy;
 
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
@@ -172,6 +173,8 @@ const World = struct {
     clients: [4]as_mod.ClientRegistration,
     // The helpers.
     features: Features,
+    /// The proxy of the HTTP client transport of `call`.
+    proxy: mcp.transport.proxy.Config,
     /// The test CA. It is empty without the `https` feature.
     ca_bundle: std.crypto.Certificate.Bundle,
     chain: tls.CertChain,
@@ -192,6 +195,7 @@ const World = struct {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
         self.features = features;
+        self.proxy = .none;
         self.arena_state = .init(gpa);
         errdefer self.arena_state.deinit();
         const arena = self.arena_state.allocator();
@@ -372,6 +376,7 @@ const World = struct {
             .url = self.mcp_url,
             .auth_provider = provider,
             .tls = if (self.features.https) .{ .trust = .{ .bundle = &self.ca_bundle } } else null,
+            .proxy = self.proxy,
         });
         defer transport.deinit();
         var client: mcp.Client = .init(gpa, io, .{
@@ -514,6 +519,66 @@ test "authorization code flow over HTTPS with the CA of the ca_bundle option" {
     try std.testing.expect(std.mem.startsWith(u8, who, "alice|"));
     try std.testing.expectEqualStrings(world.issuer, oauth.issuer.?);
     try std.testing.expectEqualStrings(who, try world.call(arena, oauth.provider(), null));
+}
+
+/// The `host:port` part of an `https` URL, in `arena`.
+fn authority(arena: Allocator, url: []const u8) ![]const u8 {
+    const rest = url["https://".len..];
+    return arena.dupe(u8, rest[0 .. std.mem.findScalar(u8, rest, '/') orelse rest.len]);
+}
+
+test "authorization code flow over HTTPS through a CONNECT proxy" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var world: World = undefined;
+    try world.start(.{ .https = true });
+    defer world.stop();
+    var p: TestProxy = undefined;
+    try p.start(null);
+    defer p.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var proxy_buf: [96]u8 = undefined;
+    // The hosts are `localhost`, thus the test needs `loopback`.
+    const through: mcp.transport.proxy.Config = .{ .explicit = .{ .url = p.url(&proxy_buf, "agent:s3cret"), .loopback = true } };
+
+    // The fetcher of the OAuth client and the HTTP client transport use the same proxy. The
+    // discovery, the registration, the authorization and the token request go through it with
+    // the std TLS client, and the MCP requests with the SDK TLS client.
+    world.proxy = through;
+    var oauth: mcp.auth.OAuthClient = .init(io, gpa, .{ .ca_bundle = &world.ca_bundle, .proxy = through });
+    defer oauth.deinit();
+    const who = try world.call(arena, oauth.provider(), null);
+    try std.testing.expect(std.mem.startsWith(u8, who, "alice|"));
+    try std.testing.expect(p.sawTarget(try authority(arena, world.issuer)));
+    try std.testing.expect(p.sawTarget(try authority(arena, world.mcp_url)));
+    try std.testing.expectEqualStrings("Basic YWdlbnQ6czNjcmV0", (try p.lastAuthorization(arena)).?);
+
+    // A fetch through the proxy takes one tunnel.
+    var fetcher: common.Fetcher = .init(io, gpa, 1 << 16, false);
+    defer fetcher.deinit();
+    fetcher.ca_bundle = &world.ca_bundle;
+    fetcher.proxy = through;
+    const tunnels = p.tunnels.load(.monotonic);
+    const jwks = try fetcher.fetch(arena, .GET, try std.fmt.allocPrint(arena, "{s}/jwks", .{world.issuer}), null, null, &.{});
+    try std.testing.expectEqual(200, jwks.status);
+    try std.testing.expectEqual(2, (try jwt.parseJwks(arena, jwks.body)).len);
+    try std.testing.expectEqual(tunnels + 1, p.tunnels.load(.monotonic));
+
+    // A proxy that refuses the tunnel: the fetch fails with `error.ProxyRefused`, and the
+    // client finds no metadata.
+    var refusing: TestProxy = undefined;
+    try refusing.start(.forbidden);
+    defer refusing.stop();
+    var refused_buf: [64]u8 = undefined;
+    const refused: mcp.transport.proxy.Config = .{ .explicit = .{ .url = refusing.url(&refused_buf, ""), .loopback = true } };
+    fetcher.proxy = refused;
+    try std.testing.expectError(error.ProxyRefused, fetcher.fetch(arena, .GET, try std.fmt.allocPrint(arena, "{s}/jwks", .{world.issuer}), null, null, &.{}));
+    var blocked: mcp.auth.OAuthClient = .init(io, gpa, .{ .ca_bundle = &world.ca_bundle, .proxy = refused });
+    defer blocked.deinit();
+    try std.testing.expectError(error.NoResourceMetadata, blocked.handleChallenge(arena, world.mcp_url, 401, null, 1));
+    try std.testing.expect(refusing.sawTarget(try authority(arena, world.mcp_url)));
 }
 
 test "client credentials: a client secret and private_key_jwt" {
