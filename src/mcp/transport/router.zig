@@ -16,7 +16,11 @@ const jsonrpc = @import("../jsonrpc.zig");
 const RequestId = jsonrpc.RequestId;
 const Transport = @import("Transport.zig");
 
-/// Receives a notification that belongs to no request in flight.
+/// Receives each notification that has no progress token and no subscription id, for example
+/// a log message of the server during a request. The router drops a notification whose
+/// progress token or subscription id names no request in flight. The function runs on the
+/// reader task: while it runs, the router routes no frame. `method` and `params` are valid
+/// only during the call.
 pub const NotificationFn = *const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void;
 
 pub const Router = struct {

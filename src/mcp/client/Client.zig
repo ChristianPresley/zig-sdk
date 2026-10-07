@@ -148,7 +148,9 @@ pub const RequestOptions = struct {
     /// and write the data. It must not send a request through the same client. It must not
     /// wait for a lock that another task holds while that task waits for a response through
     /// the same client. The reader task cannot route that response while the callback waits.
-    /// The request returns only after its last callback returned.
+    ///
+    /// The request returns only after its last callback returned. While a callback runs,
+    /// `close` and `deinit` of the transport do not return.
     inline_notifications: bool = false,
     /// The log level for this request. It replaces `Options.log_level`. The client sends it in
     /// `_meta` also when `Options.log_level` is null.

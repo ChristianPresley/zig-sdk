@@ -851,7 +851,13 @@ pub const ClientOptions = struct {
     limits: Limits = .{},
     /// How often a request that waits checks for cancellation and its deadline.
     poll_interval: Io.Duration = .fromMilliseconds(50),
-    /// Receives notifications that belong to no request in flight.
+    /// Receives each notification that has no progress token and no subscription id, for
+    /// example a log message of the server during a request. The router drops a notification
+    /// whose progress token or subscription id names no request in flight.
+    ///
+    /// The function runs on the reader task. It must not block: while it runs, the reader task
+    /// routes no frame, and `close` does not return. `method` and `params` are valid only
+    /// during the call.
     on_notification: ?router_mod.NotificationFn = null,
     userdata: ?*anyopaque = null,
 };

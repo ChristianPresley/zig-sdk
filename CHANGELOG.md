@@ -22,6 +22,7 @@ All notable changes to this project are recorded in this file. The format follow
 ### Fixed
 
 - The doc comments of `RequestOptions.on_log`, `RequestOptions.on_notification` and `Hooks.on_notification` tell which notifications they receive. These callbacks receive only the notifications that the transport routes to a request. Before, the comment of `Hooks.on_notification` said that it receives the notifications that belong to no request on stdio. The stdio, Unix socket and WebSocket transports route a notification only by its progress token or its subscription id. A notification that has neither goes to the `on_notification` spawn option of `stdio.Client`, or to the `on_notification` option of the Unix socket and WebSocket clients. Log messages of the server are such notifications, also during a request.
+- The doc comments of the `on_notification` options of the Unix socket and WebSocket clients tell which notifications they receive. Before, they said that the option receives the notifications that belong to no request in flight. But the option also receives the log messages of a request in flight. The router drops a notification whose progress token or subscription id names no request in flight. The comments also tell that the function runs on the reader task, must not block, and gets arguments that are valid only during the call.
 
 ## [0.3.0] - 2026-09-30
 
