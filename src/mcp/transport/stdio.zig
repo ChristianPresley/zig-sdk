@@ -464,8 +464,8 @@ pub const Client = struct {
     generation: std.atomic.Value(u32) = .init(0),
     restarts: u32 = 0,
     /// Guards the process id in `child` and `exit_status`. A signal and a reap both take it.
-    /// Thus the client signals no process after it reaped it. Take `out_lock` first when a
-    /// task takes both.
+    /// Thus the client signals no process after it reaped it. `kill` sets `closed` under it,
+    /// and `spawnChild` reads `closed` under it. Take `out_lock` first when a task takes both.
     child_lock: Io.Mutex = .init,
     /// The status of the last process that the client reaped.
     exit_status: ?std.process.Child.Term = null,
@@ -530,7 +530,9 @@ pub const Client = struct {
         return self;
     }
 
-    /// Start the child and attach the streams. Used at spawn and at every restart.
+    /// Start the child and attach the streams. Used at spawn and at every restart. When `close`
+    /// or `kill` started before the new process is in `child`, the function sends the kill
+    /// signal to the new process and returns `error.Closed`. The caller then reaps it.
     fn spawnChild(self: *Client) !void {
         const io = self.io;
         const options = self.options;
@@ -551,11 +553,16 @@ pub const Client = struct {
             win.assign(job, child.id.?) catch {};
             _ = std.os.windows.ntdll.NtResumeThread(child.thread_handle, null);
         };
+        // `kill` sets `closed` under `child_lock` before it signals the process. Thus either
+        // `kill` finds the new process, or this task sees `closed` and signals it.
         self.child_lock.lockUncancelable(io);
         self.child = child;
+        const closed = self.closed.load(.acquire);
+        if (closed) self.terminateLocked(.forced);
         self.child_lock.unlock(io);
         self.stdout_reader = self.child.stdout.?.readerStreaming(io, self.in_buf);
         self.stdin_writer = self.child.stdin.?.writerStreaming(io, self.out_buf);
+        if (closed) return error.Closed;
     }
 
     pub fn transport(self: *Client) Transport.ClientTransport {
@@ -581,7 +588,13 @@ pub const Client = struct {
 
     /// Terminate the process tree at once.
     pub fn kill(self: *Client) void {
+        // A restart can spawn a process after its check of `closed`. `spawnChild` reads the
+        // flag under `child_lock` when it puts the process in `child`. Thus `terminate` below
+        // finds the new process, or the restart signals it. Do not take `out_lock` here: a
+        // writer that waits on a full input pipe holds it.
+        self.child_lock.lockUncancelable(self.io);
         self.closed.store(true, .release);
+        self.child_lock.unlock(self.io);
         self.terminate(.forced);
         if (self.reader_future) |*f| {
             f.await(self.io);
@@ -712,6 +725,11 @@ pub const Client = struct {
     fn terminate(self: *Client, how: Termination) void {
         self.child_lock.lockUncancelable(self.io);
         defer self.child_lock.unlock(self.io);
+        self.terminateLocked(how);
+    }
+
+    /// `terminate` for a caller that holds `child_lock`.
+    fn terminateLocked(self: *Client, how: Termination) void {
         if (self.child.id == null) return;
         if (builtin.os.tag == .windows) {
             if (self.job) |job| {
@@ -853,7 +871,8 @@ pub const Client = struct {
     }
 
     /// Reap the old process and spawn a new one. Returns false when the spawn failed, or when
-    /// `close` or `kill` started before the spawn.
+    /// `close` or `kill` started before the new process was in `child`. `spawnChild` then
+    /// sends the kill signal to the new process, and `close` or `kill` reaps it.
     fn restartChild(self: *Client) bool {
         const io = self.io;
         self.out_lock.lockUncancelable(io);
@@ -861,9 +880,12 @@ pub const Client = struct {
         self.closeInputLocked();
         self.reapChild();
         if (self.closed.load(.acquire)) return false;
-        self.spawnChild() catch |e| {
-            log.warn("could not restart the stdio server: {t}", .{e});
-            return false;
+        self.spawnChild() catch |e| switch (e) {
+            error.Closed => return false,
+            else => {
+                log.warn("could not restart the stdio server: {t}", .{e});
+                return false;
+            },
         };
         _ = self.generation.fetchAdd(1, .acq_rel);
         self.router.wakeAll();
@@ -898,6 +920,32 @@ test "the log text of an exit status" {
     w = .fixed(&buf);
     try w.print("{f}", .{ExitText{ .term = .{ .unknown = 7 } }});
     try std.testing.expectEqualStrings("status 7", w.buffered());
+}
+
+test "a process that a restart spawns after kill started gets the kill signal" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    // The process reads one line and then exits with the code 5.
+    const argv: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "cmd.exe", "/d", "/c", "set", "/p", "line=&exit", "5" }
+    else
+        &.{ "/bin/sh", "-c", "read -r line; exit 5" };
+    const client = Client.spawn(io, gpa, .{ .argv = argv }) catch return error.SkipZigTest;
+    defer client.deinit();
+    client.kill();
+    // A restart that read `closed` before `kill` set it spawns the new process at this time.
+    // Before, the new process waited for its input, and `kill` waited for the reader task
+    // without a time limit.
+    try std.testing.expectError(error.Closed, client.spawnChild());
+    // Without the signal, the process exits with the code 5 at the end of its input.
+    client.closeInput();
+    client.reapChild();
+    const term = client.exitStatus().?;
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+    } else {
+        try std.testing.expectEqual(std.process.Child.Term{ .signal = .KILL }, term);
+    }
 }
 
 /// The Windows job object calls that std does not declare.

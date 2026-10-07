@@ -43,6 +43,7 @@ All notable changes to this project are recorded in this file. The format follow
 - The HTTP client transport logs a warning with the status and the content type when a response carries no JSON-RPC message. It also logs a warning when the server answers with status 401 or 403 and the client has no authorization provider. Before, the transport returned `error.HttpStatus` without a log.
 - `stdio.Client.close` and `stdio.Client.kill` also end a server process that closed its output but does not exit. Before, `close` waited for such a process without a time limit.
 - `stdio.Client` writes no request to the input of a process after `close` or a failed restart closed that input. Before, a request could write to the closed pipe at that time. A reap and a signal take the same lock. Thus the client never signals a process ID after the reap, when the system can give the ID to a new process.
+- `stdio.Client.kill` also ends a server process that a restart spawns at the same time. Before, `kill` could find no process while the restart spawned a new one. The new process then waited for its input, and `kill` waited for the reader task without a time limit.
 
 ## [0.3.0] - 2026-09-30
 
