@@ -624,21 +624,25 @@ pub const Stream = struct {
         return self.arena_state.allocator();
     }
 
-    /// Unregister and free the stream. A stream the peer still has open is reset.
+    /// Unregister and free the stream. A stream the peer still has open is reset. After a
+    /// complete response, the server resets with `no_error`, thus the client stops the request
+    /// and keeps the response (RFC 9113 section 8.1). Other streams get `cancel`.
     pub fn close(self: *Stream) void {
         const conn = self.conn;
-        var send_reset = false;
+        var send_reset: ?frame.ErrorCode = null;
         {
             conn.lock.lockUncancelable(conn.io);
             defer conn.lock.unlock(conn.io);
             if (self.id != 0) {
-                if (!self.end_stream and self.reset == null and !conn.closed) send_reset = true;
+                if (!self.end_stream and self.reset == null and !conn.closed) {
+                    send_reset = if (conn.options.role == .server and self.local_closed) .no_error else .cancel;
+                }
                 if (conn.streams.remove(self.id) and self.id % 2 != (if (conn.options.role == .client) @as(u31, 1) else 0)) {
                     conn.peer_streams_open -|= 1;
                 }
             }
         }
-        if (send_reset) conn.sendRst(self.id, .cancel);
+        if (send_reset) |code| conn.sendRst(self.id, code);
         self.destroy();
     }
 
@@ -657,7 +661,15 @@ pub const Stream = struct {
         if (self.conn_closed or self.conn.closed) return error.Closed;
     }
 
-    /// Send a header block. With `end_stream` no data follows.
+    /// The server sent a complete response and then reset the stream, thus it reads no more
+    /// of the request (RFC 9113 section 8.1). The response stays available. This applies
+    /// only to the client. On the server, the same state tells that the client canceled.
+    fn answered(self: *const Stream) bool {
+        return self.conn.options.role == .client and self.end_stream and self.reset != null;
+    }
+
+    /// Send a header block. With `end_stream` no data follows. When the server already sent a
+    /// complete response and reset the stream, the client sends nothing and gets no error.
     pub fn sendHeaders(self: *Stream, headers: []const Header, end_stream: bool) Error!void {
         const conn = self.conn;
         var block: std.ArrayList(u8) = .empty;
@@ -666,6 +678,10 @@ pub const Stream = struct {
         {
             conn.lock.lockUncancelable(conn.io);
             defer conn.lock.unlock(conn.io);
+            if (self.answered()) {
+                self.local_closed = true;
+                return;
+            }
             try self.checkOpen();
             if (end_stream) self.local_closed = true;
         }
@@ -690,6 +706,8 @@ pub const Stream = struct {
     }
 
     /// Send data. The call waits for flow control credit. With `end_stream` the send side closes.
+    /// When the server sent a complete response and reset the stream, the client stops the
+    /// data and gets no error. The caller then reads the response.
     pub fn sendData(self: *Stream, bytes: []const u8, end_stream: bool) Error!void {
         const conn = self.conn;
         var offset: usize = 0;
@@ -699,6 +717,10 @@ pub const Stream = struct {
                 conn.lock.lockUncancelable(conn.io);
                 defer conn.lock.unlock(conn.io);
                 while (true) {
+                    if (self.answered()) {
+                        self.local_closed = true;
+                        return;
+                    }
                     try self.checkOpen();
                     const remaining = bytes.len - offset;
                     if (remaining == 0) break;

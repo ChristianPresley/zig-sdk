@@ -9,6 +9,7 @@ const Client = mcp.Client;
 const grpc_server = @import("transport/grpc_server.zig");
 const grpc_client = @import("transport/grpc_client.zig");
 const Connection = @import("http2/Connection.zig");
+const ErrorCode = @import("http2/frame.zig").ErrorCode;
 const lpm = @import("grpc/lpm.zig");
 const messages = @import("protobuf/messages.zig");
 
@@ -254,7 +255,18 @@ const RawCall = struct {
     error_bin: ?[]const u8,
 };
 
+/// How `rawCallWith` sends the request message.
+const RawOptions = struct {
+    /// Send the message only after the complete response and the reset of the server
+    /// arrived. The server answers some calls before it reads the message.
+    after_answer: bool = false,
+};
+
 fn rawCall(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, content_type: []const u8, metadata: []const Connection.Header, body: []const u8) !RawCall {
+    return rawCallWith(gpa, io, port, path, content_type, metadata, body, .{});
+}
+
+fn rawCallWith(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, content_type: []const u8, metadata: []const Connection.Header, body: []const u8, options: RawOptions) !RawCall {
     const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
     const stream = try address.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -287,6 +299,12 @@ fn rawCall(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, content_
     });
     try headers.appendSlice(gpa, metadata);
     try h2.sendHeaders(headers.items, false);
+    if (options.after_answer) {
+        _ = try h2.waitEnd();
+        var spins: usize = 0;
+        while (h2.wasReset() == null and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(10), .awake);
+        try std.testing.expectEqual(@as(?ErrorCode, .no_error), h2.wasReset());
+    }
     var msg: std.ArrayList(u8) = .empty;
     defer msg.deinit(gpa);
     try messages.encodeJsonRpcMessage(gpa, &msg, body);
@@ -389,4 +407,27 @@ test "grpc: unknown path, wrong content type and missing metadata" {
     const good = try rawCall(gpa, io, port, grpc_server.call_path, "application/grpc", &.{ .{ .name = "mcp-protocol-version", .value = "2026-07-28" }, .{ .name = "mcp-method", .value = "server/discover" } }, body);
     defer freeRaw(gpa, good);
     try std.testing.expectEqualStrings("0", good.grpc_status.?);
+}
+
+test "grpc: a response before the request message stays readable after the reset" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    const port = f.transport.bound_port;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}";
+
+    // The server answers these calls from the headers, and then resets the stream with
+    // NO_ERROR (RFC 9113 section 8.1). The client sends the message after the reset. The
+    // send does not fail and the client reads the response. Before, the server sent CANCEL
+    // and the send failed with `error.StreamReset`.
+    const unknown = try rawCallWith(gpa, io, port, "/other.Service/Call", "application/grpc", &.{}, body, .{ .after_answer = true });
+    defer freeRaw(gpa, unknown);
+    try std.testing.expectEqualStrings("200", unknown.status);
+    try std.testing.expectEqualStrings("12", unknown.grpc_status.?);
+
+    const wrong_type = try rawCallWith(gpa, io, port, grpc_server.call_path, "text/plain", &.{}, body, .{ .after_answer = true });
+    defer freeRaw(gpa, wrong_type);
+    try std.testing.expectEqualStrings("415", wrong_type.status);
 }

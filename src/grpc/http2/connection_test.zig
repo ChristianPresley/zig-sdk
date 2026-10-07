@@ -58,10 +58,16 @@ const Side = struct {
 };
 
 /// The echo server: for every stream, answer 200 and echo the request body, then trailers.
+/// On the path "/early", the server sends a complete response before it reads the request.
+/// On the path "/hold", the server reads the request, waits for the reset of the client and
+/// then tries to answer.
 const EchoServer = struct {
     side: Side,
     group: Io.Group = .init,
     streams_seen: std.atomic.Value(u32) = .init(0),
+    /// The result of the answer on "/hold". It is set when `hold_done` is set.
+    hold_result: Connection.Error!void = {},
+    hold_done: Io.Event = .unset,
 
     fn onStream(userdata: ?*anyopaque, stream: *Connection.Stream) void {
         const self: *EchoServer = @ptrCast(@alignCast(userdata.?));
@@ -75,6 +81,16 @@ const EchoServer = struct {
         const path = Connection.findHeader(headers, ":path") orelse "";
         if (std.mem.eql(u8, path, "/refuse")) {
             stream.cancel();
+            return;
+        }
+        if (std.mem.eql(u8, path, "/early")) {
+            // `close` then resets the stream, because the request did not end.
+            stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = "application/grpc" }, .{ .name = "grpc-status", .value = "12" } }, true) catch {};
+            return;
+        }
+        if (std.mem.eql(u8, path, "/hold")) {
+            defer self.hold_done.set(self.side.io);
+            self.hold_result = holdAnswer(stream);
             return;
         }
         var body: std.ArrayList(u8) = .empty;
@@ -91,7 +107,21 @@ const EchoServer = struct {
         const len_text = std.fmt.bufPrint(&len_buf, "{d}", .{body.items.len}) catch unreachable;
         stream.sendHeaders(&.{ .{ .name = "grpc-status", .value = "0" }, .{ .name = "x-echo-length", .value = len_text } }, true) catch return;
     }
+
+    /// Read the complete request, wait for the reset of the client, then send headers.
+    fn holdAnswer(stream: *Connection.Stream) Connection.Error!void {
+        var buf: [4096]u8 = undefined;
+        while (try stream.read(&buf) != 0) {}
+        try stream.waitCancelled();
+        try stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = "application/grpc" } }, false);
+    }
 };
+
+/// Wait until the peer resets `stream`, for at most 5 seconds.
+fn waitReset(io: Io, stream: *Connection.Stream) !void {
+    var spins: usize = 0;
+    while (stream.wasReset() == null and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(10), .awake);
+}
 
 const Pair = struct {
     listener: Io.net.Server,
@@ -198,6 +228,60 @@ test "a reset stream fails the client side and the peer settings arrive" {
     try std.testing.expectEqual(frame.ErrorCode.cancel, stream.wasReset().?);
     // The server advertised its limit; the client learned it with the SETTINGS frame.
     try std.testing.expectEqual(4, pair.client.conn.peer.max_concurrent_streams.?);
+}
+
+test "a complete response before the end of the request stays readable after the reset" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var pair: Pair = undefined;
+    try pair.start(io, gpa, .{ .role = .client });
+    defer pair.stop();
+    const stream = try pair.client.conn.openStream();
+    defer stream.close();
+    try stream.sendHeaders(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/early" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    }, false);
+    // The client sends its data only after the response and the reset arrived. The server
+    // resets with NO_ERROR after a complete response (RFC 9113 section 8.1). The send then
+    // stops without an error. Before, the server sent CANCEL and `sendData` returned
+    // `error.StreamReset`, thus the caller lost the response.
+    _ = try stream.waitEnd();
+    try waitReset(io, stream);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .no_error), stream.wasReset());
+    try stream.sendData("the request", true);
+    const headers = try stream.waitHeaders();
+    try std.testing.expectEqualStrings("12", Connection.findHeader(headers, "grpc-status").?);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(0, try stream.read(&buf));
+    // The connection serves the next stream.
+    const echoed = try request(&pair, "/echo", "next");
+    defer gpa.free(echoed);
+    try std.testing.expectEqualStrings("next", echoed);
+}
+
+test "the server cannot answer after the client ended the request and reset the stream" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var pair: Pair = undefined;
+    try pair.start(io, gpa, .{ .role = .client });
+    defer pair.stop();
+    const stream = try pair.client.conn.openStream();
+    defer stream.close();
+    try stream.sendHeaders(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/hold" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    }, false);
+    try stream.sendData("the request", true);
+    stream.cancel();
+    // On the server, a reset after the end of the request tells that the client canceled.
+    // Thus a send fails, also when the request is complete.
+    try pair.server.hold_done.wait(io);
+    try std.testing.expectError(error.StreamReset, pair.server.hold_result);
 }
 
 test "concurrent streams interleave" {
