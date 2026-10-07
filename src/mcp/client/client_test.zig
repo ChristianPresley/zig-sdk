@@ -58,6 +58,17 @@ fn slowTask(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallTo
     return .{ .input_required = ir };
 }
 
+/// Reports the `_meta` entries that reached the server: the log level, `traceparent` and
+/// `com.example/x`.
+fn inspectMeta(ctx: *RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    const m = ctx.params.?.object.get("_meta").?;
+    const level = if (ctx.meta.log_level) |l| @tagName(l) else "none";
+    const trace = json.getString(m, "traceparent") orelse "none";
+    const vendor = json.getString(m, "com.example/x") orelse "none";
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "{s} {s} {s}", .{ level, trace, vendor }) };
+}
+
 var read_count: std.atomic.Value(u32) = .init(0);
 
 fn readCounted(ctx: *RequestContext, uri: []const u8) anyerror!mcp.Outcome(types.ReadResourceResult) {
@@ -86,6 +97,7 @@ const Fixture = struct {
         try self.server.addToolJson(.{ .name = "slow_task", .task_support = .optional }, slowTask);
         try self.server.addToolJson(.{ .name = "ask_name" }, askName);
         try self.server.addToolJson(.{ .name = "everything" }, everything);
+        try self.server.addToolJson(.{ .name = "inspect_meta" }, inspectMeta);
         try self.server.addResource(.{ .uri = "test://static", .name = "static" }, readStatic);
         try self.server.addResource(.{ .uri = "test://counted", .name = "counted" }, readCounted);
         self.link = .init(io, gpa, &self.server);
@@ -138,7 +150,7 @@ test "discover, list and call through the memory link" {
     const disc = try f.client.discover(arena, .{});
     try std.testing.expectEqualStrings("2026-07-28", disc.supportedVersions[0]);
     const tools = try f.client.listTools(arena, null, .{});
-    try std.testing.expectEqual(4, tools.tools.len);
+    try std.testing.expectEqual(5, tools.tools.len);
 
     var rec: Recorder = .{};
     const result = try f.client.callTool(arena, "add", .{ .a = 2, .b = 3 }, .{ .on_progress = Recorder.onProgress, .userdata = &rec });
@@ -189,6 +201,76 @@ test "undeclared input kinds are rejected on the client" {
     var diag: Client.Diagnostics = .{};
     const r = f.client.callTool(arena, "everything", null, .{ .diagnostics = &diag });
     try std.testing.expect(r == error.Rpc or r == error.UndeclaredInputRequest);
+}
+
+test "a per-request log level replaces the log level of the client" {
+    var f: Fixture = undefined;
+    try f.init(.{ .info = .{ .name = "cli", .version = "1" } });
+    defer f.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Without a client log level, the request sends its own level only.
+    const none = try f.client.callTool(arena, "inspect_meta", null, .{});
+    try std.testing.expectEqualStrings("none none none", none.content[0].text.text);
+    const own = try f.client.callTool(arena, "inspect_meta", null, .{ .log_level = .debug });
+    try std.testing.expectEqualStrings("debug none none", own.content[0].text.text);
+
+    // With a client log level, the request level replaces it for that request only.
+    f.client.options.log_level = .warning;
+    const client_level = try f.client.callTool(arena, "inspect_meta", null, .{});
+    try std.testing.expectEqualStrings("warning none none", client_level.content[0].text.text);
+    const replaced = try f.client.callTool(arena, "inspect_meta", null, .{ .log_level = .info });
+    try std.testing.expectEqualStrings("info none none", replaced.content[0].text.text);
+}
+
+test "extra _meta entries reach the server and SDK-owned keys fail the request" {
+    var f: Fixture = undefined;
+    try f.init(.{ .info = .{ .name = "cli", .version = "1" } });
+    defer f.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Trace context, a vendor key and an extension key under the reserved prefix pass.
+    const traceparent = "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01";
+    var extra: std.json.ObjectMap = .empty;
+    try extra.put(arena, "traceparent", .{ .string = traceparent });
+    try extra.put(arena, "tracestate", .{ .string = "congo=t61rcWkgMzE" });
+    try extra.put(arena, "com.example/x", .{ .string = "y" });
+    try extra.put(arena, "io.modelcontextprotocol/example", .{ .object = .empty });
+    const seen = try f.client.callTool(arena, "inspect_meta", null, .{ .meta = extra, .log_level = .notice });
+    try std.testing.expectEqualStrings("notice " ++ traceparent ++ " y", seen.content[0].text.text);
+
+    // The progress token of the SDK stays in place next to the extra entries.
+    var rec: Recorder = .{};
+    const sum = try f.client.callTool(arena, "add", .{ .a = 1, .b = 2 }, .{ .meta = extra, .on_progress = Recorder.onProgress, .userdata = &rec });
+    try std.testing.expectEqualStrings("3", sum.content[0].text.text);
+    try std.testing.expectEqual(1, rec.progress);
+
+    // A key that the SDK owns, or a key that breaks the grammar, fails the request before
+    // the client sends it.
+    read_count.store(0, .monotonic);
+    const refused = [_][]const u8{
+        "io.modelcontextprotocol/logLevel",
+        "progressToken",
+        "io.modelcontextprotocol/protocolVersion",
+        "io.modelcontextprotocol/clientInfo",
+        "io.modelcontextprotocol/clientCapabilities",
+        "io.modelcontextprotocol/subscriptionId",
+        "bad key",
+        "com.example/",
+        "1com.example/x",
+    };
+    for (refused) |key| {
+        var bad: std.json.ObjectMap = .empty;
+        try bad.put(arena, "traceparent", .{ .string = traceparent });
+        try bad.put(arena, key, .{ .string = "debug" });
+        try std.testing.expectError(error.InvalidMeta, f.client.callTool(arena, "inspect_meta", null, .{ .meta = bad }));
+        try std.testing.expectError(error.InvalidMeta, f.client.readResource(arena, "test://counted", .{ .meta = bad }));
+    }
+    try std.testing.expectEqual(0, read_count.load(.monotonic));
 }
 
 fn exampleServerPath() []const u8 {

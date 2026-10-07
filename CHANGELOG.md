@@ -4,6 +4,16 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- `RequestOptions.log_level`: the log level of one request. It replaces `Options.log_level` of the client. The client also sends it when `Options.log_level` is null.
+- `RequestOptions.meta`: more `_meta` entries for one request, for example `traceparent`, `tracestate`, `baggage` or a key with a vendor prefix. Before the client sends the request, it checks each key. A key that breaks the key grammar, or a key that the SDK owns, gives the new error `error.InvalidMeta` of `Client.RequestError`. The client sends nothing then. The client accepts the keys of extensions under `io.modelcontextprotocol/`. The entries of the SDK always have priority.
+- `meta.sdk_owned_request_keys` and `meta.isSdkOwnedRequestKey`: the request keys that the SDK owns. They are the protocol version, the client information, the client capabilities, the log level, the subscription id and the progress token.
+
+### Fixed
+
+- The doc comments of `RequestOptions.on_log`, `RequestOptions.on_notification` and `Hooks.on_notification` tell which notifications they receive. These callbacks receive only the notifications that the transport routes to a request. Before, the comment of `Hooks.on_notification` said that it receives the notifications that belong to no request on stdio. On the stdio, Unix socket and WebSocket transports, such notifications go to the `on_notification` option of the transport. Log messages of the server are such notifications, because they carry no progress token and no subscription id.
+
 ## [0.3.0] - 2026-09-30
 
 ### Added

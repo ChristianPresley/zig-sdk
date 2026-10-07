@@ -46,6 +46,7 @@ pub const Options = struct {
     hooks: Hooks = .{},
     limits: Limits = .{},
     /// Ask the server for log messages at this level and above (deprecated feature).
+    /// `RequestOptions.log_level` replaces it for one request.
     log_level: ?types.LoggingLevel = null,
     /// The result cache for results that carry a positive `ttlMs`. Off by default.
     cache: cache_mod.Options = .{},
@@ -79,7 +80,10 @@ pub const Hooks = struct {
     sample: ?*const fn (ctx: *HookContext, params: types.CreateMessageRequestParams) anyerror!types.CreateMessageResult = null,
     /// List the roots. Required when `capabilities.roots` declares roots.
     list_roots: ?*const fn (ctx: *HookContext) anyerror![]const types.Root = null,
-    /// A server notification that belongs to no request (stdio only).
+    /// Receives a notification that the transport routes to a request without its own
+    /// `on_notification`, when the notification is not progress or log. A notification that
+    /// belongs to no request goes to the `on_notification` option of the stdio, Unix socket
+    /// or WebSocket client transport.
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
     /// Decode, sanitize or convert a checked icon image. The formats that need a decoder
     /// (GIF, WebP and SVG) pass only when this hook is set and the icon policy turns them on.
@@ -109,9 +113,28 @@ pub const RequestOptions = struct {
     max_total_timeout: ?Io.Duration = null,
     cancel: ?*Transport.CancelToken = null,
     on_progress: ?*const fn (userdata: ?*anyopaque, params: types.ProgressNotificationParams) void = null,
+    /// Receives the log messages that the transport routes to this request. The stdio, Unix
+    /// socket and WebSocket transports route a notification only by its progress token or its
+    /// subscription id. A log message of the server has neither. Thus on these transports, log
+    /// messages go to the `on_notification` option of the transport and not to this callback.
     on_log: ?*const fn (userdata: ?*anyopaque, params: types.LoggingMessageNotificationParams) void = null,
-    /// Any notification on the request stream that is not progress or log.
+    /// Receives each notification that the transport routes to this request, when the
+    /// notification is not progress or log.
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
+    /// The log level for this request. It replaces `Options.log_level`. The client sends it in
+    /// `_meta` also when `Options.log_level` is null.
+    log_level: ?types.LoggingLevel = null,
+    /// More `_meta` entries for this request, for example `traceparent`, `tracestate`,
+    /// `baggage` or a key with a vendor prefix. The client writes these entries first and its
+    /// own entries after them, thus the entries of the SDK always have priority. The result
+    /// cache ignores `_meta`.
+    ///
+    /// Before the client sends the request, it checks each key. A key that breaks the key
+    /// grammar of the specification gives `error.InvalidMeta`. A key that the SDK owns
+    /// (`meta.sdk_owned_request_keys`) also gives `error.InvalidMeta`. Use `log_level` to set
+    /// the log level. The client accepts the other keys under `io.modelcontextprotocol/`,
+    /// because extensions define keys there.
+    meta: ?std.json.ObjectMap = null,
     /// Return an `InputRequiredResult` to the caller. The client does not call the hooks.
     allow_input_required: bool = false,
     /// Return the `CreateTaskResult` of a `tools/call` in `Response.task`. The client does not
@@ -156,6 +179,9 @@ pub const RequestError = error{
     /// The transport cannot send the request. For example, an argument for a mirrored
     /// header is an integer outside the safe range of JavaScript.
     InvalidRequest,
+    /// A key of `RequestOptions.meta` breaks the key grammar of `_meta`, or the SDK owns the
+    /// key. The client sends nothing.
+    InvalidMeta,
 };
 
 pub fn init(gpa: Allocator, io: Io, options: Options) Client {
@@ -630,6 +656,7 @@ fn dispatchNotification(self: *Client, method_name: []const u8, params: ?Value, 
 fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: Value, options: RequestOptions, known: ?methods.Method) RequestError!Raw {
     const transport = self.transport orelse return error.NotConnected;
     if (params != .object) return error.InvalidResponse;
+    try checkExtraMeta(options.meta);
     var own_token: Transport.CancelToken = .{};
     const cancel = options.cancel orelse &own_token;
     const is_listen = if (known) |m| m == .@"subscriptions/listen" else std.mem.eql(u8, method_name, "subscriptions/listen");
@@ -656,7 +683,7 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
     while (round < self.options.limits.mrtr_max_rounds_client) : (round += 1) {
         const id: RequestId = .{ .integer = self.next_id.fetchAdd(1, .monotonic) };
         var object = try cloneObject(arena, params.object);
-        try object.put(arena, "_meta", try self.buildMeta(arena, id));
+        try object.put(arena, "_meta", try self.buildMeta(arena, id, options));
         if (input_responses) |ir| try object.put(arena, "inputResponses", .{ .object = ir });
         if (request_state) |rs| try object.put(arena, "requestState", .{ .string = rs });
         const full: Value = .{ .object = object };
@@ -883,12 +910,28 @@ fn contentMatches(self: *Client, arena: Allocator, form: types.ElicitRequestForm
     return report.valid;
 }
 
-fn buildMeta(self: *Client, arena: Allocator, id: RequestId) Allocator.Error!Value {
+/// Check the keys of `RequestOptions.meta`: each key obeys the key grammar, and the SDK does
+/// not own it.
+fn checkExtraMeta(extra: ?std.json.ObjectMap) error{InvalidMeta}!void {
+    const entries = extra orelse return;
+    for (entries.keys()) |key| {
+        meta_mod.validateKey(key) catch return error.InvalidMeta;
+        if (meta_mod.isSdkOwnedRequestKey(key)) return error.InvalidMeta;
+    }
+}
+
+fn buildMeta(self: *Client, arena: Allocator, id: RequestId, options: RequestOptions) Allocator.Error!Value {
     var m: std.json.ObjectMap = .empty;
+    // The entries of the caller come first. The entries of the SDK replace an entry with the
+    // same key.
+    if (options.meta) |extra| {
+        var it = extra.iterator();
+        while (it.next()) |kv| try m.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+    }
     try m.put(arena, meta_mod.key_protocol_version, .{ .string = version.version });
     try m.put(arena, meta_mod.key_client_info, try toValue(arena, self.options.info));
     try m.put(arena, meta_mod.key_client_capabilities, try toValue(arena, self.options.capabilities));
-    if (self.options.log_level) |level| try m.put(arena, meta_mod.key_log_level, .{ .string = @tagName(level) });
+    if (options.log_level orelse self.options.log_level) |level| try m.put(arena, meta_mod.key_log_level, .{ .string = @tagName(level) });
     try m.put(arena, meta_mod.key_progress_token, switch (id) {
         .integer => |i| .{ .integer = i },
         .string => |s| .{ .string = s },
@@ -918,4 +961,32 @@ pub fn toValue(arena: Allocator, value: anytype) Allocator.Error!Value {
         error.OutOfMemory => return error.OutOfMemory,
         else => unreachable, // the SDK wrote it
     };
+}
+
+test "the entries of the SDK replace extra _meta entries with the same key" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var client: Client = .init(gpa, std.testing.io, .{ .info = .{ .name = "cli", .version = "1" }, .log_level = .warning });
+    defer client.deinit();
+
+    var extra: std.json.ObjectMap = .empty;
+    try extra.put(arena, "traceparent", .{ .string = "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01" });
+    try extra.put(arena, meta_mod.key_protocol_version, .{ .string = "2025-11-25" });
+    try extra.put(arena, meta_mod.key_log_level, .{ .string = "emergency" });
+    try extra.put(arena, meta_mod.key_progress_token, .{ .string = "other" });
+    // The request refuses these keys before it calls buildMeta. buildMeta is the second
+    // line of defense.
+    try std.testing.expectError(error.InvalidMeta, checkExtraMeta(extra));
+
+    const m = try client.buildMeta(arena, .{ .integer = 7 }, .{ .meta = extra, .log_level = .debug });
+    try std.testing.expectEqualStrings(version.version, json.getString(m, meta_mod.key_protocol_version).?);
+    try std.testing.expectEqualStrings("debug", json.getString(m, meta_mod.key_log_level).?);
+    try std.testing.expectEqual(@as(i64, 7), m.object.get(meta_mod.key_progress_token).?.integer);
+    try std.testing.expect(json.getString(m, "traceparent") != null);
+
+    // Without the override, `Options.log_level` applies.
+    const plain = try client.buildMeta(arena, .{ .integer = 8 }, .{});
+    try std.testing.expectEqualStrings("warning", json.getString(plain, meta_mod.key_log_level).?);
 }

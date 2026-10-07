@@ -13,6 +13,25 @@ pub const key_subscription_id = "io.modelcontextprotocol/subscriptionId";
 pub const key_server_info = "io.modelcontextprotocol/serverInfo";
 pub const key_progress_token = "progressToken";
 
+/// The request keys that the SDK owns. The client writes them or routes notifications by them.
+/// `RequestOptions.meta` of the client cannot set them. The other keys under
+/// `io.modelcontextprotocol/` are not in this list, because extensions define keys there.
+pub const sdk_owned_request_keys = [_][]const u8{
+    key_protocol_version,
+    key_client_info,
+    key_client_capabilities,
+    key_log_level,
+    key_subscription_id,
+    key_progress_token,
+};
+
+/// True when `key` is one of `sdk_owned_request_keys`. The comparison is case-sensitive, as
+/// JSON keys are.
+pub fn isSdkOwnedRequestKey(key: []const u8) bool {
+    for (sdk_owned_request_keys) |owned| if (std.mem.eql(u8, owned, key)) return true;
+    return false;
+}
+
 /// The lifted per-request envelope.
 pub const RequestMeta = struct {
     protocol_version: []const u8,
@@ -109,6 +128,14 @@ test "meta key grammar" {
     try std.testing.expect(isReservedPrefix("io.modelcontextprotocol/protocolVersion"));
     try std.testing.expect(isReservedPrefix("org.mcp/x"));
     try std.testing.expect(!isReservedPrefix("com.example/x"));
+}
+
+test "the SDK owns its request keys and no other key of the prefix" {
+    for (sdk_owned_request_keys) |key| try std.testing.expect(isSdkOwnedRequestKey(key));
+    try std.testing.expect(!isSdkOwnedRequestKey("io.modelcontextprotocol/ui"));
+    try std.testing.expect(!isSdkOwnedRequestKey("io.modelcontextprotocol/LogLevel"));
+    try std.testing.expect(!isSdkOwnedRequestKey("traceparent"));
+    try std.testing.expect(!isSdkOwnedRequestKey("com.example/x"));
 }
 
 test "lift envelope" {
