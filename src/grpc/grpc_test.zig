@@ -79,6 +79,8 @@ const Fixture = struct {
     server: mcp.Server,
     transport: grpc_server.Server,
     future: Io.Future(void),
+    /// Set when `serve` returns.
+    served: Io.Event,
     channel: *grpc_client.Channel,
     client: Client,
 
@@ -100,7 +102,8 @@ const Fixture = struct {
         _ = self.server.setToolEnabled(io, "hidden", false);
         self.transport = .init(io, gpa, &self.server, .{ .port = 0, .tls = server_tls });
         try self.transport.bind();
-        self.future = try io.concurrent(serveIgnoringErrors, .{&self.transport});
+        self.served = .unset;
+        self.future = try io.concurrent(serveIgnoringErrors, .{self});
         self.channel = try grpc_client.Channel.init(io, gpa, .{ .host = "127.0.0.1", .port = self.transport.bound_port, .tls = client_tls });
         self.client = .init(gpa, io, .{
             .info = .{ .name = "cli", .version = "1" },
@@ -110,8 +113,9 @@ const Fixture = struct {
         self.client.connect(self.channel.transport());
     }
 
-    fn serveIgnoringErrors(t: *grpc_server.Server) void {
-        t.serve() catch {};
+    fn serveIgnoringErrors(self: *Fixture) void {
+        defer self.served.set(std.testing.io);
+        self.transport.serve() catch {};
     }
 
     fn stop(self: *Fixture) void {
@@ -119,7 +123,9 @@ const Fixture = struct {
         self.client.deinit();
         self.channel.deinit();
         self.transport.shutdown();
-        self.future.await(io);
+        // After `wait_limit`, the cancel stops the connections of the server.
+        connection_test.waitSet(io, &self.served) catch {};
+        self.future.cancel(io);
         self.transport.deinit();
         self.server.deinit();
     }
@@ -280,14 +286,27 @@ fn rawCallWith(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, cont
     const conn = try Connection.init(gpa, io, &reader.interface, &writer.interface, .{ .role = .client });
     defer conn.deinit();
     try conn.handshake();
-    var run_future = try io.concurrent(Connection.run, .{conn});
+    var run_task: connection_test.RunTask = .{};
+    try run_task.start(io, conn);
     defer {
         conn.shutdown();
         stream.shutdown(io, .send) catch {};
-        run_future.await(io);
+        run_task.finish(io);
     }
     const h2 = try conn.openStream();
     defer h2.close();
+    // The reset of the watchdog ends each wait on the stream after `wait_limit`.
+    var watchdog: connection_test.Watchdog = .{ .stream = h2 };
+    try watchdog.start(io);
+    const result = rawExchange(gpa, io, h2, path, content_type, metadata, body, options);
+    watchdog.finish(io) catch |err| {
+        if (result) |r| freeRaw(gpa, r) else |_| {}
+        return err;
+    };
+    return result;
+}
+
+fn rawExchange(gpa: std.mem.Allocator, io: Io, h2: *Connection.Stream, path: []const u8, content_type: []const u8, metadata: []const Connection.Header, body: []const u8, options: RawOptions) !RawCall {
     var headers: std.ArrayList(Connection.Header) = .empty;
     defer headers.deinit(gpa);
     try headers.appendSlice(gpa, &.{
@@ -314,6 +333,7 @@ fn rawCallWith(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, cont
         .error_code = null,
         .error_bin = null,
     };
+    errdefer freeRaw(gpa, result);
     var source = response;
     if (Connection.findHeader(response, "grpc-status") == null) {
         while (try lpm.read(h2, gpa, 1 << 20)) |payload| gpa.free(payload);
