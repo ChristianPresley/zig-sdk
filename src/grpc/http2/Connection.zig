@@ -646,14 +646,18 @@ pub const Stream = struct {
         self.destroy();
     }
 
-    /// Reset the stream with `cancel`. The owner still calls `close`.
+    /// Reset the stream with `cancel`. Each task that waits on the stream wakes and sees the
+    /// reset. The owner still calls `close`.
     pub fn cancel(self: *Stream) void {
         const conn = self.conn;
         conn.lock.lockUncancelable(conn.io);
         const already = self.reset != null or conn.closed or self.id == 0;
         self.reset = self.reset orelse .cancel;
+        // A waiter can close the stream when it wakes, thus keep the id for the reset frame.
+        const id = self.id;
+        conn.cond.broadcast(conn.io);
         conn.lock.unlock(conn.io);
-        if (!already) conn.sendRst(self.id, .cancel);
+        if (!already) conn.sendRst(id, .cancel);
     }
 
     fn checkOpen(self: *const Stream) Error!void {
@@ -802,7 +806,8 @@ pub const Stream = struct {
         return self.trailers.items;
     }
 
-    /// Wait until the peer reset the stream or the connection ended.
+    /// Wait until the stream got a reset or the connection ended. The reset can come from the
+    /// peer or from this side, for example from `cancel`.
     pub fn waitCancelled(self: *Stream) Error!void {
         const conn = self.conn;
         conn.lock.lockUncancelable(conn.io);

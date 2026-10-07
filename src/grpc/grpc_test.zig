@@ -9,6 +9,7 @@ const Client = mcp.Client;
 const grpc_server = @import("transport/grpc_server.zig");
 const grpc_client = @import("transport/grpc_client.zig");
 const Connection = @import("http2/Connection.zig");
+const connection_test = @import("http2/connection_test.zig");
 const ErrorCode = @import("http2/frame.zig").ErrorCode;
 const lpm = @import("grpc/lpm.zig");
 const messages = @import("protobuf/messages.zig");
@@ -300,9 +301,7 @@ fn rawCallWith(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, cont
     try headers.appendSlice(gpa, metadata);
     try h2.sendHeaders(headers.items, false);
     if (options.after_answer) {
-        _ = try h2.waitEnd();
-        try h2.waitCancelled();
-        try std.testing.expectEqual(@as(?ErrorCode, .no_error), h2.wasReset());
+        try std.testing.expectEqual(@as(?ErrorCode, .no_error), try connection_test.waitAnswer(io, h2));
     }
     var msg: std.ArrayList(u8) = .empty;
     defer msg.deinit(gpa);
