@@ -13,6 +13,9 @@
 //! `error.InvalidFrame`. Thus the request does not wait until its timeout. Examples are a
 //! line over the length limit and a line that is not valid UTF-8. Other examples are a frame
 //! that is not a JSON-RPC message and an error response with a null id.
+//!
+//! The server can still run a request that fails in this way. Thus the transport then sends
+//! `notifications/cancelled` for it. A server ignores a cancellation for a request that ended.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -24,6 +27,10 @@ const RequestId = jsonrpc.RequestId;
 const Transport = @import("Transport.zig");
 
 const log = std.log.scoped(.mcp_router);
+
+/// The reason of the `notifications/cancelled` that a transport sends for a request that fails
+/// with `error.InvalidFrame`.
+pub const invalid_frame_reason = "invalid frame";
 
 /// Receives each notification that has no progress token and no subscription id, for example
 /// a log message of the server during a request. The router drops a notification whose
@@ -57,6 +64,14 @@ pub const Router = struct {
         /// notification, or the router could not read a frame of the request. The router then
         /// drops the next frames of the request. `lock` guards it.
         failed: bool = false,
+        /// True after the transport started to write the frame of the request. The transport
+        /// sets it under its write lock. Only such a request can get an error response with a
+        /// null id.
+        written: std.atomic.Value(bool) = .init(false),
+        /// True after the router routed a frame of the server to the request, for example the
+        /// acknowledgment of a listen stream or a progress notification. Thus the server knows
+        /// the id of the request. The router lock guards it.
+        routed: bool = false,
         lock: Io.Mutex = .init,
         /// The reader task holds this lock while it gives a notification to `inline_exchange`.
         /// `unregister` waits for it, thus the reader task does not use the exchange after the
@@ -177,13 +192,23 @@ pub const Router = struct {
         return .{ .unknown_id = id };
     }
 
-    /// Make the request in flight fail when it is the only one. A response without a usable
-    /// id can belong to any request in flight. The outcome has a copy of the id in `arena`.
+    /// Make a request fail for a response without a usable id, when only one request can get
+    /// it. The server gives a null id when it cannot read the id of a request. Thus such a
+    /// response can belong only to a request that the transport wrote and that got no frame
+    /// from the server. An example of the other requests is a listen stream after its
+    /// acknowledgment. The outcome has a copy of the id in `arena`.
     fn failOnly(self: *Router, arena: Allocator) Outcome {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
-        if (self.pending.items.len != 1) return .{ .ambiguous = self.pending.items.len };
-        const p = self.pending.items[0];
+        var only: ?*Pending = null;
+        var count: usize = 0;
+        for (self.pending.items) |p| {
+            if (!p.written.load(.acquire) or p.routed) continue;
+            only = p;
+            count += 1;
+        }
+        if (count != 1) return .{ .ambiguous = count };
+        const p = only.?;
         const id = p.id.dupe(arena) catch return .{ .ambiguous = 1 };
         self.fail(p);
         return .{ .failed = id };
@@ -191,8 +216,9 @@ pub const Router = struct {
 
     /// Drop a frame that the router cannot read, and make its request fail. `scan` has the
     /// top-level members of the frame. The router finds the request by the "id" member. A
-    /// frame with "result" or "error" but without a usable id fails the only request in
-    /// flight. A frame with "method" is a notification or a request, and fails nothing.
+    /// frame with "result" or "error" but without a usable id fails a request only as
+    /// `failOnly` tells. A frame with "method" is a notification or a request, and fails
+    /// nothing.
     fn dropUnreadable(self: *Router, arena: Allocator, what: What, scan: *const framer.TopLevelScanner) void {
         // Count before the request wakes, thus its task sees the count.
         self.countDrop();
@@ -234,6 +260,7 @@ pub const Router = struct {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
             for (self.pending.items) |p| if (p.id.eql(id)) {
+                p.routed = true;
                 if (kind == .response or p.inline_exchange == null) {
                     self.push(p, line);
                     return;
@@ -313,8 +340,8 @@ pub const Router = struct {
     /// requests in this revision. `arena` holds the parsed message only.
     ///
     /// A frame that is not a JSON-RPC message makes the request with its top-level "id" fail.
-    /// An error response with a null id makes the request in flight fail when it is the only
-    /// one.
+    /// An error response with a null id makes a request fail when only one request can get it.
+    /// See `failOnly`.
     pub fn deliver(self: *Router, arena: Allocator, frame: []const u8, on_notification: ?NotificationFn, userdata: ?*anyopaque) void {
         const msg = jsonrpc.Message.parse(arena, frame) catch {
             var scan: framer.TopLevelScanner = .{};
@@ -370,8 +397,9 @@ const Outcome = union(enum) {
     unknown_id: RequestId,
     /// The request of the frame is not in flight.
     not_in_flight,
-    /// This number of requests is in flight. Thus the router cannot find the request of a
-    /// frame without a usable id.
+    /// This number of requests can get a frame without a usable id: the transport wrote them,
+    /// and they got no frame from the server. Thus the router cannot find the request of the
+    /// frame, or no request can get it.
     ambiguous: usize,
     /// The frame has a "method" member, thus it is not a response.
     notification,
@@ -402,7 +430,10 @@ const DropNote = struct {
             .failed => |id| try w.print(": request {f} fails", .{IdText{ .id = id }}),
             .unknown_id => |id| try w.print(": no request in flight has the id {f}", .{IdText{ .id = id }}),
             .not_in_flight => try w.writeAll(": the request is not in flight"),
-            .ambiguous => |count| try w.print(": {d} requests are in flight, thus the request of the frame is not known", .{count}),
+            .ambiguous => |count| if (count == 0)
+                try w.writeAll(": no request in flight waits for its first frame")
+            else
+                try w.print(": {d} requests in flight wait for their first frame, thus the request of the frame is not known", .{count}),
             .notification => try w.writeAll(": the frame is not a response"),
         }
     }
@@ -650,7 +681,7 @@ test "a frame that the router cannot read makes the request with its id fail" {
         .{ .line = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"message\":\"" ++ "x" ** 2000 ++ "\"}}", .fails = null },
         // A line that is not JSON, for example a log line of the server on the wrong stream.
         .{ .line = "server started", .fails = null },
-        // An error response with a null id, while two requests are in flight.
+        // An error response with a null id, while two requests wait for their first frame.
         .{ .line = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}", .fails = null },
         // A response of a request that is not in flight, for example after its timeout.
         .{ .line = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}", .fails = null },
@@ -660,9 +691,9 @@ test "a frame that the router cannot read makes the request with its id fail" {
     for (cases) |case| for ([_]bool{ false, true }) |small_buffer| {
         var router: Router = .init(io, gpa, 64);
         defer router.deinit();
-        var a: Router.Pending = .{ .id = .{ .integer = 1 } };
+        var a: Router.Pending = .{ .id = .{ .integer = 1 }, .written = .init(true) };
         defer a.deinit(gpa);
-        var b: Router.Pending = .{ .id = .{ .integer = 2 } };
+        var b: Router.Pending = .{ .id = .{ .integer = 2 }, .written = .init(true) };
         defer b.deinit(gpa);
         try router.register(&a);
         defer router.unregister(&a);
@@ -689,25 +720,26 @@ test "a frame that the router cannot read makes the request with its id fail" {
     };
 }
 
-test "an error response with a null id makes the request fail when it is the only one" {
+const null_id_error = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}\n";
+
+test "an error response with a null id makes a request fail when only that request waits for its first frame" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var router: Router = .init(io, gpa, 64);
     defer router.deinit();
-    var p: Router.Pending = .{ .id = .{ .string = "only" } };
+    var p: Router.Pending = .{ .id = .{ .string = "only" }, .written = .init(true) };
     defer p.deinit(gpa);
     try router.register(&p);
     defer router.unregister(&p);
-    // A progress notification before the error still gets to the request.
-    routeText(&router,
-        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"only","progress":1}}
-        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
-        \\
-    , false);
-    const progress = (try router.takeFrame(&p)).?;
-    defer gpa.free(progress);
-    try std.testing.expect(!frameIsResponse(progress));
+    // A request that the transport did not write yet, for example while another request
+    // holds the output, cannot get the error.
+    var queued: Router.Pending = .{ .id = .{ .integer = 2 } };
+    defer queued.deinit(gpa);
+    try router.register(&queued);
+    defer router.unregister(&queued);
+    routeText(&router, null_id_error, false);
     try std.testing.expectError(error.InvalidFrame, router.takeFrame(&p));
+    try std.testing.expect(try router.takeFrame(&queued) == null);
     try std.testing.expectEqual(1, router.dropped_frames.load(.monotonic));
 
     // A frame with a string id that has an escape sequence finds its request too.
@@ -719,6 +751,42 @@ test "an error response with a null id makes the request fail when it is the onl
     try std.testing.expectError(error.InvalidFrame, router.takeFrame(&q));
 }
 
+test "an error response with a null id does not fail a request that got a frame" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var router: Router = .init(io, gpa, 64);
+    defer router.deinit();
+    // A listen stream after its acknowledgment, and a request after a progress notification.
+    // The server knows the ids of both, thus the error is about another frame, for example a
+    // notification of the client.
+    var listen: Router.Pending = .{ .id = .{ .integer = 1 }, .written = .init(true) };
+    defer listen.deinit(gpa);
+    try router.register(&listen);
+    defer router.unregister(&listen);
+    var call: Router.Pending = .{ .id = .{ .integer = 2 }, .written = .init(true) };
+    defer call.deinit(gpa);
+    try router.register(&call);
+    defer router.unregister(&call);
+    routeText(&router,
+        \\{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":1},"notifications":{}}}
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":2,"progress":1}}
+        \\
+    ++ null_id_error ++
+        \\{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":1}}}
+        \\{"jsonrpc":"2.0","id":2,"result":{}}
+        \\
+    , false);
+    try std.testing.expectEqual(1, router.dropped_frames.load(.monotonic));
+    // Both requests get their frames after the error.
+    for ([_]*Router.Pending{ &listen, &call }) |p| {
+        for (0..2) |_| {
+            const frame = (try router.takeFrame(p)).?;
+            gpa.free(frame);
+        }
+        try std.testing.expect(try router.takeFrame(p) == null);
+    }
+}
+
 test "the warning of a dropped frame has the reason and a short request id only" {
     var buf: [256]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
@@ -726,7 +794,10 @@ test "the warning of a dropped frame has the reason and a short request id only"
     try std.testing.expectEqualStrings("dropped a frame longer than 1024 bytes: request 7 fails", w.buffered());
     w = .fixed(&buf);
     try w.print("{f}", .{DropNote{ .what = .{ .null_id_error = -32700 }, .outcome = .{ .ambiguous = 2 } }});
-    try std.testing.expectEqualStrings("dropped an error response with the code -32700 and a null id: 2 requests are in flight, thus the request of the frame is not known", w.buffered());
+    try std.testing.expectEqualStrings("dropped an error response with the code -32700 and a null id: 2 requests in flight wait for their first frame, thus the request of the frame is not known", w.buffered());
+    w = .fixed(&buf);
+    try w.print("{f}", .{DropNote{ .what = .{ .null_id_error = -32700 }, .outcome = .{ .ambiguous = 0 } }});
+    try std.testing.expectEqualStrings("dropped an error response with the code -32700 and a null id: no request in flight waits for its first frame", w.buffered());
     // The server sets the text of a string id. The note shortens it and replaces control
     // characters.
     w = .fixed(&buf);

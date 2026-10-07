@@ -426,17 +426,20 @@ pub const Client = struct {
         .notify = notify,
     };
 
-    fn writeFrame(self: *Client, frame: []const u8) Transport.SendError!void {
+    /// Write one frame. `pending` is the request of the frame, or null for a notification. The
+    /// function marks the request as written under `out_lock`, before the frame goes out.
+    fn writeFrame(self: *Client, frame: []const u8, pending: ?*Router.Pending) Transport.SendError!void {
         if (self.closed.load(.acquire)) return error.Closed;
         self.out_lock.lockUncancelable(self.io);
         defer self.out_lock.unlock(self.io);
+        if (pending) |p| p.written.store(true, .release);
         framer.writeFrame(&self.stream_writer.interface, frame) catch return error.WriteFailed;
     }
 
     fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
         _ = io;
         const self: *Client = @ptrCast(@alignCast(ptr));
-        return self.writeFrame(frame);
+        return self.writeFrame(frame, null);
     }
 
     fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
@@ -445,7 +448,7 @@ pub const Client = struct {
         defer pending.deinit(self.gpa);
         try self.router.register(&pending);
         defer self.router.unregister(&pending);
-        self.writeFrame(ex.frame) catch |e| switch (e) {
+        self.writeFrame(ex.frame, &pending) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
             error.WriteFailed => return error.WriteFailed,
@@ -453,10 +456,13 @@ pub const Client = struct {
         };
         while (true) {
             // Deliver everything that arrived.
-            while (try self.router.takeFrame(&pending)) |frame| {
+            while (self.router.takeFrame(&pending) catch return self.cancelFailed(ex.id)) |frame| {
                 defer self.gpa.free(frame);
                 const is_response = router_mod.frameIsResponse(frame);
-                ex.deliver(io, frame) catch return error.InvalidFrame;
+                ex.deliver(io, frame) catch {
+                    if (is_response) return error.InvalidFrame;
+                    return self.cancelFailed(ex.id);
+                };
                 if (is_response) return;
             }
             if (ex.cancel.isCancelled()) {
@@ -481,7 +487,14 @@ pub const Client = struct {
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var aw: Io.Writer.Allocating = .init(fba.allocator());
         message.writeNotification(&aw.writer, "notifications/cancelled", types.CancelledNotificationParams{ .requestId = id, .reason = reason }) catch return;
-        self.writeFrame(aw.written()) catch {};
+        self.writeFrame(aw.written(), null) catch {};
+    }
+
+    /// End a request that fails because the client cannot read a frame of it. The server can
+    /// still run the request, thus the function sends `notifications/cancelled` for it.
+    fn cancelFailed(self: *Client, id: RequestId) error{InvalidFrame} {
+        self.sendCancelled(id, router_mod.invalid_frame_reason);
+        return error.InvalidFrame;
     }
 
     fn readerLoop(self: *Client) void {

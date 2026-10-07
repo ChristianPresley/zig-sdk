@@ -930,6 +930,13 @@ test "a request that got an inline notification does not retry a lost stream" {
 
 // -- Frames that the client cannot read ---------------------------------------------------------
 
+/// A child that reads one line and writes the file `events.jsonl` of its current directory to
+/// its standard output. Then it writes the next line of its input to the file `next.txt`.
+const record_argv: []const []const u8 = if (builtin.os.tag == .windows)
+    &.{ "cmd.exe", "/d", "/v:on", "/c", "set", "/p", "line=&type", "events.jsonl&set", "/p", "line=&echo", "!line!>next.txt" }
+else
+    &.{ "/bin/sh", "-c", "read -r line; cat events.jsonl; read -r line; printf '%s\\n' \"$line\" > next.txt" };
+
 test "a frame that the stdio client cannot read makes its request fail at once" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -950,7 +957,7 @@ test "a frame that the stdio client cannot read makes its request fail at once" 
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         try tmp.dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = answer });
-        const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = replay_argv, .cwd = .{ .dir = tmp.dir }, .limits = limits }) catch return error.SkipZigTest;
+        const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = record_argv, .cwd = .{ .dir = tmp.dir }, .limits = limits }) catch return error.SkipZigTest;
         defer proc.deinit();
         var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" }, .limits = limits });
         defer client.deinit();
@@ -963,5 +970,12 @@ test "a frame that the stdio client cannot read makes its request fail at once" 
         try std.testing.expectError(error.InvalidResponse, client.callTool(arena_state.allocator(), "t", null, .{ .timeout = .fromSeconds(30) }));
         try std.testing.expect(start.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds < std.time.ns_per_s * 20);
         try std.testing.expectEqual(1, proc.router.dropped_frames.load(.monotonic));
+
+        // The server can still run the request, thus the client cancels it.
+        proc.close();
+        const next = try tmp.dir.readFileAlloc(io, "next.txt", gpa, .limited(4096));
+        defer gpa.free(next);
+        try std.testing.expect(std.mem.find(u8, next, "\"method\":\"notifications/cancelled\"") != null);
+        try std.testing.expect(std.mem.find(u8, next, "\"requestId\":1,\"reason\":\"invalid frame\"") != null);
     }
 }

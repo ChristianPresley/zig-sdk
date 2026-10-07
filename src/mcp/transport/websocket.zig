@@ -1008,14 +1008,14 @@ pub const Client = struct {
         defer pending.deinit(self.gpa);
         try self.router.register(&pending);
         defer self.router.unregister(&pending);
-        self.send(gen, ex.frame) catch |e| return switch (e) {
+        self.send(gen, ex.frame, &pending) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.Canceled => error.Canceled,
             error.Closed => error.Closed,
             error.WriteFailed => error.WriteFailed,
         };
         while (true) {
-            if (try self.drain(io, &pending, ex)) return;
+            if (try self.drain(io, gen, &pending, ex)) return;
             if (ex.cancel.isCancelled()) {
                 self.sendCancelled(gen, ex.id, ex.cancel.reason);
                 return error.Canceled;
@@ -1026,7 +1026,7 @@ pub const Client = struct {
             }
             if (self.live.load(.acquire) != gen) {
                 // A response that arrived before the end of the connection still counts.
-                if (try self.drain(io, &pending, ex)) return;
+                if (try self.drain(io, gen, &pending, ex)) return;
                 return error.Closed;
             }
             pending.event.waitTimeout(io, .{ .duration = .{ .raw = self.options.poll_interval, .clock = .awake } }) catch |e| switch (e) {
@@ -1037,15 +1037,25 @@ pub const Client = struct {
         }
     }
 
-    /// Deliver the frames that arrived. True after the response.
-    fn drain(self: *Client, io: Io, pending: *Router.Pending, ex: *Transport.Exchange) Transport.ExchangeError!bool {
-        while (try self.router.takeFrame(pending)) |f| {
+    /// Deliver the frames that arrived. True after the response. When the request fails
+    /// because the client cannot read a frame of it, the server can still run the request.
+    /// Thus the function then sends `notifications/cancelled` on the connection `gen`.
+    fn drain(self: *Client, io: Io, gen: u32, pending: *Router.Pending, ex: *Transport.Exchange) Transport.ExchangeError!bool {
+        while (self.router.takeFrame(pending) catch return self.cancelFailed(gen, ex.id)) |f| {
             defer self.gpa.free(f);
             const is_response = router_mod.frameIsResponse(f);
-            ex.deliver(io, f) catch return error.InvalidFrame;
+            ex.deliver(io, f) catch {
+                if (is_response) return error.InvalidFrame;
+                return self.cancelFailed(gen, ex.id);
+            };
             if (is_response) return true;
         }
         return false;
+    }
+
+    fn cancelFailed(self: *Client, gen: u32, id: RequestId) error{InvalidFrame} {
+        self.sendCancelled(gen, id, router_mod.invalid_frame_reason);
+        return error.InvalidFrame;
     }
 
     fn notify(ptr: *anyopaque, io: Io, text: []const u8) Transport.SendError!void {
@@ -1058,7 +1068,7 @@ pub const Client = struct {
             error.Closed => error.Closed,
             else => error.WriteFailed,
         };
-        return self.send(gen, text);
+        return self.send(gen, text, null);
     }
 
     fn sendCancelled(self: *Client, gen: u32, id: RequestId, reason: ?[]const u8) void {
@@ -1066,14 +1076,16 @@ pub const Client = struct {
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var aw: Io.Writer.Allocating = .init(fba.allocator());
         message.writeNotification(&aw.writer, "notifications/cancelled", types.CancelledNotificationParams{ .requestId = id, .reason = reason }) catch return;
-        self.send(gen, aw.written()) catch {};
+        self.send(gen, aw.written(), null) catch {};
     }
 
-    /// Write one text message on the connection of generation `gen`.
-    fn send(self: *Client, gen: u32, text: []const u8) Transport.SendError!void {
+    /// Write one text message on the connection of generation `gen`. `pending` is the request
+    /// of the message, or null for a notification. The link marks the request as written under
+    /// its write lock, before the message goes out.
+    fn send(self: *Client, gen: u32, text: []const u8, pending: ?*Router.Pending) Transport.SendError!void {
         const link = self.acquire(gen) orelse return error.Closed;
         defer self.release(link);
-        return link.write(.text, text);
+        return link.write(.text, text, pending);
     }
 
     fn acquire(self: *Client, gen: u32) ?*Link {
@@ -1358,12 +1370,14 @@ const Link = struct {
         link.client.router.wakeAll();
     }
 
-    /// Write one frame with a new mask.
-    fn write(link: *Link, opcode: ws.Opcode, payload: []const u8) Transport.SendError!void {
+    /// Write one frame with a new mask. `pending` is the request of a text message, or null.
+    /// The function marks it as written under `write_lock`, before the frame goes out.
+    fn write(link: *Link, opcode: ws.Opcode, payload: []const u8, pending: ?*Router.Pending) Transport.SendError!void {
         const io = link.client.io;
         link.write_lock.lockUncancelable(io);
         defer link.write_lock.unlock(io);
         if (link.close_sent.load(.acquire) or link.broken) return error.Closed;
+        if (pending) |p| p.written.store(true, .release);
         link.writeLocked(opcode, payload) catch return error.WriteFailed;
     }
 
@@ -1379,7 +1393,7 @@ const Link = struct {
     }
 
     fn sendControl(link: *Link, opcode: ws.Opcode, payload: []const u8) void {
-        link.write(opcode, payload) catch {};
+        link.write(opcode, payload, null) catch {};
     }
 
     fn sendClose(link: *Link, code: ws.CloseCode, reason: []const u8) void {
