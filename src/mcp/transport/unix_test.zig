@@ -322,6 +322,48 @@ test "unix socket client routes the progress of concurrent requests by token" {
     try std.testing.expect(jobs[0].tokens[0] != jobs[1].tokens[0]);
 }
 
+/// Counts the progress callbacks of one request and records whether one of them ran on the
+/// thread of the caller.
+const InlineProgress = struct {
+    caller: std.Thread.Id,
+    calls: u32 = 0,
+    on_caller: bool = false,
+
+    fn onProgress(userdata: ?*anyopaque, params: types.ProgressNotificationParams) void {
+        const self: *InlineProgress = @ptrCast(@alignCast(userdata.?));
+        _ = params;
+        self.calls += 1;
+        if (std.Thread.getCurrentId() == self.caller) self.on_caller = true;
+    }
+};
+
+test "unix socket client calls the progress callback of an inline request on the reader task" {
+    if (!unix.supported) return error.SkipZigTest;
+    var f: Fixture = undefined;
+    try f.start(.{});
+    defer f.stop();
+    var t: *unix.Client = undefined;
+    var client: Client = undefined;
+    try connectClient(f.path, &t, &client);
+    defer t.deinit();
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+
+    var progress: InlineProgress = .{ .caller = std.Thread.getCurrentId() };
+    const result = try client.callTool(arena_state.allocator(), "pulse", null, .{
+        .timeout = .fromSeconds(10),
+        .inline_notifications = true,
+        .on_progress = InlineProgress.onProgress,
+        .userdata = &progress,
+    });
+    try std.testing.expectEqualStrings("pulsed", result.content[0].text.text);
+    // The five callbacks ran before the call returned, and the reader task of the transport
+    // ran them. Without the option, the task of the request runs them.
+    try std.testing.expectEqual(5, progress.calls);
+    try std.testing.expect(!progress.on_caller);
+}
+
 test "unix socket server drops an oversize line and keeps the connection" {
     if (!unix.supported) return error.SkipZigTest;
     const io = std.testing.io;

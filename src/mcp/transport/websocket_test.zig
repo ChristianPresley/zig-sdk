@@ -476,6 +476,46 @@ test "websocket: concurrent requests share one connection and get their own prog
     try std.testing.expectEqual(1, f.transport.connectionCount());
 }
 
+/// Counts the progress callbacks of one request and records whether one of them ran on the
+/// thread of the caller.
+const InlineProgress = struct {
+    caller: std.Thread.Id,
+    calls: u32 = 0,
+    on_caller: bool = false,
+
+    fn onProgress(userdata: ?*anyopaque, params: types.ProgressNotificationParams) void {
+        const self: *InlineProgress = @ptrCast(@alignCast(userdata.?));
+        _ = params;
+        self.calls += 1;
+        if (std.Thread.getCurrentId() == self.caller) self.on_caller = true;
+    }
+};
+
+test "websocket: the client calls the progress callback of an inline request on the reader task" {
+    var f: Fixture = undefined;
+    try f.start(.{}, .{});
+    try f.run();
+    defer f.stop();
+    var c: Connected = undefined;
+    try c.open(.{ .url = f.url("ws") });
+    defer c.close();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+
+    var progress: InlineProgress = .{ .caller = std.Thread.getCurrentId() };
+    const result = try c.client.callTool(arena_state.allocator(), "pulse", null, .{
+        .timeout = .fromSeconds(10),
+        .inline_notifications = true,
+        .on_progress = InlineProgress.onProgress,
+        .userdata = &progress,
+    });
+    try std.testing.expectEqualStrings("pulsed", result.content[0].text.text);
+    // The five callbacks ran before the call returned, and the reader task of the connection
+    // ran them. Without the option, the task of the request runs them.
+    try std.testing.expectEqual(5, progress.calls);
+    try std.testing.expect(!progress.on_caller);
+}
+
 const Recorder = struct {
     events: std.atomic.Value(u32) = .init(0),
     acked: std.atomic.Value(bool) = .init(false),
