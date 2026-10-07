@@ -483,6 +483,8 @@ const GatedStream = struct {
     lock: Io.Mutex = .init,
     order: [4]Kind = undefined,
     count: usize = 0,
+    /// The acknowledgment fails with `error.Closed` after `release`, as on a closed stream.
+    fail_ack: bool = false,
 
     const Kind = enum { ack, event, other };
 
@@ -498,6 +500,7 @@ const GatedStream = struct {
         if (kind == .ack) {
             self.ack_started.set(io);
             try self.release.wait(io);
+            if (self.fail_ack) return error.Closed;
         }
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
@@ -552,6 +555,37 @@ test "an event that the server publishes during the acknowledgment goes out afte
     try std.testing.expectEqual(2, stream.count);
     try std.testing.expectEqual(GatedStream.Kind.ack, stream.order[0]);
     try std.testing.expectEqual(GatedStream.Kind.event, stream.order[1]);
+}
+
+test "an acknowledgment that fails does not block a publish, and the stream gets no event" {
+    const io = std.testing.io;
+    var server = try listChangedServer();
+    defer server.deinit();
+    var stream: GatedStream = .{ .fail_ack = true };
+    var token: Transport.CancelToken = .{};
+    var listen = try io.concurrent(GatedStream.serve, .{ &stream, &server, &token });
+    var listen_done = false;
+    defer if (!listen_done) {
+        stream.release.set(io);
+        listen.await(io);
+    };
+    try std.testing.expect(waitEvent(&stream.ack_started, 4000));
+
+    // The publish holds the lock of the subscriptions and waits for the lock of the stream.
+    var publish = try io.concurrent(Server.notifyToolsListChanged, .{ &server, io });
+    const early = waitEvent(&stream.got_event, 200);
+    // The acknowledgment fails. The listen task unlocks the stream before it removes the
+    // subscription. Thus the publish and the removal do not wait for each other.
+    stream.release.set(io);
+    listen.await(io);
+    listen_done = true;
+    publish.await(io);
+
+    try std.testing.expect(!early);
+    // The publish sends no event on a stream whose acknowledgment did not go out.
+    try std.testing.expectEqual(0, stream.count);
+    try std.testing.expect(!stream.got_event.isSet());
+    try std.testing.expectEqual(0, server.subscriptions.items.len);
 }
 
 /// Publishes `notifications/tools/list_changed` until `stop` is true.
