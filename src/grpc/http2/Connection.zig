@@ -373,18 +373,19 @@ fn finishHeaderBlock(self: *Connection) Error!void {
                 new_stream = s;
             }
         }
-        if (stream) |s| {
+        if (stream) |s| decoded: {
             const arena = s.arena_state.allocator();
             var list: std.ArrayList(Header) = .empty;
             self.decoder.decode(arena, self.hb_buf.items, &list) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.HeaderListTooLarge, error.FieldTooLarge => {
+                    // The reset goes out after the unlock, as on the other paths. The write
+                    // lock comes before `lock` (see `sendHeaders`).
                     reset = .enhance_your_calm;
                     s.reset = .enhance_your_calm;
-                    self.cond.broadcast(self.io);
                     new_stream = null;
-                    self.hb_buf.clearRetainingCapacity();
-                    return self.finishReset(stream_id, reset);
+                    self.cond.broadcast(self.io);
+                    break :decoded;
                 },
                 else => return error.ProtocolError, // a compression error ends the connection
             };
@@ -416,10 +417,6 @@ fn finishHeaderBlock(self: *Connection) Error!void {
     self.hb_buf.clearRetainingCapacity();
     if (reset) |code| self.sendRst(stream_id, code);
     if (new_stream) |s| if (self.options.on_stream) |f| f(self.options.userdata, s);
-}
-
-fn finishReset(self: *Connection, stream_id: u31, reset: ?frame.ErrorCode) Error!void {
-    if (reset) |code| self.sendRst(stream_id, code);
 }
 
 /// Decode a block that goes nowhere, to keep the dynamic table in sync.

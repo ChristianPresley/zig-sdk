@@ -258,7 +258,8 @@ const Side = struct {
 ///
 /// On the path "/hold", the server reads the request, waits for the reset of the client and
 /// then tries to answer. On the path "/wait", the server waits until the stream gets a reset.
-/// The test resets the stream with `cancel` from its own task.
+/// The test resets the stream with `cancel` from its own task. On the path "/large", the
+/// response headers are larger than `large_header_len`.
 const EchoServer = struct {
     side: Side,
     group: Io.Group = .init,
@@ -293,6 +294,11 @@ const EchoServer = struct {
         const path = Connection.findHeader(headers, ":path") orelse "";
         if (std.mem.eql(u8, path, "/refuse")) {
             stream.cancel();
+            return;
+        }
+        if (std.mem.eql(u8, path, "/large")) {
+            const value = [_]u8{'a'} ** (large_header_len + 1);
+            stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "x-large", .value = &value } }, true) catch {};
             return;
         }
         if (std.mem.eql(u8, path, "/early")) {
@@ -342,6 +348,9 @@ const EchoServer = struct {
         try stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = "application/grpc" } }, false);
     }
 };
+
+/// On the path "/large", the value of the "x-large" response header has one byte more.
+const large_header_len = 2048;
 
 const Pair = struct {
     listener: Io.net.Server,
@@ -630,6 +639,47 @@ test "stopWaits ends each wait on the stream while the connection wakes its wait
         try blocked;
         try std.testing.expectError(error.Canceled, result);
     }
+}
+
+/// The stream has a reset. The function takes the lock of the connection only with `tryLock`.
+/// Thus a task that holds the lock and waits cannot stop the test.
+fn hasReset(stream: *Connection.Stream) bool {
+    const conn = stream.conn;
+    if (!conn.lock.tryLock()) return false;
+    defer conn.lock.unlock(conn.io);
+    return stream.reset != null;
+}
+
+test "a header block over the limit gives ENHANCE_YOUR_CALM after the connection unlocks" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var pair: Pair = undefined;
+    try pair.start(io, gpa, .{ .role = .client, .max_header_list_size = large_header_len });
+    defer pair.stop();
+    // After one exchange, the settings of both sides arrived. Thus the read task of the client
+    // writes no acknowledgment while the test holds the write lock.
+    const first = try request(&pair, "/echo", "first");
+    gpa.free(first);
+    const conn = pair.client.conn;
+    const stream = try conn.openStream();
+    defer stream.close();
+    try stream.sendHeaders(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/large" },
+    }, true);
+    // The test holds the write lock, as `sendHeaders` does when it takes the connection lock to
+    // give the next stream its id. The read task must not hold the connection lock while it
+    // waits for the write lock to send the reset. Before, the two tasks waited for each other.
+    conn.write_lock.lockUncancelable(io);
+    const polled = pollUntil(io, "a reset and a free connection lock", stream, hasReset);
+    conn.write_lock.unlock(io);
+    try polled;
+    try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, stream.wasReset().?);
+    // The connection serves the next stream.
+    const echoed = try request(&pair, "/echo", "next");
+    defer gpa.free(echoed);
+    try std.testing.expectEqualStrings("next", echoed);
 }
 
 test "concurrent streams interleave" {
