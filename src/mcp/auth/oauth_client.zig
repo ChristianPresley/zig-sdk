@@ -115,6 +115,13 @@ pub const Client = struct {
         /// Accept `http` metadata, registration, authorization and token endpoints. Tests
         /// only, production needs https.
         allow_http: bool = false,
+        /// Trust only the CA certificates of this bundle for the https requests of the client.
+        /// These are the metadata, registration and token requests, and the authorization
+        /// request of `headless_redirect`. Null uses the CA store of the system. Use it for a
+        /// private CA or the CA of a test server. The bundle must stay valid and unchanged
+        /// until `deinit`. The HTTP client transport can use the same bundle in its `tls`
+        /// option: `.{ .trust = .{ .bundle = &bundle } }`.
+        ca_bundle: ?*const std.crypto.Certificate.Bundle = null,
         max_document_bytes: usize = 1 << 20,
         /// Request DPoP-bound tokens with this key (RFC 9449). The token request and each
         /// request to the MCP server carry a proof. Null requests bearer tokens.
@@ -193,7 +200,9 @@ pub const Client = struct {
     };
 
     pub fn init(io: Io, gpa: Allocator, options: Options) Client {
-        return .{ .io = io, .gpa = gpa, .fetcher = .init(io, gpa, options.max_document_bytes, options.allow_http), .options = options };
+        var fetcher: common.Fetcher = .init(io, gpa, options.max_document_bytes, options.allow_http);
+        fetcher.ca_bundle = options.ca_bundle;
+        return .{ .io = io, .gpa = gpa, .fetcher = fetcher, .options = options };
     }
 
     pub fn deinit(self: *Client) void {

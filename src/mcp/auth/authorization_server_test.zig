@@ -134,6 +134,9 @@ const Features = struct {
     cimd: bool = false,
     /// A fake IdP that issues ID-JAGs.
     idp: bool = false,
+    /// The MCP server and the authorization server use HTTPS at `localhost`. The certificate
+    /// comes from the test CA, and `World.ca_bundle` has that CA.
+    https: bool = false,
 };
 
 const World = struct {
@@ -169,6 +172,8 @@ const World = struct {
     clients: [4]as_mod.ClientRegistration,
     // The helpers.
     features: Features,
+    /// The test CA. It is empty without the `https` feature.
+    ca_bundle: std.crypto.Certificate.Bundle,
     chain: tls.CertChain,
     chains: [1]*const tls.CertChain,
     tls_server: tls.Server,
@@ -192,6 +197,20 @@ const World = struct {
         const arena = self.arena_state.allocator();
         self.idp_count = .init(0);
 
+        // The certificate of the HTTPS parts names `localhost`, and the test CA signs it.
+        const with_tls = features.cimd or features.https;
+        if (with_tls) {
+            self.chain = try tls.CertChain.loadFiles(gpa, io, "test/fixtures/tls/pem/chain-leaf.crt", "test/fixtures/tls/pem/chain-leaf.key");
+            self.chains = .{&self.chain};
+            self.tls_server = try tls.Server.init(.{ .chains = &self.chains, .alpn = &.{"http/1.1"} });
+        }
+        errdefer if (with_tls) self.chain.deinit();
+        self.ca_bundle = .empty;
+        errdefer self.ca_bundle.deinit(gpa);
+        if (features.https) try self.ca_bundle.addCertsFromFilePath(gpa, io, Io.Clock.real.now(io), Io.Dir.cwd(), "test/fixtures/tls/pem/ca.crt");
+        const base = if (features.https) "https://localhost" else "http://127.0.0.1";
+        const server_tls: ?*const tls.Server = if (features.https) &self.tls_server else null;
+
         // The MCP server binds first: the authorization server needs its URL.
         self.server = try mcp.Server.init(gpa, io, .{
             .info = .{ .name = "as-test", .version = "1" },
@@ -199,10 +218,10 @@ const World = struct {
         });
         errdefer self.server.deinit();
         try self.server.addToolJson(.{ .name = "whoami" }, whoami);
-        self.transport = .init(io, gpa, &self.server, .{ .port = 0, .auth = &self.rs });
+        self.transport = .init(io, gpa, &self.server, .{ .port = 0, .auth = &self.rs, .tls = server_tls });
         errdefer self.transport.deinit();
         try self.transport.bind();
-        self.mcp_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/mcp", .{self.transport.bound_port});
+        self.mcp_url = try std.fmt.allocPrint(arena, "{s}:{d}/mcp", .{ base, self.transport.bound_port });
 
         self.idp_key = es256(44);
         if (features.idp) {
@@ -211,25 +230,18 @@ const World = struct {
         }
         errdefer if (features.idp) self.idp.stop();
         if (features.cimd) {
-            self.chain = try tls.CertChain.loadFiles(gpa, io, "test/fixtures/tls/pem/chain-leaf.crt", "test/fixtures/tls/pem/chain-leaf.key");
-            self.chains = .{&self.chain};
-            self.tls_server = try tls.Server.init(.{ .chains = &self.chains, .alpn = &.{"http/1.1"} });
             try self.cimd.start(&self.tls_server, self, cimdReply);
-            // The certificate names `localhost`.
             self.cimd_url = try std.fmt.allocPrint(arena, "https://localhost:{d}/client.json", .{self.cimd.port()});
             self.cimd_doc = try std.fmt.allocPrint(arena,
                 \\{{"client_id":"{s}","client_name":"CIMD test client","redirect_uris":["http://127.0.0.1:41893/callback"],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"}}
             , .{self.cimd_url});
         }
-        errdefer if (features.cimd) {
-            self.cimd.stop();
-            self.chain.deinit();
-        };
+        errdefer if (features.cimd) self.cimd.stop();
 
         // The authorization server binds before `init`: the issuer has the port.
         var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
         const listener = try address.listen(io, .{ .reuse_address = true });
-        self.issuer = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{listener.socket.address.getPort()});
+        self.issuer = try std.fmt.allocPrint(arena, "{s}:{d}", .{ base, listener.socket.address.getPort() });
         self.keys = .{ es256(41), es256(42) };
         // The second key is an old key: the JWK set keeps it, the server signs with the first.
         self.signing = .{ .{ .key = &self.keys[0], .kid = "as-key-2" }, .{ .key = &self.keys[1], .kid = "as-key-1" } };
@@ -270,7 +282,7 @@ const World = struct {
             return e;
         };
         errdefer self.as.deinit();
-        try self.as.listen(.{ .listener = listener });
+        try self.as.listen(.{ .listener = listener, .tls = server_tls });
         self.as_future = try io.concurrent(serveAs, .{&self.as});
         errdefer {
             self.as.shutdown();
@@ -280,6 +292,7 @@ const World = struct {
         // The MCP server verifies the tokens with the JWK set that it reads from the server.
         var fetcher: common.Fetcher = .init(io, gpa, 1 << 16, true);
         defer fetcher.deinit();
+        if (features.https) fetcher.ca_bundle = &self.ca_bundle;
         const reply = try fetcher.fetch(arena, .GET, try std.fmt.allocPrint(arena, "{s}/jwks", .{self.issuer}), null, null, &.{});
         try std.testing.expectEqual(200, reply.status);
         const keys = try jwt.parseJwks(arena, reply.body);
@@ -289,7 +302,7 @@ const World = struct {
         self.dpop_policy = .{ .io = io };
         self.rs = .{
             .resource = self.mcp_url,
-            .resource_metadata_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/.well-known/oauth-protected-resource/mcp", .{self.transport.bound_port}),
+            .resource_metadata_url = try std.fmt.allocPrint(arena, "{s}:{d}/.well-known/oauth-protected-resource/mcp", .{ base, self.transport.bound_port }),
             .authorization_servers = &self.issuers,
             .scopes_supported = &.{"mcp:read"},
             .required_scopes = &.{"mcp:read"},
@@ -316,10 +329,9 @@ const World = struct {
         self.as.deinit();
         self.transport.deinit();
         self.server.deinit();
-        if (self.features.cimd) {
-            self.cimd.stop();
-            self.chain.deinit();
-        }
+        if (self.features.cimd) self.cimd.stop();
+        if (self.features.cimd or self.features.https) self.chain.deinit();
+        self.ca_bundle.deinit(std.testing.allocator);
         if (self.features.idp) self.idp.stop();
         self.arena_state.deinit();
     }
@@ -356,7 +368,11 @@ const World = struct {
     fn call(self: *World, arena: Allocator, provider: mcp.auth.Provider, extension: ?[]const u8) ![]const u8 {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
-        const transport = try HttpClient.init(io, gpa, .{ .url = self.mcp_url, .auth_provider = provider });
+        const transport = try HttpClient.init(io, gpa, .{
+            .url = self.mcp_url,
+            .auth_provider = provider,
+            .tls = if (self.features.https) .{ .trust = .{ .bundle = &self.ca_bundle } } else null,
+        });
         defer transport.deinit();
         var client: mcp.Client = .init(gpa, io, .{
             .info = .{ .name = "as-test-client", .version = "1" },
@@ -470,6 +486,34 @@ test "authorization code flow: a client ID metadata document over HTTPS" {
     defer bound.deinit();
     try std.testing.expectEqualStrings(who, try world.call(arena, bound.provider(), dpop.extension_id));
     try std.testing.expect(bound.token_dpop);
+}
+
+test "authorization code flow over HTTPS with the CA of the ca_bundle option" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var world: World = undefined;
+    try world.start(.{ .https = true });
+    defer world.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expect(std.mem.startsWith(u8, world.issuer, "https://localhost:"));
+    try std.testing.expect(std.mem.startsWith(u8, world.mcp_url, "https://localhost:"));
+
+    // The CA store of the system does not have the test CA. Thus a client without the option
+    // does not trust the metadata host.
+    var plain: mcp.auth.OAuthClient = .init(io, gpa, .{});
+    defer plain.deinit();
+    try std.testing.expectError(error.NoResourceMetadata, plain.handleChallenge(arena, world.mcp_url, 401, null, 1));
+
+    // With the bundle, the discovery, the registration, the authorization and the token
+    // request use https. The client does not accept http for them.
+    var oauth: mcp.auth.OAuthClient = .init(io, gpa, .{ .ca_bundle = &world.ca_bundle });
+    defer oauth.deinit();
+    const who = try world.call(arena, oauth.provider(), null);
+    try std.testing.expect(std.mem.startsWith(u8, who, "alice|"));
+    try std.testing.expectEqualStrings(world.issuer, oauth.issuer.?);
+    try std.testing.expectEqualStrings(who, try world.call(arena, oauth.provider(), null));
 }
 
 test "client credentials: a client secret and private_key_jwt" {

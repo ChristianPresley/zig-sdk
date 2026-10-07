@@ -308,13 +308,28 @@ pub const Fetcher = struct {
     max_document_bytes: usize,
     /// Accept `http` metadata URLs. Tests only, production needs https.
     allow_http: bool,
+    /// Trust only the CA certificates of this bundle for https. Null uses the CA store of the
+    /// system. The fetcher does not own the bundle. Set the field before the first request.
+    /// With a bundle, only one task at a time can use the fetcher.
+    ca_bundle: ?*const std.crypto.Certificate.Bundle = null,
 
     pub fn init(io: Io, gpa: Allocator, max_document_bytes: usize, allow_http: bool) Fetcher {
         return .{ .http_client = .{ .allocator = gpa, .io = io }, .max_document_bytes = max_document_bytes, .allow_http = allow_http };
     }
 
     pub fn deinit(self: *Fetcher) void {
+        // The HTTP client frees its bundle, but the bundle of `ca_bundle` has another owner.
+        if (self.ca_bundle != null) self.http_client.ca_bundle = .empty;
         self.http_client.deinit();
+    }
+
+    /// Give the bundle of `ca_bundle` to the HTTP client, with the current time for the
+    /// validity checks of the certificates. The HTTP client loads the CA store of the system
+    /// only while its time is null. Thus it never replaces or frees this bundle.
+    fn applyTrust(self: *Fetcher) void {
+        const bundle = self.ca_bundle orelse return;
+        self.http_client.ca_bundle = bundle.*;
+        self.http_client.now = Io.Clock.real.now(self.http_client.io);
     }
 
     pub const Reply = struct {
@@ -330,6 +345,7 @@ pub const Fetcher = struct {
         if (!http_syntax.isRequestUrl(url)) return error.InvalidUrl;
         for (extra) |h| if (!http_syntax.isToken(h.name) or !http_syntax.isFieldValue(h.value)) return error.InvalidHeader;
         const uri = try std.Uri.parse(url);
+        self.applyTrust();
         var req = try self.http_client.request(method, uri, .{
             .redirect_behavior = .unhandled,
             .extra_headers = extra,
