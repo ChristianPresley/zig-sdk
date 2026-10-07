@@ -22,6 +22,8 @@ pub fn writeComment(writer: *Io.Writer, text: []const u8) Io.Writer.Error!void {
 pub const Event = struct {
     event: []const u8,
     data: []const u8,
+    /// The last event ID of the stream when the event arrived, or null when the stream has
+    /// none. The parser ignores an `id` field with more than `Parser.max_id_bytes`.
     id: ?[]const u8,
 };
 
@@ -29,8 +31,8 @@ pub const Event = struct {
 pub const Parser = struct {
     gpa: Allocator,
     /// Maximum bytes of the event that the parser reads, across all calls of `feed`. The bytes
-    /// are the line that the parser reads with its field name, and the data and the event type
-    /// of the event. Only the event that the parser reads counts, thus a stream of many small
+    /// are the line that the parser reads, the data and the event type of the event, and the
+    /// last event ID. Only the event that the parser reads counts, thus a stream of many small
     /// events and comments has no limit. Overflow: `feed` returns `error.EventTooLarge`.
     max_event_bytes: usize = 4 << 20,
     pending: std.ArrayList(u8) = .empty,
@@ -40,6 +42,11 @@ pub const Parser = struct {
     bom_checked: bool = false,
     saw_cr: bool = false,
     ready: std.ArrayList(Event) = .empty,
+
+    /// Maximum bytes of an event ID. The parser ignores an `id` field with a longer value, as
+    /// it ignores a value with a zero byte. Each event gets a copy of the last event ID.
+    /// Thus a long ID followed by many small events in one `feed` cannot use much memory.
+    pub const max_id_bytes = 256;
 
     pub fn init(gpa: Allocator) Parser {
         return .{ .gpa = gpa };
@@ -95,7 +102,7 @@ pub const Parser = struct {
 
     /// The bytes of the event that the parser reads.
     fn eventBytes(self: *const Parser) usize {
-        return self.pending.items.len + self.data.items.len + self.event_type.items.len;
+        return self.pending.items.len + self.data.items.len + self.event_type.items.len + self.last_id.items.len;
     }
 
     /// Take the next complete event. The caller owns the returned slices and frees them with
@@ -127,7 +134,7 @@ pub const Parser = struct {
             try self.data.appendSlice(self.gpa, value);
             try self.data.append(self.gpa, '\n');
         } else if (std.mem.eql(u8, field, "id")) {
-            if (std.mem.findScalar(u8, value, 0) == null) {
+            if (value.len <= max_id_bytes and std.mem.findScalar(u8, value, 0) == null) {
                 self.last_id.clearRetainingCapacity();
                 try self.last_id.appendSlice(self.gpa, value);
             }
@@ -234,6 +241,92 @@ test "parser accepts many small events and comments with more bytes than max_eve
         }
     }
     try std.testing.expectEqual(count, got);
+}
+
+/// An allocator that records the largest number of bytes in use at one time.
+const PeakAllocator = struct {
+    child: Allocator,
+    in_use: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *PeakAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn record(self: *PeakAllocator, old_len: usize, new_len: usize) void {
+        self.in_use = self.in_use - old_len + new_len;
+        self.peak = @max(self.peak, self.in_use);
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ptr));
+        const memory = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.record(0, len);
+        return memory;
+    }
+
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ptr));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.record(memory.len, new_len);
+        return true;
+    }
+
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        // The caller allocates new memory, copies and frees the old memory.
+        return null;
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ptr));
+        self.child.rawFree(memory, alignment, ret_addr);
+        self.record(memory.len, 0);
+    }
+};
+
+test "parser ignores a long event ID, thus many small events after it use little memory" {
+    var peak: PeakAllocator = .{ .child = std.testing.allocator };
+    const gpa = peak.allocator();
+    const max_event_bytes = 64 << 10;
+    var p: Parser = .init(gpa);
+    defer p.deinit();
+    p.max_event_bytes = max_event_bytes;
+    // An `id` line in the event limit, but over the ID limit.
+    const id_line = try std.testing.allocator.alloc(u8, max_event_bytes - 8);
+    defer std.testing.allocator.free(id_line);
+    @memcpy(id_line[0..4], "id: ");
+    @memset(id_line[4..], 'a');
+    try p.feed(id_line);
+    try p.feed("\n");
+    // 1024 small events in one feed, as one read of a response body gives them.
+    try p.feed("data:x\n\n" ** 1024);
+    // Before, each event got a copy of the ID: 1024 copies of 64 KiB.
+    try std.testing.expect(peak.peak < 4 * max_event_bytes);
+    var count: usize = 0;
+    while (p.next()) |e| {
+        defer p.release(e);
+        try std.testing.expectEqualStrings("x", e.data);
+        try std.testing.expect(e.id == null);
+        count += 1;
+    }
+    try std.testing.expectEqual(1024, count);
+
+    // An ID in the limit counts as a part of each event.
+    var q: Parser = .init(std.testing.allocator);
+    defer q.deinit();
+    q.max_event_bytes = 16;
+    try q.feed("id: 0123456789\ndata:0\n\n");
+    const e = q.next().?;
+    defer q.release(e);
+    try std.testing.expectEqualStrings("0", e.data);
+    try std.testing.expectEqualStrings("0123456789", e.id.?);
+    // The 10 bytes of the ID and the 6 bytes of "data: " are at the limit before the data.
+    try std.testing.expectError(error.EventTooLarge, q.feed("data: 0"));
 }
 
 test "writer output" {

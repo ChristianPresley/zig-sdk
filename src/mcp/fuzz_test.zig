@@ -53,10 +53,12 @@ fn sseParser(_: void, smith: *Smith) anyerror!void {
     // Feed in two pieces to cover splits. Stop at the first oversize event.
     const split = bytes.len / 2;
     const fed: sse.Parser.FeedError!void = if (parser.feed(bytes[0..split])) parser.feed(bytes[split..]) else |e| e;
-    // Each event obeys the limit.
+    // Each event obeys the limit, with its copy of the last event ID.
     while (parser.next()) |event| {
         defer parser.release(event);
-        try std.testing.expect(event.data.len < parser.max_event_bytes);
+        const id_len = if (event.id) |id| id.len else 0;
+        try std.testing.expect(id_len <= sse.Parser.max_id_bytes);
+        try std.testing.expect(event.data.len + id_len < parser.max_event_bytes);
     }
     fed catch |e| switch (e) {
         error.EventTooLarge => {},
