@@ -566,11 +566,15 @@ pub fn openStream(self: *Connection) Error!*Stream {
     return Stream.create(self, 0);
 }
 
-/// Assign the next id and register the stream. Called under `write_lock`.
+/// Assign the next id and register the stream. Called under `write_lock`. A stream that got a
+/// reset before this call gets no id, and its headers do not go out.
 fn assignId(self: *Connection, s: *Stream) Error!void {
     self.lock.lockUncancelable(self.io);
     defer self.lock.unlock(self.io);
     if (self.closed or self.goaway_received) return error.Closed;
+    // A `cancel` from another task before the id sends no reset, thus the peer must not see the
+    // stream at all.
+    try s.checkOpen();
     if (self.next_stream_id > frame.max_window - 2) return error.Closed;
     s.id = self.next_stream_id;
     try self.streams.put(self.gpa, s.id, s);

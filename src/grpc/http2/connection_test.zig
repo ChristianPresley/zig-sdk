@@ -105,6 +105,11 @@ fn hasWaiter(conn: *Connection) bool {
     return conn.cond.state.load(.monotonic).waiters != 0;
 }
 
+/// A task waits for the mutex. The state is a field of `std.Io.Mutex` in Zig 0.16.0.
+fn isContended(mutex: *Io.Mutex) bool {
+    return mutex.state.load(.monotonic) == .contended;
+}
+
 /// The read task of a connection, which runs `Connection.run`. The wait for its end has a
 /// limit.
 pub const RunTask = struct {
@@ -680,6 +685,47 @@ test "a header block over the limit gives ENHANCE_YOUR_CALM after the connection
     const echoed = try request(&pair, "/echo", "next");
     defer gpa.free(echoed);
     try std.testing.expectEqualStrings("next", echoed);
+}
+
+fn sendEchoHeaders(stream: *Connection.Stream) Connection.Error!void {
+    try stream.sendHeaders(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/echo" },
+    }, false);
+}
+
+test "a cancel before the stream has an id keeps the stream from the peer" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var pair: Pair = undefined;
+    try pair.start(io, gpa, .{ .role = .client });
+    defer pair.stop();
+    // After one exchange, the settings of both sides arrived. Thus the read task of the client
+    // writes no acknowledgment while the test holds the write lock.
+    const first = try request(&pair, "/echo", "first");
+    gpa.free(first);
+    const conn = pair.client.conn;
+    const stream = try conn.openStream();
+    defer stream.close();
+    // The send passes its check of the stream and waits for the write lock. Then the cancel
+    // comes from another task. It sends no reset, because the stream has no id yet. Before, the
+    // headers then went out, and the server kept the stream open until the connection ended.
+    conn.write_lock.lockUncancelable(io);
+    var sender = io.concurrent(sendEchoHeaders, .{stream}) catch |err| {
+        conn.write_lock.unlock(io);
+        return err;
+    };
+    const contended = pollUntil(io, "the send waits for the write lock", &conn.write_lock, isContended);
+    stream.cancel();
+    conn.write_lock.unlock(io);
+    const result = sender.await(io);
+    try contended;
+    try std.testing.expectError(error.StreamReset, result);
+    try std.testing.expectEqual(0, stream.id);
+    const echoed = try request(&pair, "/echo", "next");
+    defer gpa.free(echoed);
+    try std.testing.expectEqual(2, pair.server.streams_seen.load(.monotonic));
 }
 
 test "concurrent streams interleave" {
