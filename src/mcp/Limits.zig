@@ -91,7 +91,8 @@ max_filter_bytes: usize = 64 << 10,
 /// `RequestOptions.on_progress`.
 max_progress_rate_per_s: u32 = 50,
 /// The timeout of a client request without `RequestOptions.timeout`. A listen stream has no
-/// default timeout. Overflow: the client cancels the request and returns `error.Timeout`.
+/// default timeout. Overflow: the client cancels the request and returns `error.Timeout`. The
+/// memory link (`memory.ClientLink`) does not obey it.
 request_timeout: Io.Duration = .fromSeconds(60),
 /// The upper limit of the timeout of a client request without
 /// `RequestOptions.max_total_timeout`. Progress notifications do not extend a timeout.
@@ -105,7 +106,8 @@ shutdown_grace: Io.Duration = .fromSeconds(2),
 max_lost_stream_retries: u32 = 3,
 /// The time that the client waits for `notifications/subscriptions/acknowledged`, the first
 /// message of a `subscriptions/listen` stream, from the start of the request. Zero disables
-/// the limit. Overflow: the client cancels the stream and returns `error.Timeout`.
+/// the limit. Overflow: the client cancels the stream and returns `error.Timeout`. The memory
+/// link (`memory.ClientLink`) does not obey it.
 listen_ack_timeout: Io.Duration = .fromSeconds(10),
 /// The lifetime of a `requestState` that the server seals. Overflow: `-32602` with the
 /// reason `invalid_request_state`.

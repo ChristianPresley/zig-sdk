@@ -114,7 +114,8 @@ pub const RequestOptions = struct {
     /// Relative timeout for the whole request, with all multi round-trip rounds. Null uses
     /// `limits.request_timeout`. A `subscriptions/listen` stream has no default timeout.
     /// Progress notifications do not extend the timeout. When the timeout ends, the client
-    /// cancels the request and returns `error.Timeout`.
+    /// cancels the request and returns `error.Timeout`. The memory link (`memory.ClientLink`)
+    /// does not obey it.
     timeout: ?Io.Duration = null,
     /// The upper limit of `timeout`. Null uses `limits.max_total_timeout`. A longer `timeout`
     /// gets this value. A `subscriptions/listen` stream has this limit only when the caller
@@ -201,7 +202,10 @@ pub const RequestError = error{
     Closed,
     TransportFailed,
     OutOfMemory,
-    /// The response is not a valid result for the method.
+    /// The response is not a valid result for the method, or the transport cannot read the
+    /// response. Examples are a message over a size limit, a line that is not valid UTF-8 and
+    /// an error response with a null id. An HTTP status without a JSON-RPC message also gives
+    /// this error (see `Diagnostics.http_status`). The client does not send the request again.
     InvalidResponse,
     /// The server asked for an input kind the client did not declare.
     UndeclaredInputRequest,
@@ -572,8 +576,9 @@ pub fn complete(self: *Client, arena: Allocator, params: types.CompleteRequestPa
 
 /// Open a `subscriptions/listen` stream. `options.on_notification` receives every event
 /// notification. The call returns when the server closes the stream gracefully, or with
-/// `error.Canceled` when the cancel token fires. A stream without its acknowledgment in
-/// `limits.listen_ack_timeout` ends with `error.Timeout`.
+/// `error.Canceled` when the caller fires the cancel token. A stream without its
+/// acknowledgment in `limits.listen_ack_timeout` ends with `error.Timeout`. The memory link
+/// (`memory.ClientLink`) does not obey this limit.
 pub fn listen(self: *Client, arena: Allocator, filter: types.SubscriptionsListenRequestParams, options: RequestOptions) RequestError!types.SubscriptionsListenResult {
     return (try self.request(arena, .@"subscriptions/listen", try toValue(arena, filter), options)).result;
 }
