@@ -435,7 +435,7 @@ pub const Client = struct {
 
     fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
         const self: *Client = @ptrCast(@alignCast(ptr));
-        var pending: Router.Pending = .{ .id = ex.id };
+        var pending: Router.Pending = .{ .id = ex.id, .inline_exchange = if (ex.inline_notifications) ex else null };
         defer pending.deinit(self.gpa);
         try self.router.register(&pending);
         defer self.router.unregister(&pending);
@@ -447,7 +447,7 @@ pub const Client = struct {
         };
         while (true) {
             // Deliver everything that arrived.
-            while (self.router.takeFrame(&pending)) |frame| {
+            while (try self.router.takeFrame(&pending)) |frame| {
                 defer self.gpa.free(frame);
                 const is_response = router_mod.frameIsResponse(frame);
                 ex.deliver(io, frame) catch return error.InvalidFrame;

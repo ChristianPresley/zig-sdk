@@ -571,6 +571,8 @@ const listen_uri = "test://counted";
 const UpdateCounter = struct {
     acks: std.atomic.Value(u32) = .init(0),
     updates: std.atomic.Value(u32) = .init(0),
+    /// The callback waits this time before it counts an update.
+    delay: ?Io.Duration = null,
 
     fn onNotification(userdata: ?*anyopaque, method: []const u8, params: ?Value) void {
         const self: *UpdateCounter = @ptrCast(@alignCast(userdata.?));
@@ -580,6 +582,7 @@ const UpdateCounter = struct {
         }
         if (!std.mem.eql(u8, method, "notifications/resources/updated")) return;
         const uri = json.getString(params orelse return, "uri") orelse return;
+        if (self.delay) |d| std.testing.io.sleep(d, .awake) catch {};
         if (std.mem.eql(u8, uri, listen_uri)) _ = self.updates.fetchAdd(1, .release);
     }
 };
@@ -601,6 +604,7 @@ const ListenJob = struct {
     arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator),
     token: Transport.CancelToken = .{},
     result: ?Client.RequestError = null,
+    inline_notifications: bool = false,
 
     fn run(job: *ListenJob) void {
         const filter: types.SubscriptionsListenRequestParams = .{
@@ -612,6 +616,7 @@ const ListenJob = struct {
             .retry = .never,
             .on_notification = UpdateCounter.onNotification,
             .userdata = job.counter,
+            .inline_notifications = job.inline_notifications,
         }) catch |e| {
             job.result = e;
         };
@@ -712,4 +717,126 @@ test "a long listen stream over stdio does not make the request arena larger" {
     const short = try replayListen(tmp.dir, 100);
     const long = try replayListen(tmp.dir, 10_000);
     try std.testing.expectEqual(short, long);
+}
+
+// -- Notifications on the reader task -----------------------------------------------------------
+
+/// A child that answers two lines. After the first line it writes the file `ack.jsonl` of its
+/// current directory, and after the second line the file `events.jsonl`. Then it reads one
+/// more line.
+const replay_twice_argv: []const []const u8 = if (builtin.os.tag == .windows)
+    &.{ "cmd.exe", "/d", "/c", "set", "/p", "line=&type", "ack.jsonl&set", "/p", "line=&type", "events.jsonl&set", "/p", "line=" }
+else
+    &.{ "/bin/sh", "-c", "read -r line; cat ack.jsonl; read -r line; cat events.jsonl; read -r line; exit 0" };
+
+test "an inline listen event reaches its callback before the response that the server wrote after it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The listen stream is the first request of the client (id 1), the tool call the second
+    // (id 2). The server writes an event of the stream and then the response of the call.
+    try tmp.dir.writeFile(io, .{ .sub_path = "ack.jsonl", .data = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1},\"notifications\":{\"resourceSubscriptions\":[\"" ++ listen_uri ++ "\"]}}}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1},\"uri\":\"" ++ listen_uri ++ "\"}}\n" ++
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n" });
+
+    const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = replay_twice_argv, .cwd = .{ .dir = tmp.dir } }) catch return error.SkipZigTest;
+    defer proc.deinit();
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(proc.transport());
+
+    // The callback of the event is slow. Without the option, the response of the call can get
+    // to its caller first.
+    var counter: UpdateCounter = .{ .delay = .fromMilliseconds(50) };
+    var job: ListenJob = .{ .client = &client, .counter = &counter, .inline_notifications = true };
+    defer job.arena_state.deinit();
+    var future = try io.concurrent(ListenJob.run, .{&job});
+    var stopped = false;
+    defer if (!stopped) job.stop(&future);
+    try awaitCount(&counter.acks, 1);
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    _ = try client.callTool(arena_state.allocator(), "t", null, .{});
+    // The reader task routed the response after the callback of the event returned.
+    try std.testing.expectEqual(1, counter.updates.load(.acquire));
+
+    job.stop(&future);
+    stopped = true;
+    try std.testing.expectEqual(error.Canceled, job.result.?);
+}
+
+/// Counts the exchanges that reach the inner transport.
+const Counting = struct {
+    inner: Transport.ClientTransport,
+    exchanges: u32 = 0,
+
+    fn transport(self: *Counting) Transport.ClientTransport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Transport.ClientTransport.VTable = .{ .kind = .stdio, .exchange = exchange, .notify = notify };
+
+    fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
+        const self: *Counting = @ptrCast(@alignCast(ptr));
+        self.exchanges += 1;
+        return self.inner.exchange(io, ex);
+    }
+
+    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        const self: *Counting = @ptrCast(@alignCast(ptr));
+        return self.inner.notify(io, frame);
+    }
+};
+
+/// Records the thread of each progress callback.
+const ProgressThread = struct {
+    calls: u32 = 0,
+    thread: ?std.Thread.Id = null,
+
+    fn onProgress(userdata: ?*anyopaque, params: types.ProgressNotificationParams) void {
+        const self: *ProgressThread = @ptrCast(@alignCast(userdata.?));
+        _ = params;
+        self.calls += 1;
+        self.thread = std.Thread.getCurrentId();
+    }
+};
+
+/// A child that reads one line, writes the file `events.jsonl` of its current directory and
+/// exits.
+const replay_and_exit_argv: []const []const u8 = if (builtin.os.tag == .windows)
+    &.{ "cmd.exe", "/d", "/c", "set", "/p", "line=&type", "events.jsonl" }
+else
+    &.{ "/bin/sh", "-c", "read -r line; cat events.jsonl; exit 0" };
+
+test "a request that got an inline notification does not retry a lost stream" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The server writes progress for the first request (id 1) and then exits.
+    try tmp.dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"progress\":1}}\n" });
+
+    const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = replay_and_exit_argv, .cwd = .{ .dir = tmp.dir } }) catch return error.SkipZigTest;
+    defer proc.deinit();
+    var counting: Counting = .{ .inner = proc.transport() };
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(counting.transport());
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var progress: ProgressThread = .{};
+    // `tools/list` is idempotent. The client re-issues it after a lost stream only when no
+    // frame arrived.
+    try std.testing.expectError(error.Closed, client.listTools(arena_state.allocator(), null, .{
+        .inline_notifications = true,
+        .on_progress = ProgressThread.onProgress,
+        .userdata = &progress,
+    }));
+    try std.testing.expectEqual(1, counting.exchanges);
+    try std.testing.expectEqual(1, progress.calls);
+    // The reader task of the transport called the callback, not the task of the request.
+    try std.testing.expect(progress.thread.? != std.Thread.getCurrentId());
 }

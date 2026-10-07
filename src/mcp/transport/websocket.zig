@@ -998,7 +998,7 @@ pub const Client = struct {
         // A text message must be UTF-8. The server closes the connection for one that is not.
         if (!std.unicode.utf8ValidateSlice(ex.frame)) return error.InvalidRequest;
         const gen = try self.linkFor(io, ex);
-        var pending: Router.Pending = .{ .id = ex.id, .generation = gen };
+        var pending: Router.Pending = .{ .id = ex.id, .generation = gen, .inline_exchange = if (ex.inline_notifications) ex else null };
         defer pending.deinit(self.gpa);
         try self.router.register(&pending);
         defer self.router.unregister(&pending);
@@ -1033,7 +1033,7 @@ pub const Client = struct {
 
     /// Deliver the frames that arrived. True after the response.
     fn drain(self: *Client, io: Io, pending: *Router.Pending, ex: *Transport.Exchange) Transport.ExchangeError!bool {
-        while (self.router.takeFrame(pending)) |f| {
+        while (try self.router.takeFrame(pending)) |f| {
             defer self.gpa.free(f);
             const is_response = router_mod.frameIsResponse(f);
             ex.deliver(io, f) catch return error.InvalidFrame;

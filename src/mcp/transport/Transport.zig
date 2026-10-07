@@ -221,6 +221,16 @@ pub const Exchange = struct {
     got_frame: std.atomic.Value(bool) = .init(false),
     /// Set by HTTP transports: the status of the response.
     http_status: u16 = 0,
+    /// Give each notification of this request to the sink at once on the task that reads the
+    /// connection. That task routes the next frame only after the sink returns. A transport
+    /// with one reader task for many requests obeys it (stdio, Unix socket and WebSocket).
+    /// A transport that gives each frame to the sink on the task that reads or writes it
+    /// ignores the option.
+    ///
+    /// The sink then gets the notifications on the reader task and the response on the task
+    /// of the request. The two tasks can call the sink at the same time. The reader task must
+    /// not use the exchange after `exchange` returns.
+    inline_notifications: bool = false,
 
     /// Give one frame to the sink. Transports call this function, not `Sink.deliver`, so that
     /// the first frame stops `first_frame_timeout`.

@@ -85,7 +85,8 @@ pub const Hooks = struct {
     /// `on_notification`, when the notification is not progress or log. A notification that
     /// belongs to no request goes to the `on_notification` option of the stdio, Unix socket
     /// or WebSocket client transport. `method` and `params` are valid only during the call.
-    /// Copy the data that you keep.
+    /// Copy the data that you keep. For a request with `RequestOptions.inline_notifications`,
+    /// the hook runs on the reader task of the transport and has the same rules.
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
     /// Decode, sanitize or convert a checked icon image. The formats that need a decoder
     /// (GIF, WebP and SVG) pass only when this hook is set and the icon policy turns them on.
@@ -128,6 +129,24 @@ pub const RequestOptions = struct {
     /// notification is not progress or log. `method` and `params` are valid only during the
     /// call. Copy the data that you keep.
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
+    /// Call `on_progress`, `on_log` and `on_notification` of this request on the reader task
+    /// of the transport, at once. The reader task routes the next frame only after the callback
+    /// returns. Thus a notification gets to its callback before the response of another
+    /// request that the server wrote after it. Without this option, the reader task puts the
+    /// notification in the queue of the request, and the task of the request calls the
+    /// callback later. The response of the other request can then get to its caller first.
+    ///
+    /// The stdio, Unix socket and WebSocket transports obey the option. The memory link, HTTP
+    /// and gRPC ignore it. The memory link always calls the callbacks on the task that writes
+    /// the frame. On HTTP and gRPC each request has its own stream. Thus the client cannot know
+    /// the order in which the server wrote the frames of two requests.
+    ///
+    /// A callback blocks the reader task of the connection. Thus it must only copy, serialize
+    /// and write the data. It must not send a request through the same client. It must not
+    /// wait for a lock that another task holds while that task waits for a response through
+    /// the same client. The reader task cannot route that response while the callback waits.
+    /// The request returns only after its last callback returned.
+    inline_notifications: bool = false,
     /// The log level for this request. It replaces `Options.log_level`. The client sends it in
     /// `_meta` also when `Options.log_level` is null.
     log_level: ?types.LoggingLevel = null,
@@ -592,12 +611,17 @@ const Collector = struct {
     arena: Allocator,
     id: RequestId,
     options: RequestOptions,
+    /// The response fields. With `inline_notifications`, the transport still gives the
+    /// response on the task of the request.
     response: ?Value = null,
     rpc_error: ?types.Error = null,
-    invalid: bool = false,
+    invalid: std.atomic.Value(bool) = .init(false),
     /// Frames delivered so far. The client retries a lost stream only when nothing arrived.
-    frames: u32 = 0,
-    /// The rate limit of the progress notifications of this request.
+    /// With `RequestOptions.inline_notifications`, the reader task of the transport counts
+    /// the notifications.
+    frames: std.atomic.Value(u32) = .init(0),
+    /// The rate limit of the progress notifications of this request. The transport gives the
+    /// notifications of one request one after the other. Thus one task at a time uses it.
     progress: rate_limit.Window = .{},
     /// The memory of the notification in the current frame. The collector resets it after
     /// each frame and keeps at most `scratch_keep_bytes` of it for the next frame. Thus a
@@ -611,7 +635,7 @@ const Collector = struct {
 
     fn onFrame(ptr: *anyopaque, io: Io, frame: []const u8) anyerror!void {
         const self: *Collector = @ptrCast(@alignCast(ptr));
-        self.frames += 1;
+        _ = self.frames.fetchAdd(1, .monotonic);
         // The caller uses a response after the exchange, thus it goes into the request arena.
         if (router.frameIsResponse(frame)) return self.handle(io, try self.parse(self.arena, frame), self.arena, false);
 
@@ -621,9 +645,10 @@ const Collector = struct {
         const progress_counted = if (router.frameMethod(frame)) |m| std.mem.eql(u8, m, progress_method) else false;
         if (progress_counted and !self.admitProgress(io)) return;
 
-        // A transport gives the frames of one exchange one after the other. A frame that
-        // arrives while another frame uses `scratch`, from a callback or from another task,
-        // gets its own arena.
+        // A transport gives the notifications of one exchange one after the other. With
+        // `inline_notifications`, the response can arrive on the task of the request at the
+        // same time. A frame that arrives while another frame uses `scratch`, from a callback
+        // or from another task, gets its own arena.
         const shared = self.scratch_busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null;
         defer if (shared) {
             _ = self.scratch.reset(.{ .retain_with_limit = scratch_keep_bytes });
@@ -644,7 +669,7 @@ const Collector = struct {
 
     fn parse(self: *Collector, arena: Allocator, frame: []const u8) error{InvalidFrame}!message.Message {
         return message.Message.parseMaxDepth(arena, frame, self.client.options.limits.json_max_depth) catch {
-            self.invalid = true;
+            self.invalid.store(true, .monotonic);
             return error.InvalidFrame;
         };
     }
@@ -669,7 +694,7 @@ const Collector = struct {
             },
             .request => {
                 // Servers do not send requests in this revision.
-                self.invalid = true;
+                self.invalid.store(true, .monotonic);
                 return error.InvalidFrame;
             },
         }
@@ -756,6 +781,7 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             .cancel = cancel,
             .timeout = deadline,
             .first_frame_timeout = if (is_listen) self.listenAckTimeout() else .none,
+            .inline_notifications = options.inline_notifications,
         };
         transport.exchange(self.io, &ex) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -764,7 +790,7 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             error.InvalidFrame, error.HttpStatus => return error.InvalidResponse,
             error.InvalidRequest => return error.InvalidRequest,
             error.Closed, error.WriteFailed, error.ReadFailed => {
-                if (self.canRetryLost(options, known, collector.frames, lost_retries)) {
+                if (self.canRetryLost(options, known, collector.frames.load(.monotonic), lost_retries)) {
                     lost_retries += 1;
                     round -|= 1;
                     continue;
