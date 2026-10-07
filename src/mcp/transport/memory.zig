@@ -1,4 +1,6 @@
-//! An in-process transport for tests: frames go in as text, frames come out into a list.
+//! In-process transports. `Harness` is for tests: frames go in as text, and frames come out
+//! into a list. `ClientLink` connects a client to a server in the same process. You can use
+//! it in production with the limits that its doc comment tells.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -102,7 +104,23 @@ pub const Harness = struct {
     }
 };
 
-/// An in-process client transport that hands frames straight to a server.
+/// An in-process client transport that gives each request straight to a server. It has no
+/// task of its own and no deadlines. These are its limits:
+///
+/// - `exchange` runs the handler of the request on the task of the caller. The frames of
+///   the request get to the sink on that task, also the acknowledgment of a listen stream.
+///   The events of a listen stream get to the sink on the task that publishes them.
+/// - Only the cancel token of the caller ends an exchange. The server uses that token as the
+///   token of the request. Thus a server shutdown also fires it.
+/// - The link does not obey `Exchange.timeout` and `Exchange.first_frame_timeout`. Thus
+///   `RequestOptions.timeout`, `limits.request_timeout` and `limits.listen_ack_timeout` have no
+///   effect on it.
+/// - The link ignores `Exchange.inline_notifications`. The callbacks always run on the task
+///   that gives the frame.
+/// - A callback of a listen stream runs while the server holds the lock of the stream. Thus
+///   it must not publish an event of the same server, for example with
+///   `Server.setToolEnabled` or `Server.notifyToolsListChanged`. It also must not wait for a
+///   task that publishes an event or ends a listen stream of the same server.
 pub const ClientLink = struct {
     io: Io,
     gpa: Allocator,
@@ -124,6 +142,12 @@ pub const ClientLink = struct {
 
     const Forward = struct {
         sink: Transport.Exchange.Sink,
+        /// Gives the frames of the request to the sink one at a time, as `out_lock` of stdio
+        /// and `write_lock` of HTTP do. The events of a listen stream come from the task that
+        /// publishes them, and the other frames from the task of the request.
+        lock: Io.Mutex = .init,
+        /// Set under `lock`. `exchange` reads it after the server returns, when no other task
+        /// gives frames to the sink.
         failed: bool = false,
     };
 
@@ -175,6 +199,8 @@ pub const ClientLink = struct {
 
     fn forwardNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
         const f: *Forward = @ptrCast(@alignCast(ptr));
+        f.lock.lockUncancelable(io);
+        defer f.lock.unlock(io);
         f.sink.deliver(io, frame) catch {
             f.failed = true;
             return error.Closed;
@@ -190,3 +216,38 @@ pub const ClientLink = struct {
         _ = io;
     }
 };
+
+/// A sink that counts its calls and the calls that overlap another call.
+const OverlapSink = struct {
+    inside: std.atomic.Value(u32) = .init(0),
+    calls: std.atomic.Value(u32) = .init(0),
+    overlaps: std.atomic.Value(u32) = .init(0),
+
+    fn onFrame(ptr: *anyopaque, io: Io, frame: []const u8) anyerror!void {
+        _ = frame;
+        const self: *OverlapSink = @ptrCast(@alignCast(ptr));
+        if (self.inside.fetchAdd(1, .acq_rel) != 0) _ = self.overlaps.fetchAdd(1, .monotonic);
+        defer _ = self.inside.fetchSub(1, .acq_rel);
+        _ = self.calls.fetchAdd(1, .monotonic);
+        // Stay in the sink for a moment. A second task that does not wait then overlaps.
+        try io.sleep(.fromMicroseconds(500), .awake);
+    }
+
+    fn forwardMany(forward: *ClientLink.Forward, count: usize) void {
+        for (0..count) |_| ClientLink.forwardNotify(forward, std.testing.io, "{}") catch {};
+    }
+};
+
+test "the memory link gives the frames of one request to the sink one at a time" {
+    const io = std.testing.io;
+    var sink: OverlapSink = .{};
+    var forward: ClientLink.Forward = .{ .sink = .{ .ptr = &sink, .on_frame = OverlapSink.onFrame } };
+    // An event of a listen stream comes from the task that publishes it, the other frames
+    // from the task of the request.
+    var a = try io.concurrent(OverlapSink.forwardMany, .{ &forward, 10 });
+    var b = try io.concurrent(OverlapSink.forwardMany, .{ &forward, 10 });
+    a.await(io);
+    b.await(io);
+    try std.testing.expectEqual(20, sink.calls.load(.monotonic));
+    try std.testing.expectEqual(0, sink.overlaps.load(.monotonic));
+}

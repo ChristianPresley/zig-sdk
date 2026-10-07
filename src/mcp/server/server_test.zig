@@ -446,6 +446,330 @@ test "client-cancelled listen stream gets no response" {
     try std.testing.expect(f.harness.finished);
 }
 
+// -- Order of the acknowledgment and the events -------------------------------------------------
+
+const ack_method = "notifications/subscriptions/acknowledged";
+const event_method = "notifications/tools/list_changed";
+const tools_listen = "\"notifications\":{\"toolsListChanged\":true}";
+
+fn listChangedServer() !Server {
+    return Server.init(std.testing.allocator, std.testing.io, .{
+        .info = .{ .name = "test", .version = "0.1.0" },
+        .capabilities = .{ .tools = .{ .listChanged = true } },
+    });
+}
+
+/// Wait until `event` is set, at most `ms` milliseconds. Returns false when the time ends
+/// first.
+fn waitEvent(event: *Io.Event, ms: i64) bool {
+    const io = std.testing.io;
+    const deadline = Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromMilliseconds(ms), .clock = .awake });
+    while (!event.isSet()) {
+        // A wait can also end early without the event. Then wait again until the deadline.
+        event.waitTimeout(io, .{ .deadline = deadline }) catch |e| switch (e) {
+            error.Timeout => if (Io.Clock.Timestamp.now(io, .awake).durationTo(deadline).raw.nanoseconds <= 0) return event.isSet(),
+            error.Canceled => return event.isSet(),
+        };
+    }
+    return true;
+}
+
+/// A listen stream that holds its acknowledgment until `release` is set, and records the
+/// order of its frames.
+const GatedStream = struct {
+    release: Io.Event = .unset,
+    ack_started: Io.Event = .unset,
+    got_event: Io.Event = .unset,
+    lock: Io.Mutex = .init,
+    order: [4]Kind = undefined,
+    count: usize = 0,
+
+    const Kind = enum { ack, event, other };
+
+    fn responder(self: *GatedStream) Transport.Responder {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Transport.Responder.VTable = .{ .notify = notify, .finish = notify, .abort = abort };
+
+    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        const self: *GatedStream = @ptrCast(@alignCast(ptr));
+        const kind: Kind = if (std.mem.find(u8, frame, ack_method) != null) .ack else if (std.mem.find(u8, frame, event_method) != null) .event else .other;
+        if (kind == .ack) {
+            self.ack_started.set(io);
+            try self.release.wait(io);
+        }
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        if (self.count < self.order.len) self.order[self.count] = kind;
+        self.count += 1;
+        if (kind == .event) self.got_event.set(io);
+    }
+
+    fn abort(ptr: *anyopaque, io: Io) void {
+        _ = ptr;
+        _ = io;
+    }
+
+    fn serve(self: *GatedStream, server: *Server, token: *Transport.CancelToken) void {
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const text = request(arena, 1, "subscriptions/listen", meta_none, tools_listen) catch return;
+        const msg = mcp.jsonrpc.Message.parse(arena, text) catch return;
+        server.handle(std.testing.io, .{ .kind = .memory, .arena = arena, .message = msg, .responder = self.responder(), .cancel = token });
+    }
+};
+
+test "an event that the server publishes during the acknowledgment goes out after it" {
+    const io = std.testing.io;
+    var server = try listChangedServer();
+    defer server.deinit();
+    var stream: GatedStream = .{};
+    var token: Transport.CancelToken = .{};
+    var listen = try io.concurrent(GatedStream.serve, .{ &stream, &server, &token });
+    var listen_done = false;
+    defer if (!listen_done) {
+        stream.release.set(io);
+        token.cancel(io, "done");
+        listen.await(io);
+    };
+    try std.testing.expect(waitEvent(&stream.ack_started, 4000));
+
+    // The subscription is visible to publish, but its acknowledgment is not out. The event
+    // waits for it. Without the order, the event arrives in this time.
+    var publish = try io.concurrent(Server.notifyToolsListChanged, .{ &server, io });
+    const early = waitEvent(&stream.got_event, 200);
+    stream.release.set(io);
+    const delivered = waitEvent(&stream.got_event, 4000);
+    publish.await(io);
+    token.cancel(io, "done");
+    listen.await(io);
+    listen_done = true;
+
+    try std.testing.expect(!early);
+    try std.testing.expect(delivered);
+    try std.testing.expectEqual(2, stream.count);
+    try std.testing.expectEqual(GatedStream.Kind.ack, stream.order[0]);
+    try std.testing.expectEqual(GatedStream.Kind.event, stream.order[1]);
+}
+
+/// Publishes `notifications/tools/list_changed` until `stop` is true.
+const Publisher = struct {
+    server: *Server,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// While true, the publisher publishes nothing. A loop of publications holds the lock of
+    /// the subscriptions most of the time, thus a listen stream then ends slowly.
+    paused: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Publisher) void {
+        while (!self.stop.load(.acquire)) {
+            if (!self.paused.load(.acquire)) self.server.notifyToolsListChanged(std.testing.io);
+        }
+    }
+
+    fn halt(self: *Publisher, future: *Io.Future(void)) void {
+        self.stop.store(true, .release);
+        future.await(std.testing.io);
+    }
+};
+
+/// The listen streams that each stress test opens one after the other.
+const order_rounds = 200;
+
+/// One listen stream over the memory link. It counts its events and the events that arrive
+/// before its acknowledgment.
+const LinkListen = struct {
+    client: *mcp.Client,
+    token: Transport.CancelToken = .{},
+    acked: Io.Event = .unset,
+    events: std.atomic.Value(u32) = .init(0),
+    early: std.atomic.Value(u32) = .init(0),
+
+    fn onNotification(userdata: ?*anyopaque, method: []const u8, params: ?Value) void {
+        _ = params;
+        const self: *LinkListen = @ptrCast(@alignCast(userdata.?));
+        if (std.mem.eql(u8, method, ack_method)) {
+            self.acked.set(std.testing.io);
+        } else if (std.mem.eql(u8, method, event_method)) {
+            if (!self.acked.isSet()) _ = self.early.fetchAdd(1, .monotonic);
+            _ = self.events.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn run(self: *LinkListen) void {
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+        const filter: types.SubscriptionsListenRequestParams = .{
+            ._meta = .{ .@"io.modelcontextprotocol/protocolVersion" = "2026-07-28", .@"io.modelcontextprotocol/clientCapabilities" = .{} },
+            .notifications = .{ .toolsListChanged = true },
+        };
+        _ = self.client.listen(arena_state.allocator(), filter, .{
+            .cancel = &self.token,
+            .retry = .never,
+            .on_notification = onNotification,
+            .userdata = self,
+        }) catch {};
+    }
+};
+
+test "a publish that races new listen streams over the memory link never gets to the client before the acknowledgment" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var server = try listChangedServer();
+    defer server.deinit();
+    var link: mcp.transport.memory.ClientLink = .init(io, gpa, &server);
+    var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(link.transport());
+
+    var publisher: Publisher = .{ .server = &server };
+    var publishing = try io.concurrent(Publisher.run, .{&publisher});
+    var halted = false;
+    defer if (!halted) publisher.halt(&publishing);
+
+    var events: u32 = 0;
+    var early: u32 = 0;
+    for (0..order_rounds) |_| {
+        var job: LinkListen = .{ .client = &client };
+        publisher.paused.store(false, .release);
+        var future = try io.concurrent(LinkListen.run, .{&job});
+        const acked = waitEvent(&job.acked, 4000);
+        publisher.paused.store(true, .release);
+        job.token.cancel(io, "done");
+        future.await(io);
+        try std.testing.expect(acked);
+        events += job.events.load(.monotonic);
+        early += job.early.load(.monotonic);
+    }
+    publisher.halt(&publishing);
+    halted = true;
+    try std.testing.expectEqual(0, early);
+    // The publisher raced the streams.
+    try std.testing.expect(events > 0);
+}
+
+/// The output of a stdio server. It reads each line when the transport flushes it, thus in
+/// the order of the writes. For each subscription id, it counts the events before the
+/// acknowledgment.
+const StdioOrder = struct {
+    writer: Io.Writer,
+    /// The start of a line that the next flush ends.
+    line: std.ArrayList(u8) = .empty,
+    acked: [order_rounds + 1]bool = @splat(false),
+    /// The highest subscription id with an acknowledgment.
+    last_ack: std.atomic.Value(usize) = .init(0),
+    /// Set at each acknowledgment.
+    ack_event: Io.Event = .unset,
+    events: u32 = 0,
+    early: u32 = 0,
+
+    fn init(buffer: []u8) StdioOrder {
+        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn deinit(self: *StdioOrder) void {
+        self.line.deinit(std.testing.allocator);
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *StdioOrder = @fieldParentPtr("writer", w);
+        self.take(w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var count: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.take(bytes) catch return error.WriteFailed;
+            count += bytes.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| self.take(last) catch return error.WriteFailed;
+        return count + last.len * splat;
+    }
+
+    fn take(self: *StdioOrder, bytes: []const u8) !void {
+        var rest = bytes;
+        while (std.mem.findScalar(u8, rest, '\n')) |end| {
+            try self.line.appendSlice(std.testing.allocator, rest[0..end]);
+            try self.record(self.line.items);
+            self.line.clearRetainingCapacity();
+            rest = rest[end + 1 ..];
+        }
+        try self.line.appendSlice(std.testing.allocator, rest);
+    }
+
+    fn record(self: *StdioOrder, line: []const u8) !void {
+        var buf: [4096]u8 = undefined;
+        var fba: std.heap.FixedBufferAllocator = .init(&buf);
+        const frame = try json.parseTree(fba.allocator(), line);
+        const method = json.getString(frame, "method") orelse return;
+        const params = frame.object.get("params") orelse return;
+        const meta = params.object.get("_meta") orelse return;
+        const sid = meta.object.get("io.modelcontextprotocol/subscriptionId") orelse return;
+        const index: usize = @intCast(sid.integer);
+        if (std.mem.eql(u8, method, ack_method)) {
+            self.acked[index] = true;
+            self.last_ack.store(@max(index, self.last_ack.load(.monotonic)), .release);
+            self.ack_event.set(std.testing.io);
+        } else if (std.mem.eql(u8, method, event_method)) {
+            self.events += 1;
+            if (!self.acked[index]) self.early += 1;
+        }
+    }
+
+    /// Wait until the stream `id` has its acknowledgment, at most four seconds.
+    fn awaitAck(self: *StdioOrder, id: usize) bool {
+        while (self.last_ack.load(.acquire) < id) {
+            if (!waitEvent(&self.ack_event, 4000)) return false;
+            // Only this task waits for the event.
+            self.ack_event.reset();
+        }
+        return true;
+    }
+};
+
+test "a publish that races new listen streams over stdio never writes an event before the acknowledgment" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var server = try listChangedServer();
+    defer server.deinit();
+    var buffer: [8192]u8 = undefined;
+    var order: StdioOrder = .init(&buffer);
+    defer order.deinit();
+    var transport: mcp.transport.stdio.Server = .init(io, gpa, &server, &order.writer);
+    defer transport.deinit();
+    var drained = false;
+    defer if (!drained) {
+        transport.stopAdmission();
+        transport.cancelAll("done", false);
+        transport.awaitInFlight(.fromSeconds(10));
+    };
+
+    var publisher: Publisher = .{ .server = &server };
+    var publishing = try io.concurrent(Publisher.run, .{&publisher});
+    var halted = false;
+    defer if (!halted) publisher.halt(&publishing);
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (1..order_rounds + 1) |id| {
+        try transport.receive(try request(arena, @intCast(id), "subscriptions/listen", meta_none, tools_listen));
+        try std.testing.expect(order.awaitAck(id));
+        try transport.receive(try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{d},\"reason\":\"done\"}}}}", .{id}));
+    }
+    publisher.halt(&publishing);
+    halted = true;
+    transport.stopAdmission();
+    transport.cancelAll("done", false);
+    transport.awaitInFlight(.fromSeconds(10));
+    drained = true;
+
+    // No task writes now.
+    try std.testing.expectEqual(0, order.early);
+    // The publisher raced the streams.
+    try std.testing.expect(order.events > 0);
+}
+
 // -- Tasks extension --------------------------------------------------------------------------
 
 const meta_tasks =

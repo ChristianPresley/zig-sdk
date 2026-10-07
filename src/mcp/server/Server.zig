@@ -207,7 +207,13 @@ const Subscription = struct {
     responder: Transport.Responder,
     cancel: *Transport.CancelToken,
     kind: Transport.Kind,
+    /// Serializes the frames of the stream. `listen` holds it from before `publish` can see
+    /// the subscription until the acknowledgment is out. Thus an event waits for the
+    /// acknowledgment.
     mutex: Io.Mutex = .init,
+    /// True after the server sent the acknowledgment. Guarded by `mutex`. Without the
+    /// acknowledgment, the subscription gets no events: the listen request ends.
+    acked: bool = false,
     broken: bool = false,
     arena: std.heap.ArenaAllocator,
 };
@@ -1376,19 +1382,29 @@ fn listen(self: *Server, ctx: *RequestContext, params: types.SubscriptionsListen
         }
         try self.subscriptions.append(self.gpa, sub);
         owned = false;
+        // Lock the stream before `publish` can see the subscription. The lock order is the
+        // order of `publish`: first `subscriptions_lock`, then `sub.mutex`.
+        sub.mutex.lockUncancelable(ctx.io);
     }
     ctx.long_lived = true;
     if (self.shutting_down.load(.acquire)) ctx.cancel.shutdown(ctx.io, shutdown_reason);
 
-    // The acknowledgement is always the first message on the stream.
+    // The acknowledgment is always the first message on the stream. A concurrent `publish`
+    // waits for `sub.mutex`, thus its event goes out after the acknowledgment.
     const ack: types.SubscriptionsAcknowledgedNotificationParams = .{
         ._meta = .{ .@"io.modelcontextprotocol/subscriptionId" = ctx.id },
         .notifications = honoured,
     };
     ctx.sendNotification("notifications/subscriptions/acknowledged", ack) catch |e| {
+        // `removeSubscription` takes `subscriptions_lock`, and a `publish` that holds it can
+        // wait for `sub.mutex`. Thus unlock first. `sub.acked` stays false, so that `publish`
+        // sends no event in the meantime.
+        sub.mutex.unlock(ctx.io);
         _ = self.removeSubscription(ctx.io, sub);
         return e;
     };
+    sub.acked = true;
+    sub.mutex.unlock(ctx.io);
 
     // Park until the client cancels, the transport closes, or the server shuts down.
     ctx.cancel.wait(ctx.io) catch {};
@@ -1473,6 +1489,8 @@ fn deliver(self: *Server, io: Io, sub: *Subscription, event: Event, uri: ?[]cons
     }
     sub.mutex.lockUncancelable(io);
     defer sub.mutex.unlock(io);
+    // The acknowledgment did not go out: the listen request ends without events.
+    if (!sub.acked) return;
     try sub.responder.notify(io, aw.written());
 }
 

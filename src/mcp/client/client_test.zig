@@ -690,17 +690,11 @@ test "a long listen stream over the memory link does not make the request arena 
     var stopped = false;
     defer if (!stopped) job.stop(&future);
     try awaitCount(&counter.acks, 1);
-    // Publish until the first event arrives, because the server can make the subscription
-    // visible to publish after the acknowledgment.
-    var spins: usize = 0;
-    while (counter.updates.load(.acquire) == 0) : (spins += 1) {
-        if (spins > 4000) return error.TestTimeout;
-        server.notifyResourceUpdated(io, listen_uri);
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-
     // The server gives each event to the client on this task, thus the client has the event
-    // when the call returns.
+    // when the call returns. The subscription is visible to publish before the
+    // acknowledgment, thus the first event after it arrives.
+    server.notifyResourceUpdated(io, listen_uri);
+    try std.testing.expectEqual(1, counter.updates.load(.acquire));
     for (0..100) |_| server.notifyResourceUpdated(io, listen_uri);
     const updates = counter.updates.load(.acquire);
     const capacity = job.arena_state.queryCapacity();
