@@ -197,6 +197,49 @@ fn fallbackIsResponse(frame: []const u8) bool {
     return std.mem.indexOf(u8, frame, "\"result\"") != null or std.mem.indexOf(u8, frame, "\"error\"") != null;
 }
 
+/// The value of the top-level "method" member of `frame`, without a full parse. The slice
+/// points into `frame`. The function does not check the remaining part of the frame. It
+/// gives null when the frame has no such member, or when the value is not a string without
+/// escape sequences. It also gives null when the scanner cannot read the keys in its fixed
+/// buffer.
+pub fn frameMethod(frame: []const u8) ?[]const u8 {
+    var buf: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    var scanner: std.json.Scanner = .initCompleteInput(fba.allocator(), frame);
+    return topLevelMethod(fba.allocator(), &scanner) catch null;
+}
+
+fn topLevelMethod(fba: std.mem.Allocator, scanner: *std.json.Scanner) !?[]const u8 {
+    if (try scanner.next() != .object_begin) return error.NotAnObject;
+    while (true) {
+        switch (try scanner.nextAllocMax(fba, .alloc_if_needed, 64)) {
+            .object_end => return null,
+            .string, .allocated_string => |key| if (std.mem.eql(u8, key, "method")) {
+                return switch (try scanner.next()) {
+                    .string => |name| name,
+                    else => null,
+                };
+            },
+            else => return error.UnexpectedToken,
+        }
+        try scanner.skipValue();
+    }
+}
+
+test "the method of a frame comes from the top-level member only" {
+    try std.testing.expectEqualStrings("notifications/progress", frameMethod("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"progress\":1}}").?);
+    // The member can come after the parameters.
+    try std.testing.expectEqualStrings("notifications/message", frameMethod("{\"params\":{\"method\":\"x\",\"data\":[{\"method\":\"y\"}]},\"method\":\"notifications/message\",\"jsonrpc\":\"2.0\"}").?);
+    // A "method" key inside a nested value does not count.
+    try std.testing.expect(frameMethod("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"method\":\"notifications/progress\"}}") == null);
+    // A value with an escape sequence, a value that is not a string, and a frame that is not
+    // an object give null.
+    try std.testing.expect(frameMethod("{\"jsonrpc\":\"2.0\",\"method\":\"notifications\\/progress\"}") == null);
+    try std.testing.expect(frameMethod("{\"jsonrpc\":\"2.0\",\"method\":7}") == null);
+    try std.testing.expect(frameMethod("[{\"method\":\"notifications/progress\"}]") == null);
+    try std.testing.expect(frameMethod("{\"jsonrpc\":") == null);
+}
+
 test "only top-level keys make a frame a response" {
     try std.testing.expect(frameIsResponse("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"));
     try std.testing.expect(frameIsResponse("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"x\"}}"));

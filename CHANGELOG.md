@@ -10,6 +10,12 @@ All notable changes to this project are recorded in this file. The format follow
 - `RequestOptions.meta`: more `_meta` entries for one request, for example `traceparent`, `tracestate`, `baggage` or a key with a vendor prefix. Before the client sends the request, it checks each key. A key that breaks the key grammar, or a key that the SDK owns, gives the new error `error.InvalidMeta` of `Client.RequestError`. The client sends nothing then. The client accepts the keys of extensions under `io.modelcontextprotocol/`. The entries of the SDK always have priority.
 - `meta.sdk_owned_request_keys` and `meta.isSdkOwnedRequestKey`: the request keys that the SDK owns. They are the protocol version, the client information, the client capabilities, the log level, the subscription id and the progress token.
 
+### Changed
+
+- Breaking: the client parses each notification of a request into scratch memory and resets that memory after the frame. Thus the `method` and `params` arguments of `RequestOptions.on_notification` and `Hooks.on_notification` are valid only during the call. Before, they stayed valid until the caller freed the request arena. A callback that keeps a part of them must copy it. The parameters of `on_progress` and `on_log` were already valid only during the call.
+- The request arena does not hold the notifications of the request. Thus a long `subscriptions/listen` stream does not make the request arena larger. Before, each event added approximately 1900 bytes to the request arena on all transports.
+- The client applies the progress rate limit before it parses a notification, when the method has no escape sequence. Thus it does not parse a progress notification over `limits.max_progress_rate_per_s`.
+
 ### Fixed
 
 - The doc comments of `RequestOptions.on_log`, `RequestOptions.on_notification` and `Hooks.on_notification` tell which notifications they receive. These callbacks receive only the notifications that the transport routes to a request. Before, the comment of `Hooks.on_notification` said that it receives the notifications that belong to no request on stdio. On the stdio, Unix socket and WebSocket transports, such notifications go to the `on_notification` option of the transport. Log messages of the server are such notifications, because they carry no progress token and no subscription id.

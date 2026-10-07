@@ -16,6 +16,7 @@ const json = @import("../json.zig");
 const message = @import("../jsonrpc/message.zig");
 const RequestId = @import("../jsonrpc/id.zig").RequestId;
 const Transport = @import("../transport/Transport.zig");
+const router = @import("../transport/router.zig");
 const Limits = @import("../Limits.zig");
 const rate_limit = @import("../util/rate_limit.zig");
 const tasks = @import("../server/tasks.zig");
@@ -83,7 +84,8 @@ pub const Hooks = struct {
     /// Receives a notification that the transport routes to a request without its own
     /// `on_notification`, when the notification is not progress or log. A notification that
     /// belongs to no request goes to the `on_notification` option of the stdio, Unix socket
-    /// or WebSocket client transport.
+    /// or WebSocket client transport. `method` and `params` are valid only during the call.
+    /// Copy the data that you keep.
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
     /// Decode, sanitize or convert a checked icon image. The formats that need a decoder
     /// (GIF, WebP and SVG) pass only when this hook is set and the icon policy turns them on.
@@ -112,14 +114,19 @@ pub const RequestOptions = struct {
     /// sets it.
     max_total_timeout: ?Io.Duration = null,
     cancel: ?*Transport.CancelToken = null,
+    /// Receives the progress notifications of this request. The client drops the
+    /// notifications over `limits.max_progress_rate_per_s`. `params` is valid only during
+    /// the call.
     on_progress: ?*const fn (userdata: ?*anyopaque, params: types.ProgressNotificationParams) void = null,
     /// Receives the log messages that the transport routes to this request. The stdio, Unix
     /// socket and WebSocket transports route a notification only by its progress token or its
     /// subscription id. A log message of the server has neither. Thus on these transports, log
     /// messages go to the `on_notification` option of the transport and not to this callback.
+    /// `params` is valid only during the call.
     on_log: ?*const fn (userdata: ?*anyopaque, params: types.LoggingMessageNotificationParams) void = null,
     /// Receives each notification that the transport routes to this request, when the
-    /// notification is not progress or log.
+    /// notification is not progress or log. `method` and `params` are valid only during the
+    /// call. Copy the data that you keep.
     on_notification: ?*const fn (userdata: ?*anyopaque, method: []const u8, params: ?Value) void = null,
     /// The log level for this request. It replaces `Options.log_level`. The client sends it in
     /// `_meta` also when `Options.log_level` is null.
@@ -592,14 +599,59 @@ const Collector = struct {
     frames: u32 = 0,
     /// The rate limit of the progress notifications of this request.
     progress: rate_limit.Window = .{},
+    /// The memory of the notification in the current frame. The collector resets it after
+    /// each frame and keeps at most `scratch_keep_bytes` of it for the next frame. Thus a
+    /// long listen stream does not make the request arena larger.
+    scratch: std.heap.ArenaAllocator,
+    /// True while a frame uses `scratch`.
+    scratch_busy: std.atomic.Value(bool) = .init(false),
+
+    const scratch_keep_bytes = 64 * 1024;
+    const progress_method = "notifications/progress";
 
     fn onFrame(ptr: *anyopaque, io: Io, frame: []const u8) anyerror!void {
         const self: *Collector = @ptrCast(@alignCast(ptr));
         self.frames += 1;
-        const msg = message.Message.parseMaxDepth(self.arena, frame, self.client.options.limits.json_max_depth) catch {
+        // The caller uses a response after the exchange, thus it goes into the request arena.
+        if (router.frameIsResponse(frame)) return self.handle(io, try self.parse(self.arena, frame), self.arena, false);
+
+        // A flood of progress does not reach the callback: the client drops the
+        // notifications over `limits.max_progress_rate_per_s`. When the method has no escape
+        // sequence, the client drops them before the parse.
+        const progress_counted = if (router.frameMethod(frame)) |m| std.mem.eql(u8, m, progress_method) else false;
+        if (progress_counted and !self.admitProgress(io)) return;
+
+        // A transport gives the frames of one exchange one after the other. A frame that
+        // arrives while another frame uses `scratch`, from a callback or from another task,
+        // gets its own arena.
+        const shared = self.scratch_busy.cmpxchgStrong(false, true, .acquire, .monotonic) == null;
+        defer if (shared) {
+            _ = self.scratch.reset(.{ .retain_with_limit = scratch_keep_bytes });
+            self.scratch_busy.store(false, .release);
+        };
+        var own: std.heap.ArenaAllocator = .init(self.client.gpa);
+        defer own.deinit();
+        const scratch = if (shared) self.scratch.allocator() else own.allocator();
+
+        const msg = try self.parse(scratch, frame);
+        return switch (msg) {
+            // The check of the top-level keys did not find this response. Parse it again into
+            // the request arena.
+            .response, .error_response => self.handle(io, try self.parse(self.arena, frame), self.arena, false),
+            else => self.handle(io, msg, scratch, progress_counted),
+        };
+    }
+
+    fn parse(self: *Collector, arena: Allocator, frame: []const u8) error{InvalidFrame}!message.Message {
+        return message.Message.parseMaxDepth(arena, frame, self.client.options.limits.json_max_depth) catch {
             self.invalid = true;
             return error.InvalidFrame;
         };
+    }
+
+    /// Handle one parsed frame. `scratch` holds the parsed message and the parameters of its
+    /// callback. `progress_counted` is true when the rate limit already counted the frame.
+    fn handle(self: *Collector, io: Io, msg: message.Message, scratch: Allocator, progress_counted: bool) error{InvalidFrame}!void {
         switch (msg) {
             .response => |r| {
                 if (!r.id.eql(self.id)) return; // a late response for another request
@@ -610,12 +662,10 @@ const Collector = struct {
                 self.rpc_error = .{ .code = e.code, .message = e.message, .data = e.data };
             },
             .notification => |n| {
-                // A flood of progress does not reach the callback: the client drops the
-                // notifications over `limits.max_progress_rate_per_s`.
-                if (std.mem.eql(u8, n.method, "notifications/progress")) {
-                    if (!self.progress.admit(io, self.client.options.limits.max_progress_rate_per_s)) return;
+                if (!progress_counted and std.mem.eql(u8, n.method, progress_method)) {
+                    if (!self.admitProgress(io)) return;
                 }
-                self.client.dispatchNotification(n.method, n.params, self.options);
+                self.client.dispatchNotification(scratch, n.method, n.params, self.options);
             },
             .request => {
                 // Servers do not send requests in this revision.
@@ -624,24 +674,27 @@ const Collector = struct {
             },
         }
     }
+
+    fn admitProgress(self: *Collector, io: Io) bool {
+        return self.progress.admit(io, self.client.options.limits.max_progress_rate_per_s);
+    }
 };
 
-fn dispatchNotification(self: *Client, method_name: []const u8, params: ?Value, options: RequestOptions) void {
+/// Give a notification to the callbacks. `scratch` holds `params` and the parsed parameters
+/// of the callback.
+fn dispatchNotification(self: *Client, scratch: Allocator, method_name: []const u8, params: ?Value, options: RequestOptions) void {
     // A change notification invalidates the cached lists and reads.
     if (cache_mod.Cache.methodForNotification(method_name)) |m| self.cache.invalidate(m);
-    // Parsed notification params live only for the callback.
-    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
-    defer scratch.deinit();
     if (std.mem.eql(u8, method_name, "notifications/progress")) {
         if (options.on_progress) |f| {
-            const p = json.parseValue(types.ProgressNotificationParams, scratch.allocator(), params orelse .null) catch return;
+            const p = json.parseValue(types.ProgressNotificationParams, scratch, params orelse .null) catch return;
             f(options.userdata, p);
         }
         return;
     }
     if (std.mem.eql(u8, method_name, "notifications/message")) {
         if (options.on_log) |f| {
-            const p = json.parseValue(types.LoggingMessageNotificationParams, scratch.allocator(), params orelse .null) catch return;
+            const p = json.parseValue(types.LoggingMessageNotificationParams, scratch, params orelse .null) catch return;
             f(options.userdata, p);
         }
         return;
@@ -692,7 +745,8 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
         message.writeRequest(&aw.writer, id, method_name, full) catch return error.OutOfMemory;
         const frame = aw.written();
 
-        var collector: Collector = .{ .client = self, .arena = arena, .id = id, .options = options };
+        var collector: Collector = .{ .client = self, .arena = arena, .id = id, .options = options, .scratch = .init(self.gpa) };
+        defer collector.scratch.deinit();
         var ex: Transport.Exchange = .{
             .frame = frame,
             .id = id,

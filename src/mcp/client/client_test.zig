@@ -1,13 +1,16 @@
 //! Client behavior over the in-memory link to a server.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Value = std.json.Value;
 const mcp = @import("../../mcp.zig");
 const Server = mcp.Server;
 const Client = mcp.Client;
 const RequestContext = mcp.RequestContext;
+const Transport = mcp.transport.Transport;
 const types = mcp.types;
 const json = mcp.json;
+const router = @import("../transport/router.zig");
 
 const AddArgs = struct { a: i64, b: i64 };
 
@@ -417,4 +420,296 @@ test "the result cache serves reads with a lifetime until invalidated" {
     try std.testing.expectEqual(2, f.client.cache.count());
     _ = try f.client.discover(arena, .{});
     try std.testing.expectEqual(2, f.client.cache.count());
+}
+
+// -- The memory of notifications ----------------------------------------------------------------
+
+/// A client transport that gives the same frames to each request. `{id}` in a frame becomes
+/// the id of the request. A callback can give more frames to the request in progress.
+const Scripted = struct {
+    frames: []const []const u8,
+    in_flight: ?*Transport.Exchange = null,
+
+    fn transport(self: *Scripted) Transport.ClientTransport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = notify };
+
+    fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
+        const self: *Scripted = @ptrCast(@alignCast(ptr));
+        self.in_flight = ex;
+        defer self.in_flight = null;
+        for (self.frames) |template| try self.give(io, template);
+    }
+
+    /// Give one frame to the request in progress.
+    fn give(self: *Scripted, io: Io, template: []const u8) Transport.ExchangeError!void {
+        const ex = self.in_flight.?;
+        var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const id = try std.fmt.allocPrint(arena, "{d}", .{ex.id.integer});
+        const frame = try std.mem.replaceOwned(u8, arena, template, "{id}", id);
+        ex.deliver(io, frame) catch return error.InvalidFrame;
+    }
+
+    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        _ = ptr;
+        _ = io;
+        _ = frame;
+    }
+};
+
+/// Fills memory with 0xaa before it gives the memory back to `child`. A read of freed memory
+/// then gives other bytes.
+const Poisoning = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *Poisoning) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Poisoning = @ptrCast(@alignCast(ptr));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *Poisoning = @ptrCast(@alignCast(ptr));
+        if (new_len < memory.len) @memset(memory[new_len..], 0xaa);
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        // The caller copies the memory and frees the old memory.
+        return null;
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Poisoning = @ptrCast(@alignCast(ptr));
+        @memset(memory, 0xaa);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "a response that the check of the top-level keys does not find stays valid after the exchange" {
+    // A top-level key with an escape sequence is too long for the buffer of the scanner, and a
+    // nested "method" key makes the fallback check give "not a response". The collector
+    // parses the frame into its scratch memory first.
+    const head = "{\"jsonrpc\":\"2.0\",\"id\":";
+    const tail = ",\"\\u006b" ++ "k" ** 80 ++ "\":0,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"kept\"}],\"structuredContent\":{\"method\":\"get\"}}}";
+    const response = head ++ "{id}" ++ tail;
+    // The first request of a client has the id 1.
+    try std.testing.expect(!router.frameIsResponse(head ++ "1" ++ tail));
+    var scripted: Scripted = .{ .frames = &.{
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":{id},\"progress\":1}}",
+        response,
+    } };
+    // The scratch memory of the client comes from `gpa`. Freed memory changes its bytes.
+    var poisoning: Poisoning = .{ .child = std.testing.allocator };
+    var client: Client = .init(poisoning.allocator(), std.testing.io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(scripted.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const result = try client.callTool(arena_state.allocator(), "t", null, .{});
+    try std.testing.expectEqualStrings("kept", result.content[0].text.text);
+    try std.testing.expectEqualStrings("get", json.getString(result.structuredContent.?, "method").?);
+}
+
+/// Gives two more frames from the callback of the first notification. Then it checks that
+/// the parameters of the first notification did not change.
+const Nested = struct {
+    scripted: *Scripted,
+    first_intact: bool = false,
+    nested_seen: u32 = 0,
+
+    fn onNotification(userdata: ?*anyopaque, method: []const u8, params: ?Value) void {
+        const self: *Nested = @ptrCast(@alignCast(userdata.?));
+        if (!std.mem.eql(u8, method, "test/first")) {
+            const text = json.getString(params.?, "text").?;
+            if (std.mem.startsWith(u8, text, "nested ")) self.nested_seen += 1;
+            return;
+        }
+        const nested = "{\"jsonrpc\":\"2.0\",\"method\":\"test/nested\",\"params\":{\"progressToken\":{id},\"text\":\"nested " ++ "n" ** 200 ++ "\"}}";
+        self.scripted.give(std.testing.io, nested) catch return;
+        self.scripted.give(std.testing.io, nested) catch return;
+        const text = json.getString(params.?, "text") orelse "";
+        self.first_intact = std.mem.eql(u8, method, "test/first") and std.mem.eql(u8, text, "first frame");
+    }
+};
+
+test "a frame that a callback gives during another frame does not overwrite the parameters of that frame" {
+    var scripted: Scripted = .{ .frames = &.{
+        "{\"jsonrpc\":\"2.0\",\"method\":\"test/first\",\"params\":{\"progressToken\":{id},\"text\":\"first frame\"}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{\"resultType\":\"complete\",\"content\":[]}}",
+    } };
+    var nested: Nested = .{ .scripted = &scripted };
+    // The scratch memory of the client comes from `gpa`. Freed memory changes its bytes.
+    var poisoning: Poisoning = .{ .child = std.testing.allocator };
+    var client: Client = .init(poisoning.allocator(), std.testing.io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(scripted.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    _ = try client.callTool(arena_state.allocator(), "t", null, .{ .on_notification = Nested.onNotification, .userdata = &nested });
+    try std.testing.expectEqual(2, nested.nested_seen);
+    try std.testing.expect(nested.first_intact);
+}
+
+const listen_uri = "test://counted";
+
+/// Counts the acknowledgments and the `notifications/resources/updated` for `listen_uri`.
+const UpdateCounter = struct {
+    acks: std.atomic.Value(u32) = .init(0),
+    updates: std.atomic.Value(u32) = .init(0),
+
+    fn onNotification(userdata: ?*anyopaque, method: []const u8, params: ?Value) void {
+        const self: *UpdateCounter = @ptrCast(@alignCast(userdata.?));
+        if (std.mem.eql(u8, method, "notifications/subscriptions/acknowledged")) {
+            _ = self.acks.fetchAdd(1, .release);
+            return;
+        }
+        if (!std.mem.eql(u8, method, "notifications/resources/updated")) return;
+        const uri = json.getString(params orelse return, "uri") orelse return;
+        if (std.mem.eql(u8, uri, listen_uri)) _ = self.updates.fetchAdd(1, .release);
+    }
+};
+
+/// Wait until `value` is `at_least` or more, at most 20 seconds.
+fn awaitCount(value: *const std.atomic.Value(u32), at_least: u32) !void {
+    var spins: usize = 0;
+    while (value.load(.acquire) < at_least) : (spins += 1) {
+        if (spins > 4000) return error.TestTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+/// One listen stream for `listen_uri` in its own task. The job owns the request arena, thus
+/// the test can read its capacity.
+const ListenJob = struct {
+    client: *Client,
+    counter: *UpdateCounter,
+    arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator),
+    token: Transport.CancelToken = .{},
+    result: ?Client.RequestError = null,
+
+    fn run(job: *ListenJob) void {
+        const filter: types.SubscriptionsListenRequestParams = .{
+            ._meta = .{ .@"io.modelcontextprotocol/protocolVersion" = "2026-07-28", .@"io.modelcontextprotocol/clientCapabilities" = .{} },
+            .notifications = .{ .resourceSubscriptions = &.{listen_uri} },
+        };
+        _ = job.client.listen(job.arena_state.allocator(), filter, .{
+            .cancel = &job.token,
+            .retry = .never,
+            .on_notification = UpdateCounter.onNotification,
+            .userdata = job.counter,
+        }) catch |e| {
+            job.result = e;
+        };
+    }
+
+    /// Cancel the stream and wait for the end of its task.
+    fn stop(job: *ListenJob, future: *Io.Future(void)) void {
+        job.token.cancel(std.testing.io, "done");
+        future.await(std.testing.io);
+    }
+};
+
+test "a long listen stream over the memory link does not make the request arena larger" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var server = try Server.init(gpa, io, .{ .info = .{ .name = "srv", .version = "1" }, .capabilities = .{ .resources = .{ .subscribe = true } } });
+    defer server.deinit();
+    var link: mcp.transport.memory.ClientLink = .init(io, gpa, &server);
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(link.transport());
+
+    var counter: UpdateCounter = .{};
+    var job: ListenJob = .{ .client = &client, .counter = &counter };
+    defer job.arena_state.deinit();
+    var future = try io.concurrent(ListenJob.run, .{&job});
+    var stopped = false;
+    defer if (!stopped) job.stop(&future);
+    try awaitCount(&counter.acks, 1);
+    // Publish until the first event arrives, because the server can make the subscription
+    // visible to publish after the acknowledgment.
+    var spins: usize = 0;
+    while (counter.updates.load(.acquire) == 0) : (spins += 1) {
+        if (spins > 4000) return error.TestTimeout;
+        server.notifyResourceUpdated(io, listen_uri);
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    // The server gives each event to the client on this task, thus the client has the event
+    // when the call returns.
+    for (0..100) |_| server.notifyResourceUpdated(io, listen_uri);
+    const updates = counter.updates.load(.acquire);
+    const capacity = job.arena_state.queryCapacity();
+    for (0..10_000) |_| server.notifyResourceUpdated(io, listen_uri);
+    try std.testing.expectEqual(updates + 10_000, counter.updates.load(.acquire));
+    try std.testing.expectEqual(capacity, job.arena_state.queryCapacity());
+
+    job.stop(&future);
+    stopped = true;
+    try std.testing.expectEqual(error.Canceled, job.result.?);
+}
+
+/// A child that reads one line, writes the file `events.jsonl` of its current directory to
+/// its standard output, and then reads one more line.
+const replay_argv: []const []const u8 = if (builtin.os.tag == .windows)
+    &.{ "cmd.exe", "/d", "/c", "set", "/p", "line=&type", "events.jsonl&set", "/p", "line=" }
+else
+    &.{ "/bin/sh", "-c", "read -r line; cat events.jsonl; read -r line; exit 0" };
+
+/// Replay an acknowledgment and `count` events for the first request of a new client over
+/// stdio. Return the capacity of the request arena of the listen stream after the last event.
+fn replayListen(dir: Io.Dir, count: u32) !usize {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    // The first request of a client has the id 1, thus the subscription id is 1.
+    try text.appendSlice(gpa, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1},\"notifications\":{\"resourceSubscriptions\":[\"" ++ listen_uri ++ "\"]}}}\n");
+    for (0..count) |_| try text.appendSlice(gpa, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":1},\"uri\":\"" ++ listen_uri ++ "\"}}\n");
+    try dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = text.items });
+
+    const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = replay_argv, .cwd = .{ .dir = dir } }) catch return error.SkipZigTest;
+    defer proc.deinit();
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" } });
+    defer client.deinit();
+    client.connect(proc.transport());
+
+    var counter: UpdateCounter = .{};
+    var job: ListenJob = .{ .client = &client, .counter = &counter };
+    defer job.arena_state.deinit();
+    var future = try io.concurrent(ListenJob.run, .{&job});
+    var stopped = false;
+    defer if (!stopped) job.stop(&future);
+    try awaitCount(&counter.updates, count);
+    const capacity = job.arena_state.queryCapacity();
+    try std.testing.expectEqual(1, counter.acks.load(.acquire));
+
+    job.stop(&future);
+    stopped = true;
+    try std.testing.expectEqual(error.Canceled, job.result.?);
+    try std.testing.expectEqual(count, counter.updates.load(.acquire));
+    return capacity;
+}
+
+test "a long listen stream over stdio does not make the request arena larger" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const short = try replayListen(tmp.dir, 100);
+    const long = try replayListen(tmp.dir, 10_000);
+    try std.testing.expectEqual(short, long);
 }
