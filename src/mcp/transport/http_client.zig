@@ -225,6 +225,7 @@ pub const Client = struct {
         while (true) {
             const challenge = (try self.performOnce(arena, ex)) orelse return;
             const auth = self.authProvider() orelse {
+                log.warn("the server answered with status {d}, and the client has no authorization provider", .{challenge.status});
                 ex.http_status = challenge.status;
                 return error.HttpStatus;
             };
@@ -332,8 +333,14 @@ pub const Client = struct {
             return null;
         }
         _ = body.discardRemaining() catch {};
+        // For example 404 for a wrong path, or an error page of a proxy.
+        const shown = if (content_type.len == 0) "none" else content_type[0..@min(content_type.len, max_logged_bytes)];
+        log.warn("the server answered with status {d} and the content type {s}, which carries no JSON-RPC message", .{ ex.http_status, shown });
         return error.HttpStatus;
     }
+
+    /// The maximum bytes of a header value in a log line.
+    const max_logged_bytes = 100;
 
     /// Add `Mcp-Name` and the `Mcp-Param-*` headers the request needs.
     fn mirrorHeaders(self: *Client, arena: Allocator, headers: *std.ArrayList(http.Header), ex: *Transport.Exchange) tool_headers.Map.AppendError!void {

@@ -104,6 +104,10 @@ pub const Diagnostics = struct {
     /// True when the `structuredContent` of a `callTool` result does not match the
     /// `outputSchema` of the tool. The client knows the schema from `listTools`.
     structured_content_invalid: bool = false,
+    /// The HTTP status of the last response to the request, also when the request failed.
+    /// The Streamable HTTP and gRPC transports give it. The WebSocket transport gives the
+    /// status of an upgrade that the server refused. Null when the transport gave no status.
+    http_status: ?u16 = null,
 };
 
 pub const RequestOptions = struct {
@@ -791,7 +795,11 @@ fn requestRaw(self: *Client, arena: Allocator, method_name: []const u8, params: 
             .first_frame_timeout = if (is_listen) self.listenAckTimeout() else .none,
             .inline_notifications = options.inline_notifications,
         };
-        transport.exchange(self.io, &ex) catch |e| switch (e) {
+        const exchanged = transport.exchange(self.io, &ex);
+        if (ex.http_status != 0) if (options.diagnostics) |d| {
+            d.http_status = ex.http_status;
+        };
+        exchanged catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Timeout => return error.Timeout,
             error.Canceled => return error.Canceled,

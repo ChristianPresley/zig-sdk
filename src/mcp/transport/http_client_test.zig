@@ -175,6 +175,8 @@ test "http client: json, sse, header mirroring and mrtr" {
     const first = try f.client.callTool(arena, "test_headers", .{ .region = "us west", .priority = 7 }, .{ .diagnostics = &diag });
     try std.testing.expectEqualStrings("us west/7", first.content[0].text.text);
     try std.testing.expect(diag.rpc_error == null);
+    // The status of the last response, the response to the second call.
+    try std.testing.expectEqual(200, diag.http_status.?);
     // After tools/list the headers are mirrored, including the base64 sentinel for the space.
     const tools = try f.client.listTools(arena, null, .{});
     try std.testing.expectEqual(6, tools.tools.len);
@@ -286,7 +288,10 @@ test "http client: a wrong path is an http status without a message" {
     defer f.stop();
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
-    try std.testing.expectError(error.InvalidResponse, f.client.discover(arena_state.allocator(), .{}));
+    var diag: Client.Diagnostics = .{};
+    try std.testing.expectError(error.InvalidResponse, f.client.discover(arena_state.allocator(), .{ .diagnostics = &diag }));
+    // The caller can tell a wrong path from a response that is not valid.
+    try std.testing.expectEqual(404, diag.http_status.?);
 }
 
 const listen_filter = "{\"notifications\":{\"toolsListChanged\":true}}";

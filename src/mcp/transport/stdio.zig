@@ -437,6 +437,10 @@ pub fn serve(io: Io, gpa: Allocator, server: *McpServer) !void {
 
 /// Spawns a server process and speaks MCP over its stdin and stdout. One reader task demuxes
 /// the frames to the requests in flight by id, progress token and subscription id.
+///
+/// The process can end its output when no restart is left. Then the reader task closes the
+/// input of the process and reaps it, as `close` does. It logs a warning in the scope
+/// `mcp_stdio` with the exit status. `exitStatus` gives the status.
 pub const Client = struct {
     io: Io,
     gpa: Allocator,
@@ -449,6 +453,7 @@ pub const Client = struct {
     out_buf: []u8,
     stdout_reader: Io.File.Reader,
     stdin_writer: Io.File.Writer,
+    /// Guards `stdin_writer` and the input pipe in `child`.
     out_lock: Io.Mutex = .init,
     router: Router,
     reader_future: ?Io.Future(void) = null,
@@ -458,6 +463,12 @@ pub const Client = struct {
     /// Counts the restarts. A request that waits across a restart fails.
     generation: std.atomic.Value(u32) = .init(0),
     restarts: u32 = 0,
+    /// Guards the process id in `child` and `exit_status`. A signal and a reap both take it.
+    /// Thus the client signals no process after it reaped it. Take `out_lock` first when a
+    /// task takes both.
+    child_lock: Io.Mutex = .init,
+    /// The status of the last process that the client reaped.
+    exit_status: ?std.process.Child.Term = null,
 
     pub const SpawnOptions = struct {
         /// The command. The slices must stay valid while the client lives (restarts reuse them).
@@ -540,7 +551,9 @@ pub const Client = struct {
             win.assign(job, child.id.?) catch {};
             _ = std.os.windows.ntdll.NtResumeThread(child.thread_handle, null);
         };
+        self.child_lock.lockUncancelable(io);
         self.child = child;
+        self.child_lock.unlock(io);
         self.stdout_reader = self.child.stdout.?.readerStreaming(io, self.in_buf);
         self.stdin_writer = self.child.stdin.?.writerStreaming(io, self.out_buf);
     }
@@ -553,15 +566,7 @@ pub const Client = struct {
     /// process tree gets a termination signal, and after one more grace period a kill signal.
     pub fn close(self: *Client) void {
         const io = self.io;
-        if (!self.closed.swap(true, .acq_rel)) {
-            self.out_lock.lockUncancelable(io);
-            self.stdin_writer.interface.flush() catch {};
-            self.out_lock.unlock(io);
-            if (self.child.stdin) |stdin| {
-                stdin.close(io);
-                self.child.stdin = null;
-            }
-        }
+        if (!self.closed.swap(true, .acq_rel)) self.closeInput();
         if (self.reader_future) |*f| {
             if (!self.waitReader(self.limits.shutdown_grace)) {
                 self.terminate(.graceful);
@@ -570,7 +575,7 @@ pub const Client = struct {
             f.await(io);
             self.reader_future = null;
         }
-        if (self.child.id != null) _ = self.child.wait(io) catch {};
+        self.reapChild();
         self.closeJob();
     }
 
@@ -582,8 +587,19 @@ pub const Client = struct {
             f.await(self.io);
             self.reader_future = null;
         }
-        if (self.child.id != null) _ = self.child.wait(self.io) catch {};
+        self.closeInput();
+        self.reapChild();
         self.closeJob();
+    }
+
+    /// The status of the last server process that ended: its exit code, or the signal that
+    /// ended it. Null before the client reaped the first process, and when the system gave no
+    /// status. The client reaps a process after it ends its output, before a restart, and in
+    /// `close` and `kill`. After a restart, the status is that of the earlier process.
+    pub fn exitStatus(self: *Client) ?std.process.Child.Term {
+        self.child_lock.lockUncancelable(self.io);
+        defer self.child_lock.unlock(self.io);
+        return self.exit_status;
     }
 
     pub fn deinit(self: *Client) void {
@@ -610,10 +626,92 @@ pub const Client = struct {
         return true;
     }
 
+    /// Flush and close the input of the process. The process then sees the end of its input.
+    fn closeInput(self: *Client) void {
+        self.out_lock.lockUncancelable(self.io);
+        defer self.out_lock.unlock(self.io);
+        self.closeInputLocked();
+    }
+
+    /// `closeInput` for a caller that holds `out_lock`.
+    fn closeInputLocked(self: *Client) void {
+        const stdin = self.child.stdin orelse return;
+        self.stdin_writer.interface.flush() catch {};
+        stdin.close(self.io);
+        self.child.stdin = null;
+    }
+
+    /// Reap the process and record its status. A process that runs after
+    /// `limits.shutdown_grace` gets a termination signal, and after one more grace period a
+    /// kill signal.
+    fn reapChild(self: *Client) void {
+        const grace = self.limits.shutdown_grace;
+        if (self.awaitExit(grace)) return;
+        self.terminate(.graceful);
+        if (self.awaitExit(grace)) return;
+        self.terminate(.forced);
+        _ = self.awaitExit(null);
+    }
+
+    /// Reap the process when it ends, and wait at most `limit` for that. Null waits without a
+    /// limit. True when no process remains.
+    fn awaitExit(self: *Client, limit: ?Io.Duration) bool {
+        const io = self.io;
+        const deadline: ?Io.Clock.Timestamp = if (limit) |d| Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = d, .clock = .awake }) else null;
+        while (!self.tryReap()) {
+            if (deadline) |d| if (Io.Clock.Timestamp.now(io, .awake).durationTo(d).raw.nanoseconds <= 0) return false;
+            io.sleep(.fromMilliseconds(10), .awake) catch return false;
+        }
+        return true;
+    }
+
+    /// Reap the process when it ended, without a wait. True when no process remains. A reap
+    /// and a signal both take `child_lock`. Thus `terminate` never signals a process id that
+    /// the system can give to a new process.
+    fn tryReap(self: *Client) bool {
+        const io = self.io;
+        self.child_lock.lockUncancelable(io);
+        defer self.child_lock.unlock(io);
+        const id = self.child.id orelse return true;
+        switch (builtin.os.tag) {
+            .windows => {
+                const windows = std.os.windows;
+                const no_wait: windows.LARGE_INTEGER = 0;
+                if (windows.ntdll.NtWaitForSingleObject(id, .FALSE, &no_wait) != windows.NTSTATUS.WAIT_0) return false;
+                // The process ended, thus the wait returns at once.
+                self.exit_status = self.child.wait(io) catch null;
+            },
+            .wasi => return true,
+            else => {
+                const posix = std.posix;
+                var status: if (builtin.link_libc) c_int else u32 = 0;
+                const rc = posix.system.waitpid(id, &status, posix.W.NOHANG);
+                self.exit_status = switch (posix.errno(rc)) {
+                    .SUCCESS => if (rc == 0) return false else Io.Threaded.statusToTerm(@bitCast(status)),
+                    .INTR => return false,
+                    // The process is gone without a status.
+                    else => null,
+                };
+                // The reap freed the process id. Close the pipes, as `Child.wait` does. The
+                // input is already closed: each caller closes it first.
+                inline for (.{ &self.child.stdin, &self.child.stdout, &self.child.stderr }) |pipe| {
+                    if (pipe.*) |file| {
+                        file.close(io);
+                        pipe.* = null;
+                    }
+                }
+                self.child.id = null;
+            },
+        }
+        return true;
+    }
+
     const Termination = enum { graceful, forced };
 
     /// Signal the process tree. On Windows a job has no graceful signal: both modes kill it.
     fn terminate(self: *Client, how: Termination) void {
+        self.child_lock.lockUncancelable(self.io);
+        defer self.child_lock.unlock(self.io);
         if (self.child.id == null) return;
         if (builtin.os.tag == .windows) {
             if (self.job) |job| {
@@ -651,6 +749,8 @@ pub const Client = struct {
         if (self.closed.load(.acquire)) return error.Closed;
         self.out_lock.lockUncancelable(self.io);
         defer self.out_lock.unlock(self.io);
+        // The input can close while this task waits for the lock.
+        if (self.closed.load(.acquire) or self.child.stdin == null) return error.Closed;
         framer.writeFrame(&self.stdin_writer.interface, frame) catch return error.WriteFailed;
         self.stdin_writer.interface.flush() catch return error.WriteFailed;
     }
@@ -733,9 +833,17 @@ pub const Client = struct {
             if (self.closed.load(.acquire) or self.restarts >= self.options.max_restarts) break;
             self.restarts += 1;
             if (!self.restartChild()) break;
-            log.warn("stdio server exited; restarted it ({d} of {d})", .{ self.restarts, self.options.max_restarts });
+            log.warn("stdio server exited ({f}); restarted it ({d} of {d})", .{ ExitText{ .term = self.exitStatus() }, self.restarts, self.options.max_restarts });
         }
-        self.closed.store(true, .release);
+        const ours = self.closed.swap(true, .acq_rel);
+        // The requests in flight fail now, not after the reap.
+        self.router.wakeAll();
+        if (!ours) {
+            // The process ended its output on its own. Reap it, as `close` does.
+            self.closeInput();
+            self.reapChild();
+            log.warn("stdio server exited ({f}); no restart is left", .{ExitText{ .term = self.exitStatus() }});
+        }
         self.reader_done.store(true, .release);
         self.router.wakeAll();
     }
@@ -744,22 +852,53 @@ pub const Client = struct {
         self.router.readUntilEof(&self.stdout_reader.interface, self.limits.stdio.max_line_bytes, self.options.on_notification, self.options.userdata);
     }
 
-    /// Reap the old process and spawn a new one. Returns false when the spawn failed.
+    /// Reap the old process and spawn a new one. Returns false when the spawn failed, or when
+    /// `close` or `kill` started before the spawn.
     fn restartChild(self: *Client) bool {
         const io = self.io;
         self.out_lock.lockUncancelable(io);
         defer self.out_lock.unlock(io);
-        if (self.child.stdin) |stdin| {
-            stdin.close(io);
-            self.child.stdin = null;
-        }
-        if (self.child.id != null) _ = self.child.wait(io) catch {};
-        self.spawnChild() catch return false;
+        self.closeInputLocked();
+        self.reapChild();
+        if (self.closed.load(.acquire)) return false;
+        self.spawnChild() catch |e| {
+            log.warn("could not restart the stdio server: {t}", .{e});
+            return false;
+        };
         _ = self.generation.fetchAdd(1, .acq_rel);
         self.router.wakeAll();
         return true;
     }
 };
+
+/// The exit status of a process for a log line.
+const ExitText = struct {
+    term: ?std.process.Child.Term,
+
+    pub fn format(self: ExitText, w: *Io.Writer) Io.Writer.Error!void {
+        const term = self.term orelse return w.writeAll("status not known");
+        switch (term) {
+            .exited => |code| try w.print("exit code {d}", .{code}),
+            // Windows has no signals.
+            .signal => |sig| if (@TypeOf(sig) == void) try w.writeAll("a signal") else try w.print("signal {d}", .{@intFromEnum(sig)}),
+            .stopped => |sig| if (@TypeOf(sig) == void) try w.writeAll("stopped") else try w.print("stopped by signal {d}", .{@intFromEnum(sig)}),
+            .unknown => |status| try w.print("status {d}", .{status}),
+        }
+    }
+};
+
+test "the log text of an exit status" {
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try w.print("{f}", .{ExitText{ .term = .{ .exited = 3 } }});
+    try std.testing.expectEqualStrings("exit code 3", w.buffered());
+    w = .fixed(&buf);
+    try w.print("{f}", .{ExitText{ .term = null }});
+    try std.testing.expectEqualStrings("status not known", w.buffered());
+    w = .fixed(&buf);
+    try w.print("{f}", .{ExitText{ .term = .{ .unknown = 7 } }});
+    try std.testing.expectEqualStrings("status 7", w.buffered());
+}
 
 /// The Windows job object calls that std does not declare.
 const win = if (builtin.os.tag == .windows) struct {

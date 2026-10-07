@@ -1356,6 +1356,86 @@ test "stdio client terminates a server that does not exit after its input closed
     try std.testing.expect(ms < 10_000);
 }
 
+/// A child that exits with the code 3 at once, and does not read its input.
+const exit3_argv: []const []const u8 = if (builtin.os.tag == .windows)
+    &.{ "cmd.exe", "/d", "/c", "exit", "3" }
+else
+    &.{ "/bin/sh", "-c", "exit 3" };
+
+/// Wait at most 10 seconds until the client reaped a process.
+fn awaitExitStatus(io: Io, proc: *mcp.transport.stdio.Client) !std.process.Child.Term {
+    const start = Io.Clock.Timestamp.now(io, .awake);
+    while (true) {
+        if (proc.exitStatus()) |term| return term;
+        if (elapsedMs(io, start) > 10_000) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
+test "stdio client gives the exit status of a server that exits on its own" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = exit3_argv }) catch return error.SkipZigTest;
+    defer proc.deinit();
+    // The reader task reaps the process after the end of its output, without a call of the
+    // application.
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 3 }, try awaitExitStatus(io, proc));
+    var client: Client = .init(gpa, io, .{ .info = .{ .name = "g2", .version = "1" } });
+    defer client.deinit();
+    client.connect(proc.transport());
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.Closed, client.discover(arena_state.allocator(), .{ .timeout = .fromSeconds(10) }));
+}
+
+test "stdio client gives the exit status of the last process after the restarts" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = exit3_argv, .max_restarts = 2 }) catch return error.SkipZigTest;
+    defer proc.deinit();
+    // The reader task is done only after the last process.
+    const start = Io.Clock.Timestamp.now(io, .awake);
+    while (!proc.reader_done.load(.acquire)) {
+        if (elapsedMs(io, start) > 10_000) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectEqual(2, proc.restartCount());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 3 }, proc.exitStatus().?);
+}
+
+/// A child that reads one line and then exits with the code 5.
+const read_exit5_argv: []const []const u8 = if (builtin.os.tag == .windows)
+    &.{ "cmd.exe", "/d", "/c", "set", "/p", "line=&exit", "5" }
+else
+    &.{ "/bin/sh", "-c", "read -r line; exit 5" };
+
+test "stdio client gives the exit status after close" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = read_exit5_argv }) catch return error.SkipZigTest;
+    defer proc.deinit();
+    try std.testing.expect(proc.exitStatus() == null);
+    // The process exits at the end of its input.
+    proc.close();
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 5 }, proc.exitStatus().?);
+}
+
+test "stdio client ends a server that closes its output and runs on" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var limits: mcp.Limits = .{};
+    limits.shutdown_grace = .fromMilliseconds(100);
+    // The child closes its output and ignores the end of its input.
+    const argv: []const []const u8 = &.{ "/bin/sh", "-c", "exec >&-; sleep 30" };
+    const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = argv, .limits = limits }) catch return error.SkipZigTest;
+    defer proc.deinit();
+    // The reader task sends the termination signal after the grace period. It reaps the
+    // process long before the end of the sleep.
+    const term = try awaitExitStatus(io, proc);
+    try std.testing.expect(term == .signal);
+}
+
 const ListenRecorder = struct {
     acked: std.atomic.Value(bool) = .init(false),
     subscription_id: std.atomic.Value(i64) = .init(-1),
