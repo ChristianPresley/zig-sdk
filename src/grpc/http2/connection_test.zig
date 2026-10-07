@@ -59,6 +59,8 @@ const Side = struct {
 
 /// The echo server: for every stream, answer 200 and echo the request body, then trailers.
 /// On the path "/early", the server sends a complete response before it reads the request.
+/// On the path "/early-cancel", the server sends the same response and then resets the stream
+/// with `cancel`. The server of version 0.3.0 and some other servers do this.
 /// On the path "/hold", the server reads the request, waits for the reset of the client and
 /// then tries to answer.
 const EchoServer = struct {
@@ -86,6 +88,12 @@ const EchoServer = struct {
         if (std.mem.eql(u8, path, "/early")) {
             // `close` then resets the stream, because the request did not end.
             stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = "application/grpc" }, .{ .name = "grpc-status", .value = "12" } }, true) catch {};
+            return;
+        }
+        if (std.mem.eql(u8, path, "/early-cancel")) {
+            // The reset comes before `close`, thus `close` sends no second reset.
+            stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = "application/grpc" }, .{ .name = "grpc-status", .value = "12" } }, true) catch return;
+            stream.cancel();
             return;
         }
         if (std.mem.eql(u8, path, "/hold")) {
@@ -116,12 +124,6 @@ const EchoServer = struct {
         try stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = "application/grpc" } }, false);
     }
 };
-
-/// Wait until the peer resets `stream`, for at most 5 seconds.
-fn waitReset(io: Io, stream: *Connection.Stream) !void {
-    var spins: usize = 0;
-    while (stream.wasReset() == null and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(10), .awake);
-}
 
 const Pair = struct {
     listener: Io.net.Server,
@@ -249,10 +251,41 @@ test "a complete response before the end of the request stays readable after the
     // stops without an error. Before, the server sent CANCEL and `sendData` returned
     // `error.StreamReset`, thus the caller lost the response.
     _ = try stream.waitEnd();
-    try waitReset(io, stream);
+    try stream.waitCancelled();
     try std.testing.expectEqual(@as(?frame.ErrorCode, .no_error), stream.wasReset());
     try stream.sendData("the request", true);
     const headers = try stream.waitHeaders();
+    try std.testing.expectEqualStrings("12", Connection.findHeader(headers, "grpc-status").?);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(0, try stream.read(&buf));
+    // The connection serves the next stream.
+    const echoed = try request(&pair, "/echo", "next");
+    defer gpa.free(echoed);
+    try std.testing.expectEqualStrings("next", echoed);
+}
+
+test "a complete response before the end of the request stays readable after a CANCEL reset" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var pair: Pair = undefined;
+    try pair.start(io, gpa, .{ .role = .client });
+    defer pair.stop();
+    const stream = try pair.client.conn.openStream();
+    defer stream.close();
+    try stream.sendHeaders(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = "/early-cancel" },
+        .{ .name = "content-type", .value = "application/grpc" },
+    }, false);
+    // The server of version 0.3.0 and some other servers reset with CANCEL after a complete
+    // response. The response comes before the reset, thus the client keeps it. The send
+    // after the reset stops without an error, as after a reset with NO_ERROR.
+    try stream.waitCancelled();
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .cancel), stream.wasReset());
+    try stream.sendData("the request", true);
+    const headers = try stream.waitHeaders();
+    try std.testing.expectEqualStrings("200", Connection.findHeader(headers, ":status").?);
     try std.testing.expectEqualStrings("12", Connection.findHeader(headers, "grpc-status").?);
     var buf: [16]u8 = undefined;
     try std.testing.expectEqual(0, try stream.read(&buf));

@@ -301,8 +301,7 @@ fn rawCallWith(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, cont
     try h2.sendHeaders(headers.items, false);
     if (options.after_answer) {
         _ = try h2.waitEnd();
-        var spins: usize = 0;
-        while (h2.wasReset() == null and spins < 500) : (spins += 1) try io.sleep(.fromMilliseconds(10), .awake);
+        try h2.waitCancelled();
         try std.testing.expectEqual(@as(?ErrorCode, .no_error), h2.wasReset());
     }
     var msg: std.ArrayList(u8) = .empty;

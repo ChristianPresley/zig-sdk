@@ -661,15 +661,17 @@ pub const Stream = struct {
         if (self.conn_closed or self.conn.closed) return error.Closed;
     }
 
-    /// The server sent a complete response and then reset the stream, thus it reads no more
-    /// of the request (RFC 9113 section 8.1). The response stays available. This applies
+    /// The peer ended the stream, thus the response is complete. Then the stream got a reset
+    /// from the peer or from this side, with any code. Thus the client drops the remaining part
+    /// of the request (RFC 9113 section 8.1), and the response stays available. This applies
     /// only to the client. On the server, the same state tells that the client canceled.
     fn answered(self: *const Stream) bool {
         return self.conn.options.role == .client and self.end_stream and self.reset != null;
     }
 
     /// Send a header block. With `end_stream` no data follows. When the server already sent a
-    /// complete response and reset the stream, the client sends nothing and gets no error.
+    /// complete response and the stream then got a reset, the client sends nothing and gets no
+    /// error.
     pub fn sendHeaders(self: *Stream, headers: []const Header, end_stream: bool) Error!void {
         const conn = self.conn;
         var block: std.ArrayList(u8) = .empty;
@@ -706,8 +708,8 @@ pub const Stream = struct {
     }
 
     /// Send data. The call waits for flow control credit. With `end_stream` the send side closes.
-    /// When the server sent a complete response and reset the stream, the client stops the
-    /// data and gets no error. The caller then reads the response.
+    /// When the server sent a complete response and the stream then got a reset, the client
+    /// stops the data and gets no error. The caller then reads the response.
     pub fn sendData(self: *Stream, bytes: []const u8, end_stream: bool) Error!void {
         const conn = self.conn;
         var offset: usize = 0;
