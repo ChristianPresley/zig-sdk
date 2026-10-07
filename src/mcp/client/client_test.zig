@@ -927,3 +927,41 @@ test "a request that got an inline notification does not retry a lost stream" {
     // The reader task of the transport called the callback, not the task of the request.
     try std.testing.expect(progress.thread.? != std.Thread.getCurrentId());
 }
+
+// -- Frames that the client cannot read ---------------------------------------------------------
+
+test "a frame that the stdio client cannot read makes its request fail at once" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // The answers of a server to the first request (id 1).
+    const answers = [_][]const u8{
+        // A line over `max_line_bytes`. The id comes after the result, as some servers write it.
+        "{\"jsonrpc\":\"2.0\",\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"" ++ "x" ** 8192 ++ "\"}]},\"id\":1}\n",
+        // An error response with a null id, while the request is the only one in flight.
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}\n",
+        // A line that is not valid UTF-8.
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"\xff\"}]}}\n",
+    };
+    var limits: mcp.Limits = .{};
+    limits.stdio.max_line_bytes = 1024;
+    // The long line is longer than the buffer. Thus the framer reads its tail in parts.
+    limits.stdio.read_buffer = 512;
+    for (answers) |answer| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "events.jsonl", .data = answer });
+        const proc = mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = replay_argv, .cwd = .{ .dir = tmp.dir }, .limits = limits }) catch return error.SkipZigTest;
+        defer proc.deinit();
+        var client: Client = .init(gpa, io, .{ .info = .{ .name = "cli", .version = "1" }, .limits = limits });
+        defer client.deinit();
+        client.connect(proc.transport());
+
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        // Before, the router dropped the frame, and the request waited until its timeout.
+        const start = Io.Clock.Timestamp.now(io, .awake);
+        try std.testing.expectError(error.InvalidResponse, client.callTool(arena_state.allocator(), "t", null, .{ .timeout = .fromSeconds(30) }));
+        try std.testing.expect(start.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds < std.time.ns_per_s * 20);
+        try std.testing.expectEqual(1, proc.router.dropped_frames.load(.monotonic));
+    }
+}

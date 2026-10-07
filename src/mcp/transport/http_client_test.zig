@@ -107,6 +107,7 @@ const Fixture = struct {
         try self.server.addToolJson(.{ .name = "slow" }, slow);
         try self.server.addTool(.{ .name = "chatty" }, chatty);
         try self.server.addTool(.{ .name = "big" }, big);
+        try self.server.addResource(.{ .uri = "test://big", .name = "big" }, readBig);
         self.transport = .init(io, gpa, &self.server, .{ .port = 0 });
         try self.transport.bind();
         self.future = try io.concurrent(serveIgnoringErrors, .{&self.transport});
@@ -220,7 +221,7 @@ const FrameCounter = struct {
     }
 };
 
-test "http client: one SSE event over max_response_bytes ends the exchange with error.ReadFailed" {
+test "http client: one SSE event or a JSON body over max_response_bytes ends the exchange with error.InvalidFrame" {
     const io = std.testing.io;
     var f: Fixture = undefined;
     try f.startWith("/mcp", .{ .max_response_bytes = 4 << 10 });
@@ -244,13 +245,35 @@ test "http client: one SSE event over max_response_bytes ends the exchange with 
             .sink = .{ .ptr = &counter, .on_frame = FrameCounter.onFrame },
             .cancel = &token,
         };
-        try std.testing.expectError(error.ReadFailed, transport.exchange(io, &ex));
+        try std.testing.expectError(error.InvalidFrame, transport.exchange(io, &ex));
         // The progress notification before the large event gets to the sink.
         try std.testing.expectEqual(@as(u32, if (progress) 1 else 0), counter.frames);
     }
-    // The client does not send the call again, because `tools/call` is not idempotent and a
-    // frame arrived.
-    try std.testing.expectError(error.TransportFailed, f.client.callTool(arena, "big", .{ .bytes = 8192, .progress = true }, .{}));
+    try std.testing.expectError(error.InvalidResponse, f.client.callTool(arena, "big", .{ .bytes = 8192, .progress = true }, .{}));
+}
+
+var big_reads: std.atomic.Value(u32) = .init(0);
+
+fn readBig(ctx: *mcp.RequestContext, uri: []const u8) anyerror!mcp.Outcome(types.ReadResourceResult) {
+    _ = big_reads.fetchAdd(1, .monotonic);
+    const text = try ctx.arena.alloc(u8, 8192);
+    @memset(text, 'x');
+    const contents = try ctx.arena.alloc(types.ResourceContents, 1);
+    contents[0] = .{ .text = .{ .uri = uri, .mimeType = "text/plain", .text = text } };
+    return .{ .complete = .{ .contents = contents } };
+}
+
+test "http client: the client does not send an idempotent request again after a JSON body over max_response_bytes" {
+    var f: Fixture = undefined;
+    try f.startWith("/mcp", .{ .max_response_bytes = 4 << 10 });
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    // `resources/read` is idempotent, and no frame arrived. Before, the client took the
+    // overflow for a lost stream and sent the request four times.
+    big_reads.store(0, .monotonic);
+    try std.testing.expectError(error.InvalidResponse, f.client.readResource(arena_state.allocator(), "test://big", .{}));
+    try std.testing.expectEqual(1, big_reads.load(.monotonic));
 }
 
 const meta_progress =

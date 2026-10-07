@@ -43,8 +43,9 @@ pub const Client = struct {
         /// Maximum bytes of one message from the server: an `application/json` body, or one
         /// event of an SSE response (`sse.Parser.max_event_bytes`). An SSE response has no
         /// limit of its total bytes. Thus keep-alive comments, progress notifications and log
-        /// messages do not stop a long tool call or a listen stream. Overflow: the exchange
-        /// fails with `error.ReadFailed`.
+        /// messages do not stop a long tool call or a listen stream. Overflow: the transport
+        /// logs a warning, and the exchange fails with `error.InvalidFrame`. The client then
+        /// returns `error.InvalidResponse` and does not send the request again.
         max_response_bytes: usize = 4 << 20,
         /// How often a request checks for cancellation and its deadline.
         poll_interval: Io.Duration = .fromMilliseconds(50),
@@ -288,7 +289,15 @@ pub const Client = struct {
         const is_sse = std.ascii.startsWithIgnoreCase(content_type, sse.content_type);
         const body = conn.bodyReader(&response);
         if (is_json) {
-            const text = body.allocRemaining(arena, .limited(self.options.max_response_bytes)) catch return error.ReadFailed;
+            const text = body.allocRemaining(arena, .limited(self.options.max_response_bytes)) catch |e| switch (e) {
+                // The same request gets the same body again, thus the client must not retry.
+                error.StreamTooLong => {
+                    log.warn("the JSON body of the response has more than max_response_bytes ({d})", .{self.options.max_response_bytes});
+                    return error.InvalidFrame;
+                },
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ReadFailed => return error.ReadFailed,
+            };
             try self.deliver(io, arena, ex, text);
             return null;
         }
@@ -314,7 +323,10 @@ pub const Client = struct {
                 }
                 fed catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.EventTooLarge => return error.ReadFailed,
+                    error.EventTooLarge => {
+                        log.warn("an SSE event of the response has more than max_response_bytes ({d})", .{self.options.max_response_bytes});
+                        return error.InvalidFrame;
+                    },
                 };
             }
             return null;

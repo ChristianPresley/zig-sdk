@@ -192,7 +192,9 @@ pub const ExchangeError = error{
     OutOfMemory,
     /// The deadline passed before the response arrived.
     Timeout,
-    /// The stream carried something that is not a JSON-RPC message for this request.
+    /// The stream carried a frame that the transport cannot read, or that is not a JSON-RPC
+    /// message for this request. An example is a message over a size limit. The client does
+    /// not send the request again.
     InvalidFrame,
     /// The HTTP status carried no JSON-RPC body (for example 404 for a wrong path).
     HttpStatus,

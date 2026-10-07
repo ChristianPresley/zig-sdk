@@ -88,6 +88,28 @@ test "fuzz: line framer" {
     try std.testing.fuzz({}, framer, .{ .corpus = &.{ "{}\n{}\r\n\n{\"x\":1}", "a\x00b\n", "" } });
 }
 
+fn topLevelScanner(_: void, smith: *Smith) anyerror!void {
+    var buf: [max_input]u8 = undefined;
+    const bytes = input(smith, &buf, 0x100b);
+    var whole: line_framer.TopLevelScanner = .{};
+    whole.feed(bytes);
+    // The parts of the text do not change the result.
+    const split = if (bytes.len == 0) 0 else smith.indexWithHash(bytes.len, 0x100c);
+    var parts: line_framer.TopLevelScanner = .{};
+    parts.feed(bytes[0..split]);
+    parts.feed(bytes[split..]);
+    try std.testing.expectEqual(whole.method, parts.method);
+    try std.testing.expectEqual(whole.response, parts.response);
+    if (whole.id()) |id| {
+        try std.testing.expectEqualStrings(id, parts.id().?);
+        try std.testing.expect(id.len <= line_framer.TopLevelScanner.max_id_bytes);
+    } else try std.testing.expect(parts.id() == null);
+}
+
+test "fuzz: top-level scanner" {
+    try std.testing.fuzz({}, topLevelScanner, .{ .corpus = &.{ "{\"result\":{\"id\":2},\"id\":1}", "{\"id\":\"a\\\"b\",\"error\":{}}", "{\"method\":\"m\",\"params\":[\"}\"]}" } });
+}
+
 fn headerValues(_: void, smith: *Smith) anyerror!void {
     var buf: [max_input]u8 = undefined;
     const bytes = input(smith, &buf, 0x1004);

@@ -15,7 +15,8 @@ json_max_depth: u16 = 64,
 
 stdio: struct {
     /// Maximum bytes of one newline-delimited message. Overflow: the transport drops the line
-    /// and logs a warning.
+    /// and logs a warning. On the client, the request with the top-level "id" of the line then
+    /// fails with `error.InvalidResponse`. The limit also applies to the Unix socket transport.
     max_line_bytes: usize = 16 << 20,
     /// Buffer of the line reader. For a longer line, the reader uses a buffer that grows.
     read_buffer: usize = 64 << 10,
