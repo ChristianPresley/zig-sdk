@@ -346,7 +346,10 @@ fn onContinuation(self: *Connection, header: frame.Header, payload: []const u8) 
 fn finishHeaderBlock(self: *Connection) Error!void {
     const stream_id = self.hb_stream;
     const end_stream = self.hb_flags & frame.Flags.end_stream != 0;
+    // The stream that this block opens. It goes to `on_stream`, or it is refused and freed.
+    var opened: ?*Stream = null;
     var new_stream: ?*Stream = null;
+    var refused: ?*Stream = null;
     var reset: ?frame.ErrorCode = null;
     {
         self.lock.lockUncancelable(self.io);
@@ -370,7 +373,7 @@ fn finishHeaderBlock(self: *Connection) Error!void {
                 try self.streams.put(self.gpa, stream_id, s);
                 self.peer_streams_open += 1;
                 stream = s;
-                new_stream = s;
+                opened = s;
             }
         }
         if (stream) |s| decoded: {
@@ -383,7 +386,6 @@ fn finishHeaderBlock(self: *Connection) Error!void {
                     // lock comes before `lock` (see `sendHeaders`).
                     reset = .enhance_your_calm;
                     s.reset = .enhance_your_calm;
-                    new_stream = null;
                     self.cond.broadcast(self.io);
                     break :decoded;
                 },
@@ -395,7 +397,6 @@ fn finishHeaderBlock(self: *Connection) Error!void {
                 if (!validHeaders(list.items, false, self.options.role)) {
                     reset = .protocol_error;
                     s.reset = .protocol_error;
-                    new_stream = null;
                 } else {
                     s.headers = list;
                     s.headers_done = true;
@@ -413,8 +414,21 @@ fn finishHeaderBlock(self: *Connection) Error!void {
             }
             self.cond.broadcast(self.io);
         }
+        // A stream that this block opened and refused gets no owner, because `on_stream` does
+        // not run. Thus the connection frees it, as for `REFUSED_STREAM`. Else the stream counts
+        // against `max_concurrent_streams` until the connection ends.
+        if (opened) |s| {
+            if (s.reset != null) {
+                _ = self.streams.remove(stream_id);
+                self.peer_streams_open -= 1;
+                refused = s;
+            } else {
+                new_stream = s;
+            }
+        }
     }
     self.hb_buf.clearRetainingCapacity();
+    if (refused) |s| s.destroy();
     if (reset) |code| self.sendRst(stream_id, code);
     if (new_stream) |s| if (self.options.on_stream) |f| f(self.options.userdata, s);
 }

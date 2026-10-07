@@ -1,9 +1,11 @@
-//! Loopback tests: an HTTP/2 client connection against a server connection over TCP.
+//! Loopback tests: an HTTP/2 client connection against a server connection over TCP. At the
+//! end, tests that give a server connection a fixed sequence of frames.
 const std = @import("std");
 const Io = std.Io;
 const mcp = @import("mcp");
 const Connection = @import("Connection.zig");
 const frame = @import("frame.zig");
+const hpack = @import("hpack/hpack.zig");
 const Header = Connection.Header;
 
 const buffer_len = 64 << 10;
@@ -839,4 +841,98 @@ test "a control frame with a wrong length gives GOAWAY with FRAME_SIZE_ERROR" {
 test "a PING frame on a stream gives GOAWAY with PROTOCOL_ERROR" {
     const ping: frame.Header = .{ .length = 8, .type = .ping, .flags = 0, .stream_id = 1 };
     try std.testing.expectEqual(frame.ErrorCode.protocol_error, try goawayCodeFor(&(ping.encode() ++ [_]u8{0} ** 8)));
+}
+
+// -- A server connection that reads a fixed sequence of frames ------------------------------
+
+/// Append a frame to `out`.
+fn appendFrame(gpa: std.mem.Allocator, out: *std.ArrayList(u8), kind: frame.Type, flags: u8, stream_id: u31, payload: []const u8) !void {
+    const header: frame.Header = .{ .length = @intCast(payload.len), .type = kind, .flags = flags, .stream_id = stream_id };
+    try out.appendSlice(gpa, &header.encode());
+    try out.appendSlice(gpa, payload);
+}
+
+/// Append a `HEADERS` frame with END_STREAM: the encoded `headers`, then the raw HPACK bytes
+/// of `raw`.
+fn appendRequest(gpa: std.mem.Allocator, out: *std.ArrayList(u8), stream_id: u31, headers: []const Header, raw: []const u8) !void {
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    try (hpack.Encoder{}).encodeHeaders(gpa, &block, headers);
+    try block.appendSlice(gpa, raw);
+    try appendFrame(gpa, out, .headers, frame.Flags.end_headers | frame.Flags.end_stream, stream_id, block.items);
+}
+
+/// Keeps the streams that the server connection gives to `on_stream`. The test closes them.
+const StreamList = struct {
+    items: [8]*Connection.Stream = undefined,
+    len: usize = 0,
+
+    fn onStream(userdata: ?*anyopaque, stream: *Connection.Stream) void {
+        const self: *StreamList = @ptrCast(@alignCast(userdata.?));
+        self.items[self.len] = stream;
+        self.len += 1;
+    }
+};
+
+test "a refused request frees its stream and keeps the HPACK table of the connection" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const large = [_]u8{'a'} ** 2000;
+    const post = [_]Header{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "http" } };
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    // Stream 1: a header list over the limit. Stream 3: no `:path`.
+    try appendRequest(gpa, &script, 1, &(post ++ [_]Header{ .{ .name = ":path", .value = "/1" }, .{ .name = "x-large", .value = &large } }), "");
+    try appendRequest(gpa, &script, 3, &post, "");
+    // Stream 5: a header list over the limit, then a literal with incremental indexing.
+    try appendRequest(gpa, &script, 5, &(post ++ [_]Header{ .{ .name = ":path", .value = "/5" }, .{ .name = "x-large", .value = &large } }), "\x40\x05x-tag\x04kept");
+    // Stream 7 refers to the new entry of the dynamic table (index 62).
+    try appendRequest(gpa, &script, 7, &(post ++ [_]Header{.{ .name = ":path", .value = "/7" }}), &.{0xbe});
+    try appendRequest(gpa, &script, 9, &(post ++ [_]Header{.{ .name = ":path", .value = "/9" }}), "");
+    // Streams 7 and 9 stay open, thus stream 11 is over the limit of 2.
+    try appendRequest(gpa, &script, 11, &(post ++ [_]Header{.{ .name = ":path", .value = "/11" }}), "");
+
+    var reader: Io.Reader = .fixed(script.items);
+    const written = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(written);
+    var writer: Io.Writer = .fixed(written);
+    var streams: StreamList = .{};
+    const conn = try Connection.init(gpa, io, &reader, &writer, .{
+        .role = .server,
+        .max_concurrent_streams = 2,
+        .max_header_list_size = 1024,
+        .on_stream = StreamList.onStream,
+        .userdata = &streams,
+    });
+    defer conn.deinit();
+    try conn.handshake();
+    // The read task ends at the end of the script.
+    conn.run();
+    defer for (streams.items[0..streams.len]) |s| s.close();
+
+    // Before, the refused streams 1 and 3 kept their places. Then the connection refused
+    // streams 5, 7 and 9 with REFUSED_STREAM and decoded no block of them.
+    try std.testing.expectEqual(2, streams.len);
+    try std.testing.expectEqual(7, streams.items[0].id);
+    try std.testing.expectEqualStrings("kept", Connection.findHeader(streams.items[0].headers.items, "x-tag") orelse "");
+    try std.testing.expectEqual(9, streams.items[1].id);
+    try std.testing.expectEqual(2, conn.peer_streams_open);
+    try std.testing.expectEqual(2, conn.streams.count());
+
+    var resets: [12]?frame.ErrorCode = @splat(null);
+    var out: Io.Reader = .fixed(writer.buffered());
+    while (out.bufferedLen() > 0) {
+        const header = frame.Header.parse(try out.takeArray(frame.header_len));
+        const payload = try out.take(header.length);
+        try std.testing.expect(header.type != .goaway);
+        if (header.type == .rst_stream) resets[header.stream_id] = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
+    }
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .enhance_your_calm), resets[1]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .protocol_error), resets[3]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .enhance_your_calm), resets[5]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, null), resets[7]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, null), resets[9]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .refused_stream), resets[11]);
 }
