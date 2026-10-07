@@ -334,13 +334,9 @@ pub const Client = struct {
         }
         _ = body.discardRemaining() catch {};
         // For example 404 for a wrong path, or an error page of a proxy.
-        const shown = if (content_type.len == 0) "none" else content_type[0..@min(content_type.len, max_logged_bytes)];
-        log.warn("the server answered with status {d} and the content type {s}, which carries no JSON-RPC message", .{ ex.http_status, shown });
+        log.warn("the server answered with status {d} and the content type {f}, which carries no JSON-RPC message", .{ ex.http_status, HeaderText{ .value = content_type } });
         return error.HttpStatus;
     }
-
-    /// The maximum bytes of a header value in a log line.
-    const max_logged_bytes = 100;
 
     /// Add `Mcp-Name` and the `Mcp-Param-*` headers the request needs.
     fn mirrorHeaders(self: *Client, arena: Allocator, headers: *std.ArrayList(http.Header), ex: *Transport.Exchange) tool_headers.Map.AppendError!void {
@@ -377,3 +373,32 @@ pub const Client = struct {
         ex.deliver(io, out) catch return error.InvalidFrame;
     }
 };
+
+/// A header value of the server for a log line. The note writes at most `max_bytes` of it,
+/// and a question mark for each byte that is not visible ASCII or a space. Thus a server
+/// cannot put a line break or a terminal escape sequence into the log.
+const HeaderText = struct {
+    value: []const u8,
+
+    const max_bytes = 100;
+
+    pub fn format(self: HeaderText, w: *Io.Writer) Io.Writer.Error!void {
+        if (self.value.len == 0) return w.writeAll("none");
+        for (self.value[0..@min(self.value.len, max_bytes)]) |c| try w.writeByte(if (c < ' ' or c > '~') '?' else c);
+        if (self.value.len > max_bytes) try w.writeAll("...");
+    }
+};
+
+test "the log text of a header value of the server has no control characters" {
+    var buf: [128]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    // A line break, an escape sequence, DEL and bytes over 0x7e.
+    try w.print("{f}", .{HeaderText{ .value = "text/html\n[fake] x\x1b[2J\x7f\xc2\x9b" }});
+    try std.testing.expectEqualStrings("text/html?[fake] x?[2J???", w.buffered());
+    w = .fixed(&buf);
+    try w.print("{f}", .{HeaderText{ .value = "" }});
+    try std.testing.expectEqualStrings("none", w.buffered());
+    w = .fixed(&buf);
+    try w.print("{f}", .{HeaderText{ .value = "a" ** 120 }});
+    try std.testing.expectEqualStrings("a" ** 100 ++ "...", w.buffered());
+}
