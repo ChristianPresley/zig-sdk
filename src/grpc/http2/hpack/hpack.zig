@@ -121,9 +121,15 @@ pub const Decoder = struct {
     }
 
     /// Decode one header block. The decoder copies the headers into `arena`.
+    ///
+    /// After `error.FieldTooLarge` or `error.HeaderListTooLarge`, the decoder reads the rest of
+    /// the block and gives the error at the end. It adds no more headers to `out`, but it
+    /// applies each change to the dynamic table. Thus the table stays the same as the table of
+    /// the encoder, and the next block of the connection decodes correctly (RFC 9113 section
+    /// 4.3). The other errors end the connection, thus the decoder stops at once.
     pub fn decode(self: *Decoder, arena: Allocator, block: []const u8, out: *std.ArrayList(Header)) Error!void {
+        var state: DecodeState = .{ .arena = arena, .out = out };
         var r: BlockReader = .{ .buf = block };
-        var list_size: usize = 0;
         var saw_header = false;
         while (!r.eof()) {
             const first = r.buf[r.pos];
@@ -131,15 +137,15 @@ pub const Decoder = struct {
                 // Indexed header field.
                 const index = try r.integer(7);
                 const h = self.lookup(index) orelse return error.Invalid;
-                try self.emit(arena, out, &list_size, h.name, h.value);
+                try self.emit(&state, h.name, h.value);
                 saw_header = true;
             } else if (first & 0x40 != 0) {
                 // Literal with incremental indexing.
-                const h = try self.literal(arena, &r, 6);
+                const h = try self.literal(&state, &r, 6);
                 // An indexed name refers to a dynamic entry that `add` can evict.
                 const name = try arena.dupe(u8, h.name);
                 try self.add(name, h.value);
-                try self.emit(arena, out, &list_size, name, h.value);
+                try self.emit(&state, name, h.value);
                 saw_header = true;
             } else if (first & 0x20 != 0) {
                 // Dynamic table size update: only at the start of a block.
@@ -149,40 +155,58 @@ pub const Decoder = struct {
                 self.resize(@intCast(new_size));
             } else {
                 // Literal without indexing (0000) or never indexed (0001).
-                const h = try self.literal(arena, &r, 4);
-                try self.emit(arena, out, &list_size, h.name, h.value);
+                const h = try self.literal(&state, &r, 4);
+                try self.emit(&state, h.name, h.value);
                 saw_header = true;
             }
         }
+        if (state.size_error) |e| return e;
     }
 
-    fn emit(self: *Decoder, arena: Allocator, out: *std.ArrayList(Header), list_size: *usize, name: []const u8, value: []const u8) Error!void {
-        list_size.* += name.len + value.len + entry_overhead;
-        if (list_size.* > self.options.max_header_list_size) return error.HeaderListTooLarge;
-        try out.append(arena, .{ .name = try arena.dupe(u8, name), .value = try arena.dupe(u8, value) });
+    /// The output of one call of `decode`.
+    const DecodeState = struct {
+        arena: Allocator,
+        out: *std.ArrayList(Header),
+        list_size: usize = 0,
+        /// The first size error of the block. After it, `emit` adds no header.
+        size_error: ?Error = null,
+
+        fn setSizeError(state: *DecodeState, err: Error) void {
+            if (state.size_error == null) state.size_error = err;
+        }
+    };
+
+    fn emit(self: *Decoder, state: *DecodeState, name: []const u8, value: []const u8) Error!void {
+        if (state.size_error != null) return;
+        state.list_size += name.len + value.len + entry_overhead;
+        if (state.list_size > self.options.max_header_list_size) return state.setSizeError(error.HeaderListTooLarge);
+        try state.out.append(state.arena, .{ .name = try state.arena.dupe(u8, name), .value = try state.arena.dupe(u8, value) });
     }
 
     /// A literal representation: an indexed or literal name, then a literal value.
-    fn literal(self: *Decoder, arena: Allocator, r: *BlockReader, prefix: u4) Error!Header {
+    fn literal(self: *Decoder, state: *DecodeState, r: *BlockReader, prefix: u4) Error!Header {
         const index = try r.integer(prefix);
         const name: []const u8 = if (index == 0)
-            try self.string(arena, r)
+            try self.string(state, r)
         else
             (self.lookup(index) orelse return error.Invalid).name;
-        const value = try self.string(arena, r);
+        const value = try self.string(state, r);
         return .{ .name = name, .value = value };
     }
 
-    fn string(self: *Decoder, arena: Allocator, r: *BlockReader) Error![]const u8 {
+    /// A string over `max_field_size` sets `error.FieldTooLarge`. The function still decodes
+    /// the string, because a dynamic table entry can need it. The string is part of the
+    /// block, thus the size of the block limits it.
+    fn string(self: *Decoder, state: *DecodeState, r: *BlockReader) Error![]const u8 {
         if (r.eof()) return error.Truncated;
         const huff = r.buf[r.pos] & 0x80 != 0;
         const len = try r.integer(7);
-        if (len > self.options.max_field_size) return error.FieldTooLarge;
-        const raw = try r.take(@intCast(len));
+        const raw = try r.take(std.math.cast(usize, len) orelse return error.Truncated);
+        if (raw.len > self.options.max_field_size) state.setSizeError(error.FieldTooLarge);
         if (!huff) return raw;
         var decoded: std.ArrayList(u8) = .empty;
-        try huffman.decode(arena, &decoded, raw);
-        if (decoded.items.len > self.options.max_field_size) return error.FieldTooLarge;
+        try huffman.decode(state.arena, &decoded, raw);
+        if (decoded.items.len > self.options.max_field_size) state.setSizeError(error.FieldTooLarge);
         return decoded.items;
     }
 };
@@ -391,6 +415,30 @@ test "invalid blocks" {
     try std.testing.expectError(error.Invalid, decoder.decode(arena, &.{ 0x3f, 0xe1, 0x7f }, &out)); // size update above the limit
     try std.testing.expectError(error.FieldTooLarge, decoder.decode(arena, "\x00\x11" ++ "a" ** 17 ++ "\x00", &out));
     try std.testing.expectError(error.InvalidHuffman, decoder.decode(arena, &.{ 0x00, 0x81, 0xff, 0x00 }, &out));
+}
+
+test "a size error keeps the dynamic table the same as the table of the encoder" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var decoder: Decoder = .init(gpa, .{ .max_field_size = 16, .max_header_list_size = 70 });
+    defer decoder.deinit();
+    var out: std.ArrayList(Header) = .empty;
+    // A value over the field limit, then a literal with incremental indexing.
+    try std.testing.expectError(error.FieldTooLarge, decoder.decode(arena, "\x00\x01n\x11" ++ "a" ** 17 ++ "\x40\x01k\x01v", &out));
+    try std.testing.expectEqualStrings("k", (decoder.dynamicEntry(0) orelse return error.TestExpectedEntry).name);
+    // Three headers over the list limit, then a literal with incremental indexing.
+    try std.testing.expectError(error.HeaderListTooLarge, decoder.decode(arena, "\x00\x01a\x01b" ** 3 ++ "\x40\x01m\x01w", &out));
+    try std.testing.expectEqualStrings("m", (decoder.dynamicEntry(0) orelse return error.TestExpectedEntry).name);
+    // The next block refers to both entries. Before, the decoder stopped at the error and
+    // did not add them, thus this block gave `error.Invalid` or another header.
+    out.clearRetainingCapacity();
+    try decoder.decode(arena, &.{ 0xbe, 0xbf }, &out);
+    try std.testing.expectEqualStrings("m", out.items[0].name);
+    try std.testing.expectEqualStrings("w", out.items[0].value);
+    try std.testing.expectEqualStrings("k", out.items[1].name);
+    try std.testing.expectEqualStrings("v", out.items[1].value);
 }
 
 test "a literal whose indexed name the new entry evicts keeps the name" {
