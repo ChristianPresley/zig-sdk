@@ -117,11 +117,12 @@ pub const TypedChannel = struct {
         ex: *Transport.Exchange,
         rpc: service.Rpc,
         arena: Allocator,
+        call: grpc_client.CallStream = .{},
         done: Io.Event = .unset,
         result: Transport.ExchangeError!void = {},
 
         fn run(t: *Task) void {
-            t.result = t.self.perform(t.arena, t.ex, t.rpc);
+            t.result = t.self.perform(t.arena, t.ex, t.rpc, &t.call);
             t.done.set(t.self.io);
         }
     };
@@ -137,7 +138,7 @@ pub const TypedChannel = struct {
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         var task: Task = .{ .self = self, .ex = ex, .rpc = rpc, .arena = arena_state.allocator() };
-        var future = io.concurrent(Task.run, .{&task}) catch return self.perform(task.arena, ex, rpc);
+        var future = io.concurrent(Task.run, .{&task}) catch return self.perform(task.arena, ex, rpc, &task.call);
         var stop: ?Transport.ExchangeError = null;
         while (true) {
             task.done.waitTimeout(io, .{ .duration = .{ .raw = self.options.channel.poll_interval, .clock = .awake } }) catch |e| switch (e) {
@@ -158,6 +159,9 @@ pub const TypedChannel = struct {
             }
         }
         if (stop) |err| {
+            // The reset ends each wait of the task on the stream. The cancel stops the other
+            // waits, for example the connect.
+            task.call.stop(io);
             _ = future.cancel(io);
             return err;
         }
@@ -165,7 +169,7 @@ pub const TypedChannel = struct {
         return task.result;
     }
 
-    fn perform(self: *TypedChannel, arena: Allocator, ex: *Transport.Exchange, rpc: service.Rpc) Transport.ExchangeError!void {
+    fn perform(self: *TypedChannel, arena: Allocator, ex: *Transport.Exchange, rpc: service.Rpc, call: *grpc_client.CallStream) Transport.ExchangeError!void {
         const io = self.io;
         const params: Value = ex.params orelse .{ .object = .empty };
         // A part that the message cannot carry fails before a byte goes out.
@@ -186,6 +190,8 @@ pub const TypedChannel = struct {
         };
         const stream = link.h2.openStream() catch return error.Closed;
         defer stream.close();
+        try call.attach(io, stream);
+        defer call.detach(io);
         var remaining: ?Io.Duration = null;
         if (ex.timeout.toTimestamp(io)) |d| {
             const left = Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw;

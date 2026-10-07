@@ -99,6 +99,12 @@ fn isZero(count: *const std.atomic.Value(u32)) bool {
     return count.load(.acquire) == 0;
 }
 
+/// A task waits on the condition of the connection. The waiter count is a field of
+/// `std.Io.Condition` in Zig 0.16.0.
+fn hasWaiter(conn: *Connection) bool {
+    return conn.cond.state.load(.monotonic).waiters != 0;
+}
+
 /// The read task of a connection, which runs `Connection.run`. The wait for its end has a
 /// limit.
 pub const RunTask = struct {
@@ -565,6 +571,65 @@ test "a cancel from another task wakes the task that waits on the stream" {
     pair.server.wait_stream.?.cancel();
     try waitSet(io, &pair.server.wait_done);
     try std.testing.expectEqual(@as(?frame.ErrorCode, .cancel), pair.server.wait_reset);
+}
+
+/// The waits of a stream.
+const WaitKind = enum { cancelled, headers, read, end, send };
+
+fn waitOn(stream: *Connection.Stream, kind: WaitKind) Connection.Error!void {
+    switch (kind) {
+        .cancelled => try stream.waitCancelled(),
+        .headers => _ = try stream.waitHeaders(),
+        .read => {
+            var buf: [16]u8 = undefined;
+            _ = try stream.read(&buf);
+        },
+        .end => _ = try stream.waitEnd(),
+        .send => try stream.sendData("x", false),
+    }
+}
+
+/// Wake the waiters of `conn` until `stop` is set, as frames on other streams do.
+fn wakeLoop(conn: *Connection, stop: *const std.atomic.Value(bool)) void {
+    while (!stop.load(.acquire)) {
+        conn.lock.lockUncancelable(conn.io);
+        conn.cond.broadcast(conn.io);
+        conn.lock.unlock(conn.io);
+    }
+}
+
+test "stopWaits ends each wait on the stream while the connection wakes its waiters" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var pair: Pair = undefined;
+    try pair.start(io, gpa, .{ .role = .client });
+    defer pair.stop();
+    const conn = pair.client.conn;
+    var stop_wakes: std.atomic.Value(bool) = .init(false);
+    var waker = try io.concurrent(wakeLoop, .{ conn, &stop_wakes });
+    defer {
+        stop_wakes.store(true, .release);
+        waker.await(io);
+    }
+    // A cancel of the waiting task can get lost when it comes together with a wake-up: the
+    // condition of std then gives no `error.Canceled`. The flag of `stopWaits` does not get
+    // lost. The streams have no id, thus no frame goes out for them.
+    for (0..200) |i| {
+        const kind: WaitKind = @enumFromInt(i % @typeInfo(WaitKind).@"enum".fields.len);
+        const stream = try conn.openStream();
+        defer stream.close();
+        // Without credit, `sendData` waits.
+        stream.send_window = 0;
+        var watchdog: Watchdog = .{ .stream = stream };
+        try watchdog.start(io);
+        var waiter = try io.concurrent(waitOn, .{ stream, kind });
+        const blocked = pollUntil(io, "a task waits on the connection", conn, hasWaiter);
+        stream.stopWaits();
+        const result = waiter.await(io);
+        try watchdog.finish(io);
+        try blocked;
+        try std.testing.expectError(error.Canceled, result);
+    }
 }
 
 test "concurrent streams interleave" {

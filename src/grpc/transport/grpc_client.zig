@@ -218,11 +218,12 @@ pub const Channel = struct {
         channel: *Channel,
         ex: *Transport.Exchange,
         arena: Allocator,
+        call: CallStream = .{},
         done: Io.Event = .unset,
         result: Transport.ExchangeError!void = {},
 
         fn run(t: *Task) void {
-            t.result = t.channel.perform(t.arena, t.ex);
+            t.result = t.channel.perform(t.arena, t.ex, &t.call);
             t.done.set(t.channel.io);
         }
     };
@@ -233,7 +234,7 @@ pub const Channel = struct {
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         var task: Task = .{ .channel = self, .ex = ex, .arena = arena_state.allocator() };
-        var future = io.concurrent(Task.run, .{&task}) catch return self.perform(task.arena, ex);
+        var future = io.concurrent(Task.run, .{&task}) catch return self.perform(task.arena, ex, &task.call);
         var stop: ?Transport.ExchangeError = null;
         while (true) {
             task.done.waitTimeout(io, .{ .duration = .{ .raw = self.options.poll_interval, .clock = .awake } }) catch |e| switch (e) {
@@ -254,6 +255,9 @@ pub const Channel = struct {
             }
         }
         if (stop) |err| {
+            // The reset ends each wait of the task on the stream. The cancel stops the other
+            // waits, for example the connect.
+            task.call.stop(io);
             _ = future.cancel(io);
             return err;
         }
@@ -328,7 +332,7 @@ pub const Channel = struct {
         for (self.options.extra_metadata) |h| try headers.append(arena, h);
     }
 
-    fn perform(self: *Channel, arena: Allocator, ex: *Transport.Exchange) Transport.ExchangeError!void {
+    fn perform(self: *Channel, arena: Allocator, ex: *Transport.Exchange, call: *CallStream) Transport.ExchangeError!void {
         const io = self.io;
         const link = self.acquireLink() catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -337,6 +341,8 @@ pub const Channel = struct {
         };
         const stream = link.h2.openStream() catch return error.Closed;
         defer stream.close();
+        try call.attach(io, stream);
+        defer call.detach(io);
         var remaining: ?Io.Duration = null;
         if (ex.timeout.toTimestamp(io)) |d| {
             const left = Io.Clock.Timestamp.now(io, d.clock).durationTo(d).raw;
@@ -412,6 +418,39 @@ pub const Channel = struct {
             },
             else => error.ReadFailed,
         };
+    }
+};
+
+/// The stream of a call that runs in its own task. To stop the call, the caller resets the
+/// stream with `stop` before it waits for the task. A cancel of the task alone is not
+/// sufficient: the condition of std can lose a cancel while the task waits on the stream.
+pub const CallStream = struct {
+    lock: Io.Mutex = .init,
+    stream: ?*Stream = null,
+    stopped: bool = false,
+
+    /// Record `stream`, the stream of the call. Gives `error.Canceled` after `stop`. Call
+    /// `detach` before the stream closes.
+    pub fn attach(self: *CallStream, io: Io, stream: *Stream) error{Canceled}!void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        if (self.stopped) return error.Canceled;
+        self.stream = stream;
+    }
+
+    /// Remove the stream that `attach` recorded.
+    pub fn detach(self: *CallStream, io: Io) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        self.stream = null;
+    }
+
+    /// Reset the recorded stream with `cancel`. A later `attach` gives `error.Canceled`.
+    pub fn stop(self: *CallStream, io: Io) void {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        self.stopped = true;
+        if (self.stream) |s| s.cancel();
     }
 };
 

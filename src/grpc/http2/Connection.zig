@@ -597,6 +597,8 @@ pub const Stream = struct {
     conn_closed: bool = false,
     /// We sent END_STREAM.
     local_closed: bool = false,
+    /// A call to `stopWaits` came. Each wait on the stream then gives `error.Canceled`.
+    waits_stopped: bool = false,
     send_window: i64,
     recv_window: i64,
     recv_credit: u32 = 0,
@@ -658,6 +660,29 @@ pub const Stream = struct {
         conn.cond.broadcast(conn.io);
         conn.lock.unlock(conn.io);
         if (!already) conn.sendRst(id, .cancel);
+    }
+
+    /// Stop the waits on the stream and send no reset. Each task that waits on the stream wakes
+    /// and gets `error.Canceled`. A later wait also gets `error.Canceled` when it must block. The
+    /// owner still calls `close`.
+    ///
+    /// To stop a task that waits on the stream, use this function, not `Future.cancel`. The
+    /// condition of std can lose a cancel that comes together with a wake-up of the connection.
+    /// The task then waits until the stream gets a reset or the connection ends.
+    pub fn stopWaits(self: *Stream) void {
+        const conn = self.conn;
+        conn.lock.lockUncancelable(conn.io);
+        defer conn.lock.unlock(conn.io);
+        self.waits_stopped = true;
+        conn.cond.broadcast(conn.io);
+    }
+
+    /// Wait for the next change on the connection. Gives `error.Canceled` after `stopWaits`.
+    /// Called under `lock`. The caller checks its condition again after each wake-up.
+    fn wait(self: *Stream) Error!void {
+        if (self.waits_stopped) return error.Canceled;
+        const conn = self.conn;
+        try conn.cond.wait(conn.io, &conn.lock);
     }
 
     fn checkOpen(self: *const Stream) Error!void {
@@ -737,7 +762,7 @@ pub const Stream = struct {
                         conn.send_window -= @intCast(n);
                         break;
                     }
-                    try conn.cond.wait(conn.io, &conn.lock);
+                    try self.wait();
                 }
                 if (offset + n == bytes.len and end_stream) self.local_closed = true;
             }
@@ -757,7 +782,7 @@ pub const Stream = struct {
         while (!self.headers_done) {
             try self.checkOpen();
             if (self.end_stream) return error.StreamReset;
-            try conn.cond.wait(conn.io, &conn.lock);
+            try self.wait();
         }
         return self.headers.items;
     }
@@ -772,7 +797,7 @@ pub const Stream = struct {
             while (self.data.items.len == self.read_pos) {
                 if (self.end_stream) break :blk 0;
                 try self.checkOpen();
-                try conn.cond.wait(conn.io, &conn.lock);
+                try self.wait();
             }
             const available = self.data.items[self.read_pos..];
             const n = @min(buf.len, available.len);
@@ -801,19 +826,20 @@ pub const Stream = struct {
         defer conn.lock.unlock(conn.io);
         while (!self.end_stream) {
             try self.checkOpen();
-            try conn.cond.wait(conn.io, &conn.lock);
+            try self.wait();
         }
         return self.trailers.items;
     }
 
     /// Wait until the stream got a reset or the connection ended. The reset can come from the
-    /// peer or from this side, for example from `cancel`.
+    /// peer or from this side, for example from `cancel`. After `stopWaits`, the wait ends with
+    /// `error.Canceled`.
     pub fn waitCancelled(self: *Stream) Error!void {
         const conn = self.conn;
         conn.lock.lockUncancelable(conn.io);
         defer conn.lock.unlock(conn.io);
         while (self.reset == null and !self.conn_closed and !conn.closed) {
-            try conn.cond.wait(conn.io, &conn.lock);
+            try self.wait();
         }
     }
 

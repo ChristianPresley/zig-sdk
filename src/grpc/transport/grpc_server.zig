@@ -348,8 +348,10 @@ fn handleRequest(conn: *Conn, stream: *Stream, arena: Allocator, env: envelope.H
 
     var token: Transport.CancelToken = .{};
     var watcher: ?Io.Future(void) = io.concurrent(watchCancel, .{ stream, &token, io }) catch null;
+    // Not `w.cancel`: the watcher waits on the stream, and a cancel can get lost there.
     defer if (watcher) |*w| {
-        _ = w.cancel(io);
+        stream.stopWaits();
+        w.await(io);
     };
 
     var exchange: Exchange = .{ .stream = stream, .gpa = self.gpa, .arena = arena };
