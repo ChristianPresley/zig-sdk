@@ -1,6 +1,8 @@
 //! A small D-Bus client for the Secret Service backend of `KeychainTokenStorage`. It connects
 //! to a bus at a Unix socket and authenticates with the SASL mechanism `EXTERNAL`. Then it sends
-//! requests to the methods of objects and reads the responses.
+//! requests to the methods of objects and reads the responses. Each wait for the bus can have a
+//! time limit. Thus the caller does not wait without end for a bus or a service that does not
+//! answer.
 //!
 //! The client writes little-endian messages and reads messages in both byte orders. It has the
 //! types that the Secret Service API needs: `y`, `b`, `u`, `s`, `o`, `g`, `v`, arrays, structs
@@ -29,8 +31,15 @@ pub const Error = error{
     ConnectionClosed,
     /// The response is an error message. `Connection.error_name` has its name.
     CallFailed,
+    /// The bus did not read a request or did not answer in the time limit. After this error the
+    /// connection is not usable.
+    Timeout,
     Canceled,
 };
+
+/// The time limit for an answer of the bus that `secret_service.Options` uses by default: 25
+/// seconds. It is the same as the default of the reference implementation of D-Bus.
+pub const default_timeout: Io.Duration = .fromSeconds(25);
 
 /// The largest message that the client reads or writes.
 pub const max_message_bytes = 4 << 20;
@@ -501,7 +510,8 @@ pub const Call = struct {
     body: []const u8 = "",
 };
 
-/// A connection to a bus. Create it with `open`, and free it with `close`.
+/// A connection to a bus. Create it with `open`, and free it with `close`. After
+/// `error.Timeout` or `error.Canceled`, the connection is not usable. Close it.
 pub const Connection = struct {
     io: Io,
     gpa: Allocator,
@@ -510,6 +520,10 @@ pub const Connection = struct {
     writer: Io.net.Stream.Writer,
     read_buf: [8192]u8,
     write_buf: [8192]u8,
+    /// The time limit for each wait for the bus. The connect and the authentication together
+    /// have one limit. Each `call`, `send` and `receive` has its own limit. Null waits without
+    /// a limit.
+    timeout: ?Io.Duration,
     serial: u32 = 0,
     /// The unique name that `Hello` gave.
     unique_name: ?[]u8 = null,
@@ -520,18 +534,21 @@ pub const Connection = struct {
     signals: std.ArrayList(Message) = .empty,
 
     /// Connect to `address`, authenticate with `EXTERNAL` and the user ID `user_id` (decimal
-    /// digits), and call `Hello`.
-    pub fn open(io: Io, gpa: Allocator, address: Address, user_id: []const u8) Error!*Connection {
-        const stream = try connect(io, address);
+    /// digits), and call `Hello`. `timeout` is the time limit for each answer of the bus, and
+    /// null waits without a limit. The connect and the authentication together have one time
+    /// limit. When `io` cannot run a task concurrently, the waits can have no limit.
+    pub fn open(io: Io, gpa: Allocator, address: Address, user_id: []const u8, timeout: ?Io.Duration) Error!*Connection {
+        const end = deadline(io, timeout);
+        const stream = try within(io, end, connect, .{ io, address, end });
         const self = gpa.create(Connection) catch |e| {
             stream.close(io);
             return e;
         };
-        self.* = .{ .io = io, .gpa = gpa, .stream = stream, .reader = undefined, .writer = undefined, .read_buf = undefined, .write_buf = undefined };
+        self.* = .{ .io = io, .gpa = gpa, .stream = stream, .reader = undefined, .writer = undefined, .read_buf = undefined, .write_buf = undefined, .timeout = timeout };
         self.reader = stream.reader(io, &self.read_buf);
         self.writer = stream.writer(io, &self.write_buf);
         errdefer self.close();
-        try self.authenticate(user_id);
+        try within(io, end, authenticate, .{ self, user_id });
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
         const reply = try self.call(arena_state.allocator(), .{
@@ -609,7 +626,13 @@ pub const Connection = struct {
     }
 
     /// Send a request to a method and do not wait for the response. Returns the serial number.
+    /// The write of the request has the time limit of the connection, because a bus that does
+    /// not read can block the write.
     pub fn send(self: *Connection, c: Call) Error!u32 {
+        return within(self.io, deadline(self.io, self.timeout), sendNow, .{ self, c });
+    }
+
+    fn sendNow(self: *Connection, c: Call) Error!u32 {
         const serial = self.nextSerial();
         writeMessage(self.gpa, &self.writer.interface, serial, .{
             .path = c.path,
@@ -627,8 +650,12 @@ pub const Connection = struct {
         return serial;
     }
 
-    /// Read the next message into `arena`.
+    /// Read the next message into `arena`. Wait at most the time limit of the connection.
     pub fn receive(self: *Connection, arena: Allocator) Error!Message {
+        return within(self.io, deadline(self.io, self.timeout), takeMessage, .{ self, arena });
+    }
+
+    fn takeMessage(self: *Connection, arena: Allocator) Error!Message {
         return readMessage(arena, &self.reader.interface) catch |e| switch (e) {
             error.ReadFailed, error.EndOfStream => self.readFailed(),
             else => |err| err,
@@ -638,10 +665,15 @@ pub const Connection = struct {
     /// Call a method and wait for its response. An error response gives `error.CallFailed`,
     /// and `error_name` has the name of the error. The connection keeps the signals that come
     /// before the response for `waitSignal`, so use one `arena` for the calls and the waits.
+    /// The request and the response together have the time limit of the connection.
     pub fn call(self: *Connection, arena: Allocator, c: Call) Error!Message {
-        const serial = try self.send(c);
+        return within(self.io, deadline(self.io, self.timeout), callNow, .{ self, arena, c });
+    }
+
+    fn callNow(self: *Connection, arena: Allocator, c: Call) Error!Message {
+        const serial = try self.sendNow(c);
         while (true) {
-            const m = try self.receive(arena);
+            const m = try self.takeMessage(arena);
             switch (m.kind) {
                 .method_return, .error_reply => if (m.reply_serial == serial) {
                     if (m.kind == .method_return) return m;
@@ -657,14 +689,20 @@ pub const Connection = struct {
         }
     }
 
-    /// Wait for a signal with the object path, the interface and the member.
-    pub fn waitSignal(self: *Connection, arena: Allocator, path: []const u8, interface: []const u8, member: []const u8) Error!Message {
+    /// Wait for a signal with the object path, the interface and the member. `timeout` is the
+    /// time limit of the wait, and null waits without a limit. A signal can come from an action
+    /// of the user, thus the wait does not use the time limit of the connection.
+    pub fn waitSignal(self: *Connection, arena: Allocator, path: []const u8, interface: []const u8, member: []const u8, timeout: ?Io.Duration) Error!Message {
         for (self.signals.items, 0..) |m, i| if (signalMatches(m, path, interface, member)) {
             _ = self.signals.orderedRemove(i);
             return m;
         };
+        return within(self.io, deadline(self.io, timeout), waitSignalNow, .{ self, arena, path, interface, member });
+    }
+
+    fn waitSignalNow(self: *Connection, arena: Allocator, path: []const u8, interface: []const u8, member: []const u8) Error!Message {
         while (true) {
-            const m = try self.receive(arena);
+            const m = try self.takeMessage(arena);
             if (m.kind == .signal and signalMatches(m, path, interface, member)) return m;
         }
     }
@@ -674,7 +712,76 @@ fn signalMatches(m: Message, path: []const u8, interface: []const u8, member: []
     return std.mem.eql(u8, m.path orelse "", path) and std.mem.eql(u8, m.interface orelse "", interface) and std.mem.eql(u8, m.member orelse "", member);
 }
 
-fn connect(io: Io, address: Address) Error!Io.net.Stream {
+/// The end of the time limit `timeout` from now, or null for no limit.
+fn deadline(io: Io, timeout: ?Io.Duration) ?Io.Clock.Timestamp {
+    const t = timeout orelse return null;
+    return .fromNow(io, .{ .raw = t, .clock = .awake });
+}
+
+/// True after the first wait that has no limit because `io` cannot run a task concurrently.
+var unlimited_wait_logged: std.atomic.Value(bool) = .init(false);
+
+/// Run `function` with `args` and stop it at `end`. A null `end` runs the function on this
+/// task without a limit. Else the function runs in its own task, and at `end` that task gets
+/// a cancel. The function can stop in the middle of a message, thus the connection is not
+/// usable after `error.Timeout`.
+///
+/// A cancel stops a blocked read on each system. On Windows, a shutdown of the socket does not
+/// stop a blocked read. Also, a read on a Unix socket can stay blocked there after the peer
+/// closes the connection.
+///
+/// When `io` cannot run a task concurrently, the function runs on this task without a limit.
+/// The first time, the client writes a message about it to the log.
+fn within(io: Io, end: ?Io.Clock.Timestamp, comptime function: anytype, args: anytype) @typeInfo(@TypeOf(function)).@"fn".return_type.? {
+    const limit = end orelse return @call(.auto, function, args);
+    const Args = @TypeOf(args);
+    const Result = @typeInfo(@TypeOf(function)).@"fn".return_type.?;
+    const Task = struct {
+        args: Args,
+        result: Result = error.Canceled,
+        done: Io.Event = .unset,
+
+        fn run(t: *@This(), task_io: Io) void {
+            t.result = @call(.auto, function, t.args);
+            t.done.set(task_io);
+        }
+    };
+    var task: Task = .{ .args = args };
+    var future = io.concurrent(Task.run, .{ &task, io }) catch {
+        if (!unlimited_wait_logged.swap(true, .monotonic)) {
+            log.info("the Io cannot run a task concurrently, thus the D-Bus client waits without a time limit", .{});
+        }
+        return @call(.auto, function, args);
+    };
+    while (!task.done.isSet()) {
+        task.done.waitTimeout(io, .{ .deadline = limit }) catch |e| switch (e) {
+            // The wait can also end before the deadline.
+            error.Timeout => if (Io.Clock.Timestamp.now(io, limit.clock).compare(.gte, limit)) break,
+            error.Canceled => {
+                future.cancel(io);
+                // The function can end at the same time as the cancel. Then keep its result,
+                // for example a socket that the caller must close, and give the cancel again to
+                // the next cancelation point of this task.
+                const value = task.result catch return error.Canceled;
+                io.recancel();
+                return value;
+            },
+        };
+    }
+    if (task.done.isSet()) {
+        future.await(io);
+        return task.result;
+    }
+    future.cancel(io);
+    // The function can end at the same time as the cancel.
+    if (task.result) |v| return v else |e| if (e != error.Canceled) return e;
+    log.debug("the bus did not answer in the time limit", .{});
+    return error.Timeout;
+}
+
+/// Connect to `address`. A connect to a path stops at the cancel of `within`. A connect to an
+/// abstract name also stops at `end` by itself.
+fn connect(io: Io, address: Address, end: ?Io.Clock.Timestamp) Error!Io.net.Stream {
     switch (address) {
         .path => |p| {
             if (!Io.net.has_unix_sockets) return error.UnsupportedAddress;
@@ -687,34 +794,60 @@ fn connect(io: Io, address: Address) Error!Io.net.Stream {
                 },
             };
         },
-        .abstract => |name| return connectAbstract(name),
+        .abstract => |name| return connectAbstract(io, name, end),
     }
 }
 
+/// The longest pause between two tries of `connectAbstract`.
+const max_connect_pause: Io.Duration = .fromMilliseconds(100);
+
 /// The std library adds a zero byte to the end of each Unix socket path, which is wrong for an
 /// abstract name. Thus this function connects with the system calls of Linux.
-fn connectAbstract(name: []const u8) Error!Io.net.Stream {
+///
+/// The connect does not block. While the queue of the listener is full, the function tries
+/// again after a pause, until `end`. Linux gives no event when such a queue gets free space.
+/// A cancel stops the pause.
+fn connectAbstract(io: Io, name: []const u8, end: ?Io.Clock.Timestamp) Error!Io.net.Stream {
     if (builtin.os.tag != .linux) return error.UnsupportedAddress;
     const linux = std.os.linux;
-    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-    if (linux.errno(rc) != .SUCCESS) return error.ConnectFailed;
-    const fd: linux.fd_t = @intCast(rc);
     var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
-    if (name.len + 1 > addr.path.len) {
-        _ = linux.close(fd);
-        return error.ConnectFailed;
-    }
+    if (name.len + 1 > addr.path.len) return error.ConnectFailed;
     @memcpy(addr.path[1..][0..name.len], name);
     const len: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + 1 + name.len);
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.ConnectFailed;
+    const fd: linux.fd_t = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    var pause: Io.Duration = .fromMilliseconds(1);
     while (true) switch (linux.errno(linux.connect(fd, &addr, len))) {
         .SUCCESS => break,
-        .INTR => continue,
-        else => {
-            _ = linux.close(fd);
+        .INTR => try io.checkCancel(),
+        // The queue of the listener is full.
+        .AGAIN => {
+            try pauseUntil(io, end, pause);
+            pause = .fromNanoseconds(@min(2 * pause.nanoseconds, max_connect_pause.nanoseconds));
+        },
+        else => |e| {
+            log.debug("could not connect to the bus at the abstract name {s}: errno {d}", .{ name, @intFromEnum(e) });
             return error.ConnectFailed;
         },
     };
+    // The reader and the writer of the stream need a socket that blocks.
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS) return error.ConnectFailed;
+    var o: linux.O = @bitCast(@as(u32, @truncate(flags)));
+    o.NONBLOCK = false;
+    if (linux.errno(linux.fcntl(fd, linux.F.SETFL, @as(u32, @bitCast(o)))) != .SUCCESS) return error.ConnectFailed;
     return .{ .socket = .{ .handle = fd, .address = .{ .ip4 = .loopback(0) } } };
+}
+
+/// Sleep for `pause`, but not past `end`. When `end` is already past, the function gives
+/// `error.Timeout` at once. A null `end` has no limit.
+fn pauseUntil(io: Io, end: ?Io.Clock.Timestamp, pause: Io.Duration) Error!void {
+    const wake: Io.Clock.Timestamp = .fromNow(io, .{ .raw = pause, .clock = .awake });
+    const limit = end orelse return wake.wait(io);
+    if (Io.Clock.Timestamp.now(io, limit.clock).compare(.gte, limit)) return error.Timeout;
+    return if (wake.compare(.lt, limit)) wake.wait(io) else limit.wait(io);
 }
 
 /// The effective user ID of the process as decimal digits in `buf`. Windows has no user ID.
@@ -848,4 +981,112 @@ test "a message survives a write and a read" {
     try std.testing.expectEqual(Kind.method_return, reply.kind);
     try std.testing.expectEqual(9, reply.serial);
     try std.testing.expectEqual(3, reply.reply_serial.?);
+}
+
+test "d-bus client stops a wait and a pause of the connect at the deadline" {
+    const io = std.testing.io;
+    const Wait = struct {
+        fn forever(event: *Io.Event, task_io: Io) Error!u32 {
+            try event.wait(task_io);
+            return 1;
+        }
+
+        fn atOnce(value: u32) Error!u32 {
+            return value;
+        }
+    };
+    const limit: Io.Duration = .fromMilliseconds(100);
+    const long: Io.Duration = .fromSeconds(5);
+    var never: Io.Event = .unset;
+    var start: Io.Clock.Timestamp = .now(io, .awake);
+    try std.testing.expectError(error.Timeout, within(io, deadline(io, limit), Wait.forever, .{ &never, io }));
+    try std.testing.expect(start.untilNow(io).raw.nanoseconds >= limit.nanoseconds);
+    try std.testing.expectEqual(7, try within(io, deadline(io, long), Wait.atOnce, .{7}));
+    try std.testing.expectEqual(7, try within(io, null, Wait.atOnce, .{7}));
+
+    // Without concurrency, the function runs on this task without a limit, and the client
+    // writes a message to the log. Another test can set the flag first, thus clear it.
+    var single: Io.Threaded = .init_single_threaded;
+    unlimited_wait_logged.store(false, .monotonic);
+    try std.testing.expectEqual(7, try within(single.io(), deadline(io, limit), Wait.atOnce, .{7}));
+    try std.testing.expect(unlimited_wait_logged.load(.monotonic));
+
+    // A pause of the connect to an abstract name stops at the deadline. After the deadline, it
+    // gives `error.Timeout` at once.
+    start = .now(io, .awake);
+    const end = deadline(io, limit);
+    while (true) {
+        pauseUntil(io, end, long) catch |e| {
+            try std.testing.expectEqual(error.Timeout, e);
+            break;
+        };
+    }
+    const waited = start.untilNow(io).raw.nanoseconds;
+    try std.testing.expect(waited >= limit.nanoseconds and waited < long.nanoseconds);
+    try pauseUntil(io, null, .fromMilliseconds(1));
+}
+
+test "d-bus client gives a cancel of the caller through a wait with a deadline" {
+    const io = std.testing.io;
+    const long: Io.Duration = .fromSeconds(5);
+    const Wait = struct {
+        // Set `started`, then wait for `event`.
+        fn forever(started: *Io.Event, event: *Io.Event, task_io: Io) Error!u32 {
+            started.set(task_io);
+            try event.wait(task_io);
+            return 1;
+        }
+
+        // Set `started`, then wait for `event` without a cancelation point.
+        fn uncancelable(started: *Io.Event, event: *Io.Event, task_io: Io) Error!u32 {
+            started.set(task_io);
+            event.waitUncancelable(task_io);
+            return 7;
+        }
+
+        fn callForever(started: *Io.Event, event: *Io.Event, task_io: Io, limit: Io.Duration) Error!u32 {
+            return within(task_io, deadline(task_io, limit), forever, .{ started, event, task_io });
+        }
+
+        // Also record whether the next cancelation point after `within` gives the cancel.
+        fn callUncancelable(started: *Io.Event, event: *Io.Event, task_io: Io, limit: Io.Duration, canceled_again: *bool) Error!u32 {
+            const value = within(task_io, deadline(task_io, limit), uncancelable, .{ started, event, task_io });
+            task_io.checkCancel() catch {
+                canceled_again.* = true;
+            };
+            return value;
+        }
+
+        fn setAfter(event: *Io.Event, task_io: Io, pause: Io.Duration) void {
+            task_io.sleep(pause, .awake) catch {};
+            event.set(task_io);
+        }
+    };
+
+    // A cancel of the caller before the deadline gives `error.Canceled`, not `error.Timeout`.
+    var started: Io.Event = .unset;
+    var never: Io.Event = .unset;
+    const start: Io.Clock.Timestamp = .now(io, .awake);
+    var caller = try io.concurrent(Wait.callForever, .{ &started, &never, io, long });
+    defer _ = caller.cancel(io) catch 0;
+    try started.wait(io);
+    try std.testing.expectError(error.Canceled, caller.cancel(io));
+    try std.testing.expect(start.untilNow(io).raw.nanoseconds < long.nanoseconds);
+
+    // The function ends after the cancel of the caller. Then `within` keeps the result, for
+    // example a socket that the caller must close, and gives the cancel again to the caller.
+    var started_again: Io.Event = .unset;
+    var free: Io.Event = .unset;
+    var canceled_again = false;
+    var uncancelable_caller = try io.concurrent(Wait.callUncancelable, .{ &started_again, &free, io, long, &canceled_again });
+    defer {
+        free.set(io);
+        _ = uncancelable_caller.cancel(io) catch 0;
+    }
+    try started_again.wait(io);
+    // The pause is long, thus the cancel comes before the function ends.
+    var setter = try io.concurrent(Wait.setAfter, .{ &free, io, Io.Duration.fromMilliseconds(250) });
+    defer setter.await(io);
+    try std.testing.expectEqual(7, try uncancelable_caller.cancel(io));
+    try std.testing.expect(canceled_again);
 }

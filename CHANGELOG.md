@@ -4,11 +4,22 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- `secret_service.Options.timeout` and `KeychainTokenStorage.Options.timeout`: the time limit for each answer of the D-Bus bus and of the Secret Service. The default is `dbus.default_timeout`, 25 seconds, the same as in the reference implementation of D-Bus. A service that does not answer in time gives `error.KeychainUnavailable`. Before, the Secret Service backend waited without a limit, for example for a service that stopped.
+- `secret_service.Options.prompt_timeout` and `KeychainTokenStorage.Options.prompt_timeout`: the time limit for the answer of the user to a prompt of the Secret Service. The default is `secret_service.default_prompt_timeout`, 5 minutes. A prompt without an answer in time gives `error.KeychainLocked`. Null waits without a limit, as before.
+
+### Changed
+
+- Breaking: `dbus.Connection.open` has a fifth parameter, the time limit for each answer of the bus. Null waits without a limit, as before. The connect and the authentication of `open` together obey this limit, and each `Connection.send`, `Connection.call` and `Connection.receive` obeys it too. `Connection.waitSignal` has a parameter for the time limit of its wait. At the limit, these functions return the new error `dbus.Error.Timeout`, and the connection is then not usable.
+- A wait of the D-Bus client with a time limit runs in its own task, and at the limit that task gets a cancel. A cancel stops a blocked read on each system. On Windows, a shutdown of the socket does not stop a blocked read. When the `Io` cannot run a task concurrently, the client can wait without a limit. The first such wait of the process writes a message to the log of the scope `mcp_dbus`.
+
 ### Fixed
 
 - Correction to the notes of 0.4.0: the proxy sees only the host and the port of the server for an `https` URL. For an `http` URL, the tunnel has no TLS, thus the proxy can read the requests. The doc comments of `transport.proxy` and `HttpClient.Options.proxy` now say this.
 - On Windows, the fake D-Bus server of the keychain tests serves each connection in its own task. A read on a Unix socket of Windows can stay blocked after the client closes the connection. Before, the server then never accepted the next connection, and a test hung.
 - Correction to the notes of 0.4.0: the warning of the scope `mcp_router` for an error response with a null id also has the error code. That code is the code of the error response.
+- The D-Bus client connects to an abstract address (`unix:abstract=`) with a socket that does not block. While the queue of the bus is full, the client tries again after a short pause, until the time limit or a cancel. Before, this connect waited without a limit, and a cancel did not stop it.
 
 ## [0.4.0] - 2026-10-07
 

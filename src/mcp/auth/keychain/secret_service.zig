@@ -1,6 +1,7 @@
 //! The Secret Service backend of `KeychainTokenStorage` for Linux and the other POSIX systems.
 //! It talks to the service `org.freedesktop.secrets` on the D-Bus bus of the user. Each
-//! operation opens its own D-Bus connection and closes it at the end.
+//! operation opens its own D-Bus connection and closes it at the end. Each answer of the bus,
+//! of the service and of the user has a time limit (`Options.timeout`, `Options.prompt_timeout`).
 //!
 //! The items are in the collection with the alias `default`. An item has the attributes
 //! `xdg:schema`, `service` and `account`. The `account` is the name of the key, a hash. The
@@ -39,7 +40,24 @@ pub const Options = struct {
     service: []const u8,
     /// Show the unlock prompt of the service for a locked collection.
     allow_prompt: bool = true,
+    /// The time limit for each answer of the bus and of the service. Null waits without a
+    /// limit. A service that does not answer in time gives `error.KeychainUnavailable`.
+    ///
+    /// Each wait with a limit runs in a task of its own. When `io` cannot run a task
+    /// concurrently (`error.ConcurrencyUnavailable`), the backend can wait without a limit. The
+    /// first such wait of the process writes a message to the log of the scope `mcp_dbus`.
+    timeout: ?Io.Duration = dbus.default_timeout,
+    /// The time limit for the answer of the user to a prompt of the service. Null waits without
+    /// a limit. A prompt without an answer in time gives `error.KeychainLocked`.
+    ///
+    /// When `io` cannot run a task concurrently (`error.ConcurrencyUnavailable`), this wait
+    /// also has no limit, as for `timeout`.
+    prompt_timeout: ?Io.Duration = default_prompt_timeout,
 };
+
+/// The time limit for the answer of the user to a prompt that `Options` uses by default: 5
+/// minutes.
+pub const default_prompt_timeout: Io.Duration = .fromSeconds(5 * 60);
 
 /// Make sure that the service answers and has a default collection.
 pub fn probe(io: Io, gpa: Allocator, options: Options) Error!void {
@@ -146,7 +164,7 @@ const Op = struct {
 
     fn begin(io: Io, gpa: Allocator, arena: Allocator, options: Options) Error!Op {
         const address = dbus.parseAddress(arena, options.address) catch |e| return unavailable(e);
-        const conn = dbus.Connection.open(io, gpa, address, options.user_id) catch |e| return unavailable(e);
+        const conn = dbus.Connection.open(io, gpa, address, options.user_id, options.timeout) catch |e| return unavailable(e);
         errdefer conn.close();
         var op: Op = .{ .conn = conn, .arena = arena, .options = options };
         var body: dbus.Encoder = .{ .gpa = arena };
@@ -224,7 +242,13 @@ const Op = struct {
         var window: dbus.Encoder = .{ .gpa = self.arena };
         try window.string("");
         _ = self.callOn(prompt, prompt_interface, "Prompt", "s", window.written()) catch |e| return self.failed(e);
-        const done = self.conn.waitSignal(self.arena, prompt, prompt_interface, "Completed") catch |e| return self.failed(e);
+        const done = self.conn.waitSignal(self.arena, prompt, prompt_interface, "Completed", self.options.prompt_timeout) catch |e| switch (e) {
+            error.Timeout => {
+                log.info("the user did not answer the prompt of the Secret Service in the time limit", .{});
+                return error.KeychainLocked;
+            },
+            else => return self.failed(e),
+        };
         if (!std.mem.eql(u8, done.signature, "bv")) return error.StorageFailed;
         var d = done.decoder();
         if (d.boolean() catch return error.StorageFailed) return error.KeychainLocked;
@@ -240,6 +264,10 @@ const Op = struct {
         switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Canceled => return error.Canceled,
+            error.Timeout => {
+                log.warn("the Secret Service did not answer in the time limit", .{});
+                return error.KeychainUnavailable;
+            },
             error.CallFailed => {
                 const name = self.conn.error_name orelse "";
                 if (std.mem.eql(u8, name, "org.freedesktop.Secret.Error.IsLocked")) return error.KeychainLocked;

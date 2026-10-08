@@ -18,6 +18,9 @@ const unique_name = ":1.42";
 const session_path = "/org/freedesktop/secrets/session/s1";
 const collection_path = "/org/freedesktop/secrets/collection/login";
 const prompt_path = "/org/freedesktop/secrets/prompt/p1";
+/// The time limit of each wait of the client in the tests. It is much longer than an answer of
+/// the fake bus.
+const test_timeout: Io.Duration = .fromSeconds(5);
 
 const Item = struct {
     path: []u8,
@@ -68,11 +71,17 @@ const FakeBus = struct {
     /// cancels the tasks that remain.
     group: Io.Group = .init,
 
-    // Behaviour.
+    // Behaviour. Set it before the first connection that must see it.
     has_service: bool = true,
     has_default: bool = true,
     locked: bool = false,
     dismiss_prompt: bool = false,
+    /// The bus gives no answer to the authentication.
+    silent_auth: bool = false,
+    /// The Secret Service gives no answer to a request.
+    silent_service: bool = false,
+    /// The prompt sends no `Completed` signal.
+    silent_prompt: bool = false,
 
     // State.
     items: std.ArrayList(Item) = .empty,
@@ -118,7 +127,7 @@ const FakeBus = struct {
     }
 
     fn options(self: *FakeBus) secret_service.Options {
-        return .{ .address = self.address, .user_id = test_user, .service = "zig-sdk-test" };
+        return .{ .address = self.address, .user_id = test_user, .service = "zig-sdk-test", .timeout = test_timeout, .prompt_timeout = test_timeout };
     }
 
     fn acceptLoop(self: *FakeBus) void {
@@ -152,6 +161,11 @@ const FakeBus = struct {
         const w = &writer.interface;
         if ((try r.takeByte()) != 0) return self.fail("no zero byte before the authentication");
         const auth = try r.takeDelimiterInclusive('\n');
+        if (self.silent_auth) {
+            // Read until the end of the connection or the cancel of `stop`.
+            _ = r.discardRemaining() catch {};
+            return;
+        }
         // The user ID "1000" in hexadecimal digits.
         if (!std.mem.eql(u8, auth, "AUTH EXTERNAL 31303030\r\n")) {
             try w.writeAll("REJECTED EXTERNAL\r\n");
@@ -204,6 +218,7 @@ const FakeBus = struct {
         }
         if (!std.mem.eql(u8, m.destination orelse "", secret_service.bus_name)) return self.fail("unknown destination");
         if (!self.has_service) return replyError(w, serial, m, "org.freedesktop.DBus.Error.ServiceUnknown");
+        if (self.silent_service) return;
 
         if (std.mem.eql(u8, member, "OpenSession")) {
             if (!std.mem.eql(u8, m.signature, "sv")) return self.fail("OpenSession signature");
@@ -236,6 +251,7 @@ const FakeBus = struct {
             if (!std.mem.eql(u8, m.path orelse "", prompt_path)) return self.fail("prompt path");
             self.prompts += 1;
             try reply(w, serial, m, "", "");
+            if (self.silent_prompt) return;
             if (!self.dismiss_prompt) self.locked = false;
             try body.boolean(self.dismiss_prompt);
             try body.signature("ao");
@@ -341,11 +357,11 @@ test "d-bus client authenticates with EXTERNAL and keeps a signal of the bus" {
     defer arena_state.deinit();
     const address = try dbus.parseAddress(arena_state.allocator(), bus.address);
 
-    const conn = try dbus.Connection.open(std.testing.io, gpa, address, test_user);
+    const conn = try dbus.Connection.open(std.testing.io, gpa, address, test_user, test_timeout);
     try std.testing.expectEqualStrings(unique_name, conn.unique_name.?);
     // The `NameAcquired` signal comes after the reply of `Hello`. The next call keeps it.
     _ = try conn.call(arena_state.allocator(), .{ .destination = "org.freedesktop.DBus", .path = "/org/freedesktop/DBus", .interface = "org.freedesktop.DBus", .member = "AddMatch", .signature = "s", .body = &.{ 0, 0, 0, 0, 0 } });
-    const signal = try conn.waitSignal(arena_state.allocator(), "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameAcquired");
+    const signal = try conn.waitSignal(arena_state.allocator(), "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameAcquired", test_timeout);
     var d = signal.decoder();
     try std.testing.expectEqualStrings(unique_name, try d.string());
     // An unknown method gives an error reply with its name.
@@ -354,7 +370,7 @@ test "d-bus client authenticates with EXTERNAL and keeps a signal of the bus" {
     conn.close();
 
     // The bus refuses another user.
-    try std.testing.expectError(error.AuthenticationFailed, dbus.Connection.open(std.testing.io, gpa, address, "1001"));
+    try std.testing.expectError(error.AuthenticationFailed, dbus.Connection.open(std.testing.io, gpa, address, "1001", test_timeout));
     try std.testing.expect(bus.failure == null);
 }
 
@@ -446,6 +462,125 @@ test "secret service backend reports a missing bus, service or collection as una
     if (keychain.backend == .secret_service) {
         try std.testing.expectError(error.KeychainUnavailable, keychain.KeychainTokenStorage.init(io, gpa, .{}));
     }
+}
+
+test "d-bus client and secret service backend stop at the time limit when nobody answers" {
+    if (!Io.net.has_unix_sockets) return error.SkipZigTest;
+    const io = std.testing.io;
+    const limit: Io.Duration = .fromMilliseconds(200);
+    // Each part has a bus of its own. Thus no task of a connection from an earlier part reads
+    // the behaviour while the test changes it.
+    {
+        // The bus does not answer the authentication.
+        var bus: FakeBus = undefined;
+        try bus.start();
+        defer bus.stop();
+        bus.silent_auth = true;
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        const address = try dbus.parseAddress(arena_state.allocator(), bus.address);
+        const start: Io.Clock.Timestamp = .now(io, .awake);
+        try std.testing.expectError(error.Timeout, dbus.Connection.open(io, gpa, address, test_user, limit));
+        try expectWaited(io, start, limit);
+    }
+    {
+        // The Secret Service does not answer.
+        var bus: FakeBus = undefined;
+        try bus.start();
+        defer bus.stop();
+        bus.silent_service = true;
+        var options = bus.options();
+        options.timeout = limit;
+        const start: Io.Clock.Timestamp = .now(io, .awake);
+        try std.testing.expectError(error.KeychainUnavailable, secret_service.probe(io, gpa, options));
+        try expectWaited(io, start, limit);
+        try std.testing.expect(bus.failure == null);
+    }
+    {
+        // The user does not answer the unlock prompt.
+        var bus: FakeBus = undefined;
+        try bus.start();
+        defer bus.stop();
+        bus.locked = true;
+        bus.silent_prompt = true;
+        var options = bus.options();
+        options.prompt_timeout = limit;
+        const start: Io.Clock.Timestamp = .now(io, .awake);
+        try std.testing.expectError(error.KeychainLocked, secret_service.save(io, gpa, options, test_key, "{\"record\":1}"));
+        try expectWaited(io, start, limit);
+        try std.testing.expectEqual(1, bus.prompts);
+        try std.testing.expectEqual(0, bus.items.items.len);
+        try std.testing.expect(bus.failure == null);
+    }
+}
+
+test "d-bus client stops at the time limit when the bus does not take the connection" {
+    // Linux blocks a connect to a Unix socket with a full queue. Other systems can refuse it at
+    // once, thus only Linux runs this test.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const limit: Io.Duration = .fromMilliseconds(200);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/bus", .{tmp.sub_path});
+    defer gpa.free(path);
+
+    // A listener with a queue of length zero that does not accept. Linux puts the first
+    // connection in the queue and blocks the next connect until the queue has space.
+    const ua = try Io.net.UnixAddress.init(path);
+    var listener = try ua.listen(io, .{ .kernel_backlog = 0 });
+    defer listener.deinit(io);
+    const queued = try ua.connect(io);
+    defer queued.close(io);
+    var start: Io.Clock.Timestamp = .now(io, .awake);
+    try std.testing.expectError(error.Timeout, dbus.Connection.open(io, gpa, .{ .path = path }, test_user, limit));
+    try expectWaited(io, start, limit);
+
+    // The same for an abstract name.
+    var random: [6]u8 = undefined;
+    io.random(&random);
+    var name_buf: [32]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "zig-sdk-test-{s}", .{&std.fmt.bytesToHex(random, .lower)});
+    const abstract_listener = try abstractSocket(name, .listen);
+    defer _ = std.os.linux.close(abstract_listener);
+    const abstract_queued = try abstractSocket(name, .connect);
+    defer _ = std.os.linux.close(abstract_queued);
+    start = .now(io, .awake);
+    try std.testing.expectError(error.Timeout, dbus.Connection.open(io, gpa, .{ .abstract = name }, test_user, limit));
+    try expectWaited(io, start, limit);
+    // The connect to an abstract name also stops at the limit when the `Io` cannot run a task
+    // concurrently.
+    var single: Io.Threaded = .init_single_threaded;
+    start = .now(io, .awake);
+    try std.testing.expectError(error.Timeout, dbus.Connection.open(single.io(), gpa, .{ .abstract = name }, test_user, limit));
+    try expectWaited(io, start, limit);
+}
+
+/// Make sure that a wait from `start` took at least `limit`, and less than the time limit of the
+/// other waits.
+fn expectWaited(io: Io, start: Io.Clock.Timestamp, limit: Io.Duration) !void {
+    const waited = start.untilNow(io).raw;
+    try std.testing.expect(waited.nanoseconds >= limit.nanoseconds);
+    try std.testing.expect(waited.nanoseconds < test_timeout.nanoseconds);
+}
+
+/// A Unix socket of Linux at the abstract name `name`. With `.listen`, the socket listens with a
+/// queue of length zero and does not accept. With `.connect`, the socket connects to it.
+fn abstractSocket(name: []const u8, mode: enum { listen, connect }) !std.os.linux.fd_t {
+    const linux = std.os.linux;
+    var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+    @memcpy(addr.path[1..][0..name.len], name);
+    const len: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + 1 + name.len);
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.Unexpected;
+    const fd: linux.fd_t = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    const ok = switch (mode) {
+        .listen => linux.errno(linux.bind(fd, @ptrCast(&addr), len)) == .SUCCESS and linux.errno(linux.listen(fd, 0)) == .SUCCESS,
+        .connect => linux.errno(linux.connect(fd, &addr, len)) == .SUCCESS,
+    };
+    if (!ok) return error.Unexpected;
+    return fd;
 }
 
 test "keychain token storage keeps a large record in the keychain of this host" {

@@ -63,6 +63,22 @@ pub const KeychainTokenStorage = struct {
         /// Secret Service: show the unlock prompt of the service for a locked collection.
         /// False gives `error.KeychainLocked`.
         allow_prompt: bool = true,
+        /// Secret Service: the time limit for each answer of the bus and of the service. The
+        /// default is 25 seconds, and null waits without a limit. A service that does not answer
+        /// in time gives `error.KeychainUnavailable`.
+        ///
+        /// Each wait with a limit runs in a task of its own. When the `Io` of `init` cannot run
+        /// a task concurrently (`error.ConcurrencyUnavailable`), the backend can wait without a
+        /// limit. The first such wait of the process writes a message to the log of the scope
+        /// `mcp_dbus`.
+        timeout: ?Io.Duration = dbus.default_timeout,
+        /// Secret Service: the time limit for the answer of the user to a prompt. The default is
+        /// 5 minutes, and null waits without a limit. A prompt without an answer in time gives
+        /// `error.KeychainLocked`.
+        ///
+        /// When the `Io` of `init` cannot run a task concurrently
+        /// (`error.ConcurrencyUnavailable`), this wait also has no limit, as for `timeout`.
+        prompt_timeout: ?Io.Duration = secret_service.default_prompt_timeout,
         /// Windows: `local_machine` keeps the credentials on this computer. `enterprise` also
         /// copies them to the other computers of the user in a domain.
         persist: Persist = .local_machine,
@@ -111,6 +127,8 @@ pub const KeychainTokenStorage = struct {
             .user_id = dbus.userId(id_buf),
             .service = self.options.service,
             .allow_prompt = self.options.allow_prompt,
+            .timeout = self.options.timeout,
+            .prompt_timeout = self.options.prompt_timeout,
         };
     }
 
