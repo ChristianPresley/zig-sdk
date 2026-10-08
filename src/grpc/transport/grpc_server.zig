@@ -114,13 +114,14 @@ pub const Server = struct {
         self.bound_port = self.listener.?.socket.address.getPort();
     }
 
-    /// Accept connections until a call to `shutdown`.
+    /// Accept connections until a call to `shutdown`. A cancel also ends `serve`. After a
+    /// cancel, the server accepts no more connections.
     pub fn serve(self: *Server) !void {
         if (self.listener == null) try self.bind();
         var accept_future = try self.io.concurrent(acceptLoop, .{self});
         self.stop_event.wait(self.io) catch {};
-        mcp.util.wake.wakeIp(self.io, self.listener.?.socket.address);
-        _ = accept_future.cancel(self.io);
+        // On Windows a cancel can miss an accept that waits. The wake connection ends it.
+        mcp.util.wake.cancelAcceptLoop(self.io, &accept_future, self.listener.?.socket.address, &self.closing);
         self.server.shutdownSubscriptions(self.io);
         self.group.await(self.io) catch {};
     }

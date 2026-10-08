@@ -169,13 +169,14 @@ pub const Server = struct {
         };
     }
 
-    /// Accept connections until a call to `shutdown`. Then remove the socket file.
+    /// Accept connections until a call to `shutdown`. Then remove the socket file. A cancel
+    /// also ends `serve`. After a cancel, the server accepts no more connections.
     pub fn serve(self: *Server) !void {
         if (self.listener == null) try self.bind();
         var accept_future = try self.io.concurrent(acceptLoop, .{self});
         self.stop_event.wait(self.io) catch {};
-        if (self.path) |p| wake.wakeUnix(self.io, p);
-        _ = accept_future.cancel(self.io);
+        // On Windows a cancel can miss an accept that waits. The wake connection ends it.
+        wake.cancelUnixAcceptLoop(self.io, &accept_future, self.path.?, &self.closing);
         // A connection accepted during the shutdown also gets the end of its input.
         self.endInputs();
         if (builtin.os.tag == .windows) {
