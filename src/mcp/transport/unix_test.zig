@@ -452,21 +452,150 @@ test "unix socket limit on connections closes the extra connection" {
     // A free place admits the next connection.
     first.deinit();
     first_t.deinit();
-    waited = 0;
-    while (true) : (waited += 1) {
-        f.transport.connections_lock.lockUncancelable(io);
-        const open = f.transport.connections.items.len;
-        f.transport.connections_lock.unlock(io);
-        if (open == 0) break;
-        if (waited > 1000) return error.TestTimeout;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    try awaitNoConnections(&f);
     var third_t: *unix.Client = undefined;
     var third: Client = undefined;
     try connectClient(f.path, &third_t, &third);
     defer third_t.deinit();
     defer third.deinit();
     _ = try third.listTools(arena, null, .{ .timeout = .fromSeconds(10) });
+}
+
+/// Wait until the server has no open connection, at most ten seconds.
+fn awaitNoConnections(f: *Fixture) !void {
+    const io = std.testing.io;
+    var waited: u32 = 0;
+    while (true) : (waited += 1) {
+        f.transport.connections_lock.lockUncancelable(io);
+        const open = f.transport.connections.items.len;
+        f.transport.connections_lock.unlock(io);
+        if (open == 0) return;
+        if (waited > 1000) return error.TestTimeout;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
+/// Wait until `flag` is true, at most ten seconds. The loop yields the thread, because a sleep
+/// on Windows lasts at least about 15 milliseconds.
+fn spinUntil(flag: *const std.atomic.Value(bool)) !void {
+    const io = std.testing.io;
+    const deadline = Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake });
+    while (!flag.load(.acquire)) {
+        if (Io.Clock.Timestamp.now(io, .awake).durationTo(deadline).raw.nanoseconds <= 0) return error.TestTimeout;
+        std.Thread.yield() catch {};
+    }
+}
+
+// On Windows, a receive on a Unix socket that starts at about the same time as the close of
+// the peer can stay pending. The next two tests make many such closes. Without the poll of
+// `windows_afunix.zig`, some connections never see their close.
+
+test "unix socket server sees the close of each peer that closes after an answer" {
+    if (!unix.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    const peers = 500;
+    var limits: mcp.Limits = .{};
+    limits.unix_socket.max_connections = peers;
+    limits.stdio.read_buffer = 4096;
+    var f: Fixture = undefined;
+    try f.start(limits);
+    defer f.stop();
+    // The read task of the server writes the error for a line that is not JSON. Then it
+    // starts the next receive. The peer closes its connection when it has the fourth error.
+    for (0..peers) |_| {
+        const stream = try f.rawConnect();
+        defer stream.close(io);
+        var write_buf: [64]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        var read_buf: [1024]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        for (0..4) |_| {
+            try writer.interface.writeAll("x\n");
+            try writer.interface.flush();
+            _ = try reader.interface.takeDelimiterInclusive('\n');
+        }
+    }
+    try awaitNoConnections(&f);
+}
+
+/// A server that reads one frame of each client, answers it with a notification and closes
+/// the connection. Before the close it waits for a short time, a different time for each
+/// connection. Thus some closes come while the reader task of the client starts its next
+/// receive.
+const AnswerAndClose = struct {
+    path: []u8,
+    listener: Io.net.Server,
+    future: Io.Future(void),
+    stopping: std.atomic.Value(bool),
+    served: u64,
+
+    fn start(self: *AnswerAndClose, path: []const u8) !void {
+        const io = std.testing.io;
+        self.path = try absolutePath(path);
+        errdefer gpa.free(self.path);
+        self.listener = try (try Io.net.UnixAddress.init(self.path)).listen(io, .{});
+        errdefer self.listener.deinit(io);
+        self.stopping = .init(false);
+        self.served = 0;
+        self.future = try io.concurrent(acceptLoop, .{self});
+    }
+
+    fn stop(self: *AnswerAndClose) void {
+        const io = std.testing.io;
+        mcp.util.wake.cancelUnixAcceptLoop(io, &self.future, self.path, &self.stopping);
+        self.listener.deinit(io);
+        gpa.free(self.path);
+    }
+
+    fn acceptLoop(self: *AnswerAndClose) void {
+        const io = std.testing.io;
+        while (!self.stopping.load(.acquire)) {
+            const stream = self.listener.accept(io) catch |e| switch (e) {
+                error.Canceled => return,
+                else => continue,
+            };
+            defer stream.close(io);
+            if (self.stopping.load(.acquire)) return;
+            self.answer(stream) catch {};
+        }
+    }
+
+    fn answer(self: *AnswerAndClose, stream: Io.net.Stream) !void {
+        const io = std.testing.io;
+        var read_buf: [256]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        _ = try reader.interface.takeDelimiterInclusive('\n');
+        var write_buf: [256]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        try writer.interface.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"bye\"}}\n");
+        try writer.interface.flush();
+        // Wait 0 to 59 microseconds.
+        const start_time = Io.Clock.Timestamp.now(io, .awake);
+        const wait_ns: i96 = @intCast(self.served % 60 * std.time.ns_per_us);
+        while (start_time.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds < wait_ns) {}
+        self.served += 1;
+    }
+};
+
+test "unix socket client sees the close of each server that closes after an answer" {
+    if (!unix.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try socketPath(&tmp, "close.sock");
+    defer gpa.free(path);
+    var server: AnswerAndClose = undefined;
+    try server.start(path);
+    defer server.stop();
+    var limits: mcp.Limits = .{};
+    limits.stdio.read_buffer = 4096;
+    for (0..1000) |_| {
+        const t = try unix.Client.connect(io, gpa, .{ .path = path, .limits = limits });
+        defer t.deinit();
+        try t.transport().notify(io, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}");
+        // The reader task gets the notification and then the end of the stream.
+        try spinUntil(&t.reader_done);
+    }
 }
 
 test "unix socket server refuses a path that is not a socket" {
