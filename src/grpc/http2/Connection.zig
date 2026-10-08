@@ -80,6 +80,16 @@ hb_active: bool = false,
 hb_stream: u31 = 0,
 hb_flags: u8 = 0,
 hb_buf: std.ArrayList(u8) = .empty,
+/// The ids of the last peer streams that this side reset. The next id goes to the index
+/// `reset_ids_next % remembered_resets`.
+reset_ids: [remembered_resets]u31 = @splat(0),
+reset_ids_next: usize = 0,
+
+/// The number of peer streams with a reset from this side that the connection remembers. The
+/// peer can send frames on such a stream before it sees the reset. The connection ignores a
+/// header block on a remembered stream (RFC 9113 section 5.1). For an older stream, the block
+/// ends the connection, as for a stream id that the peer must not use.
+pub const remembered_resets = 64;
 
 pub fn init(gpa: Allocator, io: Io, reader: *Io.Reader, writer: *Io.Writer, options: Options) Allocator.Error!*Connection {
     const self = try gpa.create(Connection);
@@ -357,16 +367,18 @@ fn finishHeaderBlock(self: *Connection) Error!void {
         var stream = self.streams.get(stream_id);
         if (stream == null) {
             if (self.options.role != .server or stream_id % 2 == 0 or stream_id <= self.last_peer_stream_id) {
-                // A response for a stream we do not know, or a bad id: decode to keep the
-                // HPACK state in sync, then ignore or refuse.
+                // A response for a stream we do not know, a block on a stream that this side
+                // reset, or a bad id: decode to keep the HPACK state in sync, then ignore or
+                // refuse. The peer can send a block before it sees the reset (section 5.1).
                 try self.decodeDiscard();
-                if (self.options.role == .server) return error.ProtocolError;
+                if (self.options.role == .server and !self.wasResetHere(stream_id)) return error.ProtocolError;
                 return;
             }
             self.last_peer_stream_id = stream_id;
             if (self.goaway_sent or self.peer_streams_open >= self.options.max_concurrent_streams) {
                 try self.decodeDiscard();
                 reset = .refused_stream;
+                self.rememberReset(stream_id);
             } else {
                 const s = try Stream.create(self, stream_id);
                 errdefer s.destroy();
@@ -421,6 +433,7 @@ fn finishHeaderBlock(self: *Connection) Error!void {
             if (s.reset != null) {
                 _ = self.streams.remove(stream_id);
                 self.peer_streams_open -= 1;
+                self.rememberReset(stream_id);
                 refused = s;
             } else {
                 new_stream = s;
@@ -431,6 +444,18 @@ fn finishHeaderBlock(self: *Connection) Error!void {
     if (refused) |s| s.destroy();
     if (reset) |code| self.sendRst(stream_id, code);
     if (new_stream) |s| if (self.options.on_stream) |f| f(self.options.userdata, s);
+}
+
+/// Remember `id`, a peer stream that this side reset. Called under `lock`.
+fn rememberReset(self: *Connection, id: u31) void {
+    self.reset_ids[self.reset_ids_next % remembered_resets] = id;
+    self.reset_ids_next +%= 1;
+}
+
+/// This side reset the peer stream `id`, and the connection still remembers it. Called under
+/// `lock`. No stream has the id 0, thus the empty places do not match.
+fn wasResetHere(self: *const Connection, id: u31) bool {
+    return std.mem.findScalar(u31, &self.reset_ids, id) != null;
 }
 
 /// Decode a block that goes nowhere, to keep the dynamic table in sync.
@@ -656,6 +681,8 @@ pub const Stream = struct {
                 }
                 if (conn.streams.remove(self.id) and self.id % 2 != (if (conn.options.role == .client) @as(u31, 1) else 0)) {
                     conn.peer_streams_open -|= 1;
+                    // After a reset, the peer can still send frames on the stream.
+                    if (send_reset != null or self.reset != null) conn.rememberReset(self.id);
                 }
             }
         }

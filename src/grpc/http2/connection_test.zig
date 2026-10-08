@@ -855,11 +855,17 @@ fn appendFrame(gpa: std.mem.Allocator, out: *std.ArrayList(u8), kind: frame.Type
 /// Append a `HEADERS` frame with END_STREAM: the encoded `headers`, then the raw HPACK bytes
 /// of `raw`.
 fn appendRequest(gpa: std.mem.Allocator, out: *std.ArrayList(u8), stream_id: u31, headers: []const Header, raw: []const u8) !void {
+    try appendHeaders(gpa, out, stream_id, frame.Flags.end_stream, headers, raw);
+}
+
+/// Append a `HEADERS` frame with END_HEADERS and `flags`: the encoded `headers`, then the raw
+/// HPACK bytes of `raw`.
+fn appendHeaders(gpa: std.mem.Allocator, out: *std.ArrayList(u8), stream_id: u31, flags: u8, headers: []const Header, raw: []const u8) !void {
     var block: std.ArrayList(u8) = .empty;
     defer block.deinit(gpa);
     try (hpack.Encoder{}).encodeHeaders(gpa, &block, headers);
     try block.appendSlice(gpa, raw);
-    try appendFrame(gpa, out, .headers, frame.Flags.end_headers | frame.Flags.end_stream, stream_id, block.items);
+    try appendFrame(gpa, out, .headers, frame.Flags.end_headers | flags, stream_id, block.items);
 }
 
 /// Keeps the streams that the server connection gives to `on_stream`. The test closes them.
@@ -935,4 +941,135 @@ test "a refused request frees its stream and keeps the HPACK table of the connec
     try std.testing.expectEqual(@as(?frame.ErrorCode, null), resets[7]);
     try std.testing.expectEqual(@as(?frame.ErrorCode, null), resets[9]);
     try std.testing.expectEqual(@as(?frame.ErrorCode, .refused_stream), resets[11]);
+}
+
+/// Answers each stream at once with status 200 and END_STREAM, then closes it. A stream that
+/// the peer did not end then gets a reset with NO_ERROR.
+const Answerer = struct {
+    ids: [8]u31 = undefined,
+    len: usize = 0,
+
+    fn onStream(userdata: ?*anyopaque, stream: *Connection.Stream) void {
+        const self: *Answerer = @ptrCast(@alignCast(userdata.?));
+        self.ids[self.len] = stream.id;
+        self.len += 1;
+        stream.sendHeaders(&.{.{ .name = ":status", .value = "200" }}, true) catch {};
+        stream.close();
+    }
+};
+
+/// The frames that a server connection wrote for a fixed sequence of frames.
+const ScriptResult = struct {
+    /// The code of each `RST_STREAM` frame, by stream id.
+    resets: [256]?frame.ErrorCode = @splat(null),
+    goaway: ?frame.ErrorCode = null,
+};
+
+/// Give `script` to a server connection with `options` and an `Answerer`. The read task runs on
+/// the test thread and ends at the end of the script.
+fn runScript(gpa: std.mem.Allocator, script: []const u8, options: Connection.Options, answerer: *Answerer) !ScriptResult {
+    var reader: Io.Reader = .fixed(script);
+    const written = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(written);
+    var writer: Io.Writer = .fixed(written);
+    var server_options = options;
+    server_options.role = .server;
+    server_options.on_stream = Answerer.onStream;
+    server_options.userdata = answerer;
+    const conn = try Connection.init(gpa, std.testing.io, &reader, &writer, server_options);
+    defer conn.deinit();
+    try conn.handshake();
+    conn.run();
+    var result: ScriptResult = .{};
+    var out: Io.Reader = .fixed(writer.buffered());
+    while (out.bufferedLen() > 0) {
+        const header = frame.Header.parse(try out.takeArray(frame.header_len));
+        const payload = try out.take(header.length);
+        switch (header.type) {
+            .rst_stream => result.resets[header.stream_id] = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big)),
+            .goaway => result.goaway = @enumFromInt(std.mem.readInt(u32, payload[4..8], .big)),
+            else => {},
+        }
+    }
+    return result;
+}
+
+const get = [_]Header{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "http" }, .{ .name = ":path", .value = "/" } };
+const trailer = [_]Header{.{ .name = "x-trailer", .value = "1" }};
+
+test "a header block on a stream that this side reset is ignored" {
+    const gpa = std.testing.allocator;
+    const large = [_]u8{'a'} ** 2000;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    // Stream 1: the server answers before the request ends, and resets with NO_ERROR. The
+    // client did not see the reset yet and sends data and trailers.
+    try appendHeaders(gpa, &script, 1, 0, &get, "");
+    try appendFrame(gpa, &script, .data, 0, 1, "body");
+    try appendHeaders(gpa, &script, 1, frame.Flags.end_stream, &trailer, "");
+    // Stream 3: refused with ENHANCE_YOUR_CALM, then trailers.
+    try appendHeaders(gpa, &script, 3, 0, &(get ++ [_]Header{.{ .name = "x-large", .value = &large }}), "");
+    try appendHeaders(gpa, &script, 3, frame.Flags.end_stream, &trailer, "");
+    // Stream 5 shows that the connection still serves.
+    try appendRequest(gpa, &script, 5, &get, "");
+    var answerer: Answerer = .{};
+    const result = try runScript(gpa, script.items, .{ .role = .server, .max_header_list_size = 1024 }, &answerer);
+    // Before, the trailers on stream 1 ended the connection with PROTOCOL_ERROR.
+    try std.testing.expectEqual(@as(?frame.ErrorCode, null), result.goaway);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .no_error), result.resets[1]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .enhance_your_calm), result.resets[3]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, null), result.resets[5]);
+    try std.testing.expectEqualSlices(u31, &.{ 1, 5 }, answerer.ids[0..answerer.len]);
+}
+
+test "a header block on a stream id that this side did not reset ends the connection" {
+    const gpa = std.testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    // Stream 3 ends in both directions and gets no reset. Stream 1 was never open.
+    try appendRequest(gpa, &script, 3, &get, "");
+    try appendHeaders(gpa, &script, 1, frame.Flags.end_stream, &get, "");
+    var answerer: Answerer = .{};
+    const reused = try runScript(gpa, script.items, .{ .role = .server }, &answerer);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .protocol_error), reused.goaway);
+
+    // The same for a block on stream 3 after its end.
+    script.clearRetainingCapacity();
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    try appendRequest(gpa, &script, 3, &get, "");
+    try appendHeaders(gpa, &script, 3, frame.Flags.end_stream, &trailer, "");
+    answerer = .{};
+    const ended = try runScript(gpa, script.items, .{ .role = .server }, &answerer);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .protocol_error), ended.goaway);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, null), ended.resets[3]);
+}
+
+test "the connection remembers the last remembered_resets streams that it reset" {
+    const gpa = std.testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    // With no place for a stream, the connection refuses each stream with REFUSED_STREAM.
+    const count = Connection.remembered_resets + 1;
+    for (0..count) |i| try appendRequest(gpa, &script, @intCast(2 * i + 1), &get, "");
+    // Stream 3 is in the memory, thus its block is ignored, and the next stream gets its
+    // reset. Stream 1 is too old, thus its block ends the connection.
+    const next: u31 = 2 * count + 1;
+    try appendHeaders(gpa, &script, 3, frame.Flags.end_stream, &trailer, "");
+    try appendRequest(gpa, &script, next, &get, "");
+    try appendHeaders(gpa, &script, 1, frame.Flags.end_stream, &trailer, "");
+    var answerer: Answerer = .{};
+    const result = try runScript(gpa, script.items, .{ .role = .server, .max_concurrent_streams = 0 }, &answerer);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .refused_stream), result.resets[1]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .refused_stream), result.resets[2 * count - 1]);
+    // Before, the block on stream 3 ended the connection, and the next stream got no reset.
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .refused_stream), result.resets[next]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .protocol_error), result.goaway);
+    try std.testing.expectEqual(0, answerer.len);
 }
