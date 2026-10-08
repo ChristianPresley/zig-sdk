@@ -63,6 +63,10 @@ const FakeBus = struct {
     future: Io.Future(void),
     stopping: std.atomic.Value(bool) = .init(false),
     lock: Io.Mutex = .init,
+    /// The tasks of the connections. On Windows, a read on a Unix socket can stay blocked after
+    /// the client closes its connection. Thus each connection has its own task, and `stop`
+    /// cancels the tasks that remain.
+    group: Io.Group = .init,
 
     // Behaviour.
     has_service: bool = true,
@@ -100,6 +104,7 @@ const FakeBus = struct {
 
     fn stop(self: *FakeBus) void {
         mcp.util.wake.cancelUnixAcceptLoop(self.io, &self.future, self.socket_path, &self.stopping);
+        self.group.cancel(self.io);
         self.listener.deinit(self.io);
         for (self.items.items) |i| i.deinit();
         self.items.deinit(gpa);
@@ -122,10 +127,17 @@ const FakeBus = struct {
                 error.Canceled => return,
                 else => continue,
             };
-            defer stream.close(self.io);
-            if (self.stopping.load(.acquire)) return;
-            self.serve(stream) catch {};
+            if (self.stopping.load(.acquire)) {
+                stream.close(self.io);
+                return;
+            }
+            self.group.concurrent(self.io, serveConnection, .{ self, stream }) catch stream.close(self.io);
         }
+    }
+
+    fn serveConnection(self: *FakeBus, stream: Io.net.Stream) Io.Cancelable!void {
+        defer stream.close(self.io);
+        self.serve(stream) catch {};
     }
 
     fn serve(self: *FakeBus, stream: Io.net.Stream) !void {
