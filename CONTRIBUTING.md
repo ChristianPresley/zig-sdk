@@ -30,6 +30,12 @@ If you send a pull request, the maintainer applies your change as a signed commi
 
 On Windows, add `--test-timeout 10m` to `zig build test`, as CI does. With Zig 0.16.0, a process that the build runner starts at the same time can keep the output pipes of a test binary open. Without the option, the build runner then fails the step 60 seconds after the last test with `test runner failed to respond`.
 
+## Unix sockets on Windows
+
+The Windows driver of Unix sockets (afunix.sys) can lose the close of the peer. This occurs when a receive starts at about the same time as the close. The receive then stays pending until a cancel, but a poll of the socket shows the disconnect. TCP sockets on Windows and Unix sockets on Linux and macOS do not have this problem.
+
+The Unix socket transport gives each reader to `pollBeforeRead` in `src/mcp/transport/windows_afunix.zig`. Then each read first waits in a poll, and the receive starts only when it can complete at once. Do the same in new code that reads a Unix socket on Windows. A test server can also read each connection in its own task and cancel the tasks that remain when it stops.
+
 ## Prose
 
 All prose uses the project profile of ASD-STE100 Simplified Technical English. The profile is in `docs/style/ste-profile.md`. The project dictionary is in `docs/dictionary/`.

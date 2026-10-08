@@ -20,6 +20,7 @@ All notable changes to this project are recorded in this file. The format follow
 - On Windows, the fake D-Bus server of the keychain tests serves each connection in its own task. A read on a Unix socket of Windows can stay blocked after the client closes the connection. Before, the server then never accepted the next connection, and a test hung.
 - Correction to the notes of 0.4.0: the warning of the scope `mcp_router` for an error response with a null id also has the error code. That code is the code of the error response.
 - The D-Bus client connects to an abstract address (`unix:abstract=`) with a socket that does not block. While the queue of the bus is full, the client tries again after a short pause, until the time limit or a cancel. Before, this connect waited without a limit, and a cancel did not stop it.
+- On Windows, the Unix socket transport sees each close of the peer. The Windows driver of Unix sockets can lose the close of the peer when a receive starts at about the same time. Before, the server then kept the connection open until shutdown, and the connection kept its place in `limits.unix_socket.max_connections`. The client did not see the end of the connection, and a request waited until its timeout. Now each read of the server and of the client first waits in a poll of the socket, until data comes or the connection ends. Each poll stops after one second and starts again.
 
 ## [0.4.0] - 2026-10-07
 
