@@ -4,7 +4,14 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Changed
+
+- A cancel of `serve` of the HTTP, gRPC and Unix socket servers now sets the stop flag of `shutdown`. The WebSocket server and the authorization server already did this. After the cancel, the accept loop closes the wake connection of the stop and ends. A new call of `serve` on the same server then accepts no connections, and it returns only at `shutdown` or at a cancel. Before, the accept loop could serve the wake connection as a client connection, and a new `serve` accepted connections again.
+- After a cancel of `serve`, the connections of the HTTP server obey the stop flag, as after `shutdown`. A connection then answers no request after its current request. `shutdown` wakes the connections, but the cancel does not. Thus a connection that waits can see the stop flag 60 seconds or less after the cancel. Before, the connections served requests until the client closed them or until `idle_timeout`.
+
 ### Fixed
+
+- The HTTP, gRPC and Unix socket servers stop their accept loop with `util.wake.cancelAcceptLoop` or `util.wake.cancelUnixAcceptLoop`. Thus the cancel usually comes before the wake connection, while the accept waits. Before, the wake connection came first, and on Windows the cancel then frequently came during the accept of that connection. In Zig 0.16.0, std then gives `error.Canceled` for the complete accept, and a Debug build writes a stack trace of `error.Unexpected` (INVALID_PARAMETER). The change removes these traces from the test runs of the SDK. Under load, the wake connection can still come first, and a trace is still possible.
 
 - On a POSIX system, `util.wake.wakeIp` connects with a socket that does not block, and it waits for the connect in `poll` for 100 ms or less. A signal during the wait does not start a second connect. Before, `wakeIp` used the connect of std, which blocks and connects again after a signal. In Zig 0.16.0, std can send its cancel signal late, to a task that already saw its cancel. An example is a task that stops a server after a cancel. On macOS, the second connect then got `EISCONN`, and a Debug build stopped with a panic. `cancelAcceptLoop` uses `wakeIp`, and thus the stop of the WebSocket server and of the authorization server. The stop of the HTTP and gRPC servers also uses `wakeIp`.
 
