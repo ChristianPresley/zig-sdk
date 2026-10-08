@@ -182,3 +182,91 @@ test "cancelAcceptLoop ends a loop that serves each connection and waits in acce
         cancelAcceptLoop(io, &future, listener.socket.address, &stopping);
     }
 }
+
+test "wakeIp connects also when signals interrupt it" {
+    if (comptime !posix_connect or SignalTarget == void) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+    defer listener.deinit(io);
+    const Loop = struct {
+        fn run(l: *Io.net.Server, accepted: *std.atomic.Value(u32), stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.acquire)) {
+                const stream = l.accept(std.testing.io) catch return;
+                stream.close(std.testing.io);
+                _ = accepted.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var accepted: std.atomic.Value(u32) = .init(0);
+    var stopping: std.atomic.Value(bool) = .init(false);
+    var future = try io.concurrent(Loop.run, .{ &listener, &accepted, &stopping });
+    defer cancelAcceptLoop(io, &future, listener.socket.address, &stopping);
+    const rounds = 200;
+    {
+        var storm: SignalStorm = .{};
+        try storm.start();
+        defer storm.finish();
+        for (0..rounds) |_| wakeIp(io, listener.socket.address);
+    }
+    // Each wake connected, thus the loop accepts each of them.
+    const end = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromSeconds(10), .clock = .awake });
+    while (accepted.load(.monotonic) < rounds) {
+        if (end.durationFromNow(io).raw.toNanoseconds() <= 0) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+/// Sends `SIGIO` to the thread that calls `start`, with a very short pause, until `finish`. Std
+/// uses `SIGIO` to interrupt a blocked system call of a task that gets a cancel.
+const SignalStorm = struct {
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+    old: posix.Sigaction = undefined,
+
+    fn start(self: *SignalStorm) !void {
+        // A handler without `SA_RESTART`, as the handler of `Io.Threaded`.
+        const act: posix.Sigaction = .{ .handler = .{ .handler = ignore }, .mask = posix.sigemptyset(), .flags = 0 };
+        posix.sigaction(.IO, &act, &self.old);
+        errdefer posix.sigaction(.IO, &self.old, null);
+        self.thread = try std.Thread.spawn(.{}, run, .{ self, SignalTarget.current() });
+    }
+
+    fn finish(self: *SignalStorm) void {
+        self.stop.store(true, .release);
+        self.thread.join();
+        posix.sigaction(.IO, &self.old, null);
+    }
+
+    fn ignore(_: posix.SIG) callconv(.c) void {}
+
+    fn run(self: *SignalStorm, target: SignalTarget) void {
+        while (!self.stop.load(.acquire)) {
+            target.signal();
+            for (0..256) |_| std.atomic.spinLoopHint();
+        }
+    }
+};
+
+/// A thread that can get a signal, or void on a system without a test for it.
+const SignalTarget = if (builtin.link_libc and posix_connect) struct {
+    handle: std.c.pthread_t,
+
+    fn current() SignalTarget {
+        return .{ .handle = std.c.pthread_self() };
+    }
+
+    fn signal(t: SignalTarget) void {
+        _ = std.c.pthread_kill(t.handle, .IO);
+    }
+} else if (builtin.os.tag == .linux) struct {
+    pid: std.os.linux.pid_t,
+    tid: std.os.linux.pid_t,
+
+    fn current() SignalTarget {
+        return .{ .pid = std.os.linux.getpid(), .tid = std.os.linux.gettid() };
+    }
+
+    fn signal(t: SignalTarget) void {
+        _ = std.os.linux.tgkill(t.pid, t.tid, .IO);
+    }
+} else void;
