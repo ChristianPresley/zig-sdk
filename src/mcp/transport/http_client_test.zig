@@ -300,8 +300,8 @@ test "http client: a listen stream without its acknowledgment in listen_ack_time
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     // The kernel completes the connection, but nobody answers the request.
-    var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
-    var silent = try address.listen(io, .{});
+    const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var silent = try mcp.util.loopback.listen(io, address, .{});
     defer silent.deinit(io);
     var url_buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/mcp", .{silent.socket.address.getPort()});

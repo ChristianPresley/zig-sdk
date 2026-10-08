@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const tls = @import("tls.zig");
+const loopback = @import("../mcp/util/loopback.zig");
 
 const Echo = struct {
     server: tls.Server,
@@ -160,7 +161,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
             .ocsp_staples = if (server_setup.ocsp_staple != null) &staples else &.{},
             .retry_cookie = server_setup.retry_cookie,
         }),
-        .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
+        .listener = try loopback.listen(io, Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable, .{}),
         .io = io,
         .key_update = client_setup.key_update,
         .now_sec = server_setup.now_sec,
@@ -171,7 +172,7 @@ fn roundTrip(io: Io, chain: *const tls.CertChain, server_setup: ServerSetup, cli
     defer _ = future.cancel(io);
 
     const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    var stream = try address.connect(io, .{ .mode = .stream });
+    var stream = try loopback.connect(io, address);
     defer stream.close(io);
     var in_buf: [tls.Connection.min_input_buffer_len]u8 = undefined;
     var out_buf: [tls.Connection.min_output_buffer_len]u8 = undefined;
@@ -865,7 +866,7 @@ fn opensslServer(io: Io, extra: []const []const u8, setup: ClientSetup) !void {
     start: while (true) : (starts += 1) {
         if (starts == 3) return error.OpensslDidNotListen;
         const port = blk: {
-            var probe = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{});
+            var probe = try loopback.listen(io, Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable, .{});
             defer probe.deinit(io);
             break :blk probe.socket.address.getPort();
         };

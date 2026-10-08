@@ -2,6 +2,7 @@
 const std = @import("std");
 const Io = std.Io;
 const tls = @import("tls.zig");
+const loopback = @import("../mcp/util/loopback.zig");
 const StdClient = std.crypto.tls.Client;
 
 const Echo = struct {
@@ -81,7 +82,7 @@ fn roundTripGroups(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, 
     const chains = [_]*const tls.CertChain{chain};
     var echo: Echo = .{
         .server = try tls.Server.init(.{ .chains = &chains, .alpn = config_alpn, .groups = groups }),
-        .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
+        .listener = try loopback.listen(io, Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable, .{}),
         .io = io,
     };
     defer echo.listener.deinit(io);
@@ -90,7 +91,7 @@ fn roundTripGroups(gpa: std.mem.Allocator, io: Io, chain: *const tls.CertChain, 
     defer _ = future.cancel(io);
 
     const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    var stream = try address.connect(io, .{ .mode = .stream });
+    var stream = try loopback.connect(io, address);
     defer stream.close(io);
     var in_buf: [StdClient.min_buffer_len]u8 = undefined;
     var out_buf: [StdClient.min_buffer_len]u8 = undefined;
@@ -147,7 +148,7 @@ test "handshake and echo with the std client for every key type" {
 fn stdClientEcho(io: Io, config: tls.server.Config, message: []const u8) ![]const u8 {
     var echo: Echo = .{
         .server = try tls.Server.init(config),
-        .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
+        .listener = try loopback.listen(io, Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable, .{}),
         .io = io,
     };
     defer echo.listener.deinit(io);
@@ -155,7 +156,7 @@ fn stdClientEcho(io: Io, config: tls.server.Config, message: []const u8) ![]cons
     var future = try io.concurrent(Echo.serve, .{&echo});
     defer _ = future.cancel(io);
     const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    var stream = try address.connect(io, .{ .mode = .stream });
+    var stream = try loopback.connect(io, address);
     defer stream.close(io);
     var in_buf: [StdClient.min_buffer_len]u8 = undefined;
     var out_buf: [StdClient.min_buffer_len]u8 = undefined;
@@ -239,7 +240,7 @@ test "a TLS 1.2 client hello is refused with protocol_version" {
     const chains = [_]*const tls.CertChain{&chain};
     var echo: Echo = .{
         .server = try tls.Server.init(.{ .chains = &chains }),
-        .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
+        .listener = try loopback.listen(io, Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable, .{}),
         .io = io,
     };
     defer echo.listener.deinit(io);
@@ -247,7 +248,7 @@ test "a TLS 1.2 client hello is refused with protocol_version" {
     var future = try io.concurrent(Echo.serve, .{&echo});
     defer _ = future.cancel(io);
     const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    var stream = try address.connect(io, .{ .mode = .stream });
+    var stream = try loopback.connect(io, address);
     defer stream.close(io);
     var out_buf: [512]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
@@ -336,7 +337,7 @@ test "interop: openssl s_client reads the OCSP response that the SDK server stap
 fn opensslClientConfig(gpa: std.mem.Allocator, io: Io, config: tls.server.Config, extra: []const []const u8, echo: *Echo, greeting: ?[]const u8) ![]u8 {
     echo.* = .{
         .server = try tls.Server.init(config),
-        .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
+        .listener = try loopback.listen(io, Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable, .{}),
         .io = io,
         .handshake_only = true,
         .greeting = greeting,
@@ -468,7 +469,7 @@ test "a malformed certificate_authorities extension is refused with decode_error
     const chains = [_]*const tls.CertChain{&chain};
     var echo: Echo = .{
         .server = try tls.Server.init(.{ .chains = &chains }),
-        .listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{}),
+        .listener = try loopback.listen(io, Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable, .{}),
         .io = io,
     };
     defer echo.listener.deinit(io);
@@ -476,7 +477,7 @@ test "a malformed certificate_authorities extension is refused with decode_error
     var future = try io.concurrent(Echo.serve, .{&echo});
     defer _ = future.cancel(io);
     const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    var stream = try address.connect(io, .{ .mode = .stream });
+    var stream = try loopback.connect(io, address);
     defer stream.close(io);
     // A ClientHello with an X25519 share and a name list that holds an empty Name.
     var hello_buf: [256]u8 = undefined;

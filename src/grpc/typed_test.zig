@@ -510,7 +510,7 @@ const RawCall = struct {
 /// One unary call with a raw protobuf body.
 fn rawCall(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, metadata: []const Connection.Header, body: []const u8) !RawCall {
     const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    const stream = try address.connect(io, .{ .mode = .stream });
+    const stream = try mcp.util.loopback.connect(io, address);
     defer stream.close(io);
     const in_buf = try gpa.alloc(u8, 64 << 10);
     defer gpa.free(in_buf);

@@ -36,10 +36,10 @@ pub const TestProxy = struct {
 
     pub fn start(self: *TestProxy, refuse: ?http.Status) !void {
         const io = std.testing.io;
-        var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
         self.* = .{
             .io = io,
-            .listener = try address.listen(io, .{ .reuse_address = true }),
+            .listener = try mcp.util.loopback.listen(io, address, .{ .reuse_address = true }),
             .future = undefined,
             .refuse = refuse,
             .arena_state = .init(std.testing.allocator),
@@ -123,7 +123,7 @@ pub const TestProxy = struct {
         const colon = std.mem.findScalarLast(u8, target, ':') orelse return answer(&writer.interface, .bad_request);
         const target_port = std.fmt.parseInt(u16, target[colon + 1 ..], 10) catch return answer(&writer.interface, .bad_request);
         const upstream_address = try Io.net.IpAddress.parse("127.0.0.1", target_port);
-        const upstream = upstream_address.connect(io, .{ .mode = .stream }) catch return answer(&writer.interface, .bad_gateway);
+        const upstream = mcp.util.loopback.connect(io, upstream_address) catch return answer(&writer.interface, .bad_gateway);
         defer upstream.close(io);
         try writer.interface.writeAll("HTTP/1.1 200 Connection established\r\n\r\n");
         try writer.interface.flush();
@@ -359,8 +359,8 @@ test "a proxy that refuses the tunnel or that is not there gives a clear error" 
     try std.testing.expect(p.sawTarget("mcp.test:8443"));
 
     // A proxy that does not listen: the connection fails, and the log names the proxy.
-    var closed_address = try Io.net.IpAddress.parse("127.0.0.1", 0);
-    var closed = try closed_address.listen(io, .{});
+    const closed_address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var closed = try mcp.util.loopback.listen(io, closed_address, .{});
     const closed_port = closed.socket.address.getPort();
     closed.deinit(io);
     try std.testing.expectError(error.ConnectFailed, http1.Connection.openThrough(io, gpa, .{ .host = "127.0.0.1", .port = closed_port }, "mcp.test", 443, null));

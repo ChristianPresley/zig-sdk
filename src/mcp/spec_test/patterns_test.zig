@@ -1198,7 +1198,7 @@ test "http server stops a handler that writes after the client disconnects" {
     }
 
     const address = try Io.net.IpAddress.parse("127.0.0.1", transport.bound_port);
-    const stream = try address.connect(io, .{ .mode = .stream });
+    const stream = try mcp.util.loopback.connect(io, address);
     var closed = false;
     defer if (!closed) stream.close(io);
     const body =

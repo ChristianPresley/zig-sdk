@@ -88,8 +88,8 @@ const FakeAuth = struct {
             .idp_key = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{5} ** 32) },
             .nonce_issuer = try .init(io),
         };
-        var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.listener = try address.listen(io, .{ .reuse_address = true });
+        const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.listener = try mcp.util.loopback.listen(io, address, .{ .reuse_address = true });
         const port = self.listener.socket.address.getPort();
         self.base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{port});
         self.idp_issuer = try std.fmt.allocPrint(gpa, "{s}/idp", .{self.base});

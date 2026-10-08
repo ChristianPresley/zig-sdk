@@ -64,8 +64,8 @@ const TinyServer = struct {
 
     fn start(self: *TinyServer, tls_server: ?*const tls.Server, ctx: *anyopaque, handler: *const fn (ctx: *anyopaque, arena: Allocator, target: []const u8, body: []const u8) anyerror![]const u8) !void {
         const io = std.testing.io;
-        var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.* = .{ .io = io, .listener = try address.listen(io, .{ .reuse_address = true }), .future = undefined, .tls_server = tls_server, .ctx = ctx, .handler = handler };
+        const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.* = .{ .io = io, .listener = try mcp.util.loopback.listen(io, address, .{ .reuse_address = true }), .future = undefined, .tls_server = tls_server, .ctx = ctx, .handler = handler };
         self.future = try io.concurrent(acceptLoop, .{self});
     }
 
@@ -243,8 +243,8 @@ const World = struct {
         errdefer if (features.cimd) self.cimd.stop();
 
         // The authorization server binds before `init`: the issuer has the port.
-        var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        const listener = try address.listen(io, .{ .reuse_address = true });
+        const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        const listener = try mcp.util.loopback.listen(io, address, .{ .reuse_address = true });
         self.issuer = try std.fmt.allocPrint(arena, "{s}:{d}", .{ base, listener.socket.address.getPort() });
         self.keys = .{ es256(41), es256(42) };
         // The second key is an old key: the JWK set keeps it, the server signs with the first.

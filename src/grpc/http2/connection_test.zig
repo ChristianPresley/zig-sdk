@@ -365,7 +365,7 @@ const Pair = struct {
     client: Side,
 
     fn start(self: *Pair, io: Io, gpa: std.mem.Allocator, client_options: Connection.Options) !void {
-        self.listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{});
+        self.listener = try mcp.util.loopback.listen(io, Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable, .{});
         errdefer self.listener.deinit(io);
         var acceptor: Acceptor = undefined;
         try acceptor.start(io, &self.listener);
@@ -373,7 +373,7 @@ const Pair = struct {
         // sockets are in TIME_WAIT. Then the accept must end before the listener closes.
         errdefer acceptor.stop(io);
         const address = Io.net.IpAddress.parse("127.0.0.1", self.listener.socket.address.getPort()) catch unreachable;
-        try self.client.init(io, gpa, try address.connect(io, .{ .mode = .stream }), client_options);
+        try self.client.init(io, gpa, try mcp.util.loopback.connect(io, address), client_options);
         errdefer self.client.abort();
         try self.client.start();
         self.server = .{ .side = undefined };
@@ -800,14 +800,14 @@ const GoawayReader = struct {
 fn goawayCodeFor(bytes: []const u8) !frame.ErrorCode {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var listener = try (Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable).listen(io, .{});
+    var listener = try mcp.util.loopback.listen(io, Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable, .{});
     defer listener.deinit(io);
     var acceptor: Acceptor = undefined;
     try acceptor.start(io, &listener);
     // After a failed connect, the accept must end before the listener closes (see `Pair`).
     defer acceptor.stop(io);
     const address = Io.net.IpAddress.parse("127.0.0.1", listener.socket.address.getPort()) catch unreachable;
-    const stream = try address.connect(io, .{ .mode = .stream });
+    const stream = try mcp.util.loopback.connect(io, address);
     defer stream.close(io);
     var in_buf: [1024]u8 = undefined;
     var out_buf: [1024]u8 = undefined;

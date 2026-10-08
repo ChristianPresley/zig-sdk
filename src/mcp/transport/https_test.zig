@@ -72,7 +72,7 @@ const Fixture = struct {
 /// One HTTPS `POST` through the std TLS client. Returns the response head and body text.
 fn postWithStdClient(gpa: std.mem.Allocator, io: Io, port: u16, body: []const u8) ![]u8 {
     const address = Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable;
-    var stream = try address.connect(io, .{ .mode = .stream });
+    var stream = try mcp.util.loopback.connect(io, address);
     defer stream.close(io);
     var in_buf: [StdClient.min_buffer_len]u8 = undefined;
     var out_buf: [StdClient.min_buffer_len]u8 = undefined;
@@ -124,7 +124,7 @@ test "a partial head and then a full record do not stop the https server" {
     defer f.stop();
     {
         const address = Io.net.IpAddress.parse("127.0.0.1", f.port()) catch unreachable;
-        var stream = try address.connect(io, .{ .mode = .stream });
+        var stream = try mcp.util.loopback.connect(io, address);
         defer stream.close(io);
         var in_buf: [tls.Connection.min_input_buffer_len]u8 = undefined;
         var out_buf: [tls.Connection.min_output_buffer_len]u8 = undefined;

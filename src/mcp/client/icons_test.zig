@@ -36,8 +36,8 @@ const IconServer = struct {
         errdefer self.chain.deinit();
         self.chains = .{&self.chain};
         self.tls_server = try tls.Server.init(.{ .chains = &self.chains, .alpn = &.{"http/1.1"} });
-        var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.listener = try address.listen(io, .{});
+        const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.listener = try mcp.util.loopback.listen(io, address, .{});
         errdefer self.listener.deinit(io);
         self.port = self.listener.socket.address.getPort();
         self.future = try io.concurrent(acceptLoop, .{self});

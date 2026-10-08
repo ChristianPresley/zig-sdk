@@ -240,7 +240,7 @@ const Raw = struct {
         const raw = try gpa.create(Raw);
         errdefer gpa.destroy(raw);
         const address = try Io.net.IpAddress.parse("127.0.0.1", port);
-        raw.stream = try address.connect(io, .{ .mode = .stream });
+        raw.stream = try mcp.util.loopback.connect(io, address);
         raw.reader = raw.stream.reader(io, &raw.read_buf);
         raw.writer = raw.stream.writer(io, &raw.write_buf);
         raw.frames = .{ .in = &raw.reader.interface, .gpa = gpa, .role = .client, .max_frame_bytes = 1 << 24, .max_message_bytes = 1 << 24 };

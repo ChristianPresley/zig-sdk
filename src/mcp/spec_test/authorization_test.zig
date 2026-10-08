@@ -81,8 +81,8 @@ const Mock = struct {
     };
 
     fn start(self: *Mock) !void {
-        var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.listener = try address.listen(self.io, .{ .reuse_address = true });
+        const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.listener = try mcp.util.loopback.listen(self.io, address, .{ .reuse_address = true });
         self.base = try std.fmt.allocPrint(self.gpa, "http://127.0.0.1:{d}", .{self.listener.socket.address.getPort()});
         self.future = try self.io.concurrent(acceptLoop, .{self});
     }

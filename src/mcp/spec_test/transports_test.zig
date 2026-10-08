@@ -900,8 +900,8 @@ const Capture = struct {
 
     fn start(self: *Capture) !void {
         const io = std.testing.io;
-        var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
-        self.* = .{ .arena_state = .init(std.testing.allocator), .listener = try address.listen(io, .{}), .port = 0, .future = undefined };
+        const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.* = .{ .arena_state = .init(std.testing.allocator), .listener = try mcp.util.loopback.listen(io, address, .{}), .port = 0, .future = undefined };
         self.port = self.listener.socket.address.getPort();
         self.future = try io.concurrent(acceptLoop, .{self});
     }

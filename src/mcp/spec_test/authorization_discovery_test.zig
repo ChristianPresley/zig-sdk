@@ -69,12 +69,12 @@ const Mock = struct {
     fn start(self: *Mock, config: Config) !void {
         const io = std.testing.io;
         const gpa = std.testing.allocator;
-        var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
         self.* = .{
             .io = io,
             .gpa = gpa,
             .config = config,
-            .listener = try address.listen(io, .{ .reuse_address = true }),
+            .listener = try mcp.util.loopback.listen(io, address, .{ .reuse_address = true }),
             .future = undefined,
             .base = undefined,
             .issuer = undefined,
