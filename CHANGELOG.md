@@ -8,6 +8,7 @@ All notable changes to this project are recorded in this file. The format follow
 
 - `http2.Connection.Stream.stopWaits`: stops the waits on a stream without a reset. Each wait on the stream then gives `error.Canceled` when it must block. Use it, not `Future.cancel`, to stop a task that waits on the stream. In Zig 0.16.0, the condition of std can lose a cancel that comes together with a wake-up. The task then waits until the stream gets a reset or the connection ends.
 - `client.CallStream`: the stream of a gRPC call that runs in its own task. The tunnel and typed channels reset the stream with `CallStream.stop` to stop the call.
+- `util.loopback.connect` and `util.loopback.listen`: a connect to a loopback address and a listen on it, with at most five tries after `error.Unexpected` or `error.AddressUnavailable`. On Windows, Zig 0.16.0 gives two errors that can go away as `error.Unexpected`: a connect to a server with many connections in TIME_WAIT (ADDRESS_ALREADY_EXISTS), and a socket when no local port is free (TOO_MANY_ADDRESSES). On Windows, a refused connect is also `error.Unexpected`, thus use `connect` only for a server that listens. The tests of the SDK use these functions for their own sockets.
 
 ### Fixed
 
