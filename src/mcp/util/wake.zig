@@ -2,14 +2,92 @@
 //! blocked accept. Thus a server connects to its own listener one time before it cancels its
 //! accept loop. The loop sees its stop flag after the accept and closes that connection.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
+const posix = std.posix;
+
+/// The longest wait of `wakeIp` for its connect on a POSIX system.
+const connect_wait: Io.Duration = .fromMilliseconds(100);
 
 /// Connect to `address` one time and close the connection. An unspecified address becomes the
 /// loopback address of the same family. The function ignores errors.
+///
+/// On a POSIX system, the socket of the connect does not block. The function waits for the
+/// connect in `poll`, for 100 ms or less. A signal can interrupt the wait, and the
+/// function then waits again.
+///
+/// The connect of std blocks, and after a signal it connects again. In Zig 0.16.0, std can
+/// send its cancel signal late, to a task that already saw its cancel. Such a task is
+/// frequently the task that stops a server. On macOS, the second connect then gets `EISCONN`,
+/// and a Debug build stops with a panic.
 pub fn wakeIp(io: Io, address: Io.net.IpAddress) void {
     const target = loopbackFor(address);
+    if (comptime posix_connect) return connectPosix(io, target);
     const stream = target.connect(io, .{ .mode = .stream }) catch return;
     stream.close(io);
+}
+
+/// True when `wakeIp` uses the POSIX system calls for its connect.
+const posix_connect = switch (builtin.os.tag) {
+    .windows, .wasi => false,
+    else => true,
+};
+
+fn connectPosix(io: Io, target: Io.net.IpAddress) void {
+    const no_socket_flags = Io.Threaded.socket_flags_unsupported;
+    const flags: u32 = posix.SOCK.STREAM | if (no_socket_flags) 0 else posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+    const family: u32 = switch (target) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const rc = posix.system.socket(family, flags, 0);
+    if (posix.errno(rc) != .SUCCESS) return;
+    const fd: posix.fd_t = @intCast(rc);
+    defer _ = posix.system.close(fd);
+    if (no_socket_flags) {
+        if (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC))) != .SUCCESS) return;
+        const status = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+        if (posix.errno(status) != .SUCCESS) return;
+        const nonblock: usize = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+        if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, @as(usize, @intCast(status)) | nonblock)) != .SUCCESS) return;
+    }
+    var storage: extern union {
+        any: posix.sockaddr,
+        in: posix.sockaddr.in,
+        in6: posix.sockaddr.in6,
+    } = undefined;
+    const len: posix.socklen_t = switch (target) {
+        .ip4 => |a| len: {
+            storage = .{ .in = .{ .port = std.mem.nativeToBig(u16, a.port), .addr = @bitCast(a.bytes) } };
+            break :len @sizeOf(posix.sockaddr.in);
+        },
+        .ip6 => |a| len: {
+            storage = .{ .in6 = .{
+                .port = std.mem.nativeToBig(u16, a.port),
+                .flowinfo = a.flow,
+                .addr = a.bytes,
+                .scope_id = a.interface.index,
+            } };
+            break :len @sizeOf(posix.sockaddr.in6);
+        },
+    };
+    switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
+        .SUCCESS => return,
+        // The connect continues after the interrupt.
+        .INPROGRESS, .INTR => {},
+        else => return,
+    }
+    var fds = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+    const end = Io.Clock.Timestamp.fromNow(io, .{ .raw = connect_wait, .clock = .awake });
+    while (true) {
+        const left = end.durationFromNow(io).raw.toMilliseconds();
+        if (left <= 0) return;
+        switch (posix.errno(posix.system.poll(&fds, fds.len, @intCast(@min(left, std.math.maxInt(i32)))))) {
+            .INTR => continue,
+            // The connect is complete, failed, or did not end in time.
+            else => return,
+        }
+    }
 }
 
 /// Connect to the Unix socket at `path` one time and close the connection. The function
