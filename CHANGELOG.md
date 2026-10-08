@@ -4,6 +4,10 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Fixed
+
+- On a POSIX system, `util.wake.wakeIp` connects with a socket that does not block, and it waits for the connect in `poll` for 100 ms or less. A signal during the wait does not start a second connect. Before, `wakeIp` used the connect of std, which blocks and connects again after a signal. In Zig 0.16.0, std can send its cancel signal late, to a task that already saw its cancel. An example is a task that stops a server after a cancel. On macOS, the second connect then got `EISCONN`, and a Debug build stopped with a panic. `cancelAcceptLoop` uses `wakeIp`, and thus the stop of the WebSocket server and of the authorization server. The stop of the HTTP and gRPC servers also uses `wakeIp`.
+
 ## [0.5.0] - 2026-10-08
 
 ### Added
