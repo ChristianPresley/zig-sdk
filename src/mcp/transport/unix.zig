@@ -38,6 +38,7 @@ const Router = router_mod.Router;
 
 const log = std.log.scoped(.mcp_unix);
 const windows_acl = if (builtin.os.tag == .windows) @import("windows_acl.zig") else struct {};
+const windows_afunix = if (builtin.os.tag == .windows) @import("windows_afunix.zig") else struct {};
 const socket_dir = @import("socket_dir.zig");
 
 /// True when the target has Unix domain sockets. Windows has them from Windows 10 version
@@ -287,6 +288,8 @@ const Connection = struct {
         const write_buf = self.gpa.alloc(u8, 64 * 1024) catch return;
         defer self.gpa.free(write_buf);
         var reader = conn.stream.reader(io, read_buf);
+        // On Windows a receive can miss the close of the peer. See `windows_afunix.zig`.
+        if (builtin.os.tag == .windows) windows_afunix.pollBeforeRead(&reader);
         var writer = conn.stream.writer(io, write_buf);
         var peer: stdio.Server = .init(io, self.gpa, self.server, &writer.interface);
         defer peer.deinit();
@@ -372,6 +375,8 @@ pub const Client = struct {
             .stream_writer = stream.writer(io, out_buf),
             .router = .init(io, gpa, options.limits.json_max_depth),
         };
+        // On Windows a receive can miss the close of the server. See `windows_afunix.zig`.
+        if (builtin.os.tag == .windows) windows_afunix.pollBeforeRead(&self.stream_reader);
         self.reader_future = try io.concurrent(readerLoop, .{self});
         return self;
     }
@@ -584,4 +589,8 @@ test "a socket path longer than sockaddr_un gives NameTooLong" {
     try std.testing.expectError(error.NameTooLong, unixAddress(long));
     _ = try unixAddress(long[0..max_path_len]);
     if (builtin.os.tag.isDarwin()) try std.testing.expectEqual(104, max_path_len);
+}
+
+test {
+    if (builtin.os.tag == .windows) _ = windows_afunix;
 }
