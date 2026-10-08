@@ -61,8 +61,9 @@ pub const Client = struct {
         /// The trust policy and identity for `https` URLs. Null uses the system trust store.
         tls: ?http1.TlsSetup = null,
         /// The HTTP proxy of the connections. The client asks the proxy for a `CONNECT` tunnel to
-        /// the server, also for an `http` URL. The tunnel carries the TLS handshake and the
-        /// requests. A loopback host never gets a proxy from the environment. Set `.explicit`
+        /// the server, also for an `http` URL. For an `https` URL, the tunnel carries the TLS
+        /// handshake and the requests. For an `http` URL, the tunnel has no TLS, thus the proxy
+        /// can read the requests. A loopback host never gets a proxy from the environment. Set `.explicit`
         /// for a proxy URL of the application, and `.none` for no proxy.
         ///
         /// By default, the client reads the proxy variables of the environment in

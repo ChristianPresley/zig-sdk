@@ -1,8 +1,9 @@
 //! HTTP proxies for the client connections of the SDK: the Streamable HTTP client transport and
 //! the fetcher of the OAuth clients. The client asks the proxy for a tunnel with a `CONNECT`
-//! request (RFC 9110 section 9.3.6), also for an `http` URL. Then it speaks TLS and HTTP to the
-//! server through the tunnel. Thus the proxy sees the host and the port of the server, but not
-//! the requests and the tokens.
+//! request (RFC 9110 section 9.3.6), also for an `http` URL. Then it speaks HTTP to the server
+//! through the tunnel, with TLS for an `https` URL. For an `https` URL, the proxy thus sees the
+//! host and the port of the server, but not the requests and the tokens. For an `http` URL, the
+//! tunnel has no TLS, thus the proxy can read the requests.
 //!
 //! By default, the client reads the proxy from the environment that the application gives
 //! (`Config.environment`):

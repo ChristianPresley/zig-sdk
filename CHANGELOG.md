@@ -4,6 +4,11 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Fixed
+
+- Correction to the notes of 0.4.0: the proxy sees only the host and the port of the server for an `https` URL. For an `http` URL, the tunnel has no TLS, thus the proxy can read the requests. The doc comments of `transport.proxy` and `HttpClient.Options.proxy` now say this.
+- Correction to the notes of 0.4.0: the warning of the scope `mcp_router` for an error response with a null id also has the error code. That code is the code of the error response.
+
 ## [0.4.0] - 2026-10-07
 
 ### Added
