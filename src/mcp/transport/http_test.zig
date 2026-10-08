@@ -265,6 +265,22 @@ const Raw = struct {
         try raw.writer.interface.flush();
     }
 
+    /// One response with a `content-length` body: its head and its body.
+    fn readResponse(raw: *Raw, arena: std.mem.Allocator) ![]u8 {
+        const r = &raw.reader.interface;
+        var all: std.ArrayList(u8) = .empty;
+        while (!std.mem.endsWith(u8, all.items, "\r\n\r\n")) try all.append(arena, try r.takeByte());
+        var lines = std.mem.splitSequence(u8, all.items, "\r\n");
+        const length = while (lines.next()) |line| {
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(line[0..colon], "content-length")) break try std.fmt.parseInt(usize, std.mem.trim(u8, line[colon + 1 ..], " "), 10);
+        } else return error.NoContentLength;
+        const head_len = all.items.len;
+        try all.resize(arena, head_len + length);
+        try r.readSliceAll(all.items[head_len..]);
+        return all.items;
+    }
+
     /// All bytes until the end of the connection. A reset also ends the read.
     fn readToEnd(raw: *Raw, arena: std.mem.Allocator) ![]u8 {
         var all: std.ArrayList(u8) = .empty;
@@ -352,15 +368,19 @@ test "http limits: the server closes a keep-alive connection after idle_timeout 
         try std.testing.expect(std.mem.startsWith(u8, bytes, "HTTP/1.1 202 "));
         try std.testing.expectEqual(1, countResponses(bytes));
     }
-    // A second request before the limit uses the same connection.
+    // A second request before the limit uses the same connection. It goes out when the first
+    // response arrived, thus the wait between them is far below the limit. Before, the test
+    // slept 100 ms after the first request, and a slow computer slept more than the limit.
     {
         const raw = try Raw.open(gpa, f.transport.bound_port);
         defer raw.close(gpa);
         const request_bytes = try discoverRequest(arena);
         try raw.send(request_bytes);
-        try std.testing.io.sleep(.fromMilliseconds(100), .awake);
+        try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
         try raw.send(request_bytes);
-        try std.testing.expectEqual(2, countResponses(try raw.readToEnd(arena)));
+        const rest = try raw.readToEnd(arena);
+        try std.testing.expect(std.mem.startsWith(u8, rest, "HTTP/1.1 200 "));
+        try std.testing.expectEqual(1, countResponses(rest));
     }
 }
 
