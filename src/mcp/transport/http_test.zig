@@ -435,6 +435,36 @@ test "http shutdown ends a connection that sends nothing, also without time limi
     try std.testing.expectEqual(0, countResponses(try silent.readToEnd(arena)));
 }
 
+/// Send one `server/discover` request on a new connection, read the status line and close
+/// the connection.
+fn discoverOnce(gpa: std.mem.Allocator, port: u16) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const raw = try Raw.open(gpa, port);
+    defer raw.close(gpa);
+    try raw.send(try discoverRequest(arena_state.allocator()));
+    var head: [12]u8 = undefined;
+    try raw.reader.interface.readSliceAll(&head);
+    try std.testing.expectEqualStrings("HTTP/1.1 200", &head);
+}
+
+test "http server ends serve at a cancel without a shutdown" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer {
+        f.client.deinit();
+        f.transport.deinit();
+        f.server.deinit();
+        gpa.free(f.base);
+    }
+    const served = discoverOnce(gpa, f.transport.bound_port);
+    // No `shutdown`. Only the cancel can end `serve`.
+    f.future.cancel(std.testing.io);
+    try served;
+    try std.testing.expect(f.transport.closing.load(.acquire));
+}
+
 test "http limits: a message deeper than json_max_depth gets -32700" {
     const gpa = std.testing.allocator;
     var limits: mcp.Limits = .{};

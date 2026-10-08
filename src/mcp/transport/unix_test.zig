@@ -717,6 +717,34 @@ test "unix socket shutdown ends listen streams and cancels requests in flight" {
     try std.testing.expectError(error.FileNotFound, f.tmp.dir.statFile(io, "run/mcp.sock", .{ .follow_symlinks = false }));
 }
 
+/// Connect a client, call `add` one time and close the client.
+fn addOnce(path: []const u8) !void {
+    var t: *unix.Client = undefined;
+    var client: Client = undefined;
+    try connectClient(path, &t, &client);
+    defer t.deinit();
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const sum = try client.callTool(arena_state.allocator(), "add", .{ .a = 40, .b = 2 }, .{ .timeout = .fromSeconds(10) });
+    try std.testing.expectEqualStrings("42", sum.content[0].text.text);
+}
+
+test "unix socket server ends serve at a cancel without a shutdown" {
+    if (!unix.supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(.{});
+    defer f.stop();
+    const served = addOnce(f.path);
+    // No `shutdown`. Only the cancel can end `serve`.
+    f.future.cancel(io);
+    f.halted = true;
+    try served;
+    try std.testing.expect(f.transport.closing.load(.acquire));
+    try std.testing.expectError(error.FileNotFound, f.tmp.dir.statFile(io, "run/mcp.sock", .{ .follow_symlinks = false }));
+}
+
 /// A path in the temporary directory, relative like `socketPath`.
 fn tmpPath(tmp: *std.testing.TmpDir, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });

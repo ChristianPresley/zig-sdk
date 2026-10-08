@@ -236,6 +236,26 @@ test "grpc: a listen stream delivers events until the client cancels" {
     try std.testing.expectError(error.Canceled, job.result);
 }
 
+test "grpc: a cancel without a shutdown ends serve" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer {
+        f.transport.deinit();
+        f.server.deinit();
+    }
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const discovered = f.client.discover(arena_state.allocator(), .{ .timeout = .fromSeconds(10) });
+    f.client.deinit();
+    f.channel.deinit();
+    // No `shutdown`. Only the cancel can end `serve`.
+    f.future.cancel(std.testing.io);
+    try std.testing.expect(f.served.isSet());
+    try std.testing.expectEqualStrings("2026-07-28", (try discovered).supportedVersions[0]);
+    try std.testing.expect(f.transport.closing.load(.acquire));
+}
+
 test "grpc over TLS with ALPN h2" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
