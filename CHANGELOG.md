@@ -4,6 +4,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-08
+
 ### Added
 
 - `secret_service.Options.timeout` and `KeychainTokenStorage.Options.timeout`: the time limit for each answer of the D-Bus bus and of the Secret Service. The default is `dbus.default_timeout`, 25 seconds, the same as in the reference implementation of D-Bus. A service that does not answer in time gives `error.KeychainUnavailable`. Before, the Secret Service backend waited without a limit, for example for a service that stopped.
@@ -250,7 +252,8 @@ All notable changes to this project are recorded in this file. The format follow
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.1.0...v0.2.0
