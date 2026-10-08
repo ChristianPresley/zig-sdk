@@ -36,6 +36,7 @@ pub const tls = @import("tls/tls.zig");
 pub const util = struct {
     pub const line_framer = @import("mcp/util/line_framer.zig");
     pub const wake = @import("mcp/util/wake.zig");
+    pub const loopback = @import("mcp/util/loopback.zig");
     pub const rate_limit = @import("mcp/util/rate_limit.zig");
     pub const http_syntax = @import("mcp/util/http_syntax.zig");
 };
@@ -69,6 +70,7 @@ test {
     _ = @import("mcp/util/rate_limit.zig");
     _ = @import("mcp/util/http_syntax.zig");
     _ = @import("mcp/util/wake.zig");
+    _ = @import("mcp/util/loopback.zig");
     _ = @import("mcp/transport/unix_test.zig");
     _ = @import("mcp/transport/ws_frame.zig");
     _ = @import("mcp/transport/websocket_test.zig");
