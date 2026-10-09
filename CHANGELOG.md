@@ -4,6 +4,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-09
+
 ### Changed
 
 - A cancel of `serve` of the HTTP, gRPC and Unix socket servers now sets the stop flag of `shutdown`. The WebSocket server and the authorization server already did this. After the cancel, the accept loop closes the wake connection of the stop and ends. A new call of `serve` on the same server then accepts no connections, and it returns only at `shutdown` or at a cancel. Before, the accept loop could serve the wake connection as a client connection, and a new `serve` accepted connections again.
@@ -263,7 +265,8 @@ All notable changes to this project are recorded in this file. The format follow
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.2.0...v0.3.0
