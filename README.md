@@ -66,6 +66,27 @@ pub fn main(init: std.process.Init) !void {
 
 The SDK derives the JSON Schema of the tool input from the `AddArgs` struct at compile time.
 
+## Use the server from VS Code
+
+The MCP clients of VS Code speak revision 2025-11-25 and start with `initialize`. A zig-sdk server answers `initialize` with `-32601`. Thus VS Code cannot use the server directly. The issue for 2026-07-28 support in VS Code is [microsoft/vscode#329848](https://github.com/microsoft/vscode/issues/329848).
+
+The project [zig-bridge-sdk](https://github.com/ChristianPresley/zig-bridge-sdk) (release v0.1.2, pins zig-sdk v0.5.1) gives two ways. The executable `mcp-bridge-vscode` is a stdio server for VS Code. It starts your server as a child process, or connects to it at an HTTPS URL. This `mcp.json` starts the server of the example above:
+
+```json
+{
+  "servers": {
+    "calc": {
+      "command": "mcp-bridge-vscode",
+      "args": ["--", "./zig-out/bin/calc"]
+    }
+  }
+}
+```
+
+Or embed the bridge. Depend on the package `bridge_sdk` and take the `mcp` module from it, not from a second pin of zig-sdk. Then call `vscode.serveStdio(init.io, init.gpa, &server, .{})` in place of `mcp.transport.stdio.serve`. One executable then serves both revisions, and `mcp.json` names it directly, without `args`.
+
+The Copilot harness of VS Code can list and call the tools of a 2026-07-28 server without the bridge. It sends `server/discover` first. But it cannot complete a tool that asks for input, because it has no multi round-trip requests. The Local harness needs the bridge. See the [README of the bridge](https://github.com/ChristianPresley/zig-bridge-sdk/blob/main/bridges/vscode/README.md) and its wiki page [VS Code](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code).
+
 ## Build and test
 
 ```bash
@@ -86,6 +107,7 @@ The wiki holds the guides, the style guide and the bibliography.[^wiki] The [API
 - [Server Guide](https://github.com/ChristianPresley/zig-sdk/wiki/Server-Guide) and [Client Guide](https://github.com/ChristianPresley/zig-sdk/wiki/Client-Guide)
 - [Transports](https://github.com/ChristianPresley/zig-sdk/wiki/Transports)
 - [Release Notes](https://github.com/ChristianPresley/zig-sdk/wiki/Release-Notes)
+- [VS Code](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code) on the wiki of zig-bridge-sdk, the bridge for VS Code
 
 All prose in this repository uses ASD-STE100 Simplified Technical English, customized for this project.[^ste] The profile is in `docs/style/ste-profile.md`. `zig build lint-docs` checks the prose.
 

@@ -581,6 +581,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | SDK | software development kit |
 | STE | Simplified Technical English |
 | US | United States |
+| VS | Visual Studio, in the name VS Code |
 | WHATWG | Web Hypertext Application Technology Working Group |
 | gRPC | the remote procedure call framework that the gRPC transport uses |
 | stdio | standard input and standard output |

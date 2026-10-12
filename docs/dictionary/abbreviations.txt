@@ -107,6 +107,7 @@ RFC: request for comments, a document of the IETF
 SDK: software development kit
 STE: Simplified Technical English
 US: United States
+VS: Visual Studio, in the name VS Code
 WHATWG: Web Hypertext Application Technology Working Group
 # AB-4 names that start with a lowercase letter
 gRPC: the remote procedure call framework that the gRPC transport uses

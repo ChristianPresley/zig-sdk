@@ -4,6 +4,10 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Changed
+
+- README: a section on VS Code, which needs the bridge of zig-bridge-sdk.
+
 ## [0.5.1] - 2026-10-09
 
 ### Changed
