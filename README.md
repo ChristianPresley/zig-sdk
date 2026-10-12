@@ -76,6 +76,7 @@ The project [zig-bridge-sdk](https://github.com/ChristianPresley/zig-bridge-sdk)
 {
   "servers": {
     "calc": {
+      "type": "stdio",
       "command": "mcp-bridge-vscode",
       "args": ["--", "./zig-out/bin/calc"]
     }
