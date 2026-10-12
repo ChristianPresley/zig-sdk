@@ -4,6 +4,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-10-12
+
 ### Changed
 
 - README: a section on VS Code, which needs the bridge of zig-bridge-sdk.
@@ -269,7 +271,8 @@ All notable changes to this project are recorded in this file. The format follow
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.3.0...v0.4.0
