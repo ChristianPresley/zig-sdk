@@ -11,6 +11,7 @@ const jwt = mcp.auth.jwt;
 const grpc_server = @import("transport/grpc_server.zig");
 const typed_client = @import("transport/typed_client.zig");
 const Connection = @import("http2/Connection.zig");
+const connection_test = @import("http2/connection_test.zig");
 const lpm = @import("grpc/lpm.zig");
 const codec = @import("protobuf/codec.zig");
 const pb = @import("protobuf/mcp_messages.zig");
@@ -64,11 +65,17 @@ fn askName(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.Cal
     return .{ .input_required = ir };
 }
 
+/// Set when the slow tool stops at a cancel.
+var slow_cancelled: std.atomic.Value(bool) = .init(false);
+
 fn slow(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
     _ = args;
     var waited: u32 = 0;
     while (waited < 5000) : (waited += 20) {
-        try ctx.checkCancel();
+        ctx.checkCancel() catch |e| {
+            slow_cancelled.store(true, .release);
+            return e;
+        };
         try ctx.io.sleep(.fromMilliseconds(20), .awake);
     }
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "late", .{}) };
@@ -402,7 +409,9 @@ test "typed: deadlines and cancellation" {
     const arena = arena_state.allocator();
 
     // The client deadline resets the stream, and the server handler stops.
+    slow_cancelled.store(false, .release);
     try std.testing.expectError(error.Timeout, f.client.callTool(arena, "slow", null, .{ .timeout = .fromMilliseconds(300) }));
+    try connection_test.waitFlag(io, &slow_cancelled);
     const again = try f.client.callTool(arena, "add", .{ .a = 1, .b = 1 }, timeout);
     try std.testing.expectEqualStrings("2", again.content[0].text.text);
 

@@ -85,12 +85,10 @@ pub fn handleCall(self: *grpc_server.Server, stream: *Stream, arena: Allocator, 
     }
 
     var token: Transport.CancelToken = .{};
-    var watcher: ?Io.Future(void) = io.concurrent(watchCancel, .{ stream, &token, io }) catch null;
-    // Not `w.cancel`: the watcher waits on the stream, and a cancel can get lost there.
-    defer if (watcher) |*w| {
-        stream.stopWaits();
-        w.await(io);
-    };
+    // The connection cancels the request when the client resets the stream or the connection
+    // ends. The hook goes before the token does. Before, a second task waited on the stream.
+    stream.setOnReset(onReset, &token);
+    defer stream.setOnReset(null, null);
     var deadline_hit: std.atomic.Value(bool) = .init(false);
     var deadline_future: ?Io.Future(void) = null;
     if (deadline) |d| deadline_future = io.concurrent(deadlineTask, .{ io, d, &token, &deadline_hit }) catch null;
@@ -250,10 +248,11 @@ fn captureAbort(ptr: *anyopaque, io: Io) void {
     _ = io;
 }
 
-/// Cancel the request when the client resets the stream or the connection goes away.
-fn watchCancel(stream: *Stream, token: *Transport.CancelToken, io: Io) void {
-    stream.waitCancelled() catch return;
-    token.cancel(io, "stream reset");
+/// Cancel the request. The connection calls this hook under its lock when the client resets
+/// the stream or when the connection ends. The cancel of the token takes no lock.
+fn onReset(userdata: ?*anyopaque, stream: *Stream) void {
+    const token: *Transport.CancelToken = @ptrCast(@alignCast(userdata.?));
+    token.cancel(stream.conn.io, "stream reset");
 }
 
 fn deadlineTask(io: Io, duration: Io.Duration, token: *Transport.CancelToken, hit: *std.atomic.Value(bool)) void {

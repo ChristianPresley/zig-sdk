@@ -44,11 +44,17 @@ fn askName(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.Cal
     return .{ .input_required = ir };
 }
 
+/// Set when the slow tool stops at a cancel.
+var slow_cancelled: std.atomic.Value(bool) = .init(false);
+
 fn slow(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
     _ = args;
     var waited: u32 = 0;
     while (waited < 5000) : (waited += 20) {
-        try ctx.checkCancel();
+        ctx.checkCancel() catch |e| {
+            slow_cancelled.store(true, .release);
+            return e;
+        };
         try ctx.io.sleep(.fromMilliseconds(20), .awake);
     }
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "late", .{}) };
@@ -184,7 +190,9 @@ test "grpc: discover, tools, progress, header mirroring, mrtr and errors" {
     try std.testing.expectEqual(@as(i64, -32601), diag.rpc_error.?.code);
 
     // A timeout cancels the call with a reset; the server handler stops.
+    slow_cancelled.store(false, .release);
     try std.testing.expectError(error.Timeout, f.client.callTool(arena, "slow", null, .{ .timeout = .fromMilliseconds(300) }));
+    try connection_test.waitFlag(std.testing.io, &slow_cancelled);
     // The channel is still usable afterwards.
     const again = try f.client.callTool(arena, "add", .{ .a = 1, .b = 1 }, .{ .timeout = .fromSeconds(10) });
     try std.testing.expectEqualStrings("2", again.content[0].text.text);

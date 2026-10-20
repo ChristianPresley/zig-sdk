@@ -4,6 +4,14 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- `http2.Connection.Stream.setOnReset`: the hook that the connection calls once, when the stream gets a reset or when the connection ends. The reset can come from the peer, from this side or from `cancel`. The connection calls the hook under its lock, thus the hook must not call a function of the stream or of the connection. The gRPC servers use the hook to cancel the request of the stream.
+
+### Changed
+
+- The gRPC server runs one task for each call. Before, a second task waited on the stream of the call, to cancel the request at a reset or at the end of the connection. Now the hook of `setOnReset` cancels the request from the read task of the connection. With `std.Io.Threaded`, each task that waits has its own thread, and on Windows each thread commits 16 MiB of stack. In a load test on one connection, 32 calls in flight used 37 threads and 580 MiB, before 72 threads and 1,141 MiB. With 128 calls in flight, the server used 149 threads and 2,376 MiB, before 226 threads and 3,611 MiB.
+
 ## [0.5.2] - 2026-10-12
 
 ### Changed

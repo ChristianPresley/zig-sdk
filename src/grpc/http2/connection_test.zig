@@ -84,6 +84,18 @@ pub fn waitSet(io: Io, event: *Io.Event) !void {
     }
 }
 
+/// Wait until `flag` is set, for at most `wait_limit`. Else give `error.Timeout`.
+pub fn waitFlag(io: Io, flag: *const std.atomic.Value(bool)) !void {
+    const deadline: Io.Clock.Timestamp = .fromNow(io, .{ .raw = wait_limit, .clock = .awake });
+    while (!flag.load(.acquire)) {
+        if (deadline.durationFromNow(io).raw.nanoseconds <= 0) {
+            std.log.err("the flag is not set after {d} s", .{wait_limit.toSeconds()});
+            return error.Timeout;
+        }
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
 /// Wait until `done(context)` is true, for at most `wait_limit`. Else log an error with `what`
 /// and give `error.Timeout`.
 fn pollUntil(io: Io, what: []const u8, context: anytype, comptime done: fn (@TypeOf(context)) bool) !void {
@@ -884,7 +896,6 @@ test "a refused request frees its stream and keeps the HPACK table of the connec
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const large = [_]u8{'a'} ** 2000;
-    const post = [_]Header{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "http" } };
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(gpa);
     try script.appendSlice(gpa, frame.preface);
@@ -994,7 +1005,8 @@ fn runScript(gpa: std.mem.Allocator, script: []const u8, options: Connection.Opt
     return result;
 }
 
-const get = [_]Header{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "http" }, .{ .name = ":path", .value = "/" } };
+const post = [_]Header{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "http" } };
+const get = post ++ [_]Header{.{ .name = ":path", .value = "/" }};
 const trailer = [_]Header{.{ .name = "x-trailer", .value = "1" }};
 
 test "a header block on a stream that this side reset is ignored" {
@@ -1047,6 +1059,96 @@ test "a header block on a stream id that this side did not reset ends the connec
     const ended = try runScript(gpa, script.items, .{ .role = .server }, &answerer);
     try std.testing.expectEqual(@as(?frame.ErrorCode, .protocol_error), ended.goaway);
     try std.testing.expectEqual(@as(?frame.ErrorCode, null), ended.resets[3]);
+}
+
+/// Keeps the streams that the server connection gives to `on_stream`, and sets the hook of
+/// `setOnReset` on each of them. The hook counts its calls by stream id. On the path "/close",
+/// the handler closes the stream at once. On the path "/none", it sets no hook. On the path
+/// "/remove", it sets the hook and removes it again.
+const HookRecorder = struct {
+    items: [8]*Connection.Stream = undefined,
+    len: usize = 0,
+    /// The calls of the hook, by stream id.
+    calls: [16]u32 = @splat(0),
+    /// The reset code that the hook saw, by stream id.
+    codes: [16]?frame.ErrorCode = @splat(null),
+    /// The hook saw the end of the connection, by stream id.
+    closed: [16]bool = @splat(false),
+
+    fn onStream(userdata: ?*anyopaque, stream: *Connection.Stream) void {
+        const self: *HookRecorder = @ptrCast(@alignCast(userdata.?));
+        const path = Connection.findHeader(stream.headers.items, ":path") orelse "";
+        if (std.mem.eql(u8, path, "/close")) {
+            stream.setOnReset(onReset, self);
+            stream.close();
+            return;
+        }
+        self.items[self.len] = stream;
+        self.len += 1;
+        if (std.mem.eql(u8, path, "/none")) return;
+        stream.setOnReset(onReset, self);
+        if (std.mem.eql(u8, path, "/remove")) stream.setOnReset(null, null);
+    }
+
+    /// The connection calls the hook under its lock, thus the hook only reads the stream.
+    fn onReset(userdata: ?*anyopaque, stream: *Connection.Stream) void {
+        const self: *HookRecorder = @ptrCast(@alignCast(userdata.?));
+        self.calls[stream.id] += 1;
+        self.codes[stream.id] = stream.reset;
+        self.closed[stream.id] = stream.conn_closed;
+    }
+};
+
+test "the hook of setOnReset runs once at a reset or at the end of the connection" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    const cancel = [_]u8{ 0, 0, 0, @intFromEnum(frame.ErrorCode.cancel) };
+    // Stream 1 gets a reset from the peer, twice. Stream 3 stays open until the end of the
+    // connection. Stream 5 closes at once. Stream 7 gets its hook after the end of the
+    // connection. Stream 9 loses its hook before its reset.
+    try appendHeaders(gpa, &script, 1, 0, &get, "");
+    try appendHeaders(gpa, &script, 3, 0, &get, "");
+    try appendHeaders(gpa, &script, 5, 0, &(post ++ [_]Header{.{ .name = ":path", .value = "/close" }}), "");
+    try appendHeaders(gpa, &script, 7, 0, &(post ++ [_]Header{.{ .name = ":path", .value = "/none" }}), "");
+    try appendHeaders(gpa, &script, 9, 0, &(post ++ [_]Header{.{ .name = ":path", .value = "/remove" }}), "");
+    try appendFrame(gpa, &script, .rst_stream, 0, 1, &cancel);
+    try appendFrame(gpa, &script, .rst_stream, 0, 1, &cancel);
+    try appendFrame(gpa, &script, .rst_stream, 0, 9, &cancel);
+
+    var reader: Io.Reader = .fixed(script.items);
+    const written = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(written);
+    var writer: Io.Writer = .fixed(written);
+    var recorder: HookRecorder = .{};
+    const conn = try Connection.init(gpa, io, &reader, &writer, .{ .role = .server, .on_stream = HookRecorder.onStream, .userdata = &recorder });
+    defer conn.deinit();
+    try conn.handshake();
+    // The read task ends at the end of the script, and the connection then ends.
+    conn.run();
+    defer for (recorder.items[0..recorder.len]) |s| s.close();
+    try std.testing.expectEqual(4, recorder.len);
+
+    try std.testing.expectEqual(1, recorder.calls[1]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, .cancel), recorder.codes[1]);
+    try std.testing.expect(!recorder.closed[1]);
+    try std.testing.expectEqual(1, recorder.calls[3]);
+    try std.testing.expectEqual(@as(?frame.ErrorCode, null), recorder.codes[3]);
+    try std.testing.expect(recorder.closed[3]);
+    try std.testing.expectEqual(0, recorder.calls[5]);
+    try std.testing.expectEqual(0, recorder.calls[9]);
+    // A hook that comes after the end of the connection runs at once.
+    try std.testing.expectEqual(0, recorder.calls[7]);
+    try std.testing.expectEqual(7, recorder.items[2].id);
+    recorder.items[2].setOnReset(HookRecorder.onReset, &recorder);
+    try std.testing.expectEqual(1, recorder.calls[7]);
+    try std.testing.expect(recorder.closed[7]);
+    // A cancel from this side after the end of the connection runs no hook again.
+    recorder.items[2].cancel();
+    try std.testing.expectEqual(1, recorder.calls[7]);
 }
 
 test "the connection remembers the last remembered_resets streams that it reset" {
