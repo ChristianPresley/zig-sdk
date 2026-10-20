@@ -11,6 +11,7 @@ All notable changes to this project are recorded in this file. The format follow
 ### Changed
 
 - The gRPC server runs one task for each call. Before, a second task waited on the stream of the call, to cancel the request at a reset or at the end of the connection. Now the hook of `setOnReset` cancels the request from the read task of the connection. With `std.Io.Threaded`, each task that waits has its own thread, and on Windows each thread commits 16 MiB of stack. In a load test on one connection, 32 calls in flight used 37 threads and 580 MiB, before 72 threads and 1,141 MiB. With 128 calls in flight, the server used 149 threads and 2,376 MiB, before 226 threads and 3,611 MiB.
+- Each stream of an HTTP/2 connection has its own condition, `http2.Connection.Stream.cond`. A frame on a stream wakes only the tasks that wait on that stream. A window update of the connection and the end of the connection wake the tasks of each stream. Before, every frame, header block, reset and window update woke each task that waited on the connection, also the tasks of the other streams. In the load test on one connection, the 99th percentile of the latency with 32 calls in flight went from 459 ms to 8 ms. With 128 calls in flight, it went from 411 ms to 282 ms, and the server used 134 threads and 2,135 MiB.
 
 ## [0.5.2] - 2026-10-12
 

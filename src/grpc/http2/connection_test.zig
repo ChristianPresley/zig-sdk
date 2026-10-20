@@ -44,7 +44,7 @@ pub const Watchdog = struct {
         // test binary.
         const conn = self.stream.conn;
         conn.lock.lockUncancelable(conn.io);
-        conn.cond.broadcast(conn.io);
+        self.stream.cond.broadcast(conn.io);
         conn.lock.unlock(conn.io);
     }
 };
@@ -113,10 +113,10 @@ fn isZero(count: *const std.atomic.Value(u32)) bool {
     return count.load(.acquire) == 0;
 }
 
-/// A task waits on the condition of the connection. The waiter count is a field of
+/// A task waits on the condition of the stream. The waiter count is a field of
 /// `std.Io.Condition` in Zig 0.16.0.
-fn hasWaiter(conn: *Connection) bool {
-    return conn.cond.state.load(.monotonic).waiters != 0;
+fn hasWaiter(stream: *Connection.Stream) bool {
+    return stream.cond.state.load(.monotonic).waiters != 0;
 }
 
 /// A task waits for the mutex. The state is a field of `std.Io.Mutex` in Zig 0.16.0.
@@ -389,7 +389,7 @@ const Pair = struct {
         errdefer self.client.abort();
         try self.client.start();
         self.server = .{ .side = undefined };
-        try self.server.side.init(io, gpa, try acceptor.finish(io), .{ .role = .server, .on_stream = EchoServer.onStream, .userdata = &self.server, .max_concurrent_streams = 4 });
+        try self.server.side.init(io, gpa, try acceptor.finish(io), .{ .role = .server, .on_stream = EchoServer.onStream, .userdata = &self.server, .max_concurrent_streams = 8 });
         errdefer self.server.side.abort();
         try self.server.side.start();
     }
@@ -493,7 +493,7 @@ test "a reset stream fails the client side and the peer settings arrive" {
     try std.testing.expectError(error.StreamReset, result);
     try std.testing.expectEqual(frame.ErrorCode.cancel, stream.wasReset().?);
     // The server advertised its limit; the client learned it with the SETTINGS frame.
-    try std.testing.expectEqual(4, pair.client.conn.peer.max_concurrent_streams.?);
+    try std.testing.expectEqual(8, pair.client.conn.peer.max_concurrent_streams.?);
 }
 
 test "a complete response before the end of the request stays readable after the reset" {
@@ -617,11 +617,13 @@ fn waitOn(stream: *Connection.Stream, kind: WaitKind) Connection.Error!void {
     }
 }
 
-/// Wake the waiters of `conn` until `stop` is set, as frames on other streams do.
-fn wakeLoop(conn: *Connection, stop: *const std.atomic.Value(bool)) void {
+/// Wake the waits on `stream` until `stop` is set, as frames on the stream and window updates
+/// of the connection do.
+fn wakeLoop(stream: *Connection.Stream, stop: *const std.atomic.Value(bool)) void {
+    const conn = stream.conn;
     while (!stop.load(.acquire)) {
         conn.lock.lockUncancelable(conn.io);
-        conn.cond.broadcast(conn.io);
+        stream.cond.broadcast(conn.io);
         conn.lock.unlock(conn.io);
     }
 }
@@ -633,12 +635,6 @@ test "stopWaits ends each wait on the stream while the connection wakes its wait
     try pair.start(io, gpa, .{ .role = .client });
     defer pair.stop();
     const conn = pair.client.conn;
-    var stop_wakes: std.atomic.Value(bool) = .init(false);
-    var waker = try io.concurrent(wakeLoop, .{ conn, &stop_wakes });
-    defer {
-        stop_wakes.store(true, .release);
-        waker.await(io);
-    }
     // A cancel of the waiting task can get lost when it comes together with a wake-up: the
     // condition of std then gives no `error.Canceled`. The flag of `stopWaits` does not get
     // lost. The streams have no id, thus no frame goes out for them.
@@ -648,15 +644,70 @@ test "stopWaits ends each wait on the stream while the connection wakes its wait
         defer stream.close();
         // Without credit, `sendData` waits.
         stream.send_window = 0;
+        var stop_wakes: std.atomic.Value(bool) = .init(false);
+        var waker = try io.concurrent(wakeLoop, .{ stream, &stop_wakes });
+        defer {
+            stop_wakes.store(true, .release);
+            waker.await(io);
+        }
         var watchdog: Watchdog = .{ .stream = stream };
         try watchdog.start(io);
         var waiter = try io.concurrent(waitOn, .{ stream, kind });
-        const blocked = pollUntil(io, "a task waits on the connection", conn, hasWaiter);
+        const blocked = pollUntil(io, "a task waits on the stream", stream, hasWaiter);
         stream.stopWaits();
         const result = waiter.await(io);
         try watchdog.finish(io);
         try blocked;
         try std.testing.expectError(error.Canceled, result);
+    }
+}
+
+test "a frame on one stream does not wake the waits on the other streams" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var pair: Pair = undefined;
+    try pair.start(io, gpa, .{ .role = .client });
+    defer pair.stop();
+    // After one exchange, the settings of both sides arrived. Thus no SETTINGS frame wakes a
+    // stream during the test.
+    const first = try request(&pair, "/echo", "first");
+    gpa.free(first);
+    const conn = pair.client.conn;
+    // Five streams wait for their response headers. The server sends nothing on "/wait" until
+    // the stream gets a reset, at the end of the test.
+    const idle_count = 5;
+    var idle: [idle_count]*Connection.Stream = undefined;
+    var waiters: [idle_count]Io.Future(Connection.Error!void) = undefined;
+    var started: usize = 0;
+    defer for (idle[0..started], waiters[0..started]) |s, *w| {
+        s.stopWaits();
+        w.await(io) catch {};
+        s.close();
+    };
+    for (&idle) |*s| {
+        s.* = try conn.openStream();
+        errdefer s.*.close();
+        try s.*.sendHeaders(&.{
+            .{ .name = ":method", .value = "POST" },
+            .{ .name = ":scheme", .value = "http" },
+            .{ .name = ":path", .value = "/wait" },
+            .{ .name = "content-type", .value = "application/grpc" },
+        }, false);
+        waiters[started] = try io.concurrent(waitOn, .{ s.*, WaitKind.headers });
+        started += 1;
+    }
+    for (idle) |s| try pollUntil(io, "a task waits on the stream", s, hasWaiter);
+    // The condition of std counts its wake-ups in `epoch`.
+    var epochs: [idle_count]u32 = undefined;
+    for (idle, &epochs) |s, *e| e.* = s.cond.epoch.load(.acquire);
+    // The echo on one more stream brings headers, data and trailers. Before, each of these
+    // frames woke each task that waited on the connection, also the tasks of the other
+    // streams.
+    const echoed = try request(&pair, "/echo", "next");
+    gpa.free(echoed);
+    for (idle, epochs) |s, e| {
+        try std.testing.expectEqual(e, s.cond.epoch.load(.acquire));
+        try std.testing.expect(hasWaiter(s));
     }
 }
 

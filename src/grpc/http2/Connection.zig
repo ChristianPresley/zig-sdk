@@ -55,8 +55,6 @@ writer: *Io.Writer,
 options: Options,
 /// Guards every field below that changes after `init`, and the streams.
 lock: Io.Mutex = .init,
-/// Signaled on every state change: windows, stream data, headers, resets and the close.
-cond: Io.Condition = .init,
 /// Serializes writes to the socket.
 write_lock: Io.Mutex = .init,
 decoder: hpack.Decoder,
@@ -179,9 +177,9 @@ fn terminate(self: *Connection) void {
     var it = self.streams.valueIterator();
     while (it.next()) |s| {
         s.*.conn_closed = true;
+        s.*.cond.broadcast(self.io);
         s.*.notifyReset();
     }
-    self.cond.broadcast(self.io);
 }
 
 pub fn isClosed(self: *Connection) bool {
@@ -309,12 +307,12 @@ fn onData(self: *Connection, header: frame.Header, payload: []const u8) Error!vo
                 } else {
                     try stream.data.appendSlice(self.gpa, data);
                     if (header.has(frame.Flags.end_stream)) stream.end_stream = true;
+                    stream.cond.broadcast(self.io);
                 }
             }
         } else if (header.stream_id > self.last_peer_stream_id and self.options.role == .server) {
             return error.ProtocolError; // data on a stream that was never opened
         }
-        self.cond.broadcast(self.io);
     }
     if (reply_conn_update) |inc| self.sendWindowUpdate(0, inc);
     if (reset) |code| self.sendRst(header.stream_id, code);
@@ -401,7 +399,6 @@ fn finishHeaderBlock(self: *Connection) Error!void {
                     // lock comes before `lock` (see `sendHeaders`).
                     reset = .enhance_your_calm;
                     s.setReset(.enhance_your_calm);
-                    self.cond.broadcast(self.io);
                     break :decoded;
                 },
                 else => return error.ProtocolError, // a compression error ends the connection
@@ -427,7 +424,7 @@ fn finishHeaderBlock(self: *Connection) Error!void {
                     s.end_stream = true;
                 }
             }
-            self.cond.broadcast(self.io);
+            s.cond.broadcast(self.io);
         }
         // A stream that this block opened and refused gets no owner, because `on_stream` does
         // not run. Thus the connection frees it, as for `REFUSED_STREAM`. Else the stream counts
@@ -520,7 +517,6 @@ fn onRstStream(self: *Connection, header: frame.Header, payload: []const u8) Rea
     defer self.lock.unlock(self.io);
     if (self.streams.get(header.stream_id)) |s| {
         s.setReset(code);
-        self.cond.broadcast(self.io);
     } else if (self.options.role == .server and header.stream_id > self.last_peer_stream_id) {
         return error.ProtocolError;
     }
@@ -548,10 +544,11 @@ fn onSettings(self: *Connection, header: frame.Header, payload: []const u8) Read
                 while (it.next()) |s| {
                     s.*.send_window += delta;
                     if (s.*.send_window > frame.max_window) return error.ProtocolError;
+                    // A larger window gives credit to a send that waits.
+                    if (delta > 0) s.*.cond.broadcast(self.io);
                 }
             }
         }
-        self.cond.broadcast(self.io);
     }
     try self.writeFrame(.settings, frame.Flags.ack, 0, &.{});
 }
@@ -569,7 +566,6 @@ fn onGoaway(self: *Connection, header: frame.Header, payload: []const u8) Error!
     while (it.next()) |s| if (s.*.id > last and s.*.id % 2 == (if (self.options.role == .client) @as(u31, 1) else 0)) {
         s.*.setReset(.refused_stream);
     };
-    self.cond.broadcast(self.io);
 }
 
 fn onWindowUpdate(self: *Connection, header: frame.Header, payload: []const u8) ReadError!void {
@@ -585,6 +581,9 @@ fn onWindowUpdate(self: *Connection, header: frame.Header, payload: []const u8) 
     if (header.stream_id == 0) {
         self.send_window += increment;
         if (self.send_window > frame.max_window) return error.ProtocolError;
+        // The credit of the connection can continue a send on each stream.
+        var it = self.streams.valueIterator();
+        while (it.next()) |s| s.*.cond.broadcast(self.io);
     } else if (self.streams.get(header.stream_id)) |s| {
         s.send_window += increment;
         if (s.send_window > frame.max_window) {
@@ -592,9 +591,10 @@ fn onWindowUpdate(self: *Connection, header: frame.Header, payload: []const u8) 
             self.lock.unlock(self.io);
             self.sendRst(header.stream_id, .flow_control_error);
             self.lock.lockUncancelable(self.io);
+        } else {
+            s.cond.broadcast(self.io);
         }
     }
-    self.cond.broadcast(self.io);
 }
 
 // -- Streams ---------------------------------------------------------------------------------
@@ -627,6 +627,10 @@ pub const Stream = struct {
     conn: *Connection,
     id: u31,
     arena_state: std.heap.ArenaAllocator,
+    /// Signaled at each change of the stream: data, headers, trailers, a reset, `stopWaits` and
+    /// more credit to send. The end of the connection also signals it. A change on another
+    /// stream does not wake the waits on this stream.
+    cond: Io.Condition = .init,
     /// The request or response headers, in the stream arena.
     headers: std.ArrayList(Header) = .empty,
     headers_done: bool = false,
@@ -707,7 +711,6 @@ pub const Stream = struct {
         self.setReset(.cancel);
         // A waiter can close the stream when it wakes, thus keep the id for the reset frame.
         const id = self.id;
-        conn.cond.broadcast(conn.io);
         conn.lock.unlock(conn.io);
         if (!already) conn.sendRst(id, .cancel);
     }
@@ -717,14 +720,14 @@ pub const Stream = struct {
     /// owner still calls `close`.
     ///
     /// To stop a task that waits on the stream, use this function, not `Future.cancel`. The
-    /// condition of std can lose a cancel that comes together with a wake-up of the connection.
+    /// condition of std can lose a cancel that comes together with a wake-up of the stream.
     /// The task then waits until the stream gets a reset or the connection ends.
     pub fn stopWaits(self: *Stream) void {
         const conn = self.conn;
         conn.lock.lockUncancelable(conn.io);
         defer conn.lock.unlock(conn.io);
         self.waits_stopped = true;
-        conn.cond.broadcast(conn.io);
+        self.cond.broadcast(conn.io);
     }
 
     /// The hook of `setOnReset`.
@@ -760,19 +763,20 @@ pub const Stream = struct {
         hook(self.on_reset_userdata, self);
     }
 
-    /// Give the stream the reset `code` when it has none, and run the hook of the owner. Called
-    /// under `lock`.
+    /// Give the stream the reset `code` when it has none, wake its waits and run the hook of
+    /// the owner. Called under `lock`.
     fn setReset(self: *Stream, code: frame.ErrorCode) void {
         if (self.reset == null) self.reset = code;
+        self.cond.broadcast(self.conn.io);
         self.notifyReset();
     }
 
-    /// Wait for the next change on the connection. Gives `error.Canceled` after `stopWaits`.
+    /// Wait for the next change of the stream. Gives `error.Canceled` after `stopWaits`.
     /// Called under `lock`. The caller checks its condition again after each wake-up.
     fn wait(self: *Stream) Error!void {
         if (self.waits_stopped) return error.Canceled;
         const conn = self.conn;
-        try conn.cond.wait(conn.io, &conn.lock);
+        try self.cond.wait(conn.io, &conn.lock);
     }
 
     fn checkOpen(self: *const Stream) Error!void {
