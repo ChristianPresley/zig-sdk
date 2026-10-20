@@ -62,6 +62,7 @@ test {
     _ = http2.Connection;
     _ = grpc.status;
     _ = grpc.timeout;
+    _ = @import("grpc/transport/socket_opts.zig");
     _ = @import("grpc/http2/connection_test.zig");
     _ = @import("grpc/grpc_test.zig");
     _ = @import("grpc/typed_test.zig");

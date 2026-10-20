@@ -21,6 +21,7 @@ const status = @import("../grpc/status.zig");
 const timeout = @import("../grpc/timeout.zig");
 const messages = @import("../protobuf/messages.zig");
 const grpc_server = @import("grpc_server.zig");
+const socket_opts = @import("socket_opts.zig");
 
 const log = std.log.scoped(.mcp_grpc_client);
 
@@ -131,6 +132,12 @@ pub const Channel = struct {
             else => return error.ConnectFailed,
         };
         errdefer stream.close(io);
+        // Without `TCP_NODELAY`, the Nagle algorithm holds the data of a call until the server
+        // acknowledges the headers. A failure costs latency only, and `setNoDelay` logs it.
+        socket_opts.setNoDelay(io, stream.socket) catch |e| switch (e) {
+            error.Canceled => return error.Canceled,
+            error.OptionRejected => {},
+        };
         link.* = .{
             .stream = stream,
             .in_buf = in_buf,

@@ -14,6 +14,10 @@ All notable changes to this project are recorded in this file. The format follow
 - Each stream of an HTTP/2 connection has its own condition, `http2.Connection.Stream.cond`. A frame on a stream wakes only the tasks that wait on that stream. A window update of the connection and the end of the connection wake the tasks of each stream. Before, every frame, header block, reset and window update woke each task that waited on the connection, also the tasks of the other streams. In the load test on one connection, the 99th percentile of the latency with 32 calls in flight went from 459 ms to 8 ms. With 128 calls in flight, it went from 411 ms to 282 ms, and the server used 134 threads and 2,135 MiB.
 - The conformance server, the conformance authorization server, the conformance client and the examples use `std.heap.smp_allocator` in a release build. Before, they used `init.gpa`, which in a release build without libc is the debug allocator of std. That allocator takes one lock for every allocation of every thread. With four gRPC clients, the conformance server then saturated at about 14,000 calls each second, now at about 24,000. A Debug build keeps the debug allocator and its checks.
 
+### Fixed
+
+- The gRPC server and client now set `TCP_NODELAY` on each connection, on POSIX systems and on Windows. The server writes a response in three parts: the response headers, the data and the trailers. Before, the Nagle algorithm of the kernel held the second and the third part until the client acknowledged the first. On Linux, a call then took about 40 ms on loopback, and 60 ms more than the round trip time on a network. Windows did not show the delay. A failure to set the option does not end the connection: the transport logs it at debug level in the scope `mcp_grpc` and continues.
+
 ## [0.5.2] - 2026-10-12
 
 ### Changed

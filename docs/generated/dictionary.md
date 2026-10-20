@@ -524,6 +524,7 @@ Abbreviations and names with a fixed case that the prose can use (PRJ-2). A sent
 | YAML | the data format of the skill frontmatter |
 | ECMA | Ecma International, the publisher of ECMA-262 |
 | BSD | the Berkeley Software Distribution family of operating systems |
+| AFD | the Ancillary Function Driver, the socket driver of Windows |
 | AEAD | authenticated encryption with associated data |
 | AEGIS | a family of AEAD algorithms on the AES round function (draft-irtf-cfrg-aegis-aead) |
 | AES | Advanced Encryption Standard |

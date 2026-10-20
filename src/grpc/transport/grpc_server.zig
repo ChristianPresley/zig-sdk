@@ -26,6 +26,7 @@ const messages = @import("../protobuf/messages.zig");
 const codec = @import("../protobuf/codec.zig");
 const service = @import("../typed/service.zig");
 const typed_server = @import("typed_server.zig");
+const socket_opts = @import("socket_opts.zig");
 
 const log = std.log.scoped(.mcp_grpc);
 
@@ -140,6 +141,10 @@ pub const Server = struct {
                 stream.close(self.io);
                 break;
             }
+            // Without `TCP_NODELAY`, the Nagle algorithm holds the data and the trailers of a
+            // response until the client acknowledges the headers. A failure costs latency only,
+            // and `setNoDelay` logs it. After a cancel, the next accept ends the loop.
+            socket_opts.setNoDelay(self.io, stream.socket) catch {};
             self.permits.waitUncancelable(self.io);
             const conn = self.gpa.create(Conn) catch {
                 stream.close(self.io);

@@ -8,6 +8,7 @@ const json = mcp.json;
 const Client = mcp.Client;
 const grpc_server = @import("transport/grpc_server.zig");
 const grpc_client = @import("transport/grpc_client.zig");
+const socket_opts = @import("transport/socket_opts.zig");
 const Connection = @import("http2/Connection.zig");
 const connection_test = @import("http2/connection_test.zig");
 const ErrorCode = @import("http2/frame.zig").ErrorCode;
@@ -242,6 +243,32 @@ test "grpc: a listen stream delivers events until the client cancels" {
     job.token.cancel(io, "done");
     future.await(io);
     try std.testing.expectError(error.Canceled, job.result);
+}
+
+test "grpc: the server and the client set TCP_NODELAY" {
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    // After the call, the server tracks the connection.
+    _ = try f.client.discover(arena_state.allocator(), .{ .timeout = .fromSeconds(10) });
+
+    const client_socket = blk: {
+        f.channel.lock.lockUncancelable(io);
+        defer f.channel.lock.unlock(io);
+        break :blk f.channel.link.?.stream.socket;
+    };
+    try std.testing.expect(try socket_opts.getNoDelay(io, client_socket));
+
+    const server_socket = blk: {
+        f.transport.connections_lock.lockUncancelable(io);
+        defer f.transport.connections_lock.unlock(io);
+        try std.testing.expectEqual(1, f.transport.connections.items.len);
+        break :blk f.transport.connections.items[0].stream.socket;
+    };
+    try std.testing.expect(try socket_opts.getNoDelay(io, server_socket));
 }
 
 test "grpc: a cancel without a shutdown ends serve" {
