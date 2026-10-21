@@ -33,6 +33,9 @@ Add `--tls-cert cert.pem --tls-key key.pem` to serve HTTPS on the HTTP port and 
 Add `--log-requests` to log one line for each call of a tool, resource, prompt or completion handler. The server logs the line at the level info in the scope `request_log`. The line is a JSON object with `transport`, `method`, `id`, `target` (the tool name, the prompt name or the resource URI), `outcome`, `code` and `duration_us`. The line has no arguments, no content and no headers. The other requests get no line. Examples are `server/discover`, the lists and `subscriptions/listen`.
 
 
+Add `--apps` to add a fixture of the MCP Apps extension `io.modelcontextprotocol/ui`. The server then declares the extension and serves the view `ui://conformance/view` with the MIME type `text/html;profile=mcp-app`. The tool `test_app_tool` names the view in `_meta.ui.resourceUri`. A client must declare the extension with that MIME type. Other clients get no `_meta.ui` and no view. The fixture is for tests of hosts and clients only.
+
+
 ## Steps for the authorization server scenarios
 
 Do these steps to run the authorization server scenarios on your computer:

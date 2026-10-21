@@ -3,11 +3,14 @@
 //! stdio with `--stdio`. `--grpc-port` adds the gRPC tunnel, `--grpc-typed` also serves the
 //! typed service `model_context_protocol.Mcp` on that port, and `--ws-port` adds the
 //! WebSocket binding on `ws://127.0.0.1:N/mcp`. `--no-tunnel` with `--grpc-typed` removes the
-//! tunnel from the gRPC port. `--tls-cert` and `--tls-key` give PEM files for TLS on the HTTP
+//! tunnel from the gRPC port.
+//!
+//! `--tls-cert` and `--tls-key` give PEM files for TLS on the HTTP
 //! listener and on the gRPC listener. `--log-requests` logs one JSON line for each handler call.
+//! `--apps` adds a fixture of the MCP Apps extension: a `ui://` view and a tool that names it.
 //!
 //! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--no-tunnel] [--ws-port N]
-//!        [--tls-cert cert.pem --tls-key key.pem] [--log-requests] [--stdio]
+//!        [--tls-cert cert.pem --tls-key key.pem] [--log-requests] [--apps] [--stdio]
 const std = @import("std");
 const builtin = @import("builtin");
 const mcp = @import("mcp");
@@ -155,6 +158,20 @@ fn triggerResourceUpdate(ctx: *Ctx, _: NoArgs) anyerror!Result {
     ctx.server.notifyResourceUpdated(ctx.io, watched_uri);
     ctx.server.notifyResourcesListChanged(ctx.io);
     return textResult(ctx, "Resource updated", .{});
+}
+
+// -- MCP Apps fixture (--apps) ----------------------------------------------------------------
+
+/// The `ui://` resource of the fixture of the MCP Apps extension.
+const app_view_uri = "ui://conformance/view";
+const app_view_html =
+    \\<!doctype html>
+    \\<html><head><meta charset="utf-8"><title>Conformance view</title></head>
+    \\<body><p>The view of test_app_tool.</p></body></html>
+;
+
+fn appTool(ctx: *Ctx, _: NoArgs) anyerror!Result {
+    return textResult(ctx, "A result for the view", .{});
 }
 
 fn hiddenTool(ctx: *Ctx, _: NoArgs) anyerror!Result {
@@ -553,9 +570,10 @@ const json_schema_2020_12 =
     \\{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","$defs":{"address":{"$anchor":"addressDef","type":"object","properties":{"street":{"type":"string"},"city":{"type":"string"}}}},"properties":{"name":{"type":"string"},"address":{"$ref":"#/$defs/address"},"contactMethod":{"type":"string","enum":["phone","email"]},"phone":{"type":"string"},"email":{"type":"string"}},"allOf":[{"anyOf":[{"required":["phone"]},{"required":["email"]}]}],"if":{"properties":{"contactMethod":{"const":"phone"}},"required":["contactMethod"]},"then":{"required":["phone"]},"else":{"required":["email"]},"additionalProperties":false}
 ;
 
-/// The options of the server engine.
-fn serverOptions() mcp.Server.Options {
+/// The options of the server engine. `apps` declares the MCP Apps extension for `--apps`.
+fn serverOptions(apps: bool) mcp.Server.Options {
     return .{
+        .apps = if (apps) .{} else null,
         .info = .{ .name = "mcp-conformance-test-server", .version = "0.1.0" },
         .instructions = "Everything server for conformance tests.",
         .capabilities = .{
@@ -623,6 +641,12 @@ fn register(server: *mcp.Server, io: std.Io) !void {
     try server.addPrompt(.{ .name = "test_hidden_prompt", .description = "Appears after a change" }, logged(hiddenPrompt));
     _ = server.setPromptEnabled(io, "test_hidden_prompt", false);
     server.setCompletionHandler(logged(complete));
+
+    // The fixture of the MCP Apps extension: a view and a tool that names it in `_meta.ui`.
+    if (server.options.apps != null) {
+        try server.addUiResource(.{ .uri = app_view_uri, .name = "Conformance View", .description = "The view of test_app_tool" }, app_view_html);
+        try server.addTool(.{ .name = "test_app_tool", .description = "A tool with a view", .ui = .{ .resourceUri = app_view_uri } }, logged(appTool));
+    }
 }
 
 /// The settings from the command line.
@@ -642,6 +666,8 @@ const Config = struct {
     /// `--log-requests`: log one line for each call of a tool, resource, prompt or completion
     /// handler, at the level info in the scope `request_log`.
     log_requests: bool = false,
+    /// `--apps`: declare the MCP Apps extension and serve its fixture.
+    apps: bool = false,
 
     fn grpcBindings(self: Config) mcp_grpc.server.Bindings {
         return .{ .tunnel = self.grpc_tunnel, .typed = self.grpc_typed };
@@ -691,6 +717,8 @@ fn parseArgs(args: []const []const u8) !Config {
             config.ws_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
         } else if (std.mem.eql(u8, args[i], "--stdio")) {
             config.stdio = true;
+        } else if (std.mem.eql(u8, args[i], "--apps")) {
+            config.apps = true;
         } else if (std.mem.eql(u8, args[i], "--log-requests")) {
             config.log_requests = true;
         } else if (std.mem.eql(u8, args[i], "--tls-cert") and i + 1 < args.len) {
@@ -730,7 +758,7 @@ pub fn main(init: std.process.Init) !void {
     const ws_port = config.ws_port;
 
     state.log_requests.store(config.log_requests, .monotonic);
-    var server = try mcp.Server.init(gpa, io, serverOptions());
+    var server = try mcp.Server.init(gpa, io, serverOptions(config.apps));
     defer server.deinit();
     try register(&server, io);
 
@@ -816,10 +844,14 @@ const TestServer = struct {
 
     /// Send one request on a new harness and return the parsed last frame.
     fn call(self: *TestServer, method: []const u8, params: []const u8) !std.json.Value {
+        return self.callWithMeta(method, test_meta, params);
+    }
+
+    fn callWithMeta(self: *TestServer, method: []const u8, meta: []const u8, params: []const u8) !std.json.Value {
         var harness: Harness = .init(testing.io, testing.allocator, &self.server);
         defer harness.deinit();
         const sep: []const u8 = if (params.len > 0) "," else "";
-        try harness.send(try std.fmt.allocPrint(self.arena(), "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{{s}{s}{s}}}}}", .{ method, test_meta, sep, params }));
+        try harness.send(try std.fmt.allocPrint(self.arena(), "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{{s}{s}{s}}}}}", .{ method, meta, sep, params }));
         try testing.expect(harness.finished);
         return mcp.json.parseTree(self.arena(), harness.last().?);
     }
@@ -840,7 +872,7 @@ fn waitForFrames(harness: *Harness, count: usize) !void {
 
 test "test_trigger_resource_update sends resources/updated and resources/list_changed to a listen stream" {
     var t: TestServer = undefined;
-    try t.init(serverOptions());
+    try t.init(serverOptions(false));
     defer t.deinit();
     const io = testing.io;
 
@@ -878,7 +910,7 @@ fn serveGrpcIgnoringErrors(transport: *mcp_grpc.Server) void {
 
 test "--no-tunnel: a tunnel call gets UNIMPLEMENTED and the typed service answers" {
     var t: TestServer = undefined;
-    try t.init(serverOptions());
+    try t.init(serverOptions(false));
     defer t.deinit();
     const io = testing.io;
     const gpa = testing.allocator;
@@ -916,7 +948,7 @@ test "--no-tunnel: a tunnel call gets UNIMPLEMENTED and the typed service answer
 
 test "--tls-cert and --tls-key: HTTPS and gRPC with TLS from the fixture certificate" {
     var t: TestServer = undefined;
-    try t.init(serverOptions());
+    try t.init(serverOptions(false));
     defer t.deinit();
     const io = testing.io;
     const gpa = testing.allocator;
@@ -983,7 +1015,7 @@ fn captureLine(line: []const u8) void {
 
 test "--log-requests: one line for each call, without the arguments" {
     var t: TestServer = undefined;
-    try t.init(serverOptions());
+    try t.init(serverOptions(false));
     defer t.deinit();
     const config = try parseArgs(&.{ "server", "--log-requests" });
     try testing.expect(config.log_requests);
@@ -1014,4 +1046,39 @@ test "--log-requests: one line for each call, without the arguments" {
     const third = try mcp.json.parseTree(t.arena(), captured_lines.items[2]);
     try testing.expectEqualStrings("resources/read", third.object.get("method").?.string);
     try testing.expectEqualStrings("test://static-text", third.object.get("target").?.string);
+}
+
+const test_meta_ui =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}}}
+;
+
+fn findTool(list: std.json.Value, name: []const u8) ?std.json.Value {
+    for (list.object.get("result").?.object.get("tools").?.array.items) |tool| {
+        if (std.mem.eql(u8, tool.object.get("name").?.string, name)) return tool;
+    }
+    return null;
+}
+
+test "--apps: a ui:// view with the MIME type of the extension and a tool with _meta.ui.resourceUri" {
+    try testing.expect((try parseArgs(&.{ "server", "--apps" })).apps);
+    var t: TestServer = undefined;
+    try t.init(serverOptions(true));
+    defer t.deinit();
+
+    const discover = try t.callWithMeta("server/discover", test_meta_ui, "");
+    try testing.expect(discover.object.get("result").?.object.get("capabilities").?.object.get("extensions").?.object.get("io.modelcontextprotocol/ui") != null);
+    const tools = try t.callWithMeta("tools/list", test_meta_ui, "");
+    const tool = findTool(tools, "test_app_tool") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(app_view_uri, tool.object.get("_meta").?.object.get("ui").?.object.get("resourceUri").?.string);
+    const read = try t.callWithMeta("resources/read", test_meta_ui, "\"uri\":\"" ++ app_view_uri ++ "\"");
+    const content = read.object.get("result").?.object.get("contents").?.array.items[0].object;
+    try testing.expectEqualStrings("text/html;profile=mcp-app", content.get("mimeType").?.string);
+    try testing.expect(std.mem.startsWith(u8, content.get("text").?.string, "<!doctype html>"));
+}
+
+test "without --apps: no view and no tool of the fixture" {
+    var t: TestServer = undefined;
+    try t.init(serverOptions(false));
+    defer t.deinit();
+    try testing.expect(findTool(try t.callWithMeta("tools/list", test_meta_ui, ""), "test_app_tool") == null);
 }
