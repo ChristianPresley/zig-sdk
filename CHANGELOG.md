@@ -4,6 +4,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-10-21
+
 ### Added
 
 - `http2.Connection.Stream.setOnReset`: the hook that the connection calls once, when the stream gets a reset or when the connection ends. The reset can come from the peer, from this side or from `cancel`. The connection calls the hook under its lock, thus the hook must not call a function of the stream or of the connection. The gRPC servers use the hook to cancel the request of the stream.
@@ -285,7 +287,8 @@ All notable changes to this project are recorded in this file. The format follow
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.4.0...v0.5.0
