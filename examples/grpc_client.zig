@@ -4,6 +4,7 @@
 //! Usage: grpc_client [host] [port] [ca.pem]
 //! With a CA file the client connects with TLS and ALPN `h2` and verifies the chain.
 const std = @import("std");
+const builtin = @import("builtin");
 const mcp = @import("mcp");
 const mcp_grpc = @import("mcp_grpc");
 
@@ -13,7 +14,9 @@ fn onProgress(userdata: ?*anyopaque, params: mcp.types.ProgressNotificationParam
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
+    // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
+    // every allocation of every thread. The allocator of std for many threads has no such lock.
+    const gpa = if (builtin.mode == .Debug) init.gpa else std.heap.smp_allocator;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const host: []const u8 = if (args.len > 1) args[1] else "127.0.0.1";

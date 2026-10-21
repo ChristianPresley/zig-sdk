@@ -6,6 +6,7 @@
 //! `mcp.transport.unix.createPrivateDirectory` made. Each line on the socket is one JSON-RPC
 //! message, as on stdio. The server removes a stale socket file at start.
 const std = @import("std");
+const builtin = @import("builtin");
 const mcp = @import("mcp");
 
 const AddArgs = struct {
@@ -23,7 +24,9 @@ fn add(ctx: *mcp.RequestContext, args: AddArgs) anyerror!mcp.Outcome(mcp.CallToo
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
+    // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
+    // every allocation of every thread. The allocator of std for many threads has no such lock.
+    const gpa = if (builtin.mode == .Debug) init.gpa else std.heap.smp_allocator;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const path = if (args.len > 1) args[1] else path: {

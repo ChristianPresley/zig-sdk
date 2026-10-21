@@ -2,6 +2,7 @@
 //!
 //! Usage: grpc_server [port] [cert.pem key.pem]
 const std = @import("std");
+const builtin = @import("builtin");
 const mcp = @import("mcp");
 const mcp_grpc = @import("mcp_grpc");
 const types = mcp.types;
@@ -18,7 +19,9 @@ fn add(ctx: *mcp.RequestContext, args: AddArgs) anyerror!mcp.Outcome(types.CallT
 }
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
+    // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
+    // every allocation of every thread. The allocator of std for many threads has no such lock.
+    const gpa = if (builtin.mode == .Debug) init.gpa else std.heap.smp_allocator;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const port: u16 = if (args.len > 1) try std.fmt.parseInt(u16, args[1], 10) else 50051;

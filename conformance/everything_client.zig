@@ -9,6 +9,7 @@
 //! `auth/wif-jwt-bearer` uses `WorkloadIdentity`. All other `auth/*` scenarios use
 //! `OAuthClient`. The scenarios `auth/dpop` and `auth/dpop-nonce` give it a DPoP key.
 const std = @import("std");
+const builtin = @import("builtin");
 const mcp = @import("mcp");
 const types = mcp.types;
 const json = mcp.json;
@@ -132,7 +133,9 @@ fn missingContext(scenario: []const u8) u8 {
 }
 
 pub fn main(init: std.process.Init) !u8 {
-    const gpa = init.gpa;
+    // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
+    // every allocation of every thread. The allocator of std for many threads has no such lock.
+    const gpa = if (builtin.mode == .Debug) init.gpa else std.heap.smp_allocator;
     const io = init.io;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);

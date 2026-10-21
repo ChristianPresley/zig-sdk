@@ -6,6 +6,7 @@
 //!
 //! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--ws-port N] [--stdio]
 const std = @import("std");
+const builtin = @import("builtin");
 const mcp = @import("mcp");
 const mcp_grpc = @import("mcp_grpc");
 const types = mcp.types;
@@ -457,7 +458,9 @@ const json_schema_2020_12 =
 ;
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
+    // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
+    // every allocation of every thread. The allocator of std for many threads has no such lock.
+    const gpa = if (builtin.mode == .Debug) init.gpa else std.heap.smp_allocator;
     const io = init.io;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
