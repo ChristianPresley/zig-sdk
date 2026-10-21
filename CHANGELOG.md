@@ -9,6 +9,10 @@ All notable changes to this project are recorded in this file. The format follow
 - The conformance server has the tool `test_trigger_resource_update`. The tool announces a change of `test://watched-resource` and a change of the resource list. A test can thus examine `resourceSubscriptions` and `resourcesListChanged` of `subscriptions/listen` from end to end. The other tools and the default behavior of the server do not change. `zig build test` now also runs the tests of the conformance server.
 - The conformance server has the option `--no-tunnel`. With `--grpc-port N --grpc-typed --no-tunnel`, the gRPC port serves only the typed service `model_context_protocol.Mcp`. A call of the tunnel `mcp.zig.transport.v1.Mcp` then gets `UNIMPLEMENTED`, as a call of an unknown service. Without `--grpc-typed`, the option is an error.
 
+### Changed
+
+- The example `grpc_client` has the options `--metadata key=value`, `--tool name` and `--args json`. Each `--metadata` adds one metadata entry to every call, and you can give the option more than one time. `--tool` names the tool to call, and `--args` gives its arguments as a JSON object. The positional arguments host, port and CA file do not change. The default tool is now `test_simple_text` of the conformance server with the arguments `{}`. Before, the example called `add` with 40 and 2. To call the `add` tool of the example `grpc_server`, give `--tool add --args '{"a":40,"b":2}'`.
+
 ### Fixed
 
 - A request with an `MCP-Protocol-Version` value other than 2026-07-28 now gets `UnsupportedProtocolVersion` (-32022, with `data.supported` and `data.requested`) before the checks of the other headers. This applies to Streamable HTTP, the gRPC tunnel and the typed gRPC service. Before, a 2025-11-25 client, which sends the version header but no `Mcp-Method`, got `HeaderMismatch` (-32020) and did not see the supported versions. A header value that is not the version in the `_meta` of the body stays a `HeaderMismatch`. A missing or invalid header also stays a `HeaderMismatch`. `envelope.verify` now does the version check, and `envelope.Rejection.rpcError` gives the error of a rejection.
