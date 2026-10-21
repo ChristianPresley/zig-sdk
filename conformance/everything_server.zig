@@ -4,10 +4,10 @@
 //! typed service `model_context_protocol.Mcp` on that port, and `--ws-port` adds the
 //! WebSocket binding on `ws://127.0.0.1:N/mcp`. `--no-tunnel` with `--grpc-typed` removes the
 //! tunnel from the gRPC port. `--tls-cert` and `--tls-key` give PEM files for TLS on the HTTP
-//! listener and on the gRPC listener.
+//! listener and on the gRPC listener. `--log-requests` logs one JSON line for each handler call.
 //!
 //! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--no-tunnel] [--ws-port N]
-//!        [--tls-cert cert.pem --tls-key key.pem] [--stdio]
+//!        [--tls-cert cert.pem --tls-key key.pem] [--log-requests] [--stdio]
 const std = @import("std");
 const builtin = @import("builtin");
 const mcp = @import("mcp");
@@ -464,8 +464,90 @@ fn complete(ctx: *Ctx, params: types.CompleteRequestParams) anyerror!types.Compl
 const State = struct {
     hidden_tool_enabled: std.atomic.Value(bool) = .init(false),
     hidden_prompt_enabled: std.atomic.Value(bool) = .init(false),
+    /// True with `--log-requests`.
+    log_requests: std.atomic.Value(bool) = .init(false),
 };
 var state: State = .{};
+
+// -- Request log ------------------------------------------------------------------------------
+
+const request_log = std.log.scoped(.request_log);
+
+/// The function that gets each line of the request log. A test can replace it.
+var request_log_sink: *const fn (line: []const u8) void = logRequestLine;
+
+fn logRequestLine(line: []const u8) void {
+    request_log.info("{s}", .{line});
+}
+
+/// Write one line of the request log as a JSON object. The line has the transport, the
+/// method, the request ID and the target: the tool name, prompt name or resource URI. It also
+/// has the outcome, the JSON-RPC error code and the duration. It has no arguments, no content
+/// and no headers.
+fn writeRequestLine(w: *std.Io.Writer, kind: mcp.transport.Transport.Kind, method: []const u8, id: mcp.jsonrpc.RequestId, target: []const u8, outcome: []const u8, code: ?i64, duration_us: i64) std.Io.Writer.Error!void {
+    try w.print("{{\"transport\":\"{t}\",\"method\":{f},\"id\":", .{ kind, std.json.fmt(method, .{}) });
+    switch (id) {
+        .string => |text| try w.print("{f}", .{std.json.fmt(text, .{})}),
+        .integer => |n| try w.print("{d}", .{n}),
+        .big => |digits| try w.writeAll(digits),
+    }
+    try w.print(",\"target\":{f},\"outcome\":\"{s}\",\"code\":", .{ std.json.fmt(target, .{}), outcome });
+    if (code) |c| try w.print("{d}", .{c}) else try w.writeAll("null");
+    try w.print(",\"duration_us\":{d}}}", .{duration_us});
+}
+
+/// The outcome of a handler for the request log: a name and a JSON-RPC error code or null.
+fn outcomeOf(ctx: *const Ctx, result: anytype) struct { []const u8, ?i64 } {
+    const value = result catch |e| {
+        if (e == error.Rpc) if (ctx.rpc_error) |r| return .{ "error", r.code };
+        return .{ "error", mcp.protocol.errors.Code.internal_error.int() };
+    };
+    const T = @TypeOf(value);
+    if (@typeInfo(T) != .@"union") return .{ "complete", null };
+    return switch (value) {
+        .complete => |c| if (@TypeOf(c) == types.CallToolResult and (c.isError orelse false)) .{ "tool_error", null } else .{ "complete", null },
+        .input_required => .{ "input_required", null },
+        .start_task => .{ "task", null },
+    };
+}
+
+/// Log one line for a handler call when `--log-requests` is on.
+fn logCall(ctx: *const Ctx, start: std.Io.Clock.Timestamp, result: anytype) void {
+    const outcome, const code = outcomeOf(ctx, result);
+    const duration_us: i64 = @intCast(start.durationTo(std.Io.Clock.Timestamp.now(ctx.io, .awake)).raw.toMicroseconds());
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeRequestLine(&w, ctx.kind, ctx.method, ctx.id, ctx.target, outcome, code, duration_us) catch return;
+    request_log_sink(w.buffered());
+}
+
+/// The handler with a line of the request log for each call. Without `--log-requests`, the
+/// wrapper only calls the handler.
+fn logged(comptime handler: anytype) @TypeOf(handler) {
+    const info = @typeInfo(@TypeOf(handler)).@"fn";
+    const R = info.return_type.?;
+    return switch (info.params.len) {
+        2 => struct {
+            fn call(ctx: *Ctx, a: info.params[1].type.?) R {
+                if (!state.log_requests.load(.monotonic)) return handler(ctx, a);
+                const start = std.Io.Clock.Timestamp.now(ctx.io, .awake);
+                const result = handler(ctx, a);
+                logCall(ctx, start, result);
+                return result;
+            }
+        }.call,
+        3 => struct {
+            fn call(ctx: *Ctx, a: info.params[1].type.?, b: info.params[2].type.?) R {
+                if (!state.log_requests.load(.monotonic)) return handler(ctx, a, b);
+                const start = std.Io.Clock.Timestamp.now(ctx.io, .awake);
+                const result = handler(ctx, a, b);
+                logCall(ctx, start, result);
+                return result;
+            }
+        }.call,
+        else => @compileError("unexpected handler"),
+    };
+}
 
 const json_schema_2020_12 =
     \\{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","$defs":{"address":{"$anchor":"addressDef","type":"object","properties":{"street":{"type":"string"},"city":{"type":"string"}}}},"properties":{"name":{"type":"string"},"address":{"$ref":"#/$defs/address"},"contactMethod":{"type":"string","enum":["phone","email"]},"phone":{"type":"string"},"email":{"type":"string"}},"allOf":[{"anyOf":[{"required":["phone"]},{"required":["email"]}]}],"if":{"properties":{"contactMethod":{"const":"phone"}},"required":["contactMethod"]},"then":{"required":["phone"]},"else":{"required":["email"]},"additionalProperties":false}
@@ -490,57 +572,57 @@ fn serverOptions() mcp.Server.Options {
 
 /// Register each tool, resource and prompt of the fixture.
 fn register(server: *mcp.Server, io: std.Io) !void {
-    try server.addTool(.{ .name = "test_simple_text", .description = "Returns simple text" }, simpleText);
-    try server.addTool(.{ .name = "test_image_content", .description = "Returns image content" }, imageContent);
-    try server.addTool(.{ .name = "test_audio_content", .description = "Returns audio content" }, audioContent);
-    try server.addTool(.{ .name = "test_embedded_resource", .description = "Returns an embedded resource" }, embeddedResource);
-    try server.addTool(.{ .name = "test_multiple_content_types", .description = "Returns mixed content" }, multipleContentTypes);
-    try server.addTool(.{ .name = "test_error_handling", .description = "Returns an error result" }, errorHandling);
-    try server.addTool(.{ .name = "test_tool_with_progress", .description = "Sends progress notifications" }, withProgress);
-    try server.addTool(.{ .name = "test_tool_with_logging", .description = "Sends log messages" }, withLogging);
-    try server.addTool(.{ .name = "test_logging_tool", .description = "Sends log messages" }, withLogging);
-    try server.addTool(.{ .name = "test_missing_capability", .description = "Needs the sampling capability", .requires_client = .{ .sampling = .{} } }, missingCapability);
-    try server.addTool(.{ .name = "test_streaming_elicitation", .description = "Elicitation over a stream" }, streamingElicitation);
-    try server.addTool(.{ .name = "test_sampling", .description = "Requests sampling" }, sampling);
-    try server.addTool(.{ .name = "test_elicitation", .description = "Requests elicitation" }, elicitation);
-    try server.addTool(.{ .name = "test_elicitation_sep1330_enums", .description = "Elicitation with enums" }, elicitationEnums);
-    try server.addTool(.{ .name = "test_elicitation_sep1034_defaults", .description = "Elicitation with defaults" }, elicitationDefaults);
-    try server.addTool(.{ .name = "test_trigger_tool_change", .description = "Changes the tool list" }, triggerToolChange);
-    try server.addTool(.{ .name = "test_trigger_prompt_change", .description = "Changes the prompt list" }, triggerPromptChange);
-    try server.addTool(.{ .name = "test_trigger_resource_update", .description = "Announces a change of test://watched-resource and of the resource list" }, triggerResourceUpdate);
-    try server.addTool(.{ .name = "test_hidden_tool", .description = "Appears after a change" }, hiddenTool);
-    try server.addTool(.{ .name = "test_input_required_result_elicitation", .description = "MRTR elicitation" }, irElicitation);
-    try server.addTool(.{ .name = "test_input_required_result_sampling", .description = "MRTR sampling" }, irSampling);
-    try server.addTool(.{ .name = "test_input_required_result_list_roots", .description = "MRTR roots" }, irListRoots);
-    try server.addTool(.{ .name = "test_input_required_result_request_state", .description = "MRTR with state" }, irRequestState);
-    try server.addTool(.{ .name = "test_input_required_result_multiple_inputs", .description = "MRTR with several inputs" }, irMultipleInputs);
-    try server.addTool(.{ .name = "test_input_required_result_multi_round", .description = "MRTR with three rounds" }, irMultiRound);
-    try server.addTool(.{ .name = "test_input_required_result_tampered_state", .description = "MRTR state integrity" }, irTamperedState);
-    try server.addTool(.{ .name = "test_input_required_result_capabilities", .description = "MRTR per declared capability" }, irCapabilities);
-    try server.addToolJson(.{ .name = "json_schema_2020_12_tool", .description = "Tool with a 2020-12 schema", .input_schema = json_schema_2020_12 }, jsonSchema2020);
-    try server.addTool(.{ .name = "test_x_mcp_header", .description = "Tool with header annotations" }, xMcpHeader);
-    try server.addTool(.{ .name = "greet", .description = "Greets by name" }, greet);
-    try server.addTool(.{ .name = "slow_compute", .description = "Sleeps for some seconds inside a task", .task_support = .optional }, slowCompute);
-    try server.addTool(.{ .name = "failing_job", .description = "A task that ends in a tool error", .task_support = .required }, failingJob);
-    try server.addTool(.{ .name = "protocol_error_job", .description = "A task that ends in a protocol error", .task_support = .optional }, protocolErrorJob);
-    try server.addTool(.{ .name = "confirm_delete", .description = "A task that asks for confirmation", .task_support = .optional }, confirmDelete);
-    try server.addTool(.{ .name = "multi_input", .description = "A task that asks two questions at once", .task_support = .optional }, multiInput);
-    try server.addTool(.{ .name = "test_tool_with_task", .description = "MRTR round then a task", .task_support = .required }, toolWithTask);
+    try server.addTool(.{ .name = "test_simple_text", .description = "Returns simple text" }, logged(simpleText));
+    try server.addTool(.{ .name = "test_image_content", .description = "Returns image content" }, logged(imageContent));
+    try server.addTool(.{ .name = "test_audio_content", .description = "Returns audio content" }, logged(audioContent));
+    try server.addTool(.{ .name = "test_embedded_resource", .description = "Returns an embedded resource" }, logged(embeddedResource));
+    try server.addTool(.{ .name = "test_multiple_content_types", .description = "Returns mixed content" }, logged(multipleContentTypes));
+    try server.addTool(.{ .name = "test_error_handling", .description = "Returns an error result" }, logged(errorHandling));
+    try server.addTool(.{ .name = "test_tool_with_progress", .description = "Sends progress notifications" }, logged(withProgress));
+    try server.addTool(.{ .name = "test_tool_with_logging", .description = "Sends log messages" }, logged(withLogging));
+    try server.addTool(.{ .name = "test_logging_tool", .description = "Sends log messages" }, logged(withLogging));
+    try server.addTool(.{ .name = "test_missing_capability", .description = "Needs the sampling capability", .requires_client = .{ .sampling = .{} } }, logged(missingCapability));
+    try server.addTool(.{ .name = "test_streaming_elicitation", .description = "Elicitation over a stream" }, logged(streamingElicitation));
+    try server.addTool(.{ .name = "test_sampling", .description = "Requests sampling" }, logged(sampling));
+    try server.addTool(.{ .name = "test_elicitation", .description = "Requests elicitation" }, logged(elicitation));
+    try server.addTool(.{ .name = "test_elicitation_sep1330_enums", .description = "Elicitation with enums" }, logged(elicitationEnums));
+    try server.addTool(.{ .name = "test_elicitation_sep1034_defaults", .description = "Elicitation with defaults" }, logged(elicitationDefaults));
+    try server.addTool(.{ .name = "test_trigger_tool_change", .description = "Changes the tool list" }, logged(triggerToolChange));
+    try server.addTool(.{ .name = "test_trigger_prompt_change", .description = "Changes the prompt list" }, logged(triggerPromptChange));
+    try server.addTool(.{ .name = "test_trigger_resource_update", .description = "Announces a change of test://watched-resource and of the resource list" }, logged(triggerResourceUpdate));
+    try server.addTool(.{ .name = "test_hidden_tool", .description = "Appears after a change" }, logged(hiddenTool));
+    try server.addTool(.{ .name = "test_input_required_result_elicitation", .description = "MRTR elicitation" }, logged(irElicitation));
+    try server.addTool(.{ .name = "test_input_required_result_sampling", .description = "MRTR sampling" }, logged(irSampling));
+    try server.addTool(.{ .name = "test_input_required_result_list_roots", .description = "MRTR roots" }, logged(irListRoots));
+    try server.addTool(.{ .name = "test_input_required_result_request_state", .description = "MRTR with state" }, logged(irRequestState));
+    try server.addTool(.{ .name = "test_input_required_result_multiple_inputs", .description = "MRTR with several inputs" }, logged(irMultipleInputs));
+    try server.addTool(.{ .name = "test_input_required_result_multi_round", .description = "MRTR with three rounds" }, logged(irMultiRound));
+    try server.addTool(.{ .name = "test_input_required_result_tampered_state", .description = "MRTR state integrity" }, logged(irTamperedState));
+    try server.addTool(.{ .name = "test_input_required_result_capabilities", .description = "MRTR per declared capability" }, logged(irCapabilities));
+    try server.addToolJson(.{ .name = "json_schema_2020_12_tool", .description = "Tool with a 2020-12 schema", .input_schema = json_schema_2020_12 }, logged(jsonSchema2020));
+    try server.addTool(.{ .name = "test_x_mcp_header", .description = "Tool with header annotations" }, logged(xMcpHeader));
+    try server.addTool(.{ .name = "greet", .description = "Greets by name" }, logged(greet));
+    try server.addTool(.{ .name = "slow_compute", .description = "Sleeps for some seconds inside a task", .task_support = .optional }, logged(slowCompute));
+    try server.addTool(.{ .name = "failing_job", .description = "A task that ends in a tool error", .task_support = .required }, logged(failingJob));
+    try server.addTool(.{ .name = "protocol_error_job", .description = "A task that ends in a protocol error", .task_support = .optional }, logged(protocolErrorJob));
+    try server.addTool(.{ .name = "confirm_delete", .description = "A task that asks for confirmation", .task_support = .optional }, logged(confirmDelete));
+    try server.addTool(.{ .name = "multi_input", .description = "A task that asks two questions at once", .task_support = .optional }, logged(multiInput));
+    try server.addTool(.{ .name = "test_tool_with_task", .description = "MRTR round then a task", .task_support = .required }, logged(toolWithTask));
     _ = server.setToolEnabled(io, "test_hidden_tool", false);
 
-    try server.addResource(.{ .uri = "test://static-text", .name = "Static Text Resource", .mime_type = "text/plain", .description = "A static text resource" }, readStaticText);
-    try server.addResource(.{ .uri = "test://static-binary", .name = "Static Binary Resource", .mime_type = "image/png", .description = "A static binary resource" }, readStaticBinary);
-    try server.addResource(.{ .uri = watched_uri, .name = "Watched Resource", .mime_type = "text/plain" }, readWatched);
-    try server.addResourceTemplate(.{ .uri_template = "test://template/{id}/data", .name = "Template Resource", .mime_type = "application/json", .description = "A resource template" }, readTemplate);
+    try server.addResource(.{ .uri = "test://static-text", .name = "Static Text Resource", .mime_type = "text/plain", .description = "A static text resource" }, logged(readStaticText));
+    try server.addResource(.{ .uri = "test://static-binary", .name = "Static Binary Resource", .mime_type = "image/png", .description = "A static binary resource" }, logged(readStaticBinary));
+    try server.addResource(.{ .uri = watched_uri, .name = "Watched Resource", .mime_type = "text/plain" }, logged(readWatched));
+    try server.addResourceTemplate(.{ .uri_template = "test://template/{id}/data", .name = "Template Resource", .mime_type = "application/json", .description = "A resource template" }, logged(readTemplate));
 
-    try server.addPrompt(.{ .name = "test_simple_prompt", .description = "A simple prompt" }, simplePrompt);
-    try server.addPrompt(.{ .name = "test_prompt_with_arguments", .description = "A prompt with arguments", .arguments = &.{ .{ .name = "arg1", .description = "First argument", .required = true }, .{ .name = "arg2", .description = "Second argument", .required = true } } }, promptWithArguments);
-    try server.addPrompt(.{ .name = "test_prompt_with_embedded_resource", .description = "A prompt with an embedded resource", .arguments = &.{.{ .name = "resourceUri", .description = "Resource URI", .required = true }} }, promptWithEmbeddedResource);
-    try server.addPrompt(.{ .name = "test_prompt_with_image", .description = "A prompt with an image" }, promptWithImage);
-    try server.addPrompt(.{ .name = "test_input_required_result_prompt", .description = "A prompt that needs input" }, irPrompt);
-    try server.addPrompt(.{ .name = "test_hidden_prompt", .description = "Appears after a change" }, hiddenPrompt);
+    try server.addPrompt(.{ .name = "test_simple_prompt", .description = "A simple prompt" }, logged(simplePrompt));
+    try server.addPrompt(.{ .name = "test_prompt_with_arguments", .description = "A prompt with arguments", .arguments = &.{ .{ .name = "arg1", .description = "First argument", .required = true }, .{ .name = "arg2", .description = "Second argument", .required = true } } }, logged(promptWithArguments));
+    try server.addPrompt(.{ .name = "test_prompt_with_embedded_resource", .description = "A prompt with an embedded resource", .arguments = &.{.{ .name = "resourceUri", .description = "Resource URI", .required = true }} }, logged(promptWithEmbeddedResource));
+    try server.addPrompt(.{ .name = "test_prompt_with_image", .description = "A prompt with an image" }, logged(promptWithImage));
+    try server.addPrompt(.{ .name = "test_input_required_result_prompt", .description = "A prompt that needs input" }, logged(irPrompt));
+    try server.addPrompt(.{ .name = "test_hidden_prompt", .description = "Appears after a change" }, logged(hiddenPrompt));
     _ = server.setPromptEnabled(io, "test_hidden_prompt", false);
-    server.setCompletionHandler(complete);
+    server.setCompletionHandler(logged(complete));
 }
 
 /// The settings from the command line.
@@ -557,6 +639,9 @@ const Config = struct {
     /// HTTPS and the gRPC listener serves TLS with ALPN `h2`.
     tls_cert: ?[]const u8 = null,
     tls_key: ?[]const u8 = null,
+    /// `--log-requests`: log one line for each call of a tool, resource, prompt or completion
+    /// handler, at the level info in the scope `request_log`.
+    log_requests: bool = false,
 
     fn grpcBindings(self: Config) mcp_grpc.server.Bindings {
         return .{ .tunnel = self.grpc_tunnel, .typed = self.grpc_typed };
@@ -606,6 +691,8 @@ fn parseArgs(args: []const []const u8) !Config {
             config.ws_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
         } else if (std.mem.eql(u8, args[i], "--stdio")) {
             config.stdio = true;
+        } else if (std.mem.eql(u8, args[i], "--log-requests")) {
+            config.log_requests = true;
         } else if (std.mem.eql(u8, args[i], "--tls-cert") and i + 1 < args.len) {
             i += 1;
             config.tls_cert = args[i];
@@ -642,6 +729,7 @@ pub fn main(init: std.process.Init) !void {
     const grpc_typed = config.grpc_typed;
     const ws_port = config.ws_port;
 
+    state.log_requests.store(config.log_requests, .monotonic);
     var server = try mcp.Server.init(gpa, io, serverOptions());
     defer server.deinit();
     try register(&server, io);
@@ -877,4 +965,53 @@ test "--tls-cert and --tls-key: HTTPS and gRPC with TLS from the fixture certifi
 
 fn serveHttpIgnoringErrors(transport: *mcp.transport.http.Server) void {
     transport.serve() catch {};
+}
+
+test "writeRequestLine: one JSON object with the transport, the method, the ID, the target, the outcome and the duration" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRequestLine(&w, .grpc, "tools/call", .{ .string = "a\"b" }, "test_simple_text", "error", -32602, 42);
+    try testing.expectEqualStrings("{\"transport\":\"grpc\",\"method\":\"tools/call\",\"id\":\"a\\\"b\",\"target\":\"test_simple_text\",\"outcome\":\"error\",\"code\":-32602,\"duration_us\":42}", w.buffered());
+}
+
+var captured_lines: std.ArrayList([]u8) = .empty;
+
+fn captureLine(line: []const u8) void {
+    const copy = testing.allocator.dupe(u8, line) catch return;
+    captured_lines.append(testing.allocator, copy) catch testing.allocator.free(copy);
+}
+
+test "--log-requests: one line for each call, without the arguments" {
+    var t: TestServer = undefined;
+    try t.init(serverOptions());
+    defer t.deinit();
+    const config = try parseArgs(&.{ "server", "--log-requests" });
+    try testing.expect(config.log_requests);
+    state.log_requests.store(true, .monotonic);
+    request_log_sink = captureLine;
+    defer {
+        state.log_requests.store(false, .monotonic);
+        request_log_sink = logRequestLine;
+        for (captured_lines.items) |line| testing.allocator.free(line);
+        captured_lines.clearAndFree(testing.allocator);
+    }
+
+    const ok = try t.call("tools/call", "\"name\":\"greet\",\"arguments\":{\"name\":\"secret-value\"}");
+    try testing.expectEqualStrings("Hello, secret-value!", ok.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string);
+    _ = try t.call("tools/call", "\"name\":\"test_error_handling\",\"arguments\":{}");
+    _ = try t.call("resources/read", "\"uri\":\"test://static-text\"");
+    try testing.expectEqual(3, captured_lines.items.len);
+    const first = try mcp.json.parseTree(t.arena(), captured_lines.items[0]);
+    try testing.expectEqualStrings("memory", first.object.get("transport").?.string);
+    try testing.expectEqualStrings("tools/call", first.object.get("method").?.string);
+    try testing.expectEqual(@as(i64, 1), first.object.get("id").?.integer);
+    try testing.expectEqualStrings("greet", first.object.get("target").?.string);
+    try testing.expectEqualStrings("complete", first.object.get("outcome").?.string);
+    try testing.expect(first.object.get("duration_us").?.integer >= 0);
+    try testing.expect(std.mem.indexOf(u8, captured_lines.items[0], "secret-value") == null);
+    const second = try mcp.json.parseTree(t.arena(), captured_lines.items[1]);
+    try testing.expectEqualStrings("tool_error", second.object.get("outcome").?.string);
+    const third = try mcp.json.parseTree(t.arena(), captured_lines.items[2]);
+    try testing.expectEqualStrings("resources/read", third.object.get("method").?.string);
+    try testing.expectEqualStrings("test://static-text", third.object.get("target").?.string);
 }

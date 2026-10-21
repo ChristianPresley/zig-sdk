@@ -30,6 +30,9 @@ Add `--no-tunnel` to `--grpc-typed` to serve the typed service only. A call of t
 Add `--tls-cert cert.pem --tls-key key.pem` to serve HTTPS on the HTTP port and TLS with ALPN `h2` on the gRPC port. The server loads the PEM files as the example `https_server` does. To make a test, use the files in `test/fixtures/tls/pem/`, for example `p256.crt` and `p256.key`.
 
 
+Add `--log-requests` to log one line for each call of a tool, resource, prompt or completion handler. The server logs the line at the level info in the scope `request_log`. The line is a JSON object with `transport`, `method`, `id`, `target` (the tool name, the prompt name or the resource URI), `outcome`, `code` and `duration_us`. The line has no arguments, no content and no headers. The other requests get no line. Examples are `server/discover`, the lists and `subscriptions/listen`.
+
+
 ## Steps for the authorization server scenarios
 
 Do these steps to run the authorization server scenarios on your computer:
