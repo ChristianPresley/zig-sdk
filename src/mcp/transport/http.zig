@@ -680,12 +680,7 @@ fn handleRpcRequest(conn: *Connection, request: *http.Server.Request, socket: *I
             try respondError(request, .bad_request, req.id, err);
             return true;
         }
-        try respondError(request, .bad_request, req.id, errors.headerMismatch(rejection.message));
-        return true;
-    }
-    if (!std.mem.eql(u8, head.envelope_headers.protocol_version.?, version.version)) {
-        const err = try errors.unsupportedProtocolVersion(arena, &version.supported_versions, head.envelope_headers.protocol_version.?);
-        try respondError(request, .bad_request, req.id, err);
+        try respondError(request, .bad_request, req.id, try rejection.rpcError(arena));
         return true;
     }
 

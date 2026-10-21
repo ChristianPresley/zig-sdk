@@ -69,6 +69,13 @@ pub fn handleCall(self: *grpc_server.Server, stream: *Stream, arena: Allocator, 
         else => return rpcError(stream, arena, errors.parseError(try std.fmt.allocPrint(arena, "The message is not a valid {s}: {t}", .{ requestName(rpc), e }))),
     };
 
+    // A different revision in `mcp-protocol-version` gets -32022 before the other metadata
+    // checks, as on the tunnel. Without the metadata, the version of this SDK applies.
+    if (Connection.findHeader(headers, envelope.header_protocol_version)) |pv| {
+        if (try envelope.verifyVersion(arena, pv, envelope.metaVersion(params))) |rejection| {
+            if (rejection.unsupported_version != null) return rpcError(stream, arena, try rejection.rpcError(arena));
+        }
+    }
     // The routing metadata must agree with the message, as `mcp-name` on the tunnel.
     if (rpc.routeHeader()) |name| {
         const expected: ?[]const u8 = if (convert.route(rpc, params)) |r| r.value else null;

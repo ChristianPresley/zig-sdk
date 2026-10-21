@@ -365,6 +365,11 @@ test "typed: JSON-RPC errors map to status codes and back" {
     defer old.deinit(gpa);
     try std.testing.expectEqualStrings("3", old.grpc_status.?);
     try std.testing.expectEqualStrings("-32022", old.error_code.?);
+    // The version check comes before the routing check: a wrong mcp_tool with another
+    // protocol version also gets -32022.
+    const old_route = try rawCall(gpa, io, port, service.Rpc.call_tool.path(), &.{ .{ .name = "mcp-protocol-version", .value = "2025-06-18" }, .{ .name = "mcp_tool", .value = "other" } }, try encodeCall(arena, "add", "{\"a\":1,\"b\":2}", null));
+    defer old_route.deinit(gpa);
+    try std.testing.expectEqualStrings("-32022", old_route.error_code.?);
     // The metadata and _meta disagree: -32020.
     const disagree = try rawCall(gpa, io, port, service.Rpc.list_tools.path(), &.{.{ .name = "mcp-protocol-version", .value = "2025-06-18" }}, try encodeList(arena, "{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}"));
     defer disagree.deinit(gpa);

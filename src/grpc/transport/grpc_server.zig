@@ -345,11 +345,7 @@ fn handleRequest(conn: *Conn, stream: *Stream, arena: Allocator, env: envelope.H
             const err = try errors.unsupportedProtocolVersion(arena, &version.supported_versions, "unknown");
             return rpcErrorOnly(stream, arena, err, req.id);
         }
-        return rpcErrorOnly(stream, arena, errors.headerMismatch(rejection.message), req.id);
-    }
-    if (!std.mem.eql(u8, env.protocol_version.?, version.version)) {
-        const err = try errors.unsupportedProtocolVersion(arena, &version.supported_versions, env.protocol_version.?);
-        return rpcErrorOnly(stream, arena, err, req.id);
+        return rpcErrorOnly(stream, arena, try rejection.rpcError(arena), req.id);
     }
 
     var token: Transport.CancelToken = .{};

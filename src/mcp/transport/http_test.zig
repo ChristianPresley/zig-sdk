@@ -135,6 +135,28 @@ test "http ladder and json responses" {
         try std.testing.expectEqual(@as(i64, -32022), tree2.object.get("error").?.object.get("code").?.integer);
         try std.testing.expectEqualStrings("v999.0.0", tree2.object.get("error").?.object.get("data").?.object.get("requested").?.string);
     }
+    // The version check comes before the other header checks: a 2025-11-25 client sends the
+    // version header but no Mcp-Method and no _meta -> 400 + -32022 with data.supported.
+    {
+        const body = "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"old\",\"version\":\"1\"}}}";
+        const reply = try f.post(arena, body, &.{ .{ .name = "accept", .value = "application/json, text/event-stream" }, .{ .name = "mcp-protocol-version", .value = "2025-11-25" } });
+        try std.testing.expectEqual(http.Status.bad_request, reply.status);
+        const err = (try json.parseTree(arena, reply.body)).object.get("error").?.object;
+        try std.testing.expectEqual(@as(i64, -32022), err.get("code").?.integer);
+        try std.testing.expectEqualStrings("2025-11-25", err.get("data").?.object.get("requested").?.string);
+        try std.testing.expectEqualStrings("2026-07-28", err.get("data").?.object.get("supported").?.array.items[0].string);
+        // A different revision and a wrong Mcp-Method -> -32022 too.
+        const old_list = "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/list\",\"params\":{}}";
+        const reply2 = try f.post(arena, old_list, &.{ .{ .name = "accept", .value = "application/json, text/event-stream" }, .{ .name = "mcp-protocol-version", .value = "2025-11-25" }, .{ .name = "mcp-method", .value = "prompts/list" } });
+        try std.testing.expectEqual(@as(i64, -32022), (try json.parseTree(arena, reply2.body)).object.get("error").?.object.get("code").?.integer);
+        // The supported version without Mcp-Method stays -32020.
+        const reply3 = try f.post(arena, try request(arena, 42, "tools/list", ""), &std_headers);
+        try std.testing.expectEqual(http.Status.bad_request, reply3.status);
+        try std.testing.expectEqual(@as(i64, -32020), (try json.parseTree(arena, reply3.body)).object.get("error").?.object.get("code").?.integer);
+        // A different revision in the header and the supported one in _meta stays -32020.
+        const reply4 = try f.post(arena, try request(arena, 43, "tools/list", ""), &.{ .{ .name = "accept", .value = "application/json, text/event-stream" }, .{ .name = "mcp-protocol-version", .value = "2025-11-25" } });
+        try std.testing.expectEqual(@as(i64, -32020), (try json.parseTree(arena, reply4.body)).object.get("error").?.object.get("code").?.integer);
+    }
     // Unknown method -> 404 + -32601; removed method too.
     {
         const body = try request(arena, 5, "ping", "");

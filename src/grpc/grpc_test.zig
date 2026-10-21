@@ -476,6 +476,17 @@ test "grpc: unknown path, wrong content type and missing metadata" {
     try std.testing.expectEqual(@as(i64, -32020), tree.object.get("error").?.object.get("code").?.integer);
     try std.testing.expectEqual(@as(i64, 1), tree.object.get("id").?.integer);
 
+    // Another revision without mcp-method and without _meta: the version check comes first,
+    // so the answer is -32022, not a header mismatch.
+    const old_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}";
+    const old = try rawCall(gpa, io, port, grpc_server.call_path, "application/grpc", &.{.{ .name = "mcp-protocol-version", .value = "2025-11-25" }}, old_body);
+    defer freeRaw(gpa, old);
+    try std.testing.expectEqualStrings("-32022", old.error_code.?);
+    // Another revision in the metadata and the supported one in _meta stays -32020.
+    const disagree = try rawCall(gpa, io, port, grpc_server.call_path, "application/grpc", &.{ .{ .name = "mcp-protocol-version", .value = "2025-11-25" }, .{ .name = "mcp-method", .value = "server/discover" } }, body);
+    defer freeRaw(gpa, disagree);
+    try std.testing.expectEqualStrings("-32020", disagree.error_code.?);
+
     // The full metadata works from a foreign client too.
     const good = try rawCall(gpa, io, port, grpc_server.call_path, "application/grpc", &.{ .{ .name = "mcp-protocol-version", .value = "2026-07-28" }, .{ .name = "mcp-method", .value = "server/discover" } }, body);
     defer freeRaw(gpa, good);

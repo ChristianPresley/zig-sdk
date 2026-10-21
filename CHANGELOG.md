@@ -4,6 +4,10 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Fixed
+
+- A request with an `MCP-Protocol-Version` value other than 2026-07-28 now gets `UnsupportedProtocolVersion` (-32022, with `data.supported` and `data.requested`) before the checks of the other headers. This applies to Streamable HTTP, the gRPC tunnel and the typed gRPC service. Before, a 2025-11-25 client, which sends the version header but no `Mcp-Method`, got `HeaderMismatch` (-32020) and did not see the supported versions. A header value that is not the version in the `_meta` of the body stays a `HeaderMismatch`. A missing or invalid header also stays a `HeaderMismatch`. `envelope.verify` now does the version check, and `envelope.Rejection.rpcError` gives the error of a rejection.
+
 ## [0.5.3] - 2026-10-21
 
 ### Added

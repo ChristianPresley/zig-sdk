@@ -7,6 +7,8 @@ const Value = std.json.Value;
 const json = @import("../json.zig");
 const meta_mod = @import("../protocol/meta.zig");
 const methods = @import("../protocol/methods.zig");
+const errors = @import("../protocol/errors.zig");
+const version = @import("../protocol/version.zig");
 
 pub const header_protocol_version = "mcp-protocol-version";
 pub const header_method = "mcp-method";
@@ -111,7 +113,38 @@ pub fn isFieldValue(value: []const u8) bool {
 /// `-32020` error message.
 pub const Rejection = struct {
     message: []const u8,
+    /// The value of `MCP-Protocol-Version` when the server does not support that revision.
+    /// Then the answer is `-32022` with this value as `data.requested`, not `-32020`.
+    unsupported_version: ?[]const u8 = null,
+
+    /// The JSON-RPC error of the rejection: `-32022` for an unsupported version, else `-32020`.
+    pub fn rpcError(self: Rejection, arena: Allocator) Allocator.Error!errors.RpcError {
+        if (self.unsupported_version) |requested| return errors.unsupportedProtocolVersion(arena, &version.supported_versions, requested);
+        return errors.headerMismatch(self.message);
+    }
 };
+
+/// The protocol version in the `_meta` of the request `params`, or null.
+pub fn metaVersion(params: ?Value) ?[]const u8 {
+    const p = params orelse return null;
+    if (p != .object) return null;
+    const m = p.object.get("_meta") orelse return null;
+    return json.getString(m, meta_mod.key_protocol_version);
+}
+
+/// Verify the `MCP-Protocol-Version` value of a request against the version in its `_meta`
+/// and against the version of this SDK. A value with invalid characters and a value that is
+/// not the value of `_meta` give a `-32020` rejection. A different revision gives a `-32022`
+/// rejection. This check comes before the checks of the other headers. Thus a client of a
+/// different revision gets the supported versions, also without the other headers.
+pub fn verifyVersion(arena: Allocator, header: []const u8, meta_version: ?[]const u8) Allocator.Error!?Rejection {
+    if (!isPlainHeaderValue(header)) return .{ .message = "Header mismatch: MCP-Protocol-Version has an invalid value" };
+    if (meta_version) |mv| {
+        if (!std.mem.eql(u8, header, mv)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: MCP-Protocol-Version header value '{s}' does not match body value '{s}'", .{ header, mv }) };
+    }
+    if (!std.mem.eql(u8, header, version.version)) return .{ .message = "Unsupported protocol version", .unsupported_version = header };
+    return null;
+}
 
 /// Headers relevant to the envelope, already lowercased by the transport.
 pub const Headers = struct {
@@ -131,19 +164,11 @@ pub const Headers = struct {
 
 /// Verify the mirrored headers of a request against its body. `params` is the request
 /// `params` object (or null) and `schema` the tool input schema when the method is
-/// `tools/call` and the tool exists.
+/// `tools/call` and the tool exists. The version check of `verifyVersion` comes first, so a
+/// request with no rejection has the version of this SDK.
 pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?Value, schema: ?Value) Allocator.Error!?Rejection {
-    const meta_version: ?[]const u8 = blk: {
-        const p = params orelse break :blk null;
-        if (p != .object) break :blk null;
-        const m = p.object.get("_meta") orelse break :blk null;
-        break :blk json.getString(m, meta_mod.key_protocol_version);
-    };
     const hv = headers.protocol_version orelse return .{ .message = "Header mismatch: the MCP-Protocol-Version header is missing" };
-    if (!isPlainHeaderValue(hv)) return .{ .message = "Header mismatch: MCP-Protocol-Version has an invalid value" };
-    if (meta_version) |mv| {
-        if (!std.mem.eql(u8, hv, mv)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: MCP-Protocol-Version header value '{s}' does not match body value '{s}'", .{ hv, mv }) };
-    }
+    if (try verifyVersion(arena, hv, metaVersion(params))) |rejection| return rejection;
     const hm = headers.method orelse return .{ .message = "Header mismatch: the Mcp-Method header is missing" };
     if (!isFieldValue(hm)) return .{ .message = "Header mismatch: Mcp-Method has invalid characters" };
     if (!std.mem.eql(u8, hm, method)) return .{ .message = try std.fmt.allocPrint(arena, "Header mismatch: Mcp-Method header value '{s}' does not match body method '{s}'", .{ hm, method }) };
@@ -430,6 +455,23 @@ test "verify headers against body" {
     try std.testing.expect((try verify(arena, missing_version, "tools/call", params, null)) != null);
     const extra_param: Headers = .{ .protocol_version = "2026-07-28", .method = "tools/call", .name = "echo", .params = &.{ .{ .name = "region", .value = "us-west1" }, .{ .name = "priority", .value = "42" }, .{ .name = "verbose", .value = "true" } } };
     try std.testing.expect((try verify(arena, extra_param, "tools/call", params, schema)) != null);
+    // A different revision without the other headers gets -32022, not a missing Mcp-Method.
+    const old_body = try json.parseTree(arena, "{\"protocolVersion\":\"2025-11-25\"}");
+    const old_version: Headers = .{ .protocol_version = "2025-11-25" };
+    const unsupported = (try verify(arena, old_version, "initialize", old_body, null)).?;
+    try std.testing.expectEqualStrings("2025-11-25", unsupported.unsupported_version.?);
+    try std.testing.expectEqual(@as(i64, -32022), (try unsupported.rpcError(arena)).code);
+    // The same revision in the header and in _meta is also -32022.
+    const old_meta = try json.parseTree(arena, "{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2025-11-25\"}}");
+    try std.testing.expectEqualStrings("2025-11-25", (try verify(arena, old_version, "tools/list", old_meta, null)).?.unsupported_version.?);
+    // A header that is not the value of _meta stays -32020, also for a different revision.
+    const mismatch = (try verify(arena, old_version, "tools/call", params, null)).?;
+    try std.testing.expect(mismatch.unsupported_version == null);
+    try std.testing.expectEqual(@as(i64, -32020), (try mismatch.rpcError(arena)).code);
+    // A missing or invalid header stays -32020.
+    try std.testing.expect((try verify(arena, missing_version, "tools/call", params, null)).?.unsupported_version == null);
+    const invalid_version: Headers = .{ .protocol_version = "2025-11-25\x01", .method = "tools/call", .name = "echo" };
+    try std.testing.expect((try verify(arena, invalid_version, "tools/call", null, null)).?.unsupported_version == null);
     try std.testing.expect(try schemaHeadersValid(arena, schema));
     const dup = try json.parseTree(arena, "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"x-mcp-header\":\"X\"},\"b\":{\"type\":\"string\",\"x-mcp-header\":\"x\"}}}");
     try std.testing.expect(!try schemaHeadersValid(arena, dup));
