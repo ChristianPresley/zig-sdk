@@ -27,6 +27,9 @@ Add `--stdio` to the start command to serve on standard input and output instead
 
 Add `--no-tunnel` to `--grpc-typed` to serve the typed service only. A call of the tunnel then gets `UNIMPLEMENTED`, as a call of an unknown service.
 
+Add `--tls-cert cert.pem --tls-key key.pem` to serve HTTPS on the HTTP port and TLS with ALPN `h2` on the gRPC port. The server loads the PEM files as the example `https_server` does. To make a test, use the files in `test/fixtures/tls/pem/`, for example `p256.crt` and `p256.key`.
+
+
 ## Steps for the authorization server scenarios
 
 Do these steps to run the authorization server scenarios on your computer:

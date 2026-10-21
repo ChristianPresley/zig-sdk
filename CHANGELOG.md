@@ -8,6 +8,7 @@ All notable changes to this project are recorded in this file. The format follow
 
 - The conformance server has the tool `test_trigger_resource_update`. The tool announces a change of `test://watched-resource` and a change of the resource list. A test can thus examine `resourceSubscriptions` and `resourcesListChanged` of `subscriptions/listen` from end to end. The other tools and the default behavior of the server do not change. `zig build test` now also runs the tests of the conformance server.
 - The conformance server has the option `--no-tunnel`. With `--grpc-port N --grpc-typed --no-tunnel`, the gRPC port serves only the typed service `model_context_protocol.Mcp`. A call of the tunnel `mcp.zig.transport.v1.Mcp` then gets `UNIMPLEMENTED`, as a call of an unknown service. Without `--grpc-typed`, the option is an error.
+- The conformance server has the options `--tls-cert` and `--tls-key`. With both PEM files, the HTTP listener serves HTTPS with ALPN `http/1.1`, and the gRPC listener serves TLS with ALPN `h2`. The server loads the files with the in-tree TLS 1.3 server, as the example `https_server` does. One option without the other is an error. Without the options, the listeners do not use TLS.
 
 ### Changed
 

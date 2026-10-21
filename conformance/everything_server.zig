@@ -3,9 +3,11 @@
 //! stdio with `--stdio`. `--grpc-port` adds the gRPC tunnel, `--grpc-typed` also serves the
 //! typed service `model_context_protocol.Mcp` on that port, and `--ws-port` adds the
 //! WebSocket binding on `ws://127.0.0.1:N/mcp`. `--no-tunnel` with `--grpc-typed` removes the
-//! tunnel from the gRPC port.
+//! tunnel from the gRPC port. `--tls-cert` and `--tls-key` give PEM files for TLS on the HTTP
+//! listener and on the gRPC listener.
 //!
-//! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--no-tunnel] [--ws-port N] [--stdio]
+//! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--no-tunnel] [--ws-port N]
+//!        [--tls-cert cert.pem --tls-key key.pem] [--stdio]
 const std = @import("std");
 const builtin = @import("builtin");
 const mcp = @import("mcp");
@@ -551,9 +553,36 @@ const Config = struct {
     /// tunnel then gets `UNIMPLEMENTED`, as a call of an unknown service.
     grpc_tunnel: bool = true,
     ws_port: ?u16 = null,
+    /// The PEM files of `--tls-cert` and `--tls-key`. With both, the HTTP listener serves
+    /// HTTPS and the gRPC listener serves TLS with ALPN `h2`.
+    tls_cert: ?[]const u8 = null,
+    tls_key: ?[]const u8 = null,
 
     fn grpcBindings(self: Config) mcp_grpc.server.Bindings {
         return .{ .tunnel = self.grpc_tunnel, .typed = self.grpc_typed };
+    }
+};
+
+/// The certificate chain and the TLS servers of the listeners.
+const TlsListeners = struct {
+    chain: mcp.tls.CertChain,
+    chains: [1]*const mcp.tls.CertChain,
+    /// ALPN `http/1.1`, for the Streamable HTTP listener.
+    http: mcp.tls.Server,
+    /// ALPN `h2`, for the gRPC listener.
+    grpc: mcp.tls.Server,
+
+    /// Load the chain and the key from PEM files, as the example `https_server` does.
+    fn load(self: *TlsListeners, gpa: std.mem.Allocator, io: std.Io, cert: []const u8, key: []const u8) !void {
+        self.chain = try mcp.tls.CertChain.loadFiles(gpa, io, cert, key);
+        errdefer self.chain.deinit();
+        self.chains = .{&self.chain};
+        self.http = try mcp.tls.Server.init(.{ .chains = &self.chains, .alpn = &.{"http/1.1"} });
+        self.grpc = try mcp.tls.Server.init(.{ .chains = &self.chains, .alpn = &.{"h2"} });
+    }
+
+    fn deinit(self: *TlsListeners) void {
+        self.chain.deinit();
     }
 };
 
@@ -577,8 +606,15 @@ fn parseArgs(args: []const []const u8) !Config {
             config.ws_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
         } else if (std.mem.eql(u8, args[i], "--stdio")) {
             config.stdio = true;
+        } else if (std.mem.eql(u8, args[i], "--tls-cert") and i + 1 < args.len) {
+            i += 1;
+            config.tls_cert = args[i];
+        } else if (std.mem.eql(u8, args[i], "--tls-key") and i + 1 < args.len) {
+            i += 1;
+            config.tls_key = args[i];
         }
     }
+    if ((config.tls_cert == null) != (config.tls_key == null)) return error.TlsNeedsCertAndKey;
     // Without the tunnel and without the typed service, the gRPC port has no service.
     if (!config.grpc_tunnel and !config.grpc_typed) return error.NoGrpcService;
     return config;
@@ -592,7 +628,11 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
     var config = parseArgs(args) catch |e| {
-        if (e == error.NoGrpcService) std.log.err("--no-tunnel needs --grpc-typed", .{});
+        switch (e) {
+            error.NoGrpcService => std.log.err("--no-tunnel needs --grpc-typed", .{}),
+            error.TlsNeedsCertAndKey => std.log.err("--tls-cert and --tls-key go together", .{}),
+            else => {},
+        }
         return e;
     };
     if (init.environ_map.get("PORT")) |p| config.port = std.fmt.parseInt(u16, p, 10) catch config.port;
@@ -610,12 +650,17 @@ pub fn main(init: std.process.Init) !void {
         try mcp.transport.stdio.serve(io, gpa, &server);
         return;
     }
-    var transport: mcp.transport.http.Server = .init(io, gpa, &server, .{ .port = port });
+    var tls_listeners: TlsListeners = undefined;
+    const use_tls = config.tls_cert != null;
+    if (use_tls) try tls_listeners.load(gpa, io, config.tls_cert.?, config.tls_key.?);
+    defer if (use_tls) tls_listeners.deinit();
+
+    var transport: mcp.transport.http.Server = .init(io, gpa, &server, .{ .port = port, .tls = if (use_tls) &tls_listeners.http else null });
     defer transport.deinit();
     try transport.bind();
-    std.log.info("everything server listening on http://127.0.0.1:{d}/mcp", .{transport.bound_port});
+    std.log.info("everything server listening on {s}://127.0.0.1:{d}/mcp", .{ if (use_tls) "https" else "http", transport.bound_port });
 
-    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &server, .{ .port = grpc_port orelse 0, .bindings = config.grpcBindings() });
+    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &server, .{ .port = grpc_port orelse 0, .bindings = config.grpcBindings(), .tls = if (use_tls) &tls_listeners.grpc else null });
     defer grpc_transport.deinit();
     var grpc_future: ?std.Io.Future(void) = null;
     defer if (grpc_future) |*f| {
@@ -625,7 +670,7 @@ pub fn main(init: std.process.Init) !void {
     if (grpc_port != null) {
         try grpc_transport.bind();
         const services: []const u8 = if (!config.grpc_tunnel) " with the typed service only" else if (grpc_typed) " with the typed service" else "";
-        std.log.info("everything server listening for gRPC on 127.0.0.1:{d}{s}", .{ grpc_transport.bound_port, services });
+        std.log.info("everything server listening for gRPC{s} on 127.0.0.1:{d}{s}", .{ if (use_tls) " with TLS" else "", grpc_transport.bound_port, services });
         grpc_future = try io.concurrent(serveGrpc, .{&grpc_transport});
     }
 
@@ -779,4 +824,57 @@ test "--no-tunnel: a tunnel call gets UNIMPLEMENTED and the typed service answer
     typed_client.connect(typed.transport());
     const tools = try typed_client.listTools(t.arena(), null, .{ .timeout = .fromSeconds(10) });
     try testing.expect(tools.tools.len > 0);
+}
+
+test "--tls-cert and --tls-key: HTTPS and gRPC with TLS from the fixture certificate" {
+    var t: TestServer = undefined;
+    try t.init(serverOptions());
+    defer t.deinit();
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const config = try parseArgs(&.{ "server", "--tls-cert", "test/fixtures/tls/pem/p256.crt", "--tls-key", "test/fixtures/tls/pem/p256.key" });
+    try testing.expectError(error.TlsNeedsCertAndKey, parseArgs(&.{ "server", "--tls-cert", "cert.pem" }));
+    var listeners: TlsListeners = undefined;
+    try listeners.load(gpa, io, config.tls_cert.?, config.tls_key.?);
+    defer listeners.deinit();
+
+    var http_transport: mcp.transport.http.Server = .init(io, gpa, &t.server, .{ .port = 0, .tls = &listeners.http });
+    defer http_transport.deinit();
+    try http_transport.bind();
+    var http_future = try io.concurrent(serveHttpIgnoringErrors, .{&http_transport});
+    defer {
+        http_transport.shutdown();
+        http_future.await(io);
+    }
+    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &t.server, .{ .port = 0, .tls = &listeners.grpc });
+    defer grpc_transport.deinit();
+    try grpc_transport.bind();
+    var grpc_future = try io.concurrent(serveGrpcIgnoringErrors, .{&grpc_transport});
+    defer {
+        grpc_transport.shutdown();
+        grpc_future.await(io);
+    }
+
+    // The fixture certificate signs itself.
+    const url = try std.fmt.allocPrint(t.arena(), "https://127.0.0.1:{d}/mcp", .{http_transport.bound_port});
+    const http_link = try mcp.transport.HttpClient.init(io, gpa, .{ .url = url, .tls = .{ .trust = .self_signed } });
+    defer http_link.deinit();
+    var http_client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "test", .version = "1" } });
+    defer http_client.deinit();
+    http_client.connect(http_link.transport());
+    const no_args: std.json.Value = .{ .object = .empty };
+    const over_https = try http_client.callTool(t.arena(), "test_simple_text", no_args, .{ .timeout = .fromSeconds(10) });
+    try testing.expectEqualStrings("This is a simple text response", over_https.content[0].text.text);
+
+    const channel = try mcp_grpc.Channel.init(io, gpa, .{ .host = "127.0.0.1", .port = grpc_transport.bound_port, .tls = .{ .trust = .self_signed } });
+    defer channel.deinit();
+    var grpc_client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "test", .version = "1" } });
+    defer grpc_client.deinit();
+    grpc_client.connect(channel.transport());
+    const over_grpc = try grpc_client.callTool(t.arena(), "test_simple_text", no_args, .{ .timeout = .fromSeconds(10) });
+    try testing.expectEqualStrings("This is a simple text response", over_grpc.content[0].text.text);
+}
+
+fn serveHttpIgnoringErrors(transport: *mcp.transport.http.Server) void {
+    transport.serve() catch {};
 }
