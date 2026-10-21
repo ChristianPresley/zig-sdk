@@ -25,6 +25,8 @@ Do these steps to run the suite on your computer:
 
 Add `--stdio` to the start command to serve on standard input and output instead. Add `--grpc-port N` to serve the gRPC binding as well. The CI job `grpc-interop` calls it from a Node `http2` peer and from `curl` with HTTP/2 prior knowledge. Add `--grpc-typed` to serve the typed service `model_context_protocol.Mcp` on the same port. The CI job calls it from `@grpc/grpc-js` with the proto files in `test/fixtures/google_mcp_grpc_proto/`.
 
+Add `--no-tunnel` to `--grpc-typed` to serve the typed service only. A call of the tunnel then gets `UNIMPLEMENTED`, as a call of an unknown service.
+
 ## Steps for the authorization server scenarios
 
 Do these steps to run the authorization server scenarios on your computer:

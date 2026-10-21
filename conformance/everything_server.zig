@@ -2,9 +2,10 @@
 //! conformance suite for MCP 2026-07-28 expects. Serves Streamable HTTP by default and
 //! stdio with `--stdio`. `--grpc-port` adds the gRPC tunnel, `--grpc-typed` also serves the
 //! typed service `model_context_protocol.Mcp` on that port, and `--ws-port` adds the
-//! WebSocket binding on `ws://127.0.0.1:N/mcp`.
+//! WebSocket binding on `ws://127.0.0.1:N/mcp`. `--no-tunnel` with `--grpc-typed` removes the
+//! tunnel from the gRPC port.
 //!
-//! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--ws-port N] [--stdio]
+//! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--no-tunnel] [--ws-port N] [--stdio]
 const std = @import("std");
 const builtin = @import("builtin");
 const mcp = @import("mcp");
@@ -540,6 +541,49 @@ fn register(server: *mcp.Server, io: std.Io) !void {
     server.setCompletionHandler(complete);
 }
 
+/// The settings from the command line.
+const Config = struct {
+    port: u16 = 3000,
+    stdio: bool = false,
+    grpc_port: ?u16 = null,
+    grpc_typed: bool = false,
+    /// False with `--no-tunnel`: the gRPC port serves the typed service only. A call of the
+    /// tunnel then gets `UNIMPLEMENTED`, as a call of an unknown service.
+    grpc_tunnel: bool = true,
+    ws_port: ?u16 = null,
+
+    fn grpcBindings(self: Config) mcp_grpc.server.Bindings {
+        return .{ .tunnel = self.grpc_tunnel, .typed = self.grpc_typed };
+    }
+};
+
+/// Parse the command line. The function ignores an unknown argument.
+fn parseArgs(args: []const []const u8) !Config {
+    var config: Config = .{};
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
+            i += 1;
+            config.port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--grpc-port") and i + 1 < args.len) {
+            i += 1;
+            config.grpc_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
+        } else if (std.mem.eql(u8, args[i], "--grpc-typed")) {
+            config.grpc_typed = true;
+        } else if (std.mem.eql(u8, args[i], "--no-tunnel")) {
+            config.grpc_tunnel = false;
+        } else if (std.mem.eql(u8, args[i], "--ws-port") and i + 1 < args.len) {
+            i += 1;
+            config.ws_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
+        } else if (std.mem.eql(u8, args[i], "--stdio")) {
+            config.stdio = true;
+        }
+    }
+    // Without the tunnel and without the typed service, the gRPC port has no service.
+    if (!config.grpc_tunnel and !config.grpc_typed) return error.NoGrpcService;
+    return config;
+}
+
 pub fn main(init: std.process.Init) !void {
     // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
     // every allocation of every thread. The allocator of std for many threads has no such lock.
@@ -547,29 +591,16 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    var port: u16 = 3000;
-    var use_stdio = false;
-    var grpc_port: ?u16 = null;
-    var grpc_typed = false;
-    var ws_port: ?u16 = null;
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
-            i += 1;
-            port = try std.fmt.parseInt(u16, args[i], 10);
-        } else if (std.mem.eql(u8, args[i], "--grpc-port") and i + 1 < args.len) {
-            i += 1;
-            grpc_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
-        } else if (std.mem.eql(u8, args[i], "--grpc-typed")) {
-            grpc_typed = true;
-        } else if (std.mem.eql(u8, args[i], "--ws-port") and i + 1 < args.len) {
-            i += 1;
-            ws_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
-        } else if (std.mem.eql(u8, args[i], "--stdio")) {
-            use_stdio = true;
-        }
-    }
-    if (init.environ_map.get("PORT")) |p| port = std.fmt.parseInt(u16, p, 10) catch port;
+    var config = parseArgs(args) catch |e| {
+        if (e == error.NoGrpcService) std.log.err("--no-tunnel needs --grpc-typed", .{});
+        return e;
+    };
+    if (init.environ_map.get("PORT")) |p| config.port = std.fmt.parseInt(u16, p, 10) catch config.port;
+    const port = config.port;
+    const use_stdio = config.stdio;
+    const grpc_port = config.grpc_port;
+    const grpc_typed = config.grpc_typed;
+    const ws_port = config.ws_port;
 
     var server = try mcp.Server.init(gpa, io, serverOptions());
     defer server.deinit();
@@ -584,7 +615,7 @@ pub fn main(init: std.process.Init) !void {
     try transport.bind();
     std.log.info("everything server listening on http://127.0.0.1:{d}/mcp", .{transport.bound_port});
 
-    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &server, .{ .port = grpc_port orelse 0, .bindings = .{ .typed = grpc_typed } });
+    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &server, .{ .port = grpc_port orelse 0, .bindings = config.grpcBindings() });
     defer grpc_transport.deinit();
     var grpc_future: ?std.Io.Future(void) = null;
     defer if (grpc_future) |*f| {
@@ -593,7 +624,8 @@ pub fn main(init: std.process.Init) !void {
     };
     if (grpc_port != null) {
         try grpc_transport.bind();
-        std.log.info("everything server listening for gRPC on 127.0.0.1:{d}{s}", .{ grpc_transport.bound_port, if (grpc_typed) " with the typed service" else "" });
+        const services: []const u8 = if (!config.grpc_tunnel) " with the typed service only" else if (grpc_typed) " with the typed service" else "";
+        std.log.info("everything server listening for gRPC on 127.0.0.1:{d}{s}", .{ grpc_transport.bound_port, services });
         grpc_future = try io.concurrent(serveGrpc, .{&grpc_transport});
     }
 
@@ -697,4 +729,54 @@ test "test_trigger_resource_update sends resources/updated and resources/list_ch
 
     t.server.shutdownSubscriptions(io);
     try future.await(io);
+}
+
+test "parseArgs: --no-tunnel with --grpc-typed serves the typed service only" {
+    const config = try parseArgs(&.{ "server", "--grpc-port", "0", "--grpc-typed", "--no-tunnel" });
+    try testing.expectEqual(mcp_grpc.server.Bindings{ .tunnel = false, .typed = true }, config.grpcBindings());
+    // The default keeps the tunnel.
+    try testing.expectEqual(mcp_grpc.server.Bindings{ .tunnel = true, .typed = false }, (try parseArgs(&.{"server"})).grpcBindings());
+    try testing.expectError(error.NoGrpcService, parseArgs(&.{ "server", "--no-tunnel" }));
+}
+
+fn serveGrpcIgnoringErrors(transport: *mcp_grpc.Server) void {
+    transport.serve() catch {};
+}
+
+test "--no-tunnel: a tunnel call gets UNIMPLEMENTED and the typed service answers" {
+    var t: TestServer = undefined;
+    try t.init(serverOptions());
+    defer t.deinit();
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const config = try parseArgs(&.{ "server", "--grpc-typed", "--no-tunnel" });
+    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &t.server, .{ .port = 0, .bindings = config.grpcBindings() });
+    defer grpc_transport.deinit();
+    try grpc_transport.bind();
+    var future = try io.concurrent(serveGrpcIgnoringErrors, .{&grpc_transport});
+    defer {
+        grpc_transport.shutdown();
+        future.await(io);
+    }
+
+    // The tunnel answers as an unknown service.
+    const tunnel = try mcp_grpc.Channel.init(io, gpa, .{ .host = "127.0.0.1", .port = grpc_transport.bound_port });
+    defer tunnel.deinit();
+    var tunnel_client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "test", .version = "1" } });
+    defer tunnel_client.deinit();
+    tunnel_client.connect(tunnel.transport());
+    // The call ends with a gRPC status and no JSON-RPC answer. The test of the typed binding
+    // in src/grpc/typed_test.zig reads the status UNIMPLEMENTED from the same bindings.
+    var diag: mcp.Client.Diagnostics = .{};
+    try testing.expectError(error.TransportFailed, tunnel_client.listTools(t.arena(), null, .{ .timeout = .fromSeconds(10), .diagnostics = &diag }));
+    try testing.expect(diag.rpc_error == null);
+
+    // The typed service answers.
+    const typed = try mcp_grpc.TypedChannel.init(io, gpa, .{ .channel = .{ .host = "127.0.0.1", .port = grpc_transport.bound_port } });
+    defer typed.deinit();
+    var typed_client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "test", .version = "1" } });
+    defer typed_client.deinit();
+    typed_client.connect(typed.transport());
+    const tools = try typed_client.listTools(t.arena(), null, .{ .timeout = .fromSeconds(10) });
+    try testing.expect(tools.tools.len > 0);
 }
