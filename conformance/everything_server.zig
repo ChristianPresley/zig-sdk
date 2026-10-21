@@ -143,6 +143,17 @@ fn triggerPromptChange(ctx: *Ctx, _: NoArgs) anyerror!Result {
     return textResult(ctx, "Prompt list changed", .{});
 }
 
+/// The URI of the resource that `test_trigger_resource_update` announces.
+const watched_uri = "test://watched-resource";
+
+/// Announce a change of the watched resource and of the resource list. A listen stream with
+/// `resourceSubscriptions` and `resourcesListChanged` then gets both notifications.
+fn triggerResourceUpdate(ctx: *Ctx, _: NoArgs) anyerror!Result {
+    ctx.server.notifyResourceUpdated(ctx.io, watched_uri);
+    ctx.server.notifyResourcesListChanged(ctx.io);
+    return textResult(ctx, "Resource updated", .{});
+}
+
 fn hiddenTool(ctx: *Ctx, _: NoArgs) anyerror!Result {
     return textResult(ctx, "hidden", .{});
 }
@@ -457,6 +468,78 @@ const json_schema_2020_12 =
     \\{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","$defs":{"address":{"$anchor":"addressDef","type":"object","properties":{"street":{"type":"string"},"city":{"type":"string"}}}},"properties":{"name":{"type":"string"},"address":{"$ref":"#/$defs/address"},"contactMethod":{"type":"string","enum":["phone","email"]},"phone":{"type":"string"},"email":{"type":"string"}},"allOf":[{"anyOf":[{"required":["phone"]},{"required":["email"]}]}],"if":{"properties":{"contactMethod":{"const":"phone"}},"required":["contactMethod"]},"then":{"required":["phone"]},"else":{"required":["email"]},"additionalProperties":false}
 ;
 
+/// The options of the server engine.
+fn serverOptions() mcp.Server.Options {
+    return .{
+        .info = .{ .name = "mcp-conformance-test-server", .version = "0.1.0" },
+        .instructions = "Everything server for conformance tests.",
+        .capabilities = .{
+            .tools = .{ .listChanged = true },
+            .prompts = .{ .listChanged = true },
+            .resources = .{ .listChanged = true, .subscribe = true },
+            .completions = .{ .object = .empty },
+            .logging = .{ .object = .empty },
+        },
+        .mrtr = .{ .elicitation = true, .sampling = true, .sampling_tools = true, .roots = true },
+        .tasks = .{},
+    };
+}
+
+/// Register each tool, resource and prompt of the fixture.
+fn register(server: *mcp.Server, io: std.Io) !void {
+    try server.addTool(.{ .name = "test_simple_text", .description = "Returns simple text" }, simpleText);
+    try server.addTool(.{ .name = "test_image_content", .description = "Returns image content" }, imageContent);
+    try server.addTool(.{ .name = "test_audio_content", .description = "Returns audio content" }, audioContent);
+    try server.addTool(.{ .name = "test_embedded_resource", .description = "Returns an embedded resource" }, embeddedResource);
+    try server.addTool(.{ .name = "test_multiple_content_types", .description = "Returns mixed content" }, multipleContentTypes);
+    try server.addTool(.{ .name = "test_error_handling", .description = "Returns an error result" }, errorHandling);
+    try server.addTool(.{ .name = "test_tool_with_progress", .description = "Sends progress notifications" }, withProgress);
+    try server.addTool(.{ .name = "test_tool_with_logging", .description = "Sends log messages" }, withLogging);
+    try server.addTool(.{ .name = "test_logging_tool", .description = "Sends log messages" }, withLogging);
+    try server.addTool(.{ .name = "test_missing_capability", .description = "Needs the sampling capability", .requires_client = .{ .sampling = .{} } }, missingCapability);
+    try server.addTool(.{ .name = "test_streaming_elicitation", .description = "Elicitation over a stream" }, streamingElicitation);
+    try server.addTool(.{ .name = "test_sampling", .description = "Requests sampling" }, sampling);
+    try server.addTool(.{ .name = "test_elicitation", .description = "Requests elicitation" }, elicitation);
+    try server.addTool(.{ .name = "test_elicitation_sep1330_enums", .description = "Elicitation with enums" }, elicitationEnums);
+    try server.addTool(.{ .name = "test_elicitation_sep1034_defaults", .description = "Elicitation with defaults" }, elicitationDefaults);
+    try server.addTool(.{ .name = "test_trigger_tool_change", .description = "Changes the tool list" }, triggerToolChange);
+    try server.addTool(.{ .name = "test_trigger_prompt_change", .description = "Changes the prompt list" }, triggerPromptChange);
+    try server.addTool(.{ .name = "test_trigger_resource_update", .description = "Announces a change of test://watched-resource and of the resource list" }, triggerResourceUpdate);
+    try server.addTool(.{ .name = "test_hidden_tool", .description = "Appears after a change" }, hiddenTool);
+    try server.addTool(.{ .name = "test_input_required_result_elicitation", .description = "MRTR elicitation" }, irElicitation);
+    try server.addTool(.{ .name = "test_input_required_result_sampling", .description = "MRTR sampling" }, irSampling);
+    try server.addTool(.{ .name = "test_input_required_result_list_roots", .description = "MRTR roots" }, irListRoots);
+    try server.addTool(.{ .name = "test_input_required_result_request_state", .description = "MRTR with state" }, irRequestState);
+    try server.addTool(.{ .name = "test_input_required_result_multiple_inputs", .description = "MRTR with several inputs" }, irMultipleInputs);
+    try server.addTool(.{ .name = "test_input_required_result_multi_round", .description = "MRTR with three rounds" }, irMultiRound);
+    try server.addTool(.{ .name = "test_input_required_result_tampered_state", .description = "MRTR state integrity" }, irTamperedState);
+    try server.addTool(.{ .name = "test_input_required_result_capabilities", .description = "MRTR per declared capability" }, irCapabilities);
+    try server.addToolJson(.{ .name = "json_schema_2020_12_tool", .description = "Tool with a 2020-12 schema", .input_schema = json_schema_2020_12 }, jsonSchema2020);
+    try server.addTool(.{ .name = "test_x_mcp_header", .description = "Tool with header annotations" }, xMcpHeader);
+    try server.addTool(.{ .name = "greet", .description = "Greets by name" }, greet);
+    try server.addTool(.{ .name = "slow_compute", .description = "Sleeps for some seconds inside a task", .task_support = .optional }, slowCompute);
+    try server.addTool(.{ .name = "failing_job", .description = "A task that ends in a tool error", .task_support = .required }, failingJob);
+    try server.addTool(.{ .name = "protocol_error_job", .description = "A task that ends in a protocol error", .task_support = .optional }, protocolErrorJob);
+    try server.addTool(.{ .name = "confirm_delete", .description = "A task that asks for confirmation", .task_support = .optional }, confirmDelete);
+    try server.addTool(.{ .name = "multi_input", .description = "A task that asks two questions at once", .task_support = .optional }, multiInput);
+    try server.addTool(.{ .name = "test_tool_with_task", .description = "MRTR round then a task", .task_support = .required }, toolWithTask);
+    _ = server.setToolEnabled(io, "test_hidden_tool", false);
+
+    try server.addResource(.{ .uri = "test://static-text", .name = "Static Text Resource", .mime_type = "text/plain", .description = "A static text resource" }, readStaticText);
+    try server.addResource(.{ .uri = "test://static-binary", .name = "Static Binary Resource", .mime_type = "image/png", .description = "A static binary resource" }, readStaticBinary);
+    try server.addResource(.{ .uri = watched_uri, .name = "Watched Resource", .mime_type = "text/plain" }, readWatched);
+    try server.addResourceTemplate(.{ .uri_template = "test://template/{id}/data", .name = "Template Resource", .mime_type = "application/json", .description = "A resource template" }, readTemplate);
+
+    try server.addPrompt(.{ .name = "test_simple_prompt", .description = "A simple prompt" }, simplePrompt);
+    try server.addPrompt(.{ .name = "test_prompt_with_arguments", .description = "A prompt with arguments", .arguments = &.{ .{ .name = "arg1", .description = "First argument", .required = true }, .{ .name = "arg2", .description = "Second argument", .required = true } } }, promptWithArguments);
+    try server.addPrompt(.{ .name = "test_prompt_with_embedded_resource", .description = "A prompt with an embedded resource", .arguments = &.{.{ .name = "resourceUri", .description = "Resource URI", .required = true }} }, promptWithEmbeddedResource);
+    try server.addPrompt(.{ .name = "test_prompt_with_image", .description = "A prompt with an image" }, promptWithImage);
+    try server.addPrompt(.{ .name = "test_input_required_result_prompt", .description = "A prompt that needs input" }, irPrompt);
+    try server.addPrompt(.{ .name = "test_hidden_prompt", .description = "Appears after a change" }, hiddenPrompt);
+    _ = server.setPromptEnabled(io, "test_hidden_prompt", false);
+    server.setCompletionHandler(complete);
+}
+
 pub fn main(init: std.process.Init) !void {
     // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
     // every allocation of every thread. The allocator of std for many threads has no such lock.
@@ -488,71 +571,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (init.environ_map.get("PORT")) |p| port = std.fmt.parseInt(u16, p, 10) catch port;
 
-    var server = try mcp.Server.init(gpa, io, .{
-        .info = .{ .name = "mcp-conformance-test-server", .version = "0.1.0" },
-        .instructions = "Everything server for conformance tests.",
-        .capabilities = .{
-            .tools = .{ .listChanged = true },
-            .prompts = .{ .listChanged = true },
-            .resources = .{ .listChanged = true, .subscribe = true },
-            .completions = .{ .object = .empty },
-            .logging = .{ .object = .empty },
-        },
-        .mrtr = .{ .elicitation = true, .sampling = true, .sampling_tools = true, .roots = true },
-        .tasks = .{},
-    });
+    var server = try mcp.Server.init(gpa, io, serverOptions());
     defer server.deinit();
-
-    try server.addTool(.{ .name = "test_simple_text", .description = "Returns simple text" }, simpleText);
-    try server.addTool(.{ .name = "test_image_content", .description = "Returns image content" }, imageContent);
-    try server.addTool(.{ .name = "test_audio_content", .description = "Returns audio content" }, audioContent);
-    try server.addTool(.{ .name = "test_embedded_resource", .description = "Returns an embedded resource" }, embeddedResource);
-    try server.addTool(.{ .name = "test_multiple_content_types", .description = "Returns mixed content" }, multipleContentTypes);
-    try server.addTool(.{ .name = "test_error_handling", .description = "Returns an error result" }, errorHandling);
-    try server.addTool(.{ .name = "test_tool_with_progress", .description = "Sends progress notifications" }, withProgress);
-    try server.addTool(.{ .name = "test_tool_with_logging", .description = "Sends log messages" }, withLogging);
-    try server.addTool(.{ .name = "test_logging_tool", .description = "Sends log messages" }, withLogging);
-    try server.addTool(.{ .name = "test_missing_capability", .description = "Needs the sampling capability", .requires_client = .{ .sampling = .{} } }, missingCapability);
-    try server.addTool(.{ .name = "test_streaming_elicitation", .description = "Elicitation over a stream" }, streamingElicitation);
-    try server.addTool(.{ .name = "test_sampling", .description = "Requests sampling" }, sampling);
-    try server.addTool(.{ .name = "test_elicitation", .description = "Requests elicitation" }, elicitation);
-    try server.addTool(.{ .name = "test_elicitation_sep1330_enums", .description = "Elicitation with enums" }, elicitationEnums);
-    try server.addTool(.{ .name = "test_elicitation_sep1034_defaults", .description = "Elicitation with defaults" }, elicitationDefaults);
-    try server.addTool(.{ .name = "test_trigger_tool_change", .description = "Changes the tool list" }, triggerToolChange);
-    try server.addTool(.{ .name = "test_trigger_prompt_change", .description = "Changes the prompt list" }, triggerPromptChange);
-    try server.addTool(.{ .name = "test_hidden_tool", .description = "Appears after a change" }, hiddenTool);
-    try server.addTool(.{ .name = "test_input_required_result_elicitation", .description = "MRTR elicitation" }, irElicitation);
-    try server.addTool(.{ .name = "test_input_required_result_sampling", .description = "MRTR sampling" }, irSampling);
-    try server.addTool(.{ .name = "test_input_required_result_list_roots", .description = "MRTR roots" }, irListRoots);
-    try server.addTool(.{ .name = "test_input_required_result_request_state", .description = "MRTR with state" }, irRequestState);
-    try server.addTool(.{ .name = "test_input_required_result_multiple_inputs", .description = "MRTR with several inputs" }, irMultipleInputs);
-    try server.addTool(.{ .name = "test_input_required_result_multi_round", .description = "MRTR with three rounds" }, irMultiRound);
-    try server.addTool(.{ .name = "test_input_required_result_tampered_state", .description = "MRTR state integrity" }, irTamperedState);
-    try server.addTool(.{ .name = "test_input_required_result_capabilities", .description = "MRTR per declared capability" }, irCapabilities);
-    try server.addToolJson(.{ .name = "json_schema_2020_12_tool", .description = "Tool with a 2020-12 schema", .input_schema = json_schema_2020_12 }, jsonSchema2020);
-    try server.addTool(.{ .name = "test_x_mcp_header", .description = "Tool with header annotations" }, xMcpHeader);
-    try server.addTool(.{ .name = "greet", .description = "Greets by name" }, greet);
-    try server.addTool(.{ .name = "slow_compute", .description = "Sleeps for some seconds inside a task", .task_support = .optional }, slowCompute);
-    try server.addTool(.{ .name = "failing_job", .description = "A task that ends in a tool error", .task_support = .required }, failingJob);
-    try server.addTool(.{ .name = "protocol_error_job", .description = "A task that ends in a protocol error", .task_support = .optional }, protocolErrorJob);
-    try server.addTool(.{ .name = "confirm_delete", .description = "A task that asks for confirmation", .task_support = .optional }, confirmDelete);
-    try server.addTool(.{ .name = "multi_input", .description = "A task that asks two questions at once", .task_support = .optional }, multiInput);
-    try server.addTool(.{ .name = "test_tool_with_task", .description = "MRTR round then a task", .task_support = .required }, toolWithTask);
-    _ = server.setToolEnabled(io, "test_hidden_tool", false);
-
-    try server.addResource(.{ .uri = "test://static-text", .name = "Static Text Resource", .mime_type = "text/plain", .description = "A static text resource" }, readStaticText);
-    try server.addResource(.{ .uri = "test://static-binary", .name = "Static Binary Resource", .mime_type = "image/png", .description = "A static binary resource" }, readStaticBinary);
-    try server.addResource(.{ .uri = "test://watched-resource", .name = "Watched Resource", .mime_type = "text/plain" }, readWatched);
-    try server.addResourceTemplate(.{ .uri_template = "test://template/{id}/data", .name = "Template Resource", .mime_type = "application/json", .description = "A resource template" }, readTemplate);
-
-    try server.addPrompt(.{ .name = "test_simple_prompt", .description = "A simple prompt" }, simplePrompt);
-    try server.addPrompt(.{ .name = "test_prompt_with_arguments", .description = "A prompt with arguments", .arguments = &.{ .{ .name = "arg1", .description = "First argument", .required = true }, .{ .name = "arg2", .description = "Second argument", .required = true } } }, promptWithArguments);
-    try server.addPrompt(.{ .name = "test_prompt_with_embedded_resource", .description = "A prompt with an embedded resource", .arguments = &.{.{ .name = "resourceUri", .description = "Resource URI", .required = true }} }, promptWithEmbeddedResource);
-    try server.addPrompt(.{ .name = "test_prompt_with_image", .description = "A prompt with an image" }, promptWithImage);
-    try server.addPrompt(.{ .name = "test_input_required_result_prompt", .description = "A prompt that needs input" }, irPrompt);
-    try server.addPrompt(.{ .name = "test_hidden_prompt", .description = "Appears after a change" }, hiddenPrompt);
-    _ = server.setPromptEnabled(io, "test_hidden_prompt", false);
-    server.setCompletionHandler(complete);
+    try register(&server, io);
 
     if (use_stdio) {
         try mcp.transport.stdio.serve(io, gpa, &server);
@@ -597,4 +618,83 @@ fn serveGrpc(transport: *mcp_grpc.Server) void {
 
 fn serveWebSocket(transport: *mcp.transport.websocket.Server) void {
     transport.serve() catch |e| std.log.err("WebSocket server failed: {t}", .{e});
+}
+
+// -- Tests ------------------------------------------------------------------------------------
+
+const testing = std.testing;
+const Harness = mcp.transport.memory.Harness;
+
+const test_meta =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}
+;
+
+/// The fixture server on the in-memory harness.
+const TestServer = struct {
+    server: mcp.Server,
+    arena_state: std.heap.ArenaAllocator,
+
+    fn init(self: *TestServer, options: mcp.Server.Options) !void {
+        self.arena_state = .init(testing.allocator);
+        self.server = try mcp.Server.init(testing.allocator, testing.io, options);
+        try register(&self.server, testing.io);
+    }
+
+    fn deinit(self: *TestServer) void {
+        self.server.deinit();
+        self.arena_state.deinit();
+    }
+
+    fn arena(self: *TestServer) std.mem.Allocator {
+        return self.arena_state.allocator();
+    }
+
+    /// Send one request on a new harness and return the parsed last frame.
+    fn call(self: *TestServer, method: []const u8, params: []const u8) !std.json.Value {
+        var harness: Harness = .init(testing.io, testing.allocator, &self.server);
+        defer harness.deinit();
+        const sep: []const u8 = if (params.len > 0) "," else "";
+        try harness.send(try std.fmt.allocPrint(self.arena(), "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{{s}{s}{s}}}}}", .{ method, test_meta, sep, params }));
+        try testing.expect(harness.finished);
+        return mcp.json.parseTree(self.arena(), harness.last().?);
+    }
+};
+
+/// Wait until the harness has `count` frames, for 2 seconds at most.
+fn waitForFrames(harness: *Harness, count: usize) !void {
+    var spins: usize = 0;
+    while (spins < 400) : (spins += 1) {
+        harness.out_lock.lockUncancelable(testing.io);
+        const n = harness.out.items.len;
+        harness.out_lock.unlock(testing.io);
+        if (n >= count) return;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return error.Timeout;
+}
+
+test "test_trigger_resource_update sends resources/updated and resources/list_changed to a listen stream" {
+    var t: TestServer = undefined;
+    try t.init(serverOptions());
+    defer t.deinit();
+    const io = testing.io;
+
+    var listen: Harness = .init(io, testing.allocator, &t.server);
+    defer listen.deinit();
+    var token: mcp.transport.Transport.CancelToken = .{};
+    const frame = try std.fmt.allocPrint(t.arena(), "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"subscriptions/listen\",\"params\":{{{s},\"notifications\":{{\"resourcesListChanged\":true,\"resourceSubscriptions\":[\"{s}\"]}}}}}}", .{ test_meta, watched_uri });
+    var future = try io.concurrent(Harness.sendWithToken, .{ &listen, frame, &token });
+    try waitForFrames(&listen, 1);
+
+    const reply = try t.call("tools/call", "\"name\":\"test_trigger_resource_update\",\"arguments\":{}");
+    try testing.expectEqualStrings("Resource updated", reply.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string);
+    try waitForFrames(&listen, 3);
+    const updated = try mcp.json.parseTree(t.arena(), listen.out.items[1]);
+    try testing.expectEqualStrings("notifications/resources/updated", updated.object.get("method").?.string);
+    try testing.expectEqualStrings(watched_uri, updated.object.get("params").?.object.get("uri").?.string);
+    const changed = try mcp.json.parseTree(t.arena(), listen.out.items[2]);
+    try testing.expectEqualStrings("notifications/resources/list_changed", changed.object.get("method").?.string);
+
+    t.server.shutdownSubscriptions(io);
+    try future.await(io);
 }

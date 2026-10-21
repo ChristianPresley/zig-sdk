@@ -80,6 +80,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("conformance-server", "Build the conformance everything server").dependOn(&b.addInstallArtifact(conformance_server, .{}).step);
+    // The tests of the conformance server run with the other tests.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = conformance_server.root_module })).step);
     const conformance_client = b.addExecutable(.{
         .name = "mcp-conformance-client",
         .root_module = b.createModule(.{

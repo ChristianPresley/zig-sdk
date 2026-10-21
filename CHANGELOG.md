@@ -4,6 +4,10 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- The conformance server has the tool `test_trigger_resource_update`. The tool announces a change of `test://watched-resource` and a change of the resource list. A test can thus examine `resourceSubscriptions` and `resourcesListChanged` of `subscriptions/listen` from end to end. The other tools and the default behavior of the server do not change. `zig build test` now also runs the tests of the conformance server.
+
 ### Fixed
 
 - A request with an `MCP-Protocol-Version` value other than 2026-07-28 now gets `UnsupportedProtocolVersion` (-32022, with `data.supported` and `data.requested`) before the checks of the other headers. This applies to Streamable HTTP, the gRPC tunnel and the typed gRPC service. Before, a 2025-11-25 client, which sends the version header but no `Mcp-Method`, got `HeaderMismatch` (-32020) and did not see the supported versions. A header value that is not the version in the `_meta` of the body stays a `HeaderMismatch`. A missing or invalid header also stays a `HeaderMismatch`. `envelope.verify` now does the version check, and `envelope.Rejection.rpcError` gives the error of a rejection.
