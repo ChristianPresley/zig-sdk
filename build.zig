@@ -104,6 +104,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("conformance-authorization-server", "Build the conformance authorization server").dependOn(&b.addInstallArtifact(conformance_as, .{}).step);
+    // The tests of the conformance authorization server run with the other tests.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = conformance_as.root_module })).step);
 
     // Autodocs.
     const docs_obj = b.addObject(.{

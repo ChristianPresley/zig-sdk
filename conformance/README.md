@@ -51,6 +51,8 @@ Do these steps to run the authorization server scenarios on your computer:
 
 Do not give `--scenario` to the suite. The scenario `authorization-code-grant` needs the result of the scenario `authorization-server-metadata-endpoint`, and only a run of all scenarios gives it. The fixture registers the client `conformance-client` as a public client. A loopback redirect URI with any port is valid for it. Use `--client-id` and `--resource` to change the client and the resource.
 
+Add `--dcr` to offer dynamic client registration (RFC 7591) at `/register`. The metadata then names the `registration_endpoint`. Without `--dcr`, the fixture has no registration endpoint. Add `--dcr-token T` to `--dcr` to require the bearer token `T` on each registration request. The library checks each registration, also its redirect URIs. Use these options for tests only.
+
 ## Other scenarios
 
 To run one scenario that the suite does not score, use `--scenario NAME --spec-version 2026-07-28 --force --expected-failures conformance/expected-failures-unscored.yml` instead of `--requirements`. The CI job runs each of these scenarios in this way. A failure of one of them makes the job fail.
