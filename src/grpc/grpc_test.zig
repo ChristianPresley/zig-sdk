@@ -1,5 +1,6 @@
 //! The MCP client and server over the gRPC transport, on a loopback socket.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Value = std.json.Value;
 const mcp = @import("mcp");
@@ -514,4 +515,47 @@ test "grpc: a response before the request message stays readable after the reset
     const wrong_type = try rawCallWith(gpa, io, port, grpc_server.call_path, "text/plain", &.{}, body, .{ .after_answer = true });
     defer freeRaw(gpa, wrong_type);
     try std.testing.expectEqualStrings("415", wrong_type.status);
+}
+
+/// Bind a gRPC server, accept one connection and close it on the server side first. The port
+/// of the server then has a connection in `TIME_WAIT`. Then bind a second server to the same
+/// port at once. Returns true when the second bind succeeds.
+fn rebindAfterTimeWait(reuse_address: bool) !bool {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "rebind", .version = "1" } });
+    defer server.deinit();
+    var first: grpc_server.Server = .init(io, gpa, &server, .{ .port = 0, .reuse_address = reuse_address });
+    try first.bind();
+    const port = first.bound_port;
+    {
+        defer first.deinit();
+        var client = try mcp.util.loopback.connect(io, try Io.net.IpAddress.parse("127.0.0.1", port));
+        var accepted = try first.listener.?.accept(io);
+        // The side that closes first keeps the connection in TIME_WAIT.
+        accepted.close(io);
+        var buf: [16]u8 = undefined;
+        var reader = client.reader(io, &buf);
+        _ = reader.interface.peekByte() catch {};
+        client.close(io);
+    }
+    var second: grpc_server.Server = .init(io, gpa, &server, .{ .port = port, .reuse_address = reuse_address });
+    defer second.deinit();
+    second.bind() catch |e| switch (e) {
+        error.AddressInUse => return false,
+        else => return e,
+    };
+    return true;
+}
+
+test "grpc: reuse_address binds the port again while a connection of the port is in TIME_WAIT" {
+    try std.testing.expect(try rebindAfterTimeWait(true));
+    // Without the option, Linux refuses the second bind. Windows does not keep a listen port
+    // for a connection in TIME_WAIT, thus the second bind succeeds there also without it.
+    const without = try rebindAfterTimeWait(false);
+    switch (builtin.os.tag) {
+        .linux => try std.testing.expect(!without),
+        .windows => try std.testing.expect(without),
+        else => {},
+    }
 }

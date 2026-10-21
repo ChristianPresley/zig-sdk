@@ -8,9 +8,10 @@
 //! `--tls-cert` and `--tls-key` give PEM files for TLS on the HTTP
 //! listener and on the gRPC listener. `--log-requests` logs one JSON line for each handler call.
 //! `--apps` adds a fixture of the MCP Apps extension: a `ui://` view and a tool that names it.
+//! `--reuse-address` lets a new server bind a port at once after the old one stops.
 //!
 //! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--no-tunnel] [--ws-port N]
-//!        [--tls-cert cert.pem --tls-key key.pem] [--log-requests] [--apps] [--stdio]
+//!        [--tls-cert cert.pem --tls-key key.pem] [--log-requests] [--apps] [--reuse-address] [--stdio]
 const std = @import("std");
 const builtin = @import("builtin");
 const mcp = @import("mcp");
@@ -668,6 +669,17 @@ const Config = struct {
     log_requests: bool = false,
     /// `--apps`: declare the MCP Apps extension and serve its fixture.
     apps: bool = false,
+    /// `--reuse-address`: set `reuse_address` on the HTTP, WebSocket and gRPC listeners. Then
+    /// a new server can bind a port at once while old connections are in `TIME_WAIT`. On Linux
+    /// and the BSDs a second server of the same user can then bind the same port and share the
+    /// connections. The test runner must stop the old process first. The server ignores the
+    /// option on Windows.
+    reuse_address: bool = false,
+
+    /// True when the listeners set `reuse_address`: with `--reuse-address` and not on Windows.
+    fn reuseAddress(self: Config) bool {
+        return self.reuse_address and builtin.os.tag != .windows;
+    }
 
     fn grpcBindings(self: Config) mcp_grpc.server.Bindings {
         return .{ .tunnel = self.grpc_tunnel, .typed = self.grpc_typed };
@@ -717,6 +729,8 @@ fn parseArgs(args: []const []const u8) !Config {
             config.ws_port = std.fmt.parseInt(u16, args[i], 10) catch return error.InvalidPort;
         } else if (std.mem.eql(u8, args[i], "--stdio")) {
             config.stdio = true;
+        } else if (std.mem.eql(u8, args[i], "--reuse-address")) {
+            config.reuse_address = true;
         } else if (std.mem.eql(u8, args[i], "--apps")) {
             config.apps = true;
         } else if (std.mem.eql(u8, args[i], "--log-requests")) {
@@ -758,7 +772,10 @@ pub fn main(init: std.process.Init) !void {
     const ws_port = config.ws_port;
 
     state.log_requests.store(config.log_requests, .monotonic);
-    var server = try mcp.Server.init(gpa, io, serverOptions(config.apps));
+    var options = serverOptions(config.apps);
+    options.limits.http.reuse_address = config.reuseAddress();
+    if (config.reuse_address and !config.reuseAddress()) std.log.info("--reuse-address has no effect on Windows", .{});
+    var server = try mcp.Server.init(gpa, io, options);
     defer server.deinit();
     try register(&server, io);
 
@@ -776,7 +793,7 @@ pub fn main(init: std.process.Init) !void {
     try transport.bind();
     std.log.info("everything server listening on {s}://127.0.0.1:{d}/mcp", .{ if (use_tls) "https" else "http", transport.bound_port });
 
-    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &server, .{ .port = grpc_port orelse 0, .bindings = config.grpcBindings(), .tls = if (use_tls) &tls_listeners.grpc else null });
+    var grpc_transport: mcp_grpc.Server = .init(io, gpa, &server, .{ .port = grpc_port orelse 0, .bindings = config.grpcBindings(), .tls = if (use_tls) &tls_listeners.grpc else null, .reuse_address = config.reuseAddress() });
     defer grpc_transport.deinit();
     var grpc_future: ?std.Io.Future(void) = null;
     defer if (grpc_future) |*f| {
@@ -1081,4 +1098,12 @@ test "without --apps: no view and no tool of the fixture" {
     try t.init(serverOptions(false));
     defer t.deinit();
     try testing.expect(findTool(try t.callWithMeta("tools/list", test_meta_ui, ""), "test_app_tool") == null);
+}
+
+test "--reuse-address: on for the listeners except on Windows, off by default" {
+    try testing.expect(!(try parseArgs(&.{"server"})).reuseAddress());
+    const config = try parseArgs(&.{ "server", "--reuse-address" });
+    try testing.expect(config.reuse_address);
+    try testing.expectEqual(builtin.os.tag != .windows, config.reuseAddress());
+    try testing.expect(!serverOptions(false).limits.http.reuse_address);
 }

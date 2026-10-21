@@ -58,6 +58,10 @@ pub const Options = struct {
     max_connections: u32 = 256,
     /// The services of the server. The default is the tunnel only.
     bindings: Bindings = .{},
+    /// Set `SO_REUSEADDR` on the listen socket, as `Limits.http.reuse_address` does for the
+    /// HTTP server. On POSIX, std also sets `SO_REUSEPORT`. Then a new server can bind the port
+    /// while old connections of the port are in `TIME_WAIT`.
+    reuse_address: bool = false,
     /// The nesting depth and the element count of a request message of the typed binding.
     /// Overflow: `INVALID_ARGUMENT`.
     typed_limits: codec.Limits = .{},
@@ -111,7 +115,7 @@ pub const Server = struct {
     /// Bind the listen socket. After this call `bound_port` has the port.
     pub fn bind(self: *Server) !void {
         var address = try Io.net.IpAddress.parse(self.options.address, self.options.port);
-        self.listener = try address.listen(self.io, .{});
+        self.listener = try address.listen(self.io, .{ .reuse_address = self.options.reuse_address });
         self.bound_port = self.listener.?.socket.address.getPort();
     }
 
