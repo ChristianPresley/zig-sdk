@@ -4,6 +4,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-21
+
 ### Added
 
 - The conformance server has the tool `test_trigger_resource_update`. The tool announces a change of `test://watched-resource` and a change of the resource list. A test can thus examine `resourceSubscriptions` and `resourcesListChanged` of `subscriptions/listen` from end to end. The other tools and the default behavior of the server do not change. `zig build test` now also runs the tests of the conformance server.
@@ -305,7 +307,8 @@ All notable changes to this project are recorded in this file. The format follow
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.0...v0.5.1
