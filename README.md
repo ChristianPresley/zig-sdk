@@ -66,6 +66,19 @@ pub fn main(init: std.process.Init) !void {
 
 The SDK derives the JSON Schema of the tool input from the `AddArgs` struct at compile time.
 
+With `std.Io.Threaded`, each task that waits holds one thread, and the pool does not retire a thread. On Windows, `stack_size` of `std.Io.Threaded.init` sets the commit of each stack, and the reserve stays the 16 MiB of the executable. The default thus commits 16 MiB for each thread. A server with many connections makes its own `Io` with a small `stack_size`, as the examples do:
+
+```zig
+var threaded: std.Io.Threaded = .init(init.gpa, .{
+    .stack_size = if (@import("builtin").os.tag == .windows) 64 * 1024 else std.Thread.SpawnConfig.default_stack_size,
+    .environ = init.minimal.environ,
+});
+defer threaded.deinit();
+const io = threaded.io();
+```
+
+On Linux and macOS, `stack_size` is the full size of the stack, and the pages commit on first use. Thus the default costs only the pages in use there, and a small value can overflow the stack.
+
 ## Use the server from VS Code
 
 The MCP clients of VS Code speak revision 2025-11-25 and start with `initialize`. A zig-sdk server answers `initialize` with `-32601`. Thus VS Code cannot use the server directly. The issue for 2026-07-28 support in VS Code is [microsoft/vscode#329848](https://github.com/microsoft/vscode/issues/329848).

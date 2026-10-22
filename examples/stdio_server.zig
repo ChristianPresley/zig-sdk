@@ -36,7 +36,15 @@ pub fn main(init: std.process.Init) !void {
     // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
     // every allocation of every thread. The allocator of std for many threads has no such lock.
     const gpa = if (builtin.mode == .Debug) init.gpa else std.heap.smp_allocator;
-    const io = init.io;
+    // Each task that waits is a thread. On Windows, `stack_size` is only the committed part of its
+    // stack, and the reserve stays the 16 MiB of the executable. Thus 64 KiB keeps the full stack.
+    var threaded: std.Io.Threaded = .init(gpa, .{
+        .stack_size = if (builtin.os.tag == .windows) 64 * 1024 else std.Thread.SpawnConfig.default_stack_size,
+        .environ = init.minimal.environ,
+        .argv0 = .init(init.minimal.args),
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
     var server = try mcp.Server.init(gpa, io, .{
         .info = .{ .name = "zig-sdk-example", .version = "0.0.1" },
         .instructions = "Use the add tool to add two integers.",
