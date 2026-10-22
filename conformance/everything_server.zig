@@ -12,7 +12,7 @@
 //!
 //! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--no-tunnel] [--ws-port N]
 //!        [--tls-cert cert.pem --tls-key key.pem] [--log-requests] [--apps] [--reuse-address]
-//!        [--max-connections N] [--max-in-flight N] [--stdio]
+//!        [--max-connections N] [--max-in-flight N] [--idle-timeout S] [--stdio]
 const std = @import("std");
 const builtin = @import("builtin");
 const mcp = @import("mcp");
@@ -682,6 +682,9 @@ const Config = struct {
     /// `--max-in-flight N`: `Limits.http.max_in_flight`, the worker tasks of the HTTP
     /// listener. Null keeps the default of the library.
     max_in_flight: ?u32 = null,
+    /// `--idle-timeout S`: `Limits.http.idle_timeout` in seconds, zero for no limit. Null
+    /// keeps the default of the library.
+    idle_timeout_s: ?u32 = null,
 
     /// True when the listeners set `reuse_address`: with `--reuse-address` and not on Windows.
     fn reuseAddress(self: Config) bool {
@@ -745,6 +748,9 @@ fn parseArgs(args: []const []const u8) !Config {
         } else if (std.mem.eql(u8, args[i], "--max-in-flight") and i + 1 < args.len) {
             i += 1;
             config.max_in_flight = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidMaxInFlight;
+        } else if (std.mem.eql(u8, args[i], "--idle-timeout") and i + 1 < args.len) {
+            i += 1;
+            config.idle_timeout_s = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidIdleTimeout;
         } else if (std.mem.eql(u8, args[i], "--apps")) {
             config.apps = true;
         } else if (std.mem.eql(u8, args[i], "--log-requests")) {
@@ -791,6 +797,7 @@ pub fn main(init: std.process.Init) !void {
     if (config.reuse_address and !config.reuseAddress()) std.log.info("--reuse-address has no effect on Windows", .{});
     if (config.max_connections) |n| options.limits.http.max_connections = n;
     if (config.max_in_flight) |n| options.limits.http.max_in_flight = n;
+    if (config.idle_timeout_s) |s| options.limits.http.idle_timeout = .fromSeconds(s);
     var server = try mcp.Server.init(gpa, io, options);
     defer server.deinit();
     try register(&server, io);
@@ -1128,6 +1135,13 @@ test "--max-in-flight: the worker tasks of the HTTP listener, zero for the conne
     try testing.expectEqual(64, (try parseArgs(&.{ "server", "--max-in-flight", "64" })).max_in_flight);
     try testing.expectEqual(0, (try parseArgs(&.{ "server", "--max-in-flight", "0" })).max_in_flight);
     try testing.expectError(error.InvalidMaxInFlight, parseArgs(&.{ "server", "--max-in-flight", "all" }));
+}
+
+test "--idle-timeout: the idle limit of the HTTP listener in seconds, zero for no limit" {
+    try testing.expectEqual(null, (try parseArgs(&.{"server"})).idle_timeout_s);
+    try testing.expectEqual(0, (try parseArgs(&.{ "server", "--idle-timeout", "0" })).idle_timeout_s);
+    try testing.expectEqual(600, (try parseArgs(&.{ "server", "--idle-timeout", "600" })).idle_timeout_s);
+    try testing.expectError(error.InvalidIdleTimeout, parseArgs(&.{ "server", "--idle-timeout", "soon" }));
 }
 
 test "--reuse-address: on for the listeners except on Windows, off by default" {

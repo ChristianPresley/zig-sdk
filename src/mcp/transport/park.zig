@@ -116,7 +116,8 @@ pub const Poller = struct {
 
     /// Watch `handle` for bytes, for a disconnect and for the close of the socket. On Windows
     /// the poll stays pending until one of them happens. `slot` must stay in place until the
-    /// wait reports it.
+    /// wait reports it. To end the poll, close the socket: a cancel of one poll makes the
+    /// kernel walk every pending poll of the helper handle.
     pub fn arm(p: *Poller, slot: *Slot, handle: Io.net.Socket.Handle) Error!void {
         slot.handle = handle;
         if (!is_windows) return;
@@ -180,16 +181,6 @@ pub const Poller = struct {
             }
             return n;
         }
-    }
-
-    /// Cancel the pending poll of `slot`. True when a completion still arrives for the slot,
-    /// as on Windows: the slot must stay in place until then. POSIX systems have nothing
-    /// pending, and the slot is free at once.
-    pub fn cancel(p: *Poller, slot: *Slot) bool {
-        if (!is_windows) return false;
-        var iosb: windows.IO_STATUS_BLOCK = undefined;
-        _ = windows.ntdll.NtCancelIoFileEx(p.impl.helper, &slot.iosb, &iosb);
-        return true;
     }
 
     /// End a wait that runs. Safe from any task.

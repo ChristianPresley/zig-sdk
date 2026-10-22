@@ -7,7 +7,7 @@ All notable changes to this project are recorded in this file. The format follow
 ### Added
 
 - `Limits.http.max_in_flight`: the maximum worker tasks of the Streamable HTTP server, 256 by default. A worker task reads a request or runs a handler, and a listen stream holds one. An idle keep-alive connection holds no task. Zero means `max_connections`. A connection with bytes waits for a free worker task, up to `head_timeout`. A new connection waits the same way.
-- The conformance server has the options `--max-connections N` and `--max-in-flight N`. They set `Limits.http.max_connections` and `Limits.http.max_in_flight` of the HTTP listener, for load tests with many idle connections. A connection limit of zero or a value that is not a number is an error.
+- The conformance server has the options `--max-connections N`, `--max-in-flight N` and `--idle-timeout S`. They set `Limits.http.max_connections`, `Limits.http.max_in_flight` and `Limits.http.idle_timeout` (in seconds, zero for no limit) of the HTTP listener, for load tests with many idle connections. A connection limit of zero or a value that is not a number is an error.
 
 ### Changed
 

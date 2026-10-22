@@ -471,8 +471,6 @@ const Connection = struct {
         handler,
         /// The poll is the idle wait of a parked connection.
         idle,
-        /// The parker canceled the poll. Its completion frees the slot (Windows).
-        draining,
         /// The parker closed the socket. The completion of the poll frees the connection
         /// (Windows).
         closing,
@@ -778,12 +776,18 @@ const Parker = struct {
     fn watchHandler(p: *Parker, self: *Server, conn: *Connection, token: *Transport.CancelToken) bool {
         p.lock.lockUncancelable(self.io);
         defer p.lock.unlock(self.io);
-        if (conn.poll_phase != .none) return false;
         const poller = &(p.poller orelse return false);
+        conn.cancel_token = token;
+        // A poll from the previous request can still be pending, when its bytes arrived in
+        // the buffer of the task. It watches the socket the same way.
+        if (conn.poll_phase == .handler) return true;
+        if (conn.poll_phase != .none) return false;
         conn.data_seen = false;
         conn.hangup_seen = false;
-        conn.cancel_token = token;
-        poller.arm(&conn.slot, conn.stream.socket.handle) catch return false;
+        poller.arm(&conn.slot, conn.stream.socket.handle) catch {
+            conn.cancel_token = null;
+            return false;
+        };
         conn.poll_phase = .handler;
         p.watching.push(conn);
         if (!park.is_windows) poller.wake();
@@ -812,17 +816,16 @@ const Parker = struct {
             .handler => {
                 // The poll is pending: nothing arrived while the handler ran.
                 if (!keep) return .close;
-                p.watching.remove(conn);
                 if (empty) {
+                    p.watching.remove(conn);
                     p.parkLocked(self, conn);
                     if (p.parked.head == conn) poller.wake();
                     return .parked;
                 }
-                // Bytes wait in the buffer of the task. The poll ends; the task reads them.
-                conn.poll_phase = if (poller.cancel(&conn.slot)) .draining else .none;
+                // Bytes wait in the buffer of the task. The poll stays pending and watches
+                // the socket for the next request too.
                 return .read_next;
             },
-            .draining => return if (keep) .read_next else .close,
             .none => {
                 if (!keep or conn.hangup_seen) return .close;
                 if (conn.data_seen or !empty) return .read_next;
@@ -866,21 +869,28 @@ const Parker = struct {
             .none => return false,
             .handler => {
                 p.watching.remove(conn);
-                if (!p.poller.?.cancel(&conn.slot)) {
+                if (!park.is_windows) {
                     conn.poll_phase = .none;
                     return false;
                 }
             },
-            .draining => {},
             .idle, .closing => unreachable,
         }
-        conn.stream.close(io);
-        conn.closed = true;
-        conn.poll_phase = .closing;
-        p.closing_count += 1;
-        conn.state.store(.parked_closing, .release);
+        p.closeWithPollLocked(self, conn);
         p.handOverLocked(self, conn);
         return true;
+    }
+
+    /// Close the socket of `conn` while its poll is pending (Windows). The close completes
+    /// the poll, and the completion frees the connection. A cancel of the poll would make
+    /// the kernel walk every pending poll of the helper handle, which is slow with many
+    /// parked connections.
+    fn closeWithPollLocked(p: *Parker, self: *Server, conn: *Connection) void {
+        conn.stream.close(self.io);
+        conn.closed = true;
+        conn.poll_phase = .closing;
+        conn.state.store(.parked_closing, .release);
+        p.closing_count += 1;
     }
 
     /// Start the worker task of `conn`, which then has the state `running` and is in
@@ -928,17 +938,13 @@ const Parker = struct {
         self.supervisor_wake.set(io);
     }
 
-    /// Close a parked connection. On Windows the poll of the socket is pending: cancel it and
-    /// close the socket, and free the connection when the completion arrives.
+    /// Close a parked connection. On Windows the poll of the socket is pending: close the
+    /// socket, and free the connection when the completion arrives.
     fn closeParkedLocked(p: *Parker, self: *Server, conn: *Connection) void {
         p.parked.remove(conn);
         p.parked_count -= 1;
-        if (p.poller.?.cancel(&conn.slot)) {
-            conn.stream.close(self.io);
-            conn.closed = true;
-            conn.poll_phase = .closing;
-            conn.state.store(.parked_closing, .release);
-            p.closing_count += 1;
+        if (park.is_windows) {
+            p.closeWithPollLocked(self, conn);
         } else {
             conn.poll_phase = .none;
             p.finishLocked(self, conn);
@@ -953,7 +959,6 @@ const Parker = struct {
                 p.closing_count -= 1;
                 p.finishLocked(self, conn);
             },
-            .draining => conn.poll_phase = .none,
             .idle => {
                 if (ev.readable) {
                     p.parked.remove(conn);
