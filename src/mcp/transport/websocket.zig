@@ -110,11 +110,17 @@ pub const Server = struct {
     limits: Limits,
     listener: ?Io.net.Server = null,
     bound_port: u16 = 0,
+    /// The tasks that send the pings and close the connections at a time limit or the shutdown.
     group: Io.Group = .init,
     closing: std.atomic.Value(bool) = .init(false),
+    /// Set when the accept loop ended. The supervisor then ends with the last connection.
+    accepting_done: std.atomic.Value(bool) = .init(false),
     stop_event: Io.Event = .unset,
     connections: std.ArrayList(*Conn) = .empty,
     connections_lock: Io.Mutex = .init,
+    /// Wakes the supervisor: a connection changed its state, a connection ended, or the server
+    /// stops.
+    supervisor_wake: Io.Event = .unset,
 
     pub fn init(io: Io, gpa: Allocator, server: *McpServer, options: Options) Server {
         return .{
@@ -140,16 +146,29 @@ pub const Server = struct {
     }
 
     /// Accept connections until a call to `shutdown`. Then close each connection with the
-    /// code 1001 and wait for the end of the connections.
+    /// code 1001 and wait for the end of the connections. A cancel also ends `serve`.
     pub fn serve(self: *Server) !void {
         if (self.listener == null) try self.bind();
-        var accept_future = try self.io.concurrent(acceptLoop, .{self});
+        var supervisor = try self.io.concurrent(supervise, .{self});
+        var accept_future = self.io.concurrent(acceptLoop, .{self}) catch |e| {
+            self.closing.store(true, .release);
+            self.endSupervisor(&supervisor);
+            return e;
+        };
         self.stop_event.wait(self.io) catch {};
         // On Windows a cancel can miss an accept that waits. The wake connection ends it.
         wake.cancelAcceptLoop(self.io, &accept_future, self.listener.?.socket.address, &self.closing);
         self.server.shutdownSubscriptions(self.io);
-        self.wakeAll();
+        self.endSupervisor(&supervisor);
         self.group.await(self.io) catch {};
+    }
+
+    /// Tell the supervisor that no more connections come, and wait until it ended the last
+    /// connection.
+    fn endSupervisor(self: *Server, supervisor: *Io.Future(void)) void {
+        self.accepting_done.store(true, .release);
+        self.supervisor_wake.set(self.io);
+        supervisor.await(self.io);
     }
 
     /// Stop the accept loop, end the listen streams and close the connections. Another task
@@ -157,7 +176,7 @@ pub const Server = struct {
     pub fn shutdown(self: *Server) void {
         self.closing.store(true, .release);
         self.server.shutdownSubscriptions(self.io);
-        self.wakeAll();
+        self.supervisor_wake.set(self.io);
         self.stop_event.set(self.io);
     }
 
@@ -166,12 +185,6 @@ pub const Server = struct {
         self.connections_lock.lockUncancelable(self.io);
         defer self.connections_lock.unlock(self.io);
         return self.connections.items.len;
-    }
-
-    fn wakeAll(self: *Server) void {
-        self.connections_lock.lockUncancelable(self.io);
-        defer self.connections_lock.unlock(self.io);
-        for (self.connections.items) |c| c.wake.set(self.io);
     }
 
     fn acceptLoop(self: *Server) void {
@@ -188,49 +201,155 @@ pub const Server = struct {
                 stream.close(self.io);
                 break;
             }
-            const conn = self.admit(stream) orelse {
-                stream.close(self.io);
-                continue;
-            };
-            self.group.concurrent(self.io, Conn.run, .{conn}) catch {
-                self.untrack(conn);
-                conn.free();
-                stream.close(self.io);
-            };
-        }
-    }
-
-    /// Track a new connection. Return null when the server is full or stops.
-    fn admit(self: *Server, stream: Io.net.Stream) ?*Conn {
-        self.connections_lock.lockUncancelable(self.io);
-        defer self.connections_lock.unlock(self.io);
-        if (self.closing.load(.acquire)) return null;
-        if (self.connections.items.len >= self.limits.websocket.max_connections) {
-            log.warn("refused a connection: {d} connections are open", .{self.connections.items.len});
-            return null;
-        }
-        const conn = Conn.create(self, stream) catch return null;
-        self.connections.append(self.gpa, conn) catch {
-            conn.free();
-            return null;
-        };
-        return conn;
-    }
-
-    fn untrack(self: *Server, conn: *Conn) void {
-        self.connections_lock.lockUncancelable(self.io);
-        defer self.connections_lock.unlock(self.io);
-        for (self.connections.items, 0..) |c, i| {
-            if (c == conn) {
-                _ = self.connections.swapRemove(i);
-                return;
+            if (!self.startConnection(stream)) {
+                var s = stream;
+                s.close(self.io);
             }
         }
+    }
+
+    /// Track a new connection and start its reader task under the supervisor. False when the
+    /// server is full, stops, or has no memory or no task for the connection.
+    fn startConnection(self: *Server, stream: Io.net.Stream) bool {
+        self.connections_lock.lockUncancelable(self.io);
+        defer self.connections_lock.unlock(self.io);
+        if (self.closing.load(.acquire)) return false;
+        if (self.connections.items.len >= self.limits.websocket.max_connections) {
+            log.warn("refused a connection: {d} connections are open", .{self.connections.items.len});
+            return false;
+        }
+        const conn = Conn.create(self, stream) catch return false;
+        self.connections.append(self.gpa, conn) catch {
+            conn.free();
+            return false;
+        };
+        const now = ws.nowNanoseconds(self.io);
+        conn.started = now;
+        conn.last_ping = now;
+        conn.last_rx.store(now, .release);
+        // The supervisor sees the connection after the unlock, thus `worker` is set by then.
+        conn.worker = self.io.concurrent(Conn.readTask, .{conn}) catch {
+            _ = self.connections.pop();
+            conn.free();
+            return false;
+        };
+        self.supervisor_wake.set(self.io);
+        return true;
     }
 
     fn unixNow(self: *const Server) i64 {
         if (self.options.clock) |f| return f();
         return Io.Clock.Timestamp.now(self.io, .real).raw.toSeconds();
+    }
+
+    /// One task for all connections. It closes a connection when a time limit passes, when the
+    /// reader ended, or when the server stops, and it sends the pings. Each close and each ping
+    /// runs in a task of the group, thus the supervisor never blocks on the socket of one
+    /// connection. The reader of a connection is the only task of the connection, thus an idle
+    /// connection holds one task.
+    fn supervise(self: *Server) void {
+        const io = self.io;
+        const limits = self.limits.websocket;
+        const handshake_ns = nanoseconds(limits.handshake_timeout);
+        const ping_ns = nanoseconds(limits.ping_interval);
+        const idle_ns = nanoseconds(limits.idle_timeout);
+        var due_close: [16]*Conn = undefined;
+        var due_ping: [16]*Conn = undefined;
+        while (true) {
+            const now = ws.nowNanoseconds(io);
+            var next: i64 = Conn.unlimited;
+            var close_count: usize = 0;
+            var ping_count: usize = 0;
+            var again = false;
+            var empty = false;
+            var no_more = false;
+            var poll_expiry = false;
+            {
+                self.connections_lock.lockUncancelable(io);
+                defer self.connections_lock.unlock(io);
+                // The accept loop adds a connection under the lock. After `accepting_done`,
+                // no connection comes, thus an empty list is final.
+                no_more = self.accepting_done.load(.acquire);
+                var i = self.connections.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const conn = self.connections.items[i];
+                    switch (conn.state.load(.acquire)) {
+                        .finished => {
+                            // A ping task can still read the connection. It wakes the
+                            // supervisor when it ends.
+                            if (conn.pending_pings.load(.acquire) != 0) continue;
+                            conn.worker.await(io);
+                            _ = self.connections.swapRemove(i);
+                            conn.stream.close(io);
+                            conn.free();
+                            continue;
+                        },
+                        .closing => continue,
+                        .running => {},
+                    }
+                    var reason: ?EndReason = null;
+                    if (conn.reader_done.load(.acquire)) {
+                        reason = conn.reader_reason;
+                    } else if (self.closing.load(.acquire)) {
+                        reason = .shutdown;
+                    } else if (conn.lingering.load(.acquire)) {
+                        if (now >= conn.linger_deadline) reason = .failed else next = @min(next, conn.linger_deadline);
+                    } else if (!conn.upgraded.load(.acquire)) {
+                        if (handshake_ns > 0) {
+                            const d = conn.started +| handshake_ns;
+                            if (now >= d) reason = .handshake_timeout else next = @min(next, d);
+                        }
+                    } else {
+                        const rx = conn.last_rx.load(.acquire);
+                        if (idle_ns > 0) {
+                            const d = rx +| idle_ns;
+                            if (now >= d) reason = .idle else next = @min(next, d);
+                        }
+                        if (reason == null) if (conn.expires_at) |exp| {
+                            poll_expiry = true;
+                            if (exp -| self.unixNow() <= 0) reason = .expired;
+                        };
+                        if (reason == null and ping_ns > 0) {
+                            const due = @max(rx, conn.last_ping) +| ping_ns;
+                            if (now >= due) {
+                                if (ping_count == due_ping.len) {
+                                    again = true;
+                                } else {
+                                    conn.last_ping = now;
+                                    _ = conn.pending_pings.fetchAdd(1, .acq_rel);
+                                    due_ping[ping_count] = conn;
+                                    ping_count += 1;
+                                    next = @min(next, now +| ping_ns);
+                                }
+                            } else next = @min(next, due);
+                        }
+                    }
+                    if (reason) |r| {
+                        if (close_count == due_close.len) {
+                            again = true;
+                        } else if (conn.state.cmpxchgStrong(.running, .closing, .acq_rel, .acquire) == null) {
+                            conn.close_reason = r;
+                            due_close[close_count] = conn;
+                            close_count += 1;
+                        } else again = true;
+                    }
+                }
+                empty = self.connections.items.len == 0;
+            }
+            for (due_ping[0..ping_count]) |conn| self.group.concurrent(io, Conn.pingTask, .{conn}) catch conn.pingTask();
+            for (due_close[0..close_count]) |conn| self.group.concurrent(io, Conn.closeTask, .{conn}) catch conn.closeTask();
+            if (empty and no_more) return;
+            if (again) continue;
+            // The token expiry uses the real clock, which can change. Poll it each second.
+            var wait_ns: i64 = if (next == Conn.unlimited) std.time.ns_per_s else @max(next - now, 1);
+            if (poll_expiry) wait_ns = @min(wait_ns, std.time.ns_per_s);
+            self.supervisor_wake.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(wait_ns), .clock = .awake } }) catch |e| switch (e) {
+                error.Timeout => {},
+                error.Canceled => {},
+            };
+            self.supervisor_wake.reset();
+        }
     }
 };
 
@@ -251,8 +370,10 @@ const EndReason = enum {
     expired,
 };
 
-/// One connection. The connection task supervises the timers, and a reader task reads the
-/// handshake and the frames.
+/// One connection. One reader task reads the handshake and the frames. The supervisor of the
+/// server watches its time limits and sends its pings. When a limit passes or the server
+/// stops, the supervisor runs the close of the connection in a task of the group. Thus the
+/// reader is the only task of the connection, and an idle connection holds one task.
 const Conn = struct {
     owner: *Server,
     stream: Io.net.Stream,
@@ -268,6 +389,25 @@ const Conn = struct {
     in: *Io.Reader = undefined,
     out: *Io.Writer = undefined,
     write_lock: Io.Mutex = .init,
+    /// The reader task. Only the close of the connection awaits or cancels it, one time.
+    worker: Io.Future(void) = undefined,
+    /// `running` until the reader ends by itself, or until the supervisor starts the close
+    /// (`closing`, then `finished`).
+    state: std.atomic.Value(State) = .init(.running),
+    /// The reason that the supervisor closes the connection. Only the supervisor sets it,
+    /// before the state goes to `closing`.
+    close_reason: EndReason = .none,
+    /// The awake time in nanoseconds of the accept, for the handshake timer. Only the
+    /// supervisor uses it.
+    started: i64 = 0,
+    /// The awake time in nanoseconds of the last ping. Only the supervisor uses it.
+    last_ping: i64 = 0,
+    /// The awake time in nanoseconds at which the reader must stop when it waits for the
+    /// close answer of the peer.
+    linger_deadline: i64 = 0,
+    /// The ping tasks that still read the connection. The supervisor frees a connection only
+    /// at zero.
+    pending_pings: std.atomic.Value(u32) = .init(0),
     /// Set when this side sent its close frame. The server then sends no more frames.
     close_sent: std.atomic.Value(bool) = .init(false),
     /// Set after a failed write. Guarded by `write_lock`.
@@ -283,8 +423,13 @@ const Conn = struct {
     reader_reason: EndReason = .none,
     /// The time of the last frame from the peer, from the awake clock in nanoseconds.
     last_rx: std.atomic.Value(i64) = .init(0),
-    /// Wakes the connection task for a new state.
+    /// The reader sets it at its end, so that the close of the connection ends its wait.
     wake: Io.Event = .unset,
+
+    const State = enum(u8) { running, closing, finished };
+
+    /// The sentinel of `supervise` for "no time limit".
+    const unlimited: i64 = std.math.maxInt(i64);
 
     fn create(owner: *Server, stream: Io.net.Stream) Allocator.Error!*Conn {
         const gpa = owner.gpa;
@@ -322,77 +467,31 @@ const Conn = struct {
         gpa.destroy(conn);
     }
 
-    fn run(conn: *Conn) Io.Cancelable!void {
+    /// Close the connection in a task of the group, then mark the end and wake the supervisor.
+    /// A slow close of one connection does not delay the time limits of the others.
+    fn closeTask(conn: *Conn) void {
         const self = conn.owner;
-        const io = self.io;
-        defer {
-            self.untrack(conn);
-            conn.stream.close(io);
-            conn.free();
-        }
-        conn.last_rx.store(ws.nowNanoseconds(io), .release);
-        var reader = io.concurrent(readTask, .{conn}) catch return;
-        const reason = conn.supervise();
-        conn.finish(reason, &reader);
+        conn.finish(conn.close_reason);
+        conn.state.store(.finished, .release);
+        self.supervisor_wake.set(self.io);
     }
 
-    /// Watch the timers until the connection ends, and send the pings.
-    fn supervise(conn: *Conn) EndReason {
+    /// Send one ping in a task of the group, so that a slow write does not block the
+    /// supervisor. The supervisor waits for the task before it frees the connection.
+    fn pingTask(conn: *Conn) void {
         const self = conn.owner;
-        const io = self.io;
-        const limits = self.limits.websocket;
-        const handshake_ns = nanoseconds(limits.handshake_timeout);
-        const ping_ns = nanoseconds(limits.ping_interval);
-        const idle_ns = nanoseconds(limits.idle_timeout);
-        const started = ws.nowNanoseconds(io);
-        var last_ping = started;
-        while (true) {
-            if (conn.reader_done.load(.acquire)) return conn.reader_reason;
-            if (conn.lingering.load(.acquire)) {
-                conn.awaitReader(self.limits.shutdown_grace);
-                return .failed;
-            }
-            if (self.closing.load(.acquire)) return .shutdown;
-            const now = ws.nowNanoseconds(io);
-            var wait: i64 = std.time.ns_per_s;
-            if (!conn.upgraded.load(.acquire)) {
-                if (handshake_ns > 0) {
-                    const left = started +| handshake_ns -| now;
-                    if (left <= 0) return .handshake_timeout;
-                    wait = @min(wait, left);
-                }
-            } else {
-                const rx = conn.last_rx.load(.acquire);
-                if (idle_ns > 0) {
-                    const left = rx +| idle_ns -| now;
-                    if (left <= 0) return .idle;
-                    wait = @min(wait, left);
-                }
-                if (ping_ns > 0) {
-                    const due = @max(rx, last_ping) +| ping_ns;
-                    if (now >= due) {
-                        conn.sendControl(.ping, "");
-                        last_ping = now;
-                        wait = @min(wait, ping_ns);
-                    } else wait = @min(wait, due - now);
-                }
-                if (conn.expires_at) |exp| {
-                    const left_s = exp -| self.unixNow();
-                    if (left_s <= 0) return .expired;
-                    wait = @min(wait, left_s *| std.time.ns_per_s);
-                }
-            }
-            conn.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(@max(wait, 1)), .clock = .awake } }) catch |e| switch (e) {
-                error.Timeout => {},
-                error.Canceled => return .shutdown,
-            };
-            conn.wake.reset();
+        defer {
+            _ = conn.pending_pings.fetchSub(1, .acq_rel);
+            // A connection that closed while this task ran waits on it, thus wake the
+            // supervisor to free it.
+            if (conn.state.load(.acquire) == .finished) self.supervisor_wake.set(self.io);
         }
+        conn.sendControl(.ping, "");
     }
 
     /// End the connection. For a close by the server, the requests end first, so that a
     /// listen stream sends its result before the close frame.
-    fn finish(conn: *Conn, reason: EndReason, reader: *Io.Future(void)) void {
+    fn finish(conn: *Conn, reason: EndReason) void {
         const self = conn.owner;
         const io = self.io;
         const grace = self.limits.shutdown_grace;
@@ -411,7 +510,7 @@ const Conn = struct {
             // RFC 6455 section 7.1.1: wait for the close frame of the peer.
             conn.awaitReader(grace);
         };
-        reader.cancel(io);
+        conn.worker.cancel(io);
         if (conn.peer_ready) {
             conn.peer.stopAdmission();
             conn.peer.cancelAll(stdio.Server.connection_closed_reason, false);
@@ -438,10 +537,13 @@ const Conn = struct {
     }
 
     fn readTask(conn: *Conn) void {
-        const io = conn.owner.io;
+        const self = conn.owner;
         conn.reader_reason = conn.readAll();
         conn.reader_done.store(true, .release);
-        conn.wake.set(io);
+        // Wake a close of the connection that waits for the reader, and the supervisor, so
+        // that it closes a connection that ended by itself.
+        conn.wake.set(self.io);
+        self.supervisor_wake.set(self.io);
     }
 
     fn readAll(conn: *Conn) EndReason {
@@ -460,8 +562,8 @@ const Conn = struct {
         conn.peer_ready = true;
         conn.last_rx.store(ws.nowNanoseconds(io), .release);
         conn.upgraded.store(true, .release);
-        // The connection task changes from the handshake timer to the ping timer.
-        conn.wake.set(io);
+        // The supervisor changes from the handshake timer to the idle and ping timers.
+        self.supervisor_wake.set(io);
         return conn.frameLoop();
     }
 
@@ -647,9 +749,11 @@ const Conn = struct {
                 log.debug("closed a connection with code {d}: {t}", .{ @intFromEnum(code), e });
                 conn.sendClose(code, closeReason(e));
                 // Read until the answer of the peer, so that the end of the TCP connection
-                // does not discard the close frame. The connection task limits the time.
+                // does not discard the close frame. The supervisor limits the time: it closes
+                // the connection, which cancels the reader, after the grace.
+                conn.linger_deadline = ws.nowNanoseconds(self.io) +| nanoseconds(self.limits.shutdown_grace);
                 conn.lingering.store(true, .release);
-                conn.wake.set(self.io);
+                self.supervisor_wake.set(self.io);
                 ws.lingerUntilClose(conn.in, reader.unread);
                 return .failed;
             };
