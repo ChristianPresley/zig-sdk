@@ -55,12 +55,21 @@ pub const Server = struct {
     limits: Limits,
     listener: ?Io.net.Server = null,
     bound_port: u16 = 0,
+    /// The tasks that cancel a connection at a time limit or at the shutdown.
     group: Io.Group = .init,
     permits: Io.Semaphore,
     closing: std.atomic.Value(bool) = .init(false),
+    /// Set when the accept loop ended. The supervisor then ends with the last connection.
+    accepting_done: std.atomic.Value(bool) = .init(false),
     stop_event: Io.Event = .unset,
     connections: std.ArrayList(*Connection) = .empty,
     connections_lock: Io.Mutex = .init,
+    /// Wakes the supervisor: a connection has a nearer time limit, a connection ended, or the
+    /// server stops.
+    supervisor_wake: Io.Event = .unset,
+    /// The awake time in nanoseconds at which the supervisor wakes by itself. `unlimited`
+    /// while it looks at the connections, thus each new time limit wakes it.
+    next_deadline: std.atomic.Value(i64) = .init(Connection.unlimited),
 
     pub fn init(io: Io, gpa: Allocator, server: *McpServer, options: Options) Server {
         return .{
@@ -79,23 +88,6 @@ pub const Server = struct {
         self.* = undefined;
     }
 
-    fn track(self: *Server, conn: *Connection) void {
-        self.connections_lock.lockUncancelable(self.io);
-        defer self.connections_lock.unlock(self.io);
-        self.connections.append(self.gpa, conn) catch {};
-    }
-
-    fn untrack(self: *Server, conn: *Connection) void {
-        self.connections_lock.lockUncancelable(self.io);
-        defer self.connections_lock.unlock(self.io);
-        for (self.connections.items, 0..) |c, i| {
-            if (c == conn) {
-                _ = self.connections.swapRemove(i);
-                return;
-            }
-        }
-    }
-
     /// Bind the listen socket. After this call `bound_port` has the port (useful with port 0).
     pub fn bind(self: *Server) !void {
         var address = try Io.net.IpAddress.parse(self.options.address, self.options.port);
@@ -107,12 +99,26 @@ pub const Server = struct {
     /// cancel, the server accepts no more connections.
     pub fn serve(self: *Server) !void {
         if (self.listener == null) try self.bind();
-        var accept_future = try self.io.concurrent(acceptLoop, .{self});
+        var supervisor = try self.io.concurrent(supervise, .{self});
+        var accept_future = self.io.concurrent(acceptLoop, .{self}) catch |e| {
+            self.closing.store(true, .release);
+            self.endSupervisor(&supervisor);
+            return e;
+        };
         self.stop_event.wait(self.io) catch {};
         // On Windows a cancel can miss an accept that waits. The wake connection ends it.
         wake.cancelAcceptLoop(self.io, &accept_future, self.listener.?.socket.address, &self.closing);
         self.server.shutdownSubscriptions(self.io);
+        self.endSupervisor(&supervisor);
         self.group.await(self.io) catch {};
+    }
+
+    /// Tell the supervisor that no more connections come, and wait until it ended the last
+    /// connection.
+    fn endSupervisor(self: *Server, supervisor: *Io.Future(void)) void {
+        self.accepting_done.store(true, .release);
+        self.supervisor_wake.set(self.io);
+        supervisor.await(self.io);
     }
 
     fn acceptLoop(self: *Server) void {
@@ -130,21 +136,106 @@ pub const Server = struct {
                 break;
             }
             self.permits.waitUncancelable(self.io);
-            const conn = self.gpa.create(Connection) catch {
+            if (!self.startConnection(stream)) {
                 self.permits.post(self.io);
                 var s = stream;
                 s.close(self.io);
-                continue;
+            }
+        }
+    }
+
+    /// Start the task of a new connection under the supervisor. False when the server has
+    /// no memory or no task for the connection.
+    fn startConnection(self: *Server, stream: Io.net.Stream) bool {
+        const conn = self.gpa.create(Connection) catch return false;
+        conn.* = .{ .owner = self, .stream = stream };
+        self.connections_lock.lockUncancelable(self.io);
+        defer self.connections_lock.unlock(self.io);
+        self.connections.append(self.gpa, conn) catch {
+            self.gpa.destroy(conn);
+            return false;
+        };
+        // The supervisor sees the connection after the unlock, thus `worker` is set by then.
+        conn.worker = self.io.concurrent(Connection.work, .{conn}) catch {
+            _ = self.connections.pop();
+            self.gpa.destroy(conn);
+            return false;
+        };
+        return true;
+    }
+
+    /// One task for all connections. It cancels the task of a connection when a time limit
+    /// passes or when the server stops. It frees a connection when its task ended. A
+    /// connection task thus waits only in its reads, and an idle connection holds one task.
+    fn supervise(self: *Server) void {
+        const io = self.io;
+        const grace = nanoseconds(self.limits.shutdown_grace);
+        var shutdown_end: ?i64 = null;
+        var due: [16]*Connection = undefined;
+        while (true) {
+            const now = nowNanoseconds(io);
+            var next: i64 = Connection.unlimited;
+            var due_count: usize = 0;
+            var again = false;
+            var empty = false;
+            var no_more = false;
+            {
+                self.connections_lock.lockUncancelable(io);
+                defer self.connections_lock.unlock(io);
+                // The accept loop adds a connection under the lock. After `accepting_done`,
+                // no connection comes, thus an empty list is final.
+                no_more = self.accepting_done.load(.acquire);
+                self.next_deadline.store(Connection.unlimited, .release);
+                var i = self.connections.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const conn = self.connections.items[i];
+                    switch (conn.state.load(.acquire)) {
+                        .finished => {
+                            conn.worker.await(io);
+                            _ = self.connections.swapRemove(i);
+                            self.gpa.destroy(conn);
+                            continue;
+                        },
+                        .canceling => continue,
+                        .running => {},
+                    }
+                    const d = conn.deadline.load(.acquire);
+                    if (d == Connection.expired) continue;
+                    const limit: i64 = if (self.closing.load(.acquire)) limit: {
+                        if (d != Connection.busy) break :limit now;
+                        const end = shutdown_end orelse now +| grace;
+                        shutdown_end = end;
+                        break :limit end;
+                    } else if (d != Connection.busy and d != Connection.unlimited) d else continue;
+                    if (now < limit) {
+                        next = @min(next, limit);
+                        continue;
+                    }
+                    if (due_count == due.len) {
+                        again = true;
+                        continue;
+                    }
+                    if (conn.expire(d) and conn.state.cmpxchgStrong(.running, .canceling, .acq_rel, .acquire) == null) {
+                        due[due_count] = conn;
+                        due_count += 1;
+                    } else {
+                        // The task changed the time limit or ended. Look again.
+                        again = true;
+                    }
+                }
+                empty = self.connections.items.len == 0;
+                if (!again) self.next_deadline.store(next, .release);
+            }
+            for (due[0..due_count]) |conn| self.group.concurrent(io, Connection.cancelWorker, .{conn}) catch conn.cancelWorker();
+            if (empty and no_more) return;
+            if (again) continue;
+            const wait_ns: i64 = if (next == Connection.unlimited) 60 * std.time.ns_per_s else @max(next - now, 1);
+            self.supervisor_wake.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(wait_ns), .clock = .awake } }) catch |e| switch (e) {
+                error.Timeout => {},
+                error.Canceled => {},
             };
-            conn.* = .{ .owner = self, .stream = stream };
-            self.track(conn);
-            self.group.concurrent(self.io, Connection.run, .{conn}) catch {
-                self.untrack(conn);
-                self.permits.post(self.io);
-                var s = stream;
-                s.close(self.io);
-                self.gpa.destroy(conn);
-            };
+            self.supervisor_wake.reset();
         }
     }
 
@@ -153,11 +244,9 @@ pub const Server = struct {
         self.closing.store(true, .release);
         self.stop_event.set(self.io);
         self.server.shutdownSubscriptions(self.io);
-        // The connection tasks stop the connections that wait for the next request at once,
-        // and the busy connections after `limits.shutdown_grace`.
-        self.connections_lock.lockUncancelable(self.io);
-        defer self.connections_lock.unlock(self.io);
-        for (self.connections.items) |c| c.wake.set(self.io);
+        // The supervisor cancels the connections that wait for a request at once, and the
+        // busy connections after `limits.shutdown_grace`.
+        self.supervisor_wake.set(self.io);
     }
 
     fn originAllowed(self: *Server, origin: []const u8) bool {
@@ -223,108 +312,89 @@ fn nanoseconds(d: Io.Duration) i64 {
 /// The response to a request that did not arrive in its time limit (RFC 9110 section 15.5.9).
 const request_timeout_response = "HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
-/// One connection. The connection task supervises the time limits. A worker task does the
-/// TLS handshake, reads the requests and runs the handlers. On a timeout, the connection
-/// task cancels the worker task: on Windows, a shutdown of the socket does not stop a read.
+/// The time that the server keeps a connection open after a response without keep-alive, for
+/// the close by the client. Overflow: the server closes the connection.
+const close_linger: Io.Duration = .fromSeconds(2);
+
+/// One connection, with one task that does the TLS handshake, reads the requests and runs
+/// them. The supervisor of the server watches its time limits. When a limit passes or the
+/// server stops, the supervisor cancels the task: on Windows, a shutdown of the socket does
+/// not stop a read. The handler of a request runs in a task of its own. Meanwhile the task
+/// of the connection reads the socket, and a disconnect of the client cancels the request.
+/// Thus an idle connection holds one task, and a request in flight holds two.
 const Connection = struct {
     owner: *Server,
     stream: Io.net.Stream,
-    /// The time limit of the read that the worker does now: an awake time in nanoseconds,
-    /// `busy`, `unlimited` or `expired`. Only the worker changes a value other than
-    /// `expired`. Only the connection task sets `expired`.
+    /// The task of the connection. Only the supervisor awaits or cancels it, one time.
+    worker: Io.Future(void) = undefined,
+    /// The time limit of the read that the task does now: an awake time in nanoseconds,
+    /// `busy`, `unlimited` or `expired`. Only the task and its handler change a value other
+    /// than `expired`. Only the supervisor sets `expired`.
     deadline: std.atomic.Value(i64) = .init(busy),
-    /// What the worker waits for. Only the worker uses it.
-    phase: Phase = .busy,
-    worker_done: std.atomic.Value(bool) = .init(false),
-    /// Wakes the connection task for a new deadline, the end of the worker or the shutdown.
-    wake: Io.Event = .unset,
+    /// What the task waits for.
+    phase: std.atomic.Value(Phase) = .init(.busy),
+    /// `running` until the task ends by itself (`finished`), or until the supervisor cancels
+    /// it (`canceling`, then `finished`).
+    state: std.atomic.Value(State) = .init(.running),
 
-    const Phase = enum {
+    const Phase = enum(u8) {
         /// The TLS handshake or a request head.
         head,
         /// The first byte of the next request.
         idle,
         /// The rest of a request body.
         body,
+        /// The close by the client, after a response without keep-alive.
+        close,
         busy,
     };
 
-    /// The worker runs a handler or writes a response. No time limit applies.
+    const State = enum(u8) { running, canceling, finished };
+
+    /// The task runs a handler or writes a response. No time limit applies.
     const busy: i64 = 0;
-    /// The worker waits for bytes from the client, without a time limit.
+    /// The task waits for bytes from the client, without a time limit.
     const unlimited: i64 = std.math.maxInt(i64);
-    /// The time limit passed, or the server stops. The worker must stop.
+    /// The time limit passed, or the server stops. The task must stop.
     const expired: i64 = -1;
 
-    fn run(conn: *Connection) Io.Cancelable!void {
-        const self = conn.owner;
-        defer {
-            self.untrack(conn);
-            conn.stream.close(self.io);
-            self.permits.post(self.io);
-            self.gpa.destroy(conn);
-        }
-        var worker = self.io.concurrent(work, .{conn}) catch return;
-        conn.supervise(&worker);
-    }
-
-    /// Watch the time limit of the worker until the worker ends. Cancel the worker when the
-    /// limit passes. At the shutdown, cancel a worker that waits for bytes at once, and a
-    /// busy worker after `limits.shutdown_grace`.
-    fn supervise(conn: *Connection, worker: *Io.Future(void)) void {
+    /// The task of the connection.
+    fn work(conn: *Connection) void {
         const self = conn.owner;
         const io = self.io;
-        var shutdown_end: ?i64 = null;
-        while (!conn.worker_done.load(.acquire)) {
-            const now = nowNanoseconds(io);
-            var wait: i64 = 60 * std.time.ns_per_s;
-            const d = conn.deadline.load(.acquire);
-            if (d == expired) break;
-            if (self.closing.load(.acquire)) {
-                if (d != busy) {
-                    if (conn.expire(d)) break;
-                    continue;
-                }
-                const end = shutdown_end orelse now +| nanoseconds(self.limits.shutdown_grace);
-                shutdown_end = end;
-                if (now >= end) {
-                    conn.deadline.store(expired, .release);
-                    break;
-                }
-                wait = @min(wait, end - now);
-            } else if (d != busy and d != unlimited) {
-                if (now >= d) {
-                    if (conn.expire(d)) break;
-                    continue;
-                }
-                wait = @min(wait, d - now);
-            }
-            conn.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(@max(wait, 1)), .clock = .awake } }) catch |e| switch (e) {
-                error.Timeout => {},
-                error.Canceled => {
-                    conn.deadline.store(expired, .release);
-                    break;
-                },
-            };
-            conn.wake.reset();
+        defer {
+            conn.stream.close(io);
+            self.permits.post(io);
+            // The supervisor frees the connection. After a cancel, the canceller marks the end.
+            if (conn.state.cmpxchgStrong(.running, .finished, .acq_rel, .acquire) == null) self.supervisor_wake.set(io);
         }
-        if (conn.deadline.load(.acquire) == expired) worker.cancel(io) else worker.await(io);
+        conn.serve() catch {};
     }
 
-    /// Mark the deadline `d` as passed. False when the worker changed the deadline first.
+    /// Cancel the task and mark the end. The supervisor runs it in a task of the group. Thus
+    /// a slow end of one connection does not delay the time limits of the others.
+    fn cancelWorker(conn: *Connection) void {
+        const self = conn.owner;
+        conn.worker.cancel(self.io);
+        conn.state.store(.finished, .release);
+        self.supervisor_wake.set(self.io);
+    }
+
+    /// Mark the deadline `d` as passed. False when the task changed the deadline first.
     fn expire(conn: *Connection, d: i64) bool {
         return conn.deadline.cmpxchgStrong(d, expired, .acq_rel, .acquire) == null;
     }
 
     /// Set the time limit of the next read to `limit` from now. Zero means no limit. False
-    /// when the connection expired: the worker must stop.
+    /// when the connection expired: the task must stop.
     fn startTimer(conn: *Connection, phase: Phase, limit: Io.Duration) bool {
-        conn.phase = phase;
+        conn.phase.store(phase, .release);
         const ns = nanoseconds(limit);
-        const io = conn.owner.io;
-        const value = if (ns == 0) unlimited else @max(nowNanoseconds(io) +| ns, 1);
+        const self = conn.owner;
+        const value = if (ns == 0) unlimited else @max(nowNanoseconds(self.io) +| ns, 1);
         if (!conn.setDeadline(value)) return false;
-        if (value != unlimited) conn.wake.set(io);
+        // Wake the supervisor for a time limit before its next wake.
+        if (value < self.next_deadline.load(.acquire)) self.supervisor_wake.set(self.io);
         return true;
     }
 
@@ -336,9 +406,9 @@ const Connection = struct {
         return conn.startTimer(phase, limit);
     }
 
-    /// Remove the time limit while the worker is busy. False when the connection expired.
+    /// Remove the time limit while the task is busy. False when the connection expired.
     fn stopTimer(conn: *Connection) bool {
-        conn.phase = .busy;
+        conn.phase.store(.busy, .release);
         return conn.setDeadline(busy);
     }
 
@@ -358,19 +428,29 @@ const Connection = struct {
     /// closes an idle connection without a response (RFC 9112 section 9.6), and sends nothing
     /// at the shutdown.
     fn sendTimeout(conn: *Connection, out: *Io.Writer) void {
-        if (conn.phase != .head and conn.phase != .body) return;
+        const phase = conn.phase.load(.acquire);
+        if (phase != .head and phase != .body) return;
         if (conn.owner.closing.load(.acquire)) return;
         out.writeAll(request_timeout_response) catch return;
         out.flush() catch {};
     }
 
-    fn work(conn: *Connection) void {
+    /// Read the socket while the handler of `dispatch` runs. The end of the connection
+    /// cancels the request. The task reads only into the free space at the end of the
+    /// buffer of `socket`. Thus the bytes of the request head stay in place, and the next
+    /// request on the connection uses the bytes that arrive. The function returns at the
+    /// first bytes: the handler ends first, then the task reads the next request.
+    fn watch(conn: *Connection, socket: *Io.net.Stream.Reader, dispatch: *Dispatch) void {
         const io = conn.owner.io;
-        defer {
-            conn.worker_done.store(true, .release);
-            conn.wake.set(io);
-        }
-        conn.serve() catch {};
+        const r = &socket.interface;
+        if (r.end >= r.buffer.len) return;
+        if (dispatch.exchange.token.isCancelled() or dispatch.ended.load(.acquire)) return;
+        r.fillMore() catch |e| {
+            if (e == error.ReadFailed) if (socket.err) |err| if (err == error.Canceled) return;
+            if (dispatch.ended.load(.acquire)) return;
+            log.debug("the client of request {f} disconnected", .{dispatch.exchange.id});
+            dispatch.exchange.token.cancel(io, disconnect_reason);
+        };
     }
 
     /// Read and handle requests until the connection ends. The TLS handshake and the head of
@@ -694,72 +774,74 @@ fn handleRpcRequest(conn: *Connection, request: *http.Server.Request, socket: *I
         .long_lived = std.mem.eql(u8, req.method, "subscriptions/listen"),
         .force_sse = self.options.response_mode == .sse,
     };
-    // A disconnect of the client cancels the request, also while the handler does not write.
-    var watch: Watch = .{ .socket = socket, .token = &token, .id = req.id };
-    var watcher: ?Io.Future(void) = self.io.concurrent(Watch.run, .{ &watch, self.io }) catch null;
-    self.server.handle(self.io, .{
-        .kind = .streamable_http,
-        .arena = arena,
-        .message = .{ .request = req },
-        .responder = .{ .ptr = &exchange, .vtable = &exchange_vtable },
-        .cancel = &token,
-        .context = principal,
-        .peer = .{ .address = socket.stream.socket.address },
-    });
-    if (exchange.keepalive_future) |*f| {
-        exchange.keepalive_stop.store(true, .release);
-        _ = f.cancel(self.io);
-    }
-    if (!exchange.done) {
-        // The handler ended without a response (cancelled): close the stream.
-        if (exchange.body_writer) |*bw| bw.end() catch {} else request.respond("", .{ .status = .service_unavailable }) catch {};
-    }
+    var dispatch: Dispatch = .{ .conn = conn, .exchange = &exchange, .socket = socket, .req = req, .principal = principal, .arena = arena };
+    // The handler runs in a task of its own. Meanwhile this task reads the socket: a
+    // disconnect of the client cancels the request, also while the handler does not write.
+    var handler: ?Io.Future(void) = self.io.concurrent(Dispatch.run, .{&dispatch}) catch null;
+    if (handler) |*h| {
+        conn.watch(socket, &dispatch);
+        if (conn.timedOut()) {
+            // A time limit or the shutdown canceled this task. The handler gets the cancel.
+            h.cancel(self.io);
+        } else if (dispatch.done.wait(self.io)) |_| {
+            h.await(self.io);
+        } else |_| {
+            h.cancel(self.io);
+        }
+    } else dispatch.run();
     // The connection of a canceled request does not carry one more request.
-    const reuse = exchange.reusable and !token.isCancelled() and request.head.keep_alive;
-    // The watch can wait for the next request, thus the idle time limit starts now.
-    const idle = reuse and conn.startTimer(.idle, self.limits.http.idle_timeout);
-    if (watcher) |*w| watch.stop(self.io, w, idle);
-    return reuse;
+    return exchange.reusable and !token.isCancelled() and request.head.keep_alive;
 }
 
 /// The cancellation reason of a request whose client closed the connection.
 pub const disconnect_reason = "client disconnected";
 
-/// Reads the socket of one request while its handler runs. The end of the connection
-/// cancels the request. The task reads only into the free space at the end of the buffer of
-/// `socket`. Thus the bytes of the request head stay in place, and the next request on the
-/// connection uses the bytes that arrive.
-const Watch = struct {
+/// The part of a request that runs in a task of its own: the handler and the end of the
+/// response. Meanwhile the task of the connection reads the socket.
+const Dispatch = struct {
+    conn: *Connection,
+    exchange: *Exchange,
     socket: *Io.net.Stream.Reader,
-    token: *Transport.CancelToken,
-    id: RequestId,
-    /// Set when the handler returned. After that, the watch ends at the next read.
-    handler_done: std.atomic.Value(bool) = .init(false),
-    /// Set when bytes from the client arrived while the handler ran.
-    saw_data: std.atomic.Value(bool) = .init(false),
+    req: jsonrpc.Message.Request,
+    principal: ?*resource_server.Principal,
+    arena: Allocator,
+    /// Set when the task ended.
+    ended: std.atomic.Value(bool) = .init(false),
+    /// Set when the task ended. The task of the connection waits on it, and a cancel of that
+    /// task ends the wait.
+    done: Io.Event = .unset,
 
-    fn run(self: *Watch, io: Io) void {
-        const r = &self.socket.interface;
-        while (r.end < r.buffer.len) {
-            if (self.token.isCancelled() or self.handler_done.load(.acquire)) return;
-            r.fillMore() catch |e| {
-                if (e == error.ReadFailed) if (self.socket.err) |err| if (err == error.Canceled) return;
-                if (self.handler_done.load(.acquire)) return;
-                log.debug("the client of request {f} disconnected", .{self.id});
-                self.token.cancel(io, disconnect_reason);
-                return;
-            };
-            if (self.handler_done.load(.acquire)) return;
-            self.saw_data.store(true, .release);
+    fn run(d: *Dispatch) void {
+        const self = d.conn.owner;
+        const io = self.io;
+        const exchange = d.exchange;
+        self.server.handle(io, .{
+            .kind = .streamable_http,
+            .arena = d.arena,
+            .message = .{ .request = d.req },
+            .responder = .{ .ptr = exchange, .vtable = &exchange_vtable },
+            .cancel = exchange.token,
+            .context = d.principal,
+            .peer = .{ .address = d.socket.stream.socket.address },
+        });
+        if (exchange.keepalive_future) |*f| {
+            exchange.keepalive_stop.store(true, .release);
+            _ = f.cancel(io);
         }
-    }
-
-    /// End the watch. For a connection that carries one more request, wait until the read
-    /// ends at the next bytes from the client. A canceled read can lose the bytes that
-    /// arrive at the same time. For a connection that closes, cancel the read.
-    fn stop(self: *Watch, io: Io, future: *Io.Future(void), reuse: bool) void {
-        self.handler_done.store(true, .release);
-        if (reuse and !self.saw_data.load(.acquire)) future.await(io) else future.cancel(io);
+        if (!exchange.done) {
+            // The handler ended without a response (cancelled): close the stream.
+            if (exchange.body_writer) |*bw| bw.end() catch {} else exchange.request.respond("", .{ .status = .service_unavailable }) catch {};
+        }
+        // The task of the connection reads the socket. From now on it waits for the next
+        // request, or for the close by the client after a response without keep-alive.
+        const reuse = exchange.reusable and !exchange.token.isCancelled() and exchange.request.head.keep_alive;
+        if (reuse) {
+            _ = d.conn.startTimer(.idle, self.limits.http.idle_timeout);
+        } else {
+            _ = d.conn.startTimer(.close, close_linger);
+        }
+        d.ended.store(true, .release);
+        d.done.set(io);
     }
 };
 

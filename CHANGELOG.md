@@ -4,6 +4,13 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Changed
+
+- The Streamable HTTP server runs one task for each connection and one more task for each request in flight. One supervisor task of the server watches the time limits of all connections. It cancels the task of a connection when a limit passes or when the server stops. It frees a connection when its task ended. The handler of a request runs in a task of its own, and the task of the connection reads the socket meanwhile. A disconnect of the client cancels the request, as before.
+- Before, each connection of the Streamable HTTP server had three tasks. One task watched its time limits. One task read the requests and ran the handlers. One task read the socket while a handler ran, and after the response the second task waited for it. With `std.Io.Threaded`, each task that waits has its own thread, and on Windows each thread commits 16 MiB of stack. Thus 256 idle keep-alive connections, the default of `Limits.http.max_connections`, held up to 768 threads and about 12 GiB.
+- In a load test on Windows with 20 keep-alive connections, the Streamable HTTP server now uses 25 threads and 408 MiB after the connects. Before, it used 44 threads and 727 MiB. After one request on each connection, it uses 34 threads and 560 MiB, before 59 threads and 980 MiB. In the fan-out rounds of the VS Code agent benchmark, up to 256 connections are open. The server now peaks at 264 threads and 4.14 GiB there. Before, it passed 11.6 GiB and a memory guard ended it.
+- After a response without keep-alive, the Streamable HTTP server now waits up to 2 seconds for the close by the client. Then it closes the connection. Before, the server closed the connection at once after the response.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added
