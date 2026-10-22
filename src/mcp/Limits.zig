@@ -61,6 +61,11 @@ http: struct {
     max_head_bytes: usize = 16 << 10,
     /// Maximum open connections. Overflow: the accept loop waits.
     max_connections: u32 = 256,
+    /// Maximum worker tasks: connections that read a request or run a handler, with the
+    /// listen streams. An idle keep-alive connection holds no task. Zero means
+    /// `max_connections`. Overflow: a connection with bytes waits for a free worker, up to
+    /// `head_timeout`. With `std.Io.Threaded`, each worker task is a thread.
+    max_in_flight: u32 = 256,
     /// Set `SO_REUSEADDR` on the listen socket of the HTTP and WebSocket servers.
     reuse_address: bool = false,
     /// The time that the server waits for the next request on a keep-alive connection. It is

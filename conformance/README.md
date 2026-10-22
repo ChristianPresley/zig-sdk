@@ -36,6 +36,8 @@ Add `--log-requests` to log one line for each call of a tool, resource, prompt o
 Add `--apps` to add a fixture of the MCP Apps extension `io.modelcontextprotocol/ui`. The server then declares the extension and serves the view `ui://conformance/view` with the MIME type `text/html;profile=mcp-app`. The tool `test_app_tool` names the view in `_meta.ui.resourceUri`. A client must declare the extension with that MIME type. Other clients get no `_meta.ui` and no view. The fixture is for tests of hosts and clients only.
 
 
+Add `--max-connections N` for a load test with many idle connections. The option sets `Limits.http.max_connections` of the HTTP listener. The default of the library is 256. Add `--max-in-flight N` to set `Limits.http.max_in_flight`, the worker tasks of the HTTP listener. The default of the library is 256, and zero means the connection limit.
+
 Add `--reuse-address` when a test starts the server again on the same port. The HTTP, WebSocket and gRPC listeners then set `reuse_address`, and the bind does not wait for old connections in `TIME_WAIT`. On Linux and the BSDs, a second server of the same user can then share the port. Thus the test runner must stop the old process first. The server ignores the option on Windows.
 
 

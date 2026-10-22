@@ -511,3 +511,65 @@ test "http limits: a message deeper than json_max_depth gets -32700" {
     const answer = try f.post(arena, ok, &headers);
     try std.testing.expectEqual(http.Status.ok, answer.status);
 }
+
+/// Wait until the parker of `t` holds `count` connections, for at most two seconds.
+fn waitHeld(t: *HttpServer, count: usize) !void {
+    const io = std.testing.io;
+    var waited: usize = 0;
+    while (t.parker.held.load(.acquire) != count) : (waited += 1) {
+        if (waited > 2000) return error.ParkerCountNotReached;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+test "http parker: an idle keep-alive connection holds no task, resumes on the next request and ends with the peer" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    const request_bytes = try discoverRequest(arena);
+    try raw.send(request_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+    // After the response, the parker owns the connection and no task does.
+    try waitHeld(&f.transport, 1);
+    f.transport.connections_lock.lockUncancelable(std.testing.io);
+    const with_task = f.transport.connections.items.len;
+    f.transport.connections_lock.unlock(std.testing.io);
+    try std.testing.expectEqual(0, with_task);
+    // The next request wakes the connection, and it parks again.
+    try raw.send(request_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+    try waitHeld(&f.transport, 1);
+    // The close by the peer frees the parked connection without a task.
+    raw.close(gpa);
+    try waitHeld(&f.transport, 0);
+}
+
+test "http parker: the cap of the worker tasks queues connections and serves them in turn" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    limits.http.max_in_flight = 1;
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var raws: [3]*Raw = undefined;
+    for (&raws) |*r| r.* = try Raw.open(gpa, f.transport.bound_port);
+    defer for (raws) |r| r.close(gpa);
+    const request_bytes = try discoverRequest(arena);
+    // Three requests at once share one worker task: each connection parks after its response,
+    // and the next queued connection gets the task.
+    for (raws) |r| try r.send(request_bytes);
+    for (raws) |r| try std.testing.expect(std.mem.startsWith(u8, try r.readResponse(arena), "HTTP/1.1 200 "));
+    for (raws) |r| try r.send(request_bytes);
+    for (raws) |r| try std.testing.expect(std.mem.startsWith(u8, try r.readResponse(arena), "HTTP/1.1 200 "));
+    try waitHeld(&f.transport, 3);
+}

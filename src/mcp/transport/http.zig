@@ -25,6 +25,7 @@ const McpServer = @import("../server/Server.zig");
 
 const log = std.log.scoped(.mcp_http);
 const wake = @import("../util/wake.zig");
+const park = @import("park.zig");
 
 pub const ResponseMode = enum { auto, sse, json };
 
@@ -62,8 +63,11 @@ pub const Server = struct {
     /// Set when the accept loop ended. The supervisor then ends with the last connection.
     accepting_done: std.atomic.Value(bool) = .init(false),
     stop_event: Io.Event = .unset,
+    /// The connections with a task: the supervisor watches their time limits.
     connections: std.ArrayList(*Connection) = .empty,
     connections_lock: Io.Mutex = .init,
+    /// The idle connections without a task, and the cap of the worker tasks.
+    parker: Parker = .{},
     /// Wakes the supervisor: a connection has a nearer time limit, a connection ended, or the
     /// server stops.
     supervisor_wake: Io.Event = .unset,
@@ -85,7 +89,29 @@ pub const Server = struct {
     pub fn deinit(self: *Server) void {
         if (self.listener) |*l| l.deinit(self.io);
         self.connections.deinit(self.gpa);
+        self.parker.snapshot.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// Add `conn` to the connections with a task. The caller holds no lock of the server.
+    fn track(self: *Server, conn: *Connection) !void {
+        self.connections_lock.lockUncancelable(self.io);
+        defer self.connections_lock.unlock(self.io);
+        conn.index = self.connections.items.len;
+        try self.connections.append(self.gpa, conn);
+    }
+
+    /// Remove `conn` from the connections with a task. The caller holds `connections_lock`.
+    fn untrackLocked(self: *Server, conn: *Connection) void {
+        const i = conn.index;
+        _ = self.connections.swapRemove(i);
+        if (i < self.connections.items.len) self.connections.items[i].index = i;
+    }
+
+    fn untrack(self: *Server, conn: *Connection) void {
+        self.connections_lock.lockUncancelable(self.io);
+        defer self.connections_lock.unlock(self.io);
+        self.untrackLocked(conn);
     }
 
     /// Bind the listen socket. After this call `bound_port` has the port (useful with port 0).
@@ -99,10 +125,19 @@ pub const Server = struct {
     /// cancel, the server accepts no more connections.
     pub fn serve(self: *Server) !void {
         if (self.listener == null) try self.bind();
+        const cap = if (self.limits.http.max_in_flight == 0) self.limits.http.max_connections else self.limits.http.max_in_flight;
+        try self.parker.start(self.gpa, cap);
+        defer self.parker.stop();
         var supervisor = try self.io.concurrent(supervise, .{self});
+        var parker_task = self.io.concurrent(runParker, .{self}) catch |e| {
+            self.closing.store(true, .release);
+            self.endSupervisor(&supervisor);
+            return e;
+        };
         var accept_future = self.io.concurrent(acceptLoop, .{self}) catch |e| {
             self.closing.store(true, .release);
             self.endSupervisor(&supervisor);
+            parker_task.await(self.io);
             return e;
         };
         self.stop_event.wait(self.io) catch {};
@@ -110,14 +145,16 @@ pub const Server = struct {
         wake.cancelAcceptLoop(self.io, &accept_future, self.listener.?.socket.address, &self.closing);
         self.server.shutdownSubscriptions(self.io);
         self.endSupervisor(&supervisor);
+        parker_task.await(self.io);
         self.group.await(self.io) catch {};
     }
 
-    /// Tell the supervisor that no more connections come, and wait until it ended the last
-    /// connection.
+    /// Tell the supervisor and the parker that no more connections come, and wait until the
+    /// supervisor ended the last connection.
     fn endSupervisor(self: *Server, supervisor: *Io.Future(void)) void {
         self.accepting_done.store(true, .release);
         self.supervisor_wake.set(self.io);
+        self.parker.wakeTask();
         supervisor.await(self.io);
     }
 
@@ -144,23 +181,15 @@ pub const Server = struct {
         }
     }
 
-    /// Start the task of a new connection under the supervisor. False when the server has
-    /// no memory or no task for the connection.
+    /// Give a new connection a task, or a place in the queue of the parker when the worker
+    /// tasks are at their cap. False when the server has no memory for the connection.
     fn startConnection(self: *Server, stream: Io.net.Stream) bool {
         const conn = self.gpa.create(Connection) catch return false;
         conn.* = .{ .owner = self, .stream = stream };
-        self.connections_lock.lockUncancelable(self.io);
-        defer self.connections_lock.unlock(self.io);
-        self.connections.append(self.gpa, conn) catch {
+        if (!self.parker.admit(self, conn)) {
             self.gpa.destroy(conn);
             return false;
-        };
-        // The supervisor sees the connection after the unlock, thus `worker` is set by then.
-        conn.worker = self.io.concurrent(Connection.work, .{conn}) catch {
-            _ = self.connections.pop();
-            self.gpa.destroy(conn);
-            return false;
-        };
+        }
         return true;
     }
 
@@ -193,11 +222,15 @@ pub const Server = struct {
                     switch (conn.state.load(.acquire)) {
                         .finished => {
                             conn.worker.await(io);
-                            _ = self.connections.swapRemove(i);
+                            self.untrackLocked(conn);
                             self.gpa.destroy(conn);
+                            // At the shutdown the parker waits for the last task to end.
+                            if (self.closing.load(.acquire)) self.parker.wakeTask();
                             continue;
                         },
                         .canceling => continue,
+                        // On the way to the parker, which removes it from this list.
+                        .queued, .parked, .parked_closing => continue,
                         .running => {},
                     }
                     const d = conn.deadline.load(.acquire);
@@ -228,7 +261,8 @@ pub const Server = struct {
                 if (!again) self.next_deadline.store(next, .release);
             }
             for (due[0..due_count]) |conn| self.group.concurrent(io, Connection.cancelWorker, .{conn}) catch conn.cancelWorker();
-            if (empty and no_more) return;
+            // The parker holds its connections until they end; it wakes the supervisor then.
+            if (empty and no_more and self.parker.held.load(.acquire) == 0) return;
             if (again) continue;
             const wait_ns: i64 = if (next == Connection.unlimited) 60 * std.time.ns_per_s else @max(next - now, 1);
             self.supervisor_wake.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(wait_ns), .clock = .awake } }) catch |e| switch (e) {
@@ -245,8 +279,50 @@ pub const Server = struct {
         self.stop_event.set(self.io);
         self.server.shutdownSubscriptions(self.io);
         // The supervisor cancels the connections that wait for a request at once, and the
-        // busy connections after `limits.shutdown_grace`.
+        // busy connections after `limits.shutdown_grace`. The parker closes the parked ones.
         self.supervisor_wake.set(self.io);
+        self.parker.wakeTask();
+    }
+
+    /// The task of the parker. It waits for bytes on the parked sockets and gives a ready
+    /// connection a worker task. It closes a parked connection at its idle time limit and
+    /// at the shutdown. It frees the connections that end without a task.
+    fn runParker(self: *Server) void {
+        const io = self.io;
+        const p = &self.parker;
+        const poller = &p.poller.?;
+        var events: [256]park.Event = undefined;
+        while (true) {
+            p.lock.lockUncancelable(io);
+            if (self.closing.load(.acquire)) p.closeAllLocked(self);
+            const now = nowNanoseconds(io);
+            p.expireLocked(self, now);
+            p.spawnReadyLocked(self);
+            const next = p.nextDeadlineLocked();
+            // The parker ends after the last connection: the ones it holds, the ones it
+            // watches for a handler, and the ones with a task, which can still hand over.
+            var done = self.closing.load(.acquire) and self.accepting_done.load(.acquire) and p.held.load(.acquire) == 0 and p.watching.head == null;
+            if (done) {
+                self.connections_lock.lockUncancelable(io);
+                done = self.connections.items.len == 0;
+                self.connections_lock.unlock(io);
+            }
+            if (!park.is_windows) {
+                p.snapshot.clearRetainingCapacity();
+                var it = p.parked.head;
+                while (it) |c| : (it = c.next) p.snapshot.append(self.gpa, &c.slot) catch break;
+                it = p.watching.head;
+                while (it) |c| : (it = c.next) p.snapshot.append(self.gpa, &c.slot) catch break;
+            }
+            p.lock.unlock(io);
+            if (done) return;
+            const timeout_ms: i32 = if (next == Connection.unlimited) -1 else @intCast(@min(std.math.maxInt(i32), @divFloor(@max(next - now, 0) + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+            const n = poller.wait(timeout_ms, p.snapshot.items, &events) catch 0;
+            if (n == 0) continue;
+            p.lock.lockUncancelable(io);
+            for (events[0..n]) |ev| p.handleEventLocked(self, ev);
+            p.lock.unlock(io);
+        }
     }
 
     fn originAllowed(self: *Server, origin: []const u8) bool {
@@ -325,8 +401,34 @@ const close_linger: Io.Duration = .fromSeconds(2);
 const Connection = struct {
     owner: *Server,
     stream: Io.net.Stream,
-    /// The task of the connection. Only the supervisor awaits or cancels it, one time.
+    /// The task of the connection. The supervisor awaits or cancels it one time while the
+    /// connection has a task. The parker awaits it after a park.
     worker: Io.Future(void) = undefined,
+    /// True while `worker` holds a task that nobody awaited or canceled.
+    future_live: bool = false,
+    /// The position in `Server.connections` while the connection has a task.
+    index: usize = undefined,
+    /// The links of the lists of the parker.
+    prev: ?*Connection = null,
+    next: ?*Connection = null,
+    /// The awake time in nanoseconds at which the parker closes the connection, or
+    /// `unlimited`.
+    park_deadline: i64 = unlimited,
+    /// The readiness state of the parked socket.
+    slot: park.Slot = .{},
+    /// True after the stream was closed.
+    closed: bool = false,
+    /// What the poll of the parker on this socket is for. The parker writes it under its
+    /// lock.
+    poll_phase: PollPhase = .none,
+    /// Set by the parker when bytes arrived, or when the peer closed, while a handler ran.
+    data_seen: bool = false,
+    hangup_seen: bool = false,
+    /// The cancel token of the request that runs, for a disconnect that the parker sees.
+    cancel_token: ?*Transport.CancelToken = null,
+    /// True for a plaintext connection: the parker watches its socket. A TLS connection
+    /// keeps its task as the watch, and never parks.
+    use_poll: bool = false,
     /// The time limit of the read that the task does now: an awake time in nanoseconds,
     /// `busy`, `unlimited` or `expired`. Only the task and its handler change a value other
     /// than `expired`. Only the supervisor sets `expired`.
@@ -349,7 +451,32 @@ const Connection = struct {
         busy,
     };
 
-    const State = enum(u8) { running, canceling, finished };
+    const State = enum(u8) {
+        /// The connection has a task. The supervisor watches it.
+        running,
+        canceling,
+        finished,
+        /// The connection waits in the queue of the parker for a worker task.
+        queued,
+        /// The connection is idle and has no task. The parker waits for its bytes.
+        parked,
+        /// The parker closed the socket. The completion of the poll frees the connection.
+        parked_closing,
+    };
+
+    const PollPhase = enum(u8) {
+        /// No poll is pending.
+        none,
+        /// The poll watches the socket while a handler runs.
+        handler,
+        /// The poll is the idle wait of a parked connection.
+        idle,
+        /// The parker canceled the poll. Its completion frees the slot (Windows).
+        draining,
+        /// The parker closed the socket. The completion of the poll frees the connection
+        /// (Windows).
+        closing,
+    };
 
     /// The task runs a handler or writes a response. No time limit applies.
     const busy: i64 = 0;
@@ -358,17 +485,21 @@ const Connection = struct {
     /// The time limit passed, or the server stops. The task must stop.
     const expired: i64 = -1;
 
-    /// The task of the connection.
+    /// The task of the connection. It ends when the connection closes, or when the connection
+    /// is idle and the parker takes it.
     fn work(conn: *Connection) void {
         const self = conn.owner;
         const io = self.io;
-        defer {
-            conn.stream.close(io);
-            self.permits.post(io);
-            // The supervisor frees the connection. After a cancel, the canceller marks the end.
-            if (conn.state.cmpxchgStrong(.running, .finished, .acq_rel, .acquire) == null) self.supervisor_wake.set(io);
-        }
-        conn.serve() catch {};
+        const parked = conn.serve() catch false;
+        if (parked) return;
+        // A poll that is still pending references the connection: the parker closes it.
+        if (self.parker.takeOverPending(self, conn)) return;
+        conn.stream.close(io);
+        conn.closed = true;
+        self.permits.post(io);
+        self.parker.release(self);
+        // The supervisor frees the connection. After a cancel, the canceller marks the end.
+        if (conn.state.cmpxchgStrong(.running, .finished, .acq_rel, .acquire) == null) self.supervisor_wake.set(io);
     }
 
     /// Cancel the task and mark the end. The supervisor runs it in a task of the group. Thus
@@ -453,15 +584,16 @@ const Connection = struct {
         };
     }
 
-    /// Read and handle requests until the connection ends. The TLS handshake and the head of
-    /// the first request obey `limits.http.head_timeout`. The wait for the next request obeys
-    /// `limits.http.idle_timeout`, and its head obeys `head_timeout` from its first byte.
-    fn serve(conn: *Connection) Io.Cancelable!void {
+    /// Read and handle requests until the connection ends or the parker takes it. The TLS
+    /// handshake and the head of the first request obey `limits.http.head_timeout`. The wait
+    /// for the next request obeys `limits.http.idle_timeout`, and its head obeys
+    /// `head_timeout` from its first byte. True when the parker took the connection.
+    fn serve(conn: *Connection) Io.Cancelable!bool {
         const self = conn.owner;
-        if (!conn.startTimer(.head, self.limits.http.head_timeout)) return;
-        const read_buf = self.gpa.alloc(u8, @max(self.limits.http.max_head_bytes + 4096, tls.Connection.min_input_buffer_len)) catch return;
+        if (!conn.startTimer(.head, self.limits.http.head_timeout)) return false;
+        const read_buf = self.gpa.alloc(u8, @max(self.limits.http.max_head_bytes + 4096, tls.Connection.min_input_buffer_len)) catch return false;
         defer self.gpa.free(read_buf);
-        const write_buf = self.gpa.alloc(u8, tls.Connection.min_output_buffer_len) catch return;
+        const write_buf = self.gpa.alloc(u8, tls.Connection.min_output_buffer_len) catch return false;
         defer self.gpa.free(write_buf);
         var reader = conn.stream.reader(self.io, read_buf);
         var writer = conn.stream.writer(self.io, write_buf);
@@ -478,10 +610,10 @@ const Connection = struct {
             self.gpa.free(tls_write_buf);
         };
         if (self.options.tls) |tls_server| {
-            tls_read_buf = self.gpa.alloc(u8, tls.Connection.min_read_buffer_len) catch return;
+            tls_read_buf = self.gpa.alloc(u8, tls.Connection.min_read_buffer_len) catch return false;
             tls_write_buf = self.gpa.alloc(u8, 16 * 1024) catch {
                 self.gpa.free(tls_read_buf);
-                return;
+                return false;
             };
             tls_conn = tls_server.accept(&reader.interface, &writer.interface, .{
                 .io = self.io,
@@ -491,46 +623,409 @@ const Connection = struct {
             }) catch {
                 self.gpa.free(tls_read_buf);
                 self.gpa.free(tls_write_buf);
-                return;
+                return false;
             };
             tls_active = true;
         }
         const in: *Io.Reader = if (tls_active) &tls_conn.reader else &reader.interface;
         const out: *Io.Writer = if (tls_active) &tls_conn.writer else &writer.interface;
+        conn.use_poll = !tls_active;
         var http_server: http.Server = .init(in, out);
         var first = true;
         while (!self.closing.load(.acquire)) {
             if (!first) {
                 // Wait for the first byte of the next request. A time limit that runs already
                 // (from the end of the last handler) continues.
-                if (!conn.continueTimer(.idle, self.limits.http.idle_timeout)) return;
-                _ = in.peekByte() catch return;
-                if (!conn.startTimer(.head, self.limits.http.head_timeout)) return;
+                if (!conn.continueTimer(.idle, self.limits.http.idle_timeout)) return false;
+                _ = in.peekByte() catch return false;
+                if (!conn.startTimer(.head, self.limits.http.head_timeout)) return false;
             }
             first = false;
             var request = http_server.receiveHead() catch |e| switch (e) {
-                error.HttpConnectionClosing => return,
+                error.HttpConnectionClosing => return false,
                 error.HttpHeadersOversize => {
                     out.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch {};
                     out.flush() catch {};
-                    return;
+                    return false;
                 },
                 else => {
                     if (conn.timedOut()) conn.sendTimeout(out);
-                    return;
+                    return false;
                 },
             };
-            if (!conn.stopTimer()) return;
+            if (!conn.stopTimer()) return false;
             const keep_alive = handleRequest(conn, &request, &reader) catch |err| switch (err) {
                 error.OutOfMemory => false,
                 else => false,
             };
-            if (conn.timedOut()) {
-                conn.sendTimeout(out);
-                return;
+            const timed_out = conn.timedOut();
+            if (timed_out) conn.sendTimeout(out);
+            const reuse = keep_alive and request.head.keep_alive and !timed_out;
+            if (conn.use_poll) {
+                // An idle plaintext connection goes to the parker and holds no task.
+                switch (self.parker.afterRequest(self, conn, reuse, in.bufferedLen() == 0)) {
+                    .parked => return true,
+                    .close => return false,
+                    .read_next => continue,
+                }
             }
-            if (!keep_alive or !request.head.keep_alive) return;
+            if (!reuse) return false;
         }
+        return false;
+    }
+};
+
+/// The awake time in nanoseconds `limit` from now, or `unlimited` for a zero limit.
+fn deadlineFrom(io: Io, limit: Io.Duration) i64 {
+    const ns = nanoseconds(limit);
+    return if (ns == 0) Connection.unlimited else nowNanoseconds(io) +| ns;
+}
+
+/// The idle keep-alive connections of the server, without a task each, and the cap of the
+/// worker tasks. One task of the server, `Server.runParker`, waits for bytes on all parked
+/// sockets. A connection with bytes gets a worker task again, or waits in `ready` when the
+/// worker tasks are at `cap`. New connections pass the same cap. The parker closes a parked
+/// connection at its idle time limit, when its peer closed, and at the shutdown.
+const Parker = struct {
+    lock: Io.Mutex = .init,
+    poller: ?park.Poller = null,
+    /// The parked connections in the order of their park time: the head expires first.
+    parked: List = .{},
+    parked_count: usize = 0,
+    /// The connections that wait for a worker task, in the order of arrival.
+    ready: List = .{},
+    /// The connections whose socket the parker watches while a handler runs.
+    watching: List = .{},
+    /// The connections whose socket this side closed while a poll was pending (Windows).
+    closing_count: usize = 0,
+    /// The connections the parker owns: parked, in `ready`, or with a closed socket. The
+    /// supervisor ends after the parker gave up the last one.
+    held: std.atomic.Value(usize) = .init(0),
+    /// The worker tasks that run now.
+    active: u32 = 0,
+    cap: u32 = 1,
+    /// The slots of the POSIX wait.
+    snapshot: std.ArrayList(*park.Slot) = .empty,
+
+    /// An intrusive list in the order of insertion.
+    const List = struct {
+        head: ?*Connection = null,
+        tail: ?*Connection = null,
+
+        fn push(l: *List, c: *Connection) void {
+            c.prev = l.tail;
+            c.next = null;
+            if (l.tail) |t| t.next = c else l.head = c;
+            l.tail = c;
+        }
+
+        fn remove(l: *List, c: *Connection) void {
+            if (c.prev) |p| p.next = c.next else l.head = c.next;
+            if (c.next) |n| n.prev = c.prev else l.tail = c.prev;
+            c.prev = null;
+            c.next = null;
+        }
+
+        fn pop(l: *List) ?*Connection {
+            const c = l.head orelse return null;
+            l.remove(c);
+            return c;
+        }
+    };
+
+    fn start(p: *Parker, gpa: Allocator, cap: u32) !void {
+        p.poller = try park.Poller.init(gpa);
+        p.cap = @max(cap, 1);
+    }
+
+    fn stop(p: *Parker) void {
+        if (p.poller) |*poller| poller.deinit();
+        p.poller = null;
+    }
+
+    /// Wake the task of the parker. Safe from any task.
+    fn wakeTask(p: *Parker) void {
+        if (p.poller) |*poller| poller.wake();
+    }
+
+    /// Give a new connection a worker task, or a place in `ready` when the tasks are at the
+    /// cap. False when the server has no memory for it.
+    fn admit(p: *Parker, self: *Server, conn: *Connection) bool {
+        const io = self.io;
+        p.lock.lockUncancelable(io);
+        defer p.lock.unlock(io);
+        if (p.active < p.cap) return p.spawnLocked(self, conn, false);
+        conn.park_deadline = deadlineFrom(io, self.limits.http.head_timeout);
+        conn.state.store(.queued, .release);
+        p.ready.push(conn);
+        _ = p.held.fetchAdd(1, .acq_rel);
+        if (p.ready.head == conn) p.wakeTask();
+        return true;
+    }
+
+    /// A worker task ended. Give the next ready connection a task.
+    fn release(p: *Parker, self: *Server) void {
+        p.lock.lockUncancelable(self.io);
+        defer p.lock.unlock(self.io);
+        p.active -= 1;
+        p.spawnReadyLocked(self);
+    }
+
+    /// Watch the socket of `conn` while the handler of its request runs. A close by the peer
+    /// cancels the request through `token`. The parker notes the bytes that arrive, for the
+    /// read after the handler. False when the parker cannot watch the socket now. The task
+    /// then reads the socket itself.
+    fn watchHandler(p: *Parker, self: *Server, conn: *Connection, token: *Transport.CancelToken) bool {
+        p.lock.lockUncancelable(self.io);
+        defer p.lock.unlock(self.io);
+        if (conn.poll_phase != .none) return false;
+        const poller = &(p.poller orelse return false);
+        conn.data_seen = false;
+        conn.hangup_seen = false;
+        conn.cancel_token = token;
+        poller.arm(&conn.slot, conn.stream.socket.handle) catch return false;
+        conn.poll_phase = .handler;
+        p.watching.push(conn);
+        if (!park.is_windows) poller.wake();
+        return true;
+    }
+
+    const After = enum {
+        /// The parker owns the connection. The task ends.
+        parked,
+        /// The task closes the connection (through `takeOverPending` when a poll is pending).
+        close,
+        /// The task reads the next request.
+        read_next,
+    };
+
+    /// Decide what the task does after a request. `reuse`: the connection can carry one more
+    /// request. `empty`: no bytes wait in the buffer of the task.
+    fn afterRequest(p: *Parker, self: *Server, conn: *Connection, reuse: bool, empty: bool) After {
+        const io = self.io;
+        p.lock.lockUncancelable(io);
+        defer p.lock.unlock(io);
+        conn.cancel_token = null;
+        const poller = &(p.poller orelse return if (reuse) .read_next else .close);
+        const keep = reuse and !self.closing.load(.acquire);
+        switch (conn.poll_phase) {
+            .handler => {
+                // The poll is pending: nothing arrived while the handler ran.
+                if (!keep) return .close;
+                p.watching.remove(conn);
+                if (empty) {
+                    p.parkLocked(self, conn);
+                    if (p.parked.head == conn) poller.wake();
+                    return .parked;
+                }
+                // Bytes wait in the buffer of the task. The poll ends; the task reads them.
+                conn.poll_phase = if (poller.cancel(&conn.slot)) .draining else .none;
+                return .read_next;
+            },
+            .draining => return if (keep) .read_next else .close,
+            .none => {
+                if (!keep or conn.hangup_seen) return .close;
+                if (conn.data_seen or !empty) return .read_next;
+                // No poll ran, for a response without a handler: park with a new poll.
+                poller.arm(&conn.slot, conn.stream.socket.handle) catch return .read_next;
+                p.parkLocked(self, conn);
+                if (!park.is_windows or p.parked.head == conn) poller.wake();
+                return .parked;
+            },
+            .idle, .closing => unreachable,
+        }
+    }
+
+    /// The poll of `conn` runs. Make the connection a parked one and end its task.
+    fn parkLocked(p: *Parker, self: *Server, conn: *Connection) void {
+        conn.poll_phase = .idle;
+        conn.park_deadline = deadlineFrom(self.io, self.limits.http.idle_timeout);
+        conn.state.store(.parked, .release);
+        p.parked.push(conn);
+        p.parked_count += 1;
+        p.handOverLocked(self, conn);
+    }
+
+    /// The task of `conn` ends. The parker owns the connection from now on.
+    fn handOverLocked(p: *Parker, self: *Server, conn: *Connection) void {
+        _ = p.held.fetchAdd(1, .acq_rel);
+        p.active -= 1;
+        p.spawnReadyLocked(self);
+        self.untrack(conn);
+    }
+
+    /// The task of `conn` ends with a close. When a poll is pending for the socket, the parker
+    /// takes the connection and closes the socket. The completion of the poll then frees the
+    /// connection. True in that case. False when the task closes the connection itself.
+    fn takeOverPending(p: *Parker, self: *Server, conn: *Connection) bool {
+        const io = self.io;
+        p.lock.lockUncancelable(io);
+        defer p.lock.unlock(io);
+        conn.cancel_token = null;
+        switch (conn.poll_phase) {
+            .none => return false,
+            .handler => {
+                p.watching.remove(conn);
+                if (!p.poller.?.cancel(&conn.slot)) {
+                    conn.poll_phase = .none;
+                    return false;
+                }
+            },
+            .draining => {},
+            .idle, .closing => unreachable,
+        }
+        conn.stream.close(io);
+        conn.closed = true;
+        conn.poll_phase = .closing;
+        p.closing_count += 1;
+        conn.state.store(.parked_closing, .release);
+        p.handOverLocked(self, conn);
+        return true;
+    }
+
+    /// Start the worker task of `conn`, which then has the state `running` and is in
+    /// `Server.connections`. `was_held`: the parker owned the connection before.
+    fn spawnLocked(p: *Parker, self: *Server, conn: *Connection, was_held: bool) bool {
+        const io = self.io;
+        if (conn.future_live) {
+            conn.worker.await(io);
+            conn.future_live = false;
+        }
+        self.track(conn) catch return false;
+        conn.worker = io.concurrent(Connection.work, .{conn}) catch {
+            self.untrack(conn);
+            return false;
+        };
+        conn.future_live = true;
+        conn.state.store(.running, .release);
+        p.active += 1;
+        if (was_held) _ = p.held.fetchSub(1, .acq_rel);
+        return true;
+    }
+
+    /// Give the ready connections a worker task, up to the cap.
+    fn spawnReadyLocked(p: *Parker, self: *Server) void {
+        while (p.active < p.cap) {
+            const conn = p.ready.pop() orelse return;
+            if (!p.spawnLocked(self, conn, true)) p.finishLocked(self, conn);
+        }
+    }
+
+    /// Free a connection the parker owns: no poll is pending for it.
+    fn finishLocked(p: *Parker, self: *Server, conn: *Connection) void {
+        const io = self.io;
+        if (conn.future_live) {
+            conn.worker.await(io);
+            conn.future_live = false;
+        }
+        if (!conn.closed) {
+            conn.stream.close(io);
+            conn.closed = true;
+        }
+        self.permits.post(io);
+        _ = p.held.fetchSub(1, .acq_rel);
+        self.gpa.destroy(conn);
+        self.supervisor_wake.set(io);
+    }
+
+    /// Close a parked connection. On Windows the poll of the socket is pending: cancel it and
+    /// close the socket, and free the connection when the completion arrives.
+    fn closeParkedLocked(p: *Parker, self: *Server, conn: *Connection) void {
+        p.parked.remove(conn);
+        p.parked_count -= 1;
+        if (p.poller.?.cancel(&conn.slot)) {
+            conn.stream.close(self.io);
+            conn.closed = true;
+            conn.poll_phase = .closing;
+            conn.state.store(.parked_closing, .release);
+            p.closing_count += 1;
+        } else {
+            conn.poll_phase = .none;
+            p.finishLocked(self, conn);
+        }
+    }
+
+    fn handleEventLocked(p: *Parker, self: *Server, ev: park.Event) void {
+        const conn: *Connection = @alignCast(@fieldParentPtr("slot", ev.slot));
+        switch (conn.poll_phase) {
+            .closing => {
+                conn.poll_phase = .none;
+                p.closing_count -= 1;
+                p.finishLocked(self, conn);
+            },
+            .draining => conn.poll_phase = .none,
+            .idle => {
+                if (ev.readable) {
+                    p.parked.remove(conn);
+                    p.parked_count -= 1;
+                    conn.poll_phase = .none;
+                    conn.park_deadline = deadlineFrom(self.io, self.limits.http.head_timeout);
+                    conn.state.store(.queued, .release);
+                    p.ready.push(conn);
+                } else if (ev.hangup) {
+                    p.parked.remove(conn);
+                    p.parked_count -= 1;
+                    conn.poll_phase = .none;
+                    p.finishLocked(self, conn);
+                } else {
+                    // The wait ended for another reason. Watch the socket again.
+                    p.poller.?.arm(&conn.slot, conn.stream.socket.handle) catch {
+                        p.parked.remove(conn);
+                        p.parked_count -= 1;
+                        conn.poll_phase = .none;
+                        p.finishLocked(self, conn);
+                    };
+                }
+            },
+            .handler => {
+                if (ev.readable or ev.hangup) {
+                    conn.poll_phase = .none;
+                    p.watching.remove(conn);
+                    if (ev.readable) conn.data_seen = true;
+                    if (ev.hangup) {
+                        conn.hangup_seen = true;
+                        if (conn.cancel_token) |token| {
+                            log.debug("the client of a request disconnected", .{});
+                            token.cancel(self.io, disconnect_reason);
+                        }
+                    }
+                } else {
+                    p.poller.?.arm(&conn.slot, conn.stream.socket.handle) catch {
+                        conn.poll_phase = .none;
+                        p.watching.remove(conn);
+                    };
+                }
+            },
+            .none => {},
+        }
+    }
+
+    /// Close the connections whose time limit passed: parked ones at `idle_timeout`, queued
+    /// ones at `head_timeout`.
+    fn expireLocked(p: *Parker, self: *Server, now: i64) void {
+        while (p.parked.head) |c| {
+            if (c.park_deadline > now) break;
+            p.closeParkedLocked(self, c);
+        }
+        while (p.ready.head) |c| {
+            if (c.park_deadline > now) break;
+            p.ready.remove(c);
+            p.finishLocked(self, c);
+        }
+    }
+
+    /// The nearest time limit of the parked and the queued connections, or `unlimited`.
+    fn nextDeadlineLocked(p: *Parker) i64 {
+        var next: i64 = Connection.unlimited;
+        if (p.parked.head) |c| next = @min(next, c.park_deadline);
+        if (p.ready.head) |c| next = @min(next, c.park_deadline);
+        return next;
+    }
+
+    /// At the shutdown: close every parked and queued connection at once.
+    fn closeAllLocked(p: *Parker, self: *Server) void {
+        while (p.parked.head) |c| p.closeParkedLocked(self, c);
+        while (p.ready.pop()) |c| p.finishLocked(self, c);
     }
 };
 
@@ -779,7 +1274,10 @@ fn handleRpcRequest(conn: *Connection, request: *http.Server.Request, socket: *I
     // disconnect of the client cancels the request, also while the handler does not write.
     var handler: ?Io.Future(void) = self.io.concurrent(Dispatch.run, .{&dispatch}) catch null;
     if (handler) |*h| {
-        conn.watch(socket, &dispatch);
+        // The parker watches the socket of a plaintext connection while the handler runs: a
+        // disconnect cancels the request. For a TLS connection, or when the parker cannot
+        // watch the socket, this task reads the socket instead.
+        if (!conn.use_poll or !self.parker.watchHandler(self, conn, &token)) conn.watch(socket, &dispatch);
         if (conn.timedOut()) {
             // A time limit or the shutdown canceled this task. The handler gets the cancel.
             h.cancel(self.io);

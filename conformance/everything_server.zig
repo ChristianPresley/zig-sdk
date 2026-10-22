@@ -11,7 +11,8 @@
 //! `--reuse-address` lets a new server bind a port at once after the old one stops.
 //!
 //! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--no-tunnel] [--ws-port N]
-//!        [--tls-cert cert.pem --tls-key key.pem] [--log-requests] [--apps] [--reuse-address] [--stdio]
+//!        [--tls-cert cert.pem --tls-key key.pem] [--log-requests] [--apps] [--reuse-address]
+//!        [--max-connections N] [--max-in-flight N] [--stdio]
 const std = @import("std");
 const builtin = @import("builtin");
 const mcp = @import("mcp");
@@ -675,6 +676,12 @@ const Config = struct {
     /// connections. The test runner must stop the old process first. The server ignores the
     /// option on Windows.
     reuse_address: bool = false,
+    /// `--max-connections N`: `Limits.http.max_connections` of the HTTP listener, for load
+    /// tests with many idle connections. Null keeps the default of the library.
+    max_connections: ?u32 = null,
+    /// `--max-in-flight N`: `Limits.http.max_in_flight`, the worker tasks of the HTTP
+    /// listener. Null keeps the default of the library.
+    max_in_flight: ?u32 = null,
 
     /// True when the listeners set `reuse_address`: with `--reuse-address` and not on Windows.
     fn reuseAddress(self: Config) bool {
@@ -731,6 +738,13 @@ fn parseArgs(args: []const []const u8) !Config {
             config.stdio = true;
         } else if (std.mem.eql(u8, args[i], "--reuse-address")) {
             config.reuse_address = true;
+        } else if (std.mem.eql(u8, args[i], "--max-connections") and i + 1 < args.len) {
+            i += 1;
+            config.max_connections = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidMaxConnections;
+            if (config.max_connections == 0) return error.InvalidMaxConnections;
+        } else if (std.mem.eql(u8, args[i], "--max-in-flight") and i + 1 < args.len) {
+            i += 1;
+            config.max_in_flight = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidMaxInFlight;
         } else if (std.mem.eql(u8, args[i], "--apps")) {
             config.apps = true;
         } else if (std.mem.eql(u8, args[i], "--log-requests")) {
@@ -775,6 +789,8 @@ pub fn main(init: std.process.Init) !void {
     var options = serverOptions(config.apps);
     options.limits.http.reuse_address = config.reuseAddress();
     if (config.reuse_address and !config.reuseAddress()) std.log.info("--reuse-address has no effect on Windows", .{});
+    if (config.max_connections) |n| options.limits.http.max_connections = n;
+    if (config.max_in_flight) |n| options.limits.http.max_in_flight = n;
     var server = try mcp.Server.init(gpa, io, options);
     defer server.deinit();
     try register(&server, io);
@@ -1098,6 +1114,20 @@ test "without --apps: no view and no tool of the fixture" {
     try t.init(serverOptions(false));
     defer t.deinit();
     try testing.expect(findTool(try t.callWithMeta("tools/list", test_meta_ui, ""), "test_app_tool") == null);
+}
+
+test "--max-connections: the HTTP limit, with the default of the library without the option" {
+    try testing.expectEqual(null, (try parseArgs(&.{"server"})).max_connections);
+    try testing.expectEqual(10000, (try parseArgs(&.{ "server", "--max-connections", "10000" })).max_connections);
+    try testing.expectError(error.InvalidMaxConnections, parseArgs(&.{ "server", "--max-connections", "0" }));
+    try testing.expectError(error.InvalidMaxConnections, parseArgs(&.{ "server", "--max-connections", "many" }));
+}
+
+test "--max-in-flight: the worker tasks of the HTTP listener, zero for the connection limit" {
+    try testing.expectEqual(null, (try parseArgs(&.{"server"})).max_in_flight);
+    try testing.expectEqual(64, (try parseArgs(&.{ "server", "--max-in-flight", "64" })).max_in_flight);
+    try testing.expectEqual(0, (try parseArgs(&.{ "server", "--max-in-flight", "0" })).max_in_flight);
+    try testing.expectError(error.InvalidMaxInFlight, parseArgs(&.{ "server", "--max-in-flight", "all" }));
 }
 
 test "--reuse-address: on for the listeners except on Windows, off by default" {
