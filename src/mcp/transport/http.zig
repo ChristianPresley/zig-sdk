@@ -294,6 +294,7 @@ pub const Server = struct {
         var events: [256]park.Event = undefined;
         while (true) {
             p.lock.lockUncancelable(io);
+            if (!park.is_windows) p.finishClosingLocked(self);
             if (self.closing.load(.acquire)) p.closeAllLocked(self);
             const now = nowNanoseconds(io);
             p.expireLocked(self, now);
@@ -627,7 +628,11 @@ const Connection = struct {
         }
         const in: *Io.Reader = if (tls_active) &tls_conn.reader else &reader.interface;
         const out: *Io.Writer = if (tls_active) &tls_conn.writer else &writer.interface;
-        conn.use_poll = !tls_active;
+        // The parker watches a plaintext socket with its poll. On POSIX the poll is `poll`
+        // over the whole set each wait, and the parker is not yet correct there, so only
+        // Windows parks for now. A POSIX connection keeps its task between requests, as the
+        // base behavior does. The POSIX poll path in `park.zig` stays for the follow-up.
+        conn.use_poll = !tls_active and park.is_windows;
         var http_server: http.Server = .init(in, out);
         var first = true;
         while (!self.closing.load(.acquire)) {
@@ -694,8 +699,11 @@ const Parker = struct {
     ready: List = .{},
     /// The connections whose socket the parker watches while a handler runs.
     watching: List = .{},
-    /// The connections whose socket this side closed while a poll was pending (Windows).
+    /// The connections whose socket this side closed while a poll was pending. On Windows the
+    /// completion of the poll frees them. On POSIX systems they wait in `closing` for the
+    /// next loop of the parker, because the wait that runs can still name their slot.
     closing_count: usize = 0,
+    closing: List = .{},
     /// The connections the parker owns: parked, in `ready`, or with a closed socket. The
     /// supervisor ends after the parker gave up the last one.
     held: std.atomic.Value(usize) = .init(0),
@@ -867,30 +875,39 @@ const Parker = struct {
         conn.cancel_token = null;
         switch (conn.poll_phase) {
             .none => return false,
-            .handler => {
-                p.watching.remove(conn);
-                if (!park.is_windows) {
-                    conn.poll_phase = .none;
-                    return false;
-                }
-            },
+            .handler => p.watching.remove(conn),
             .idle, .closing => unreachable,
         }
         p.closeWithPollLocked(self, conn);
         p.handOverLocked(self, conn);
+        // The POSIX wait that runs can still name the slot. The parker frees the connection
+        // in its next loop, after a new wait set.
+        if (!park.is_windows) p.wakeTask();
         return true;
     }
 
-    /// Close the socket of `conn` while its poll is pending (Windows). The close completes
+    /// Close the socket of `conn` while its poll is pending. On Windows the close completes
     /// the poll, and the completion frees the connection. A cancel of the poll would make
-    /// the kernel walk every pending poll of the helper handle, which is slow with many
-    /// parked connections.
+    /// the kernel walk every pending poll of the helper handle. That is slow with many
+    /// parked connections. On POSIX systems the parker frees the connection in its next
+    /// loop.
     fn closeWithPollLocked(p: *Parker, self: *Server, conn: *Connection) void {
         conn.stream.close(self.io);
         conn.closed = true;
         conn.poll_phase = .closing;
         conn.state.store(.parked_closing, .release);
         p.closing_count += 1;
+        if (!park.is_windows) p.closing.push(conn);
+    }
+
+    /// POSIX systems: free the connections that closed while the last wait ran. The wait
+    /// set of the next loop does not name them.
+    fn finishClosingLocked(p: *Parker, self: *Server) void {
+        while (p.closing.pop()) |conn| {
+            p.closing_count -= 1;
+            conn.poll_phase = .none;
+            p.finishLocked(self, conn);
+        }
     }
 
     /// Start the worker task of `conn`, which then has the state `running` and is in
@@ -955,6 +972,7 @@ const Parker = struct {
         const conn: *Connection = @alignCast(@fieldParentPtr("slot", ev.slot));
         switch (conn.poll_phase) {
             .closing => {
+                if (!park.is_windows) p.closing.remove(conn);
                 conn.poll_phase = .none;
                 p.closing_count -= 1;
                 p.finishLocked(self, conn);
