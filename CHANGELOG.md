@@ -4,6 +4,12 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Changed
+
+- The WebSocket server runs one task for each connection. One supervisor task of the server watches the time limits of all connections and sends the pings. It closes a connection when a time limit passes, when the reader ended, or when the server stops. It runs each close and each ping in a task of its own. Thus the supervisor never blocks on the socket of one connection, and an idle connection holds one task.
+- Before, each connection of the WebSocket server had two tasks. One task watched its time limits and sent the pings. One task read the handshake and the frames. With `std.Io.Threaded`, each task that waits has its own thread, and on Windows each thread commits 16 MiB of stack. Thus 256 idle connections, the default of `Limits.websocket.max_connections`, held up to 512 threads.
+- In a load test on Windows with 50 keep-alive WebSocket connections, the server now uses 55 threads and 915 MiB after the upgrades. Before, it used 104 threads and 1,739 MiB. After one request on each connection, it uses 72 threads and 1,201 MiB, before 119 threads and 1,992 MiB.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added
