@@ -4,6 +4,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-22
+
 ### Added
 
 - `Limits.http.max_in_flight`: the maximum worker tasks of the Streamable HTTP server, 256 by default. A worker task reads a request or runs a handler, and a listen stream holds one. An idle keep-alive connection holds no task. Zero means `max_connections`. A connection with bytes waits for a free worker task, up to `head_timeout`. A new connection waits the same way.
@@ -328,7 +330,8 @@ All notable changes to this project are recorded in this file. The format follow
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.1...v0.5.2
