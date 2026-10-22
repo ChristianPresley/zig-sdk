@@ -1,6 +1,5 @@
 //! Loopback tests for the Streamable HTTP server through `std.http.Client`.
 const std = @import("std");
-const builtin = @import("builtin");
 const Io = std.Io;
 const http = std.http;
 const mcp = @import("../../mcp.zig");
@@ -524,9 +523,6 @@ fn waitHeld(t: *HttpServer, count: usize) !void {
 }
 
 test "http parker: an idle keep-alive connection holds no task, resumes on the next request and ends with the peer" {
-    // The parker parks a connection only on Windows for now. A POSIX connection keeps its
-    // task between requests, so it never reaches the parker.
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
     try f.start(.json);
@@ -555,9 +551,6 @@ test "http parker: an idle keep-alive connection holds no task, resumes on the n
 }
 
 test "http parker: the cap of the worker tasks queues connections and serves them in turn" {
-    // The worker cap holds a connection without a task only when the parker parks it, which
-    // is Windows only for now.
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var limits: mcp.Limits = .{};
     limits.http.max_in_flight = 1;

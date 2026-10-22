@@ -294,7 +294,6 @@ pub const Server = struct {
         var events: [256]park.Event = undefined;
         while (true) {
             p.lock.lockUncancelable(io);
-            if (!park.is_windows) p.finishClosingLocked(self);
             if (self.closing.load(.acquire)) p.closeAllLocked(self);
             const now = nowNanoseconds(io);
             p.expireLocked(self, now);
@@ -565,22 +564,25 @@ const Connection = struct {
         out.flush() catch {};
     }
 
-    /// Read the socket while the handler of `dispatch` runs. The end of the connection
-    /// cancels the request. The task reads only into the free space at the end of the
-    /// buffer of `socket`. Thus the bytes of the request head stay in place, and the next
-    /// request on the connection uses the bytes that arrive. The function returns at the
-    /// first bytes: the handler ends first, then the task reads the next request.
+    /// Watch the socket of `conn` while the handler of its request runs, in a task. A close
+    /// by the peer cancels the request. The read fills only the free space at the end of the
+    /// buffer. Thus the bytes of a pipelined next request stay for the next read. The task of
+    /// the connection cancels this task when the handler ends. The cancel of the read does
+    /// not look like a disconnect, because `ended` is set.
     fn watch(conn: *Connection, socket: *Io.net.Stream.Reader, dispatch: *Dispatch) void {
         const io = conn.owner.io;
         const r = &socket.interface;
-        if (r.end >= r.buffer.len) return;
-        if (dispatch.exchange.token.isCancelled() or dispatch.ended.load(.acquire)) return;
-        r.fillMore() catch |e| {
-            if (e == error.ReadFailed) if (socket.err) |err| if (err == error.Canceled) return;
+        while (r.end < r.buffer.len) {
+            if (dispatch.exchange.token.isCancelled() or dispatch.ended.load(.acquire)) return;
+            r.fillMore() catch |e| {
+                if (e == error.ReadFailed) if (socket.err) |err| if (err == error.Canceled) return;
+                if (dispatch.ended.load(.acquire)) return;
+                log.debug("the client of request {f} disconnected", .{dispatch.exchange.id});
+                dispatch.exchange.token.cancel(io, disconnect_reason);
+                return;
+            };
             if (dispatch.ended.load(.acquire)) return;
-            log.debug("the client of request {f} disconnected", .{dispatch.exchange.id});
-            dispatch.exchange.token.cancel(io, disconnect_reason);
-        };
+        }
     }
 
     /// Read and handle requests until the connection ends or the parker takes it. The TLS
@@ -628,11 +630,10 @@ const Connection = struct {
         }
         const in: *Io.Reader = if (tls_active) &tls_conn.reader else &reader.interface;
         const out: *Io.Writer = if (tls_active) &tls_conn.writer else &writer.interface;
-        // The parker watches a plaintext socket with its poll. On POSIX the poll is `poll`
-        // over the whole set each wait, and the parker is not yet correct there, so only
-        // Windows parks for now. A POSIX connection keeps its task between requests, as the
-        // base behavior does. The POSIX poll path in `park.zig` stays for the follow-up.
-        conn.use_poll = !tls_active and park.is_windows;
+        // The parker watches the socket of a plaintext connection while it is idle, so the
+        // connection holds no task between requests. A TLS connection keeps its task: its
+        // state is in the buffers.
+        conn.use_poll = !tls_active;
         var http_server: http.Server = .init(in, out);
         var first = true;
         while (!self.closing.load(.acquire)) {
@@ -699,11 +700,9 @@ const Parker = struct {
     ready: List = .{},
     /// The connections whose socket the parker watches while a handler runs.
     watching: List = .{},
-    /// The connections whose socket this side closed while a poll was pending. On Windows the
-    /// completion of the poll frees them. On POSIX systems they wait in `closing` for the
-    /// next loop of the parker, because the wait that runs can still name their slot.
+    /// The connections whose socket this side closed while a poll was pending (Windows). The
+    /// completion of the poll frees them.
     closing_count: usize = 0,
-    closing: List = .{},
     /// The connections the parker owns: parked, in `ready`, or with a closed socket. The
     /// supervisor ends after the parker gave up the last one.
     held: std.atomic.Value(usize) = .init(0),
@@ -782,6 +781,11 @@ const Parker = struct {
     /// read after the handler. False when the parker cannot watch the socket now. The task
     /// then reads the socket itself.
     fn watchHandler(p: *Parker, self: *Server, conn: *Connection, token: *Transport.CancelToken) bool {
+        // The parker watches the socket during a handler only on Windows, where `AFD_POLL`
+        // tells a disconnect from bytes. On a POSIX system `poll` cannot tell them apart
+        // without a read, so the task of the connection reads the socket as the base does.
+        // Then no other task touches the socket of a connection the parker watches.
+        if (!park.is_windows) return false;
         p.lock.lockUncancelable(self.io);
         defer p.lock.unlock(self.io);
         const poller = &(p.poller orelse return false);
@@ -880,9 +884,6 @@ const Parker = struct {
         }
         p.closeWithPollLocked(self, conn);
         p.handOverLocked(self, conn);
-        // The POSIX wait that runs can still name the slot. The parker frees the connection
-        // in its next loop, after a new wait set.
-        if (!park.is_windows) p.wakeTask();
         return true;
     }
 
@@ -897,17 +898,6 @@ const Parker = struct {
         conn.poll_phase = .closing;
         conn.state.store(.parked_closing, .release);
         p.closing_count += 1;
-        if (!park.is_windows) p.closing.push(conn);
-    }
-
-    /// POSIX systems: free the connections that closed while the last wait ran. The wait
-    /// set of the next loop does not name them.
-    fn finishClosingLocked(p: *Parker, self: *Server) void {
-        while (p.closing.pop()) |conn| {
-            p.closing_count -= 1;
-            conn.poll_phase = .none;
-            p.finishLocked(self, conn);
-        }
     }
 
     /// Start the worker task of `conn`, which then has the state `running` and is in
@@ -972,7 +962,6 @@ const Parker = struct {
         const conn: *Connection = @alignCast(@fieldParentPtr("slot", ev.slot));
         switch (conn.poll_phase) {
             .closing => {
-                if (!park.is_windows) p.closing.remove(conn);
                 conn.poll_phase = .none;
                 p.closing_count -= 1;
                 p.finishLocked(self, conn);
@@ -1297,10 +1286,15 @@ fn handleRpcRequest(conn: *Connection, request: *http.Server.Request, socket: *I
     // disconnect of the client cancels the request, also while the handler does not write.
     var handler: ?Io.Future(void) = self.io.concurrent(Dispatch.run, .{&dispatch}) catch null;
     if (handler) |*h| {
-        // The parker watches the socket of a plaintext connection while the handler runs: a
-        // disconnect cancels the request. For a TLS connection, or when the parker cannot
-        // watch the socket, this task reads the socket instead.
-        if (!conn.use_poll or !self.parker.watchHandler(self, conn, &token)) conn.watch(socket, &dispatch);
+        // A disconnect by the peer cancels the request while the handler runs. On Windows
+        // the parker's poll watches the socket with no task. Otherwise a watch task reads
+        // the socket, and the task of the connection cancels it when the handler ends. Thus
+        // the task of the connection does not block in a read, and the connection can park.
+        var watcher: ?Io.Future(void) = null;
+        if (!(conn.use_poll and self.parker.watchHandler(self, conn, &token))) {
+            watcher = self.io.concurrent(Connection.watch, .{ conn, socket, &dispatch }) catch null;
+            if (watcher == null) conn.watch(socket, &dispatch);
+        }
         if (conn.timedOut()) {
             // A time limit or the shutdown canceled this task. The handler gets the cancel.
             h.cancel(self.io);
@@ -1308,6 +1302,12 @@ fn handleRpcRequest(conn: *Connection, request: *http.Server.Request, socket: *I
             h.await(self.io);
         } else |_| {
             h.cancel(self.io);
+        }
+        // Stop the watch task. The handler ended, thus `ended` is set and the cancel of the
+        // read does not look like a disconnect. The bytes it read stay in the buffer.
+        if (watcher) |*w| {
+            dispatch.ended.store(true, .release);
+            w.cancel(self.io);
         }
     } else dispatch.run();
     // The connection of a canceled request does not carry one more request.
