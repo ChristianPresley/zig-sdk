@@ -67,6 +67,10 @@ pending_writes: std.atomic.Value(u32) = .init(0),
 /// The read task counts as a pending write while complete frames wait in the read buffer.
 /// Thus the answers to a burst of frames go out together. Only the read task uses the field.
 read_hold: bool = false,
+/// The streams that a burst of frames opened. The read task gives them to `on_stream` at the
+/// end of the burst, after the frames with their request data. Thus a handler does not wait
+/// for its data, and the handlers of a burst start together. Only the read task uses the field.
+held_streams: std.ArrayList(*Stream) = .empty,
 decoder: hpack.Decoder,
 encoder: hpack.Encoder = .{},
 peer: frame.Settings = .{},
@@ -125,6 +129,7 @@ pub fn deinit(self: *Connection) void {
     self.streams.deinit(self.gpa);
     self.decoder.deinit();
     self.hb_buf.deinit(self.gpa);
+    self.held_streams.deinit(self.gpa);
     self.gpa.free(self.frame_buf);
     self.gpa.destroy(self);
 }
@@ -176,8 +181,17 @@ pub fn run(self: *Connection) void {
     self.terminate();
 }
 
+/// The end of the hold of the read task flushes after each group of this many held streams.
+/// The answers of a group then go out together, and an answer waits for the start of at most
+/// this many other streams. On Linux a new connection can send 10 segments before the first
+/// acknowledgment. Thus 8 keeps the answers of a large burst in a small number of segments.
+/// With one flush for the whole burst, the median latency under a load of 64 calls was up to
+/// 5 ms higher.
+pub const held_streams_per_flush = 8;
+
 /// Start or end the hold of the read task. See `read_hold`. The read task never holds while
-/// it waits for the socket.
+/// it waits for the socket. The end of the hold gives the held streams to `on_stream` and
+/// flushes after each `held_streams_per_flush` of them.
 fn setReadHold(self: *Connection, hold: bool) void {
     if (hold == self.read_hold) return;
     self.read_hold = hold;
@@ -185,6 +199,17 @@ fn setReadHold(self: *Connection, hold: bool) void {
         self.beginWrite();
         return;
     }
+    const held = self.held_streams.items;
+    for (held, 1..) |s, i| {
+        self.dispatch(s);
+        if (i % held_streams_per_flush == 0 and i < held.len) {
+            self.write_lock.lockUncancelable(self.io);
+            self.endWriteLocked(true) catch {};
+            self.write_lock.unlock(self.io);
+            self.beginWrite();
+        }
+    }
+    self.held_streams.clearRetainingCapacity();
     self.write_lock.lockUncancelable(self.io);
     defer self.write_lock.unlock(self.io);
     self.endWriteLocked(true) catch {};
@@ -311,7 +336,11 @@ fn readFrame(self: *Connection) ReadError!void {
         error.EndOfStream => return error.Closed,
         error.ReadFailed => return error.ReadFailed,
     };
-    self.setReadHold(self.frameBuffered());
+    // The hold ends after the last frame of the burst, thus the streams of that frame are
+    // also held.
+    const more = self.frameBuffered();
+    if (more) self.setReadHold(true);
+    defer if (!more) self.setReadHold(false);
     // A header block under assembly allows only its CONTINUATION frames.
     if (self.hb_active and (header.type != .continuation or header.stream_id != self.hb_stream)) return error.ProtocolError;
     switch (header.type) {
@@ -506,7 +535,15 @@ fn finishHeaderBlock(self: *Connection) Error!void {
     self.hb_buf.clearRetainingCapacity();
     if (refused) |s| s.destroy();
     if (reset) |code| self.sendRst(stream_id, code);
-    if (new_stream) |s| if (self.options.on_stream) |f| f(self.options.userdata, s);
+    if (new_stream) |s| {
+        if (!self.read_hold) return self.dispatch(s);
+        self.held_streams.append(self.gpa, s) catch self.dispatch(s);
+    }
+}
+
+/// Give a stream that the peer opened to `on_stream`.
+fn dispatch(self: *Connection, s: *Stream) void {
+    if (self.options.on_stream) |f| f(self.options.userdata, s);
 }
 
 /// Remember `id`, a peer stream that this side reset. Called under `lock`.

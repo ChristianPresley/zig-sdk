@@ -1030,7 +1030,18 @@ const ScriptResult = struct {
 /// Give `script` to a server connection with `options` and an `Answerer`. The read task runs on
 /// the test thread and ends at the end of the script.
 fn runScript(gpa: std.mem.Allocator, script: []const u8, options: Connection.Options, answerer: *Answerer) !ScriptResult {
-    var reader: Io.Reader = .fixed(script);
+    return runScriptAt(gpa, script, script.len, options, answerer);
+}
+
+/// As `runScript`, but the bytes after `split` arrive in a second read. The connection starts
+/// the streams of a burst at the end of the burst. Thus the `Answerer` answers the streams of
+/// the first part before the frames of the second part arrive.
+fn runScriptAt(gpa: std.mem.Allocator, script: []const u8, split: usize, options: Connection.Options, answerer: *Answerer) !ScriptResult {
+    const calls = [_]std.testing.Reader.Call{ .{ .buffer = script[0..split] }, .{ .buffer = script[split..] } };
+    const read_buffer = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(read_buffer);
+    var chunks: std.testing.Reader = .init(read_buffer, &calls);
+    const reader = &chunks.interface;
     const written = try gpa.alloc(u8, 64 << 10);
     defer gpa.free(written);
     var writer: Io.Writer = .fixed(written);
@@ -1038,7 +1049,7 @@ fn runScript(gpa: std.mem.Allocator, script: []const u8, options: Connection.Opt
     server_options.role = .server;
     server_options.on_stream = Answerer.onStream;
     server_options.userdata = answerer;
-    const conn = try Connection.init(gpa, std.testing.io, &reader, &writer, server_options);
+    const conn = try Connection.init(gpa, std.testing.io, reader, &writer, server_options);
     defer conn.deinit();
     try conn.handshake();
     conn.run();
@@ -1070,6 +1081,7 @@ test "a header block on a stream that this side reset is ignored" {
     // Stream 1: the server answers before the request ends, and resets with NO_ERROR. The
     // client did not see the reset yet and sends data and trailers.
     try appendHeaders(gpa, &script, 1, 0, &get, "");
+    const split = script.items.len;
     try appendFrame(gpa, &script, .data, 0, 1, "body");
     try appendHeaders(gpa, &script, 1, frame.Flags.end_stream, &trailer, "");
     // Stream 3: refused with ENHANCE_YOUR_CALM, then trailers.
@@ -1078,7 +1090,7 @@ test "a header block on a stream that this side reset is ignored" {
     // Stream 5 shows that the connection still serves.
     try appendRequest(gpa, &script, 5, &get, "");
     var answerer: Answerer = .{};
-    const result = try runScript(gpa, script.items, .{ .role = .server, .max_header_list_size = 1024 }, &answerer);
+    const result = try runScriptAt(gpa, script.items, split, .{ .role = .server, .max_header_list_size = 1024 }, &answerer);
     // Before, the trailers on stream 1 ended the connection with PROTOCOL_ERROR.
     try std.testing.expectEqual(@as(?frame.ErrorCode, null), result.goaway);
     try std.testing.expectEqual(@as(?frame.ErrorCode, .no_error), result.resets[1]);
@@ -1095,9 +1107,10 @@ test "a header block on a stream id that this side did not reset ends the connec
     try appendFrame(gpa, &script, .settings, 0, 0, &.{});
     // Stream 3 ends in both directions and gets no reset. Stream 1 was never open.
     try appendRequest(gpa, &script, 3, &get, "");
+    var split = script.items.len;
     try appendHeaders(gpa, &script, 1, frame.Flags.end_stream, &get, "");
     var answerer: Answerer = .{};
-    const reused = try runScript(gpa, script.items, .{ .role = .server }, &answerer);
+    const reused = try runScriptAt(gpa, script.items, split, .{ .role = .server }, &answerer);
     try std.testing.expectEqual(@as(?frame.ErrorCode, .protocol_error), reused.goaway);
 
     // The same for a block on stream 3 after its end.
@@ -1105,9 +1118,10 @@ test "a header block on a stream id that this side did not reset ends the connec
     try script.appendSlice(gpa, frame.preface);
     try appendFrame(gpa, &script, .settings, 0, 0, &.{});
     try appendRequest(gpa, &script, 3, &get, "");
+    split = script.items.len;
     try appendHeaders(gpa, &script, 3, frame.Flags.end_stream, &trailer, "");
     answerer = .{};
-    const ended = try runScript(gpa, script.items, .{ .role = .server }, &answerer);
+    const ended = try runScriptAt(gpa, script.items, split, .{ .role = .server }, &answerer);
     try std.testing.expectEqual(@as(?frame.ErrorCode, .protocol_error), ended.goaway);
     try std.testing.expectEqual(@as(?frame.ErrorCode, null), ended.resets[3]);
 }
@@ -1166,16 +1180,21 @@ test "the hook of setOnReset runs once at a reset or at the end of the connectio
     try appendHeaders(gpa, &script, 5, 0, &(post ++ [_]Header{.{ .name = ":path", .value = "/close" }}), "");
     try appendHeaders(gpa, &script, 7, 0, &(post ++ [_]Header{.{ .name = ":path", .value = "/none" }}), "");
     try appendHeaders(gpa, &script, 9, 0, &(post ++ [_]Header{.{ .name = ":path", .value = "/remove" }}), "");
+    // The resets arrive in a second read, after the streams started.
+    const split = script.items.len;
     try appendFrame(gpa, &script, .rst_stream, 0, 1, &cancel);
     try appendFrame(gpa, &script, .rst_stream, 0, 1, &cancel);
     try appendFrame(gpa, &script, .rst_stream, 0, 9, &cancel);
 
-    var reader: Io.Reader = .fixed(script.items);
+    const calls = [_]std.testing.Reader.Call{ .{ .buffer = script.items[0..split] }, .{ .buffer = script.items[split..] } };
+    var read_buffer: [4096]u8 = undefined;
+    var chunks: std.testing.Reader = .init(&read_buffer, &calls);
+    const reader = &chunks.interface;
     const written = try gpa.alloc(u8, 64 << 10);
     defer gpa.free(written);
     var writer: Io.Writer = .fixed(written);
     var recorder: HookRecorder = .{};
-    const conn = try Connection.init(gpa, io, &reader, &writer, .{ .role = .server, .on_stream = HookRecorder.onStream, .userdata = &recorder });
+    const conn = try Connection.init(gpa, io, reader, &writer, .{ .role = .server, .on_stream = HookRecorder.onStream, .userdata = &recorder });
     defer conn.deinit();
     try conn.handshake();
     // The read task ends at the end of the script, and the connection then ends.
@@ -1264,7 +1283,7 @@ const FlushCounter = struct {
 /// Answers each stream at once with a complete gRPC-style response: headers, one data frame
 /// and trailers, under `cork`.
 const CorkedAnswerer = struct {
-    streams: [8]*Connection.Stream = undefined,
+    streams: [32]*Connection.Stream = undefined,
     len: usize = 0,
 
     fn onStream(userdata: ?*anyopaque, stream: *Connection.Stream) void {
@@ -1286,7 +1305,7 @@ test "the answers to a burst of frames go out in a small number of writes" {
     try script.appendSlice(gpa, frame.preface);
     try appendFrame(gpa, &script, .settings, 0, 0, &.{});
     for (0..3) |_| try appendFrame(gpa, &script, .ping, 0, 0, &(@as([8]u8, @splat(7))));
-    const count = 8;
+    const count = 2 * Connection.held_streams_per_flush + 4;
     for (0..count) |i| try appendRequest(gpa, &script, @intCast(2 * i + 1), &get, "");
 
     var reader: Io.Reader = .fixed(script.items);
@@ -1306,10 +1325,11 @@ test "the answers to a burst of frames go out in a small number of writes" {
     conn.run();
     defer for (answerer.streams[0..answerer.len]) |s| s.close();
     try std.testing.expectEqual(count, answerer.len);
-    // The SETTINGS ack, the PING acks and the first responses wait while more frames are in
-    // the read buffer. The last response goes out after the read task ended its hold. Before,
-    // each frame was one write: 2 + 1 + 3 + 3 * 8 writes.
-    try std.testing.expectEqual(3, writer.flushes);
+    // The SETTINGS ack and the PING acks wait while more frames are in the read buffer. The
+    // streams start at the end of the burst. The answers go out in one write for each group of
+    // held_streams_per_flush streams: 3 writes for 20 streams. Before, each frame was one
+    // write: 2 + 1 + 3 + 3 * 20 writes.
+    try std.testing.expectEqual(4, writer.flushes);
 
     var headers: [2 * count]usize = @splat(0);
     var data: [2 * count]usize = @splat(0);
