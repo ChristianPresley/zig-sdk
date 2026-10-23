@@ -82,8 +82,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("conformance-server", "Build the conformance everything server").dependOn(&b.addInstallArtifact(conformance_server, .{}).step);
-    // The tests of the conformance server run with the other tests.
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = conformance_server.root_module })).step);
+    // The tests of the conformance server run with the other tests, after the module tests.
+    // On Windows, Zig 0.16.0 makes the pipes of a child inheritable and starts each child with
+    // all inheritable handles, so a child that starts at the same time can keep the stdout pipe
+    // of another test binary open. The long module tests then hold the pipe of the short
+    // conformance tests, and the build runner stops them after one minute without an answer.
+    const run_conformance_tests = b.addRunArtifact(b.addTest(.{ .root_module = conformance_server.root_module }));
+    run_conformance_tests.step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_conformance_tests.step);
     const conformance_client = b.addExecutable(.{
         .name = "mcp-conformance-client",
         .root_module = b.createModule(.{
