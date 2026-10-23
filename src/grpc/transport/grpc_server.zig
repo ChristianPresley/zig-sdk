@@ -505,9 +505,13 @@ fn exchangeFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendErro
     _ = io;
     const ex: *Exchange = @ptrCast(@alignCast(ptr));
     if (ex.done) return error.Closed;
+    // The headers, the message and the trailers go out together. See `Stream.cork`.
+    ex.stream.cork();
+    errdefer ex.stream.uncork() catch {};
     try ex.ensureHeaders();
     try ex.sendMessage(frame);
     ex.stream.sendHeaders(&.{.{ .name = "grpc-status", .value = status.Code.ok.wire() }}, true) catch |e| return mapSend(e);
+    ex.stream.uncork() catch |e| return mapSend(e);
     ex.done = true;
 }
 

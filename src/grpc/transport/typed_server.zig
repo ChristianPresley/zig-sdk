@@ -122,6 +122,9 @@ pub fn handleCall(self: *grpc_server.Server, stream: *Stream, arena: Allocator, 
             return rpcError(stream, arena, errors.internalError(message));
         },
     };
+    // The headers, the message and the trailers go out together. See `Stream.cork`.
+    stream.cork();
+    defer stream.uncork() catch {};
     stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = grpc_server.content_type } }, false) catch return;
     lpm.write(stream, gpa, out.items, false) catch return;
     stream.sendHeaders(&.{.{ .name = "grpc-status", .value = status.Code.ok.wire() }}, true) catch return;

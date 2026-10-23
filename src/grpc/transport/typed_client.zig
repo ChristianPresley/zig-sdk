@@ -198,8 +198,12 @@ pub const TypedChannel = struct {
             remaining = if (left.nanoseconds > 0) left else .{ .nanoseconds = 1 };
         }
         const headers = try self.callHeaders(arena, rpc, params, remaining);
+        // The headers and the message go out together. See `Stream.cork`.
+        stream.cork();
+        errdefer stream.uncork() catch {};
         stream.sendHeaders(headers, false) catch |e| return mapStream(e);
         lpm.write(stream, self.gpa, body.items, true) catch |e| return mapStream(e);
+        stream.uncork() catch |e| return mapStream(e);
 
         const response_headers = stream.waitHeaders() catch |e| return mapStream(e);
         const status_text = Connection.findHeader(response_headers, ":status") orelse "0";

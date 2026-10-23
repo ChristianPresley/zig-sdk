@@ -290,10 +290,14 @@ pub const Channel = struct {
             // Without params, the call mirrors no parameter.
             error.UnsafeInteger => unreachable,
         };
-        stream.sendHeaders(headers.items, false) catch return error.WriteFailed;
         var out: std.ArrayList(u8) = .empty;
         try messages.encodeJsonRpcMessage(arena, &out, frame);
+        // The headers and the message go out together. See `Stream.cork`.
+        stream.cork();
+        errdefer stream.uncork() catch {};
+        stream.sendHeaders(headers.items, false) catch return error.WriteFailed;
         lpm.write(stream, self.gpa, out.items, true) catch return error.WriteFailed;
+        stream.uncork() catch return error.WriteFailed;
         _ = stream.waitEnd() catch return error.WriteFailed;
     }
 
@@ -360,10 +364,14 @@ pub const Channel = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsafeInteger => return error.InvalidRequest,
         };
-        stream.sendHeaders(headers.items, false) catch |e| return mapStream(e);
         var out: std.ArrayList(u8) = .empty;
         try messages.encodeJsonRpcMessage(arena, &out, ex.frame);
+        // The headers and the message go out together. See `Stream.cork`.
+        stream.cork();
+        errdefer stream.uncork() catch {};
+        stream.sendHeaders(headers.items, false) catch |e| return mapStream(e);
         lpm.write(stream, self.gpa, out.items, true) catch |e| return mapStream(e);
+        stream.uncork() catch |e| return mapStream(e);
 
         const response_headers = stream.waitHeaders() catch |e| return mapStream(e);
         const status_text = Connection.findHeader(response_headers, ":status") orelse "0";

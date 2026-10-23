@@ -57,6 +57,16 @@ options: Options,
 lock: Io.Mutex = .init,
 /// Serializes writes to the socket.
 write_lock: Io.Mutex = .init,
+/// The writes that started and did not end. A write increments the count before it takes
+/// `write_lock` and decrements it under `write_lock`. Only the write that sets the count to
+/// zero flushes. Thus the frames of tasks that write at the same time go out together, in
+/// a small number of TCP segments. On Linux the congestion window counts segments, not
+/// bytes. With one segment for each frame, 32 calls at the same time used one more round
+/// trip.
+pending_writes: std.atomic.Value(u32) = .init(0),
+/// The read task counts as a pending write while complete frames wait in the read buffer.
+/// Thus the answers to a burst of frames go out together. Only the read task uses the field.
+read_hold: bool = false,
 decoder: hpack.Decoder,
 encoder: hpack.Encoder = .{},
 peer: frame.Settings = .{},
@@ -137,9 +147,10 @@ pub fn handshake(self: *Connection) Error!void {
         .{ .id = @intFromEnum(frame.SettingId.max_header_list_size), .value = self.options.max_header_list_size },
     };
     for (list, 0..) |s, i| settings[i * 6 ..][0..6].* = s.encode();
-    try self.writeFrame(.settings, 0, 0, &settings);
-    // Raise the connection window from the default to ours.
-    if (self.options.connection_window > frame.default_initial_window) {
+    // Raise the connection window from the default to ours. The two frames go out together.
+    const raise = self.options.connection_window > frame.default_initial_window;
+    try self.writeFrameFlush(.settings, 0, 0, &settings, !raise);
+    if (raise) {
         const increment = self.options.connection_window - frame.default_initial_window;
         var payload: [4]u8 = undefined;
         std.mem.writeInt(u32, &payload, increment, .big);
@@ -161,7 +172,30 @@ pub fn run(self: *Connection) void {
             break;
         };
     }
+    self.setReadHold(false);
     self.terminate();
+}
+
+/// Start or end the hold of the read task. See `read_hold`. The read task never holds while
+/// it waits for the socket.
+fn setReadHold(self: *Connection, hold: bool) void {
+    if (hold == self.read_hold) return;
+    self.read_hold = hold;
+    if (hold) {
+        self.beginWrite();
+        return;
+    }
+    self.write_lock.lockUncancelable(self.io);
+    defer self.write_lock.unlock(self.io);
+    self.endWriteLocked(true) catch {};
+}
+
+/// The read buffer has one more complete frame.
+fn frameBuffered(self: *Connection) bool {
+    const buffered = self.reader.buffered();
+    if (buffered.len < frame.header_len) return false;
+    const header = frame.Header.parse(buffered[0..frame.header_len]);
+    return buffered.len - frame.header_len >= header.length;
 }
 
 /// Send `GOAWAY` and accept no new streams. Existing streams finish. The read task
@@ -191,10 +225,38 @@ pub fn isClosed(self: *Connection) bool {
 // -- Writing ---------------------------------------------------------------------------------
 
 fn writeFrame(self: *Connection, kind: frame.Type, flags: u8, stream_id: u31, payload: []const u8) Error!void {
+    return self.writeFrameFlush(kind, flags, stream_id, payload, true);
+}
+
+/// Write one frame. With `flush` false, the frame stays in the buffer until the next write
+/// that flushes. See `pending_writes`.
+fn writeFrameFlush(self: *Connection, kind: frame.Type, flags: u8, stream_id: u31, payload: []const u8, flush: bool) Error!void {
+    self.beginWrite();
     self.write_lock.lockUncancelable(self.io);
     defer self.write_lock.unlock(self.io);
-    try self.writeFrameLocked(kind, flags, stream_id, payload);
-    self.writer.flush() catch return error.WriteFailed;
+    const written = self.writeFrameLocked(kind, flags, stream_id, payload);
+    try self.endWriteLocked(flush);
+    return written;
+}
+
+/// Count a write that starts. Call before `write_lock`.
+fn beginWrite(self: *Connection) void {
+    _ = self.pending_writes.fetchAdd(1, .acq_rel);
+}
+
+/// Count a write that ended. Called under `write_lock`. When no other write is pending and
+/// `flush` is true, flush the buffer.
+fn endWriteLocked(self: *Connection, flush: bool) Error!void {
+    const last = self.pending_writes.fetchSub(1, .acq_rel) == 1;
+    if (last and flush) self.writer.flush() catch return error.WriteFailed;
+}
+
+/// Flush the buffer when no write is pending. A pending write flushes when it ends.
+fn flushPending(self: *Connection) Error!void {
+    self.beginWrite();
+    self.write_lock.lockUncancelable(self.io);
+    defer self.write_lock.unlock(self.io);
+    try self.endWriteLocked(true);
 }
 
 fn writeFrameLocked(self: *Connection, kind: frame.Type, flags: u8, stream_id: u31, payload: []const u8) Error!void {
@@ -249,6 +311,7 @@ fn readFrame(self: *Connection) ReadError!void {
         error.EndOfStream => return error.Closed,
         error.ReadFailed => return error.ReadFailed,
     };
+    self.setReadHold(self.frameBuffered());
     // A header block under assembly allows only its CONTINUATION frames.
     if (self.hb_active and (header.type != .continuation or header.stream_id != self.hb_stream)) return error.ProtocolError;
     switch (header.type) {
@@ -654,6 +717,8 @@ pub const Stream = struct {
     send_window: i64,
     recv_window: i64,
     recv_credit: u32 = 0,
+    /// See `cork`. Only the task that sends on the stream uses the field.
+    corked: bool = false,
 
     fn create(conn: *Connection, id: u31) Allocator.Error!*Stream {
         const s = try conn.gpa.create(Stream);
@@ -792,6 +857,22 @@ pub const Stream = struct {
         return self.conn.options.role == .client and self.end_stream and self.reset != null;
     }
 
+    /// Keep the frames of the next sends in the buffer of the connection. Then `uncork` sends
+    /// them together, for example the headers, the data and the trailers of one response. A
+    /// send that waits for flow control credit first flushes the frames. A write of another
+    /// task can also flush them. Call `uncork` soon, because the frames of other streams can
+    /// also wait for it. Only the task that sends on the stream calls this function.
+    pub fn cork(self: *Stream) void {
+        self.corked = true;
+    }
+
+    /// End `cork` and send the frames that are in the buffer.
+    pub fn uncork(self: *Stream) Error!void {
+        if (!self.corked) return;
+        self.corked = false;
+        try self.conn.flushPending();
+    }
+
     /// Send a header block. With `end_stream` no data follows. When the server already sent a
     /// complete response and the stream then got a reset, the client sends nothing and gets no
     /// error.
@@ -811,8 +892,11 @@ pub const Stream = struct {
             if (end_stream) self.local_closed = true;
         }
         const max = conn.peer.max_frame_size;
+        conn.beginWrite();
         conn.write_lock.lockUncancelable(conn.io);
         defer conn.write_lock.unlock(conn.io);
+        var ended = false;
+        defer if (!ended) conn.endWriteLocked(true) catch {};
         if (self.id == 0) try conn.assignId(self);
         var offset: usize = 0;
         var first = true;
@@ -827,7 +911,8 @@ pub const Stream = struct {
             first = false;
             if (last) break;
         }
-        conn.writer.flush() catch return error.WriteFailed;
+        ended = true;
+        try conn.endWriteLocked(!self.corked);
     }
 
     /// Send data. The call waits for flow control credit. With `end_stream` the send side closes.
@@ -836,6 +921,9 @@ pub const Stream = struct {
     pub fn sendData(self: *Stream, bytes: []const u8, end_stream: bool) Error!void {
         const conn = self.conn;
         var offset: usize = 0;
+        // A corked stream flushes its frames before it waits for credit. The peer can need
+        // them before it gives credit.
+        var flushed = !self.corked;
         while (true) {
             var n: usize = 0;
             {
@@ -856,13 +944,23 @@ pub const Stream = struct {
                         conn.send_window -= @intCast(n);
                         break;
                     }
+                    if (!flushed) {
+                        // The write lock comes before `lock` (see `sendHeaders`).
+                        flushed = true;
+                        conn.lock.unlock(conn.io);
+                        const result = conn.flushPending();
+                        conn.lock.lockUncancelable(conn.io);
+                        try result;
+                        continue;
+                    }
                     try self.wait();
                 }
                 if (offset + n == bytes.len and end_stream) self.local_closed = true;
             }
             const last = offset + n == bytes.len;
             const flags: u8 = if (last and end_stream) frame.Flags.end_stream else 0;
-            try conn.writeFrame(.data, flags, self.id, bytes[offset..][0..n]);
+            try conn.writeFrameFlush(.data, flags, self.id, bytes[offset..][0..n], !self.corked);
+            flushed = !self.corked;
             offset += n;
             if (last) return;
         }

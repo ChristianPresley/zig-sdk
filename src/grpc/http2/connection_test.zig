@@ -1226,3 +1226,110 @@ test "the connection remembers the last remembered_resets streams that it reset"
     try std.testing.expectEqual(@as(?frame.ErrorCode, .protocol_error), result.goaway);
     try std.testing.expectEqual(0, answerer.len);
 }
+
+/// A writer that keeps the bytes and counts the flushes that sent bytes. Each such flush is
+/// one write to the socket, thus at least one TCP segment.
+const FlushCounter = struct {
+    gpa: std.mem.Allocator,
+    interface: Io.Writer,
+    sink: std.ArrayList(u8) = .empty,
+    flushes: usize = 0,
+
+    fn init(gpa: std.mem.Allocator, buffer: []u8) FlushCounter {
+        return .{ .gpa = gpa, .interface = .{ .buffer = buffer, .vtable = &.{ .drain = drain } } };
+    }
+
+    fn deinit(self: *FlushCounter) void {
+        self.sink.deinit(self.gpa);
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *FlushCounter = @alignCast(@fieldParentPtr("interface", w));
+        if (w.end > 0) self.flushes += 1;
+        self.sink.appendSlice(self.gpa, w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            self.sink.appendSlice(self.gpa, d) catch return error.WriteFailed;
+            n += d.len;
+        }
+        for (0..splat) |_| {
+            self.sink.appendSlice(self.gpa, data[data.len - 1]) catch return error.WriteFailed;
+            n += data[data.len - 1].len;
+        }
+        return n;
+    }
+};
+
+/// Answers each stream at once with a complete gRPC-style response: headers, one data frame
+/// and trailers, under `cork`.
+const CorkedAnswerer = struct {
+    streams: [8]*Connection.Stream = undefined,
+    len: usize = 0,
+
+    fn onStream(userdata: ?*anyopaque, stream: *Connection.Stream) void {
+        const self: *CorkedAnswerer = @ptrCast(@alignCast(userdata.?));
+        self.streams[self.len] = stream;
+        self.len += 1;
+        stream.cork();
+        defer stream.uncork() catch {};
+        stream.sendHeaders(&.{.{ .name = ":status", .value = "200" }}, false) catch return;
+        stream.sendData("response", false) catch return;
+        stream.sendHeaders(&trailer, true) catch return;
+    }
+};
+
+test "the answers to a burst of frames go out in a small number of writes" {
+    const gpa = std.testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    for (0..3) |_| try appendFrame(gpa, &script, .ping, 0, 0, &(@as([8]u8, @splat(7))));
+    const count = 8;
+    for (0..count) |i| try appendRequest(gpa, &script, @intCast(2 * i + 1), &get, "");
+
+    var reader: Io.Reader = .fixed(script.items);
+    var buffer: [64 << 10]u8 = undefined;
+    var writer: FlushCounter = .init(gpa, &buffer);
+    defer writer.deinit();
+    var answerer: CorkedAnswerer = .{};
+    const conn = try Connection.init(gpa, std.testing.io, &reader, &writer.interface, .{
+        .role = .server,
+        .on_stream = CorkedAnswerer.onStream,
+        .userdata = &answerer,
+    });
+    defer conn.deinit();
+    try conn.handshake();
+    // SETTINGS and WINDOW_UPDATE go out together.
+    try std.testing.expectEqual(1, writer.flushes);
+    conn.run();
+    defer for (answerer.streams[0..answerer.len]) |s| s.close();
+    try std.testing.expectEqual(count, answerer.len);
+    // The SETTINGS ack, the PING acks and the first responses wait while more frames are in
+    // the read buffer. The last response goes out after the read task ended its hold. Before,
+    // each frame was one write: 2 + 1 + 3 + 3 * 8 writes.
+    try std.testing.expectEqual(3, writer.flushes);
+
+    var headers: [2 * count]usize = @splat(0);
+    var data: [2 * count]usize = @splat(0);
+    var acks: usize = 0;
+    var out: Io.Reader = .fixed(writer.sink.items);
+    while (out.bufferedLen() > 0) {
+        const header = frame.Header.parse(try out.takeArray(frame.header_len));
+        _ = try out.take(header.length);
+        switch (header.type) {
+            .headers => headers[header.stream_id] += 1,
+            .data => data[header.stream_id] += 1,
+            .ping, .settings => if (header.has(frame.Flags.ack)) {
+                acks += 1;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(4, acks);
+    for (0..count) |i| {
+        try std.testing.expectEqual(2, headers[2 * i + 1]);
+        try std.testing.expectEqual(1, data[2 * i + 1]);
+    }
+}
