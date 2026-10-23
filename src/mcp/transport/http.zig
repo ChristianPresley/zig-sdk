@@ -117,7 +117,7 @@ pub const Server = struct {
     /// Bind the listen socket. After this call `bound_port` has the port (useful with port 0).
     pub fn bind(self: *Server) !void {
         var address = try Io.net.IpAddress.parse(self.options.address, self.options.port);
-        self.listener = try address.listen(self.io, .{ .reuse_address = self.limits.http.reuse_address });
+        self.listener = try address.listen(self.io, .{ .reuse_address = self.limits.http.reuse_address, .kernel_backlog = self.limits.http.listen_backlog });
         self.bound_port = self.listener.?.socket.address.getPort();
     }
 
@@ -172,13 +172,31 @@ pub const Server = struct {
                 stream.close(self.io);
                 break;
             }
-            self.permits.waitUncancelable(self.io);
+            if (!self.tryTakePermit()) {
+                // At `max_connections`, the parker closes the oldest idle connection. Thus a
+                // client that opens a new pool while its old pool stays open does not wait
+                // until the old connections expire.
+                self.parker.evict.store(true, .release);
+                self.parker.wakeTask();
+                self.permits.waitUncancelable(self.io);
+                self.parker.evict.store(false, .release);
+            }
             if (!self.startConnection(stream)) {
                 self.permits.post(self.io);
                 var s = stream;
                 s.close(self.io);
             }
         }
+    }
+
+    /// Take one of the `max_connections` permits without a wait. False when none is free.
+    fn tryTakePermit(self: *Server) bool {
+        const s = &self.permits;
+        s.mutex.lockUncancelable(self.io);
+        defer s.mutex.unlock(self.io);
+        if (s.permits == 0) return false;
+        s.permits -= 1;
+        return true;
     }
 
     /// Give a new connection a task, or a place in the queue of the parker when the worker
@@ -297,6 +315,7 @@ pub const Server = struct {
             if (self.closing.load(.acquire)) p.closeAllLocked(self);
             const now = nowNanoseconds(io);
             p.expireLocked(self, now);
+            p.evictLocked(self);
             p.spawnReadyLocked(self);
             const next = p.nextDeadlineLocked();
             // The parker ends after the last connection: the ones it holds, the ones it
@@ -711,6 +730,10 @@ const Parker = struct {
     cap: u32 = 1,
     /// The slots of the POSIX wait.
     snapshot: std.ArrayList(*park.Slot) = .empty,
+    /// Set by the accept loop while a new connection waits for a permit. The parker then
+    /// closes the parked connection that waited longest. Only the parker task closes a parked
+    /// connection: on POSIX systems its wait uses the slots without the lock.
+    evict: std.atomic.Value(bool) = .init(false),
 
     /// An intrusive list in the order of insertion.
     const List = struct {
@@ -858,6 +881,8 @@ const Parker = struct {
         conn.state.store(.parked, .release);
         p.parked.push(conn);
         p.parked_count += 1;
+        // A new connection waits for a permit: the parker can close this one now.
+        if (p.evict.load(.acquire)) p.wakeTask();
         p.handOverLocked(self, conn);
     }
 
@@ -1024,6 +1049,15 @@ const Parker = struct {
             p.ready.remove(c);
             p.finishLocked(self, c);
         }
+    }
+
+    /// Close the parked connection that waited longest when a new connection waits for a
+    /// permit. Its close gives the permit back. RFC 9112 section 9.6 lets a server close an
+    /// idle connection at any time.
+    fn evictLocked(p: *Parker, self: *Server) void {
+        const conn = p.parked.head orelse return;
+        if (p.evict.cmpxchgStrong(true, false, .acq_rel, .acquire) != null) return;
+        p.closeParkedLocked(self, conn);
     }
 
     /// The nearest time limit of the parked and the queued connections, or `unlimited`.
@@ -1397,8 +1431,11 @@ const Exchange = struct {
 
     fn startSse(self: *Exchange) Transport.SendError!void {
         if (self.body_writer != null) return;
-        self.body_writer = self.request.respondStreaming(&.{}, .{ .respond_options = .{ .status = .ok, .keep_alive = false, .extra_headers = &sse_headers } }) catch return error.WriteFailed;
-        self.reusable = false;
+        // The chunked body of a request stream ends with the response, thus the connection
+        // can carry the next request. A listen stream ends only at the close or the shutdown.
+        const keep_alive = !self.long_lived and self.request.head.keep_alive;
+        self.body_writer = self.request.respondStreaming(&.{}, .{ .respond_options = .{ .status = .ok, .keep_alive = keep_alive, .extra_headers = &sse_headers } }) catch return error.WriteFailed;
+        if (!keep_alive) self.reusable = false;
         if (self.long_lived and self.owner.options.keepalive) {
             self.keepalive_future = self.owner.io.concurrent(keepaliveLoop, .{self}) catch null;
         }

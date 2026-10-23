@@ -573,3 +573,68 @@ test "http parker: the cap of the worker tasks queues connections and serves the
     for (raws) |r| try std.testing.expect(std.mem.startsWith(u8, try r.readResponse(arena), "HTTP/1.1 200 "));
     try waitHeld(&f.transport, 3);
 }
+
+test "http limits: at max_connections a new connection closes the idle connection that waited longest" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    limits.http.max_connections = 2;
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const request_bytes = try discoverRequest(arena);
+    const oldest = try Raw.open(gpa, f.transport.bound_port);
+    defer oldest.close(gpa);
+    try oldest.send(request_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, try oldest.readResponse(arena), "HTTP/1.1 200 "));
+    try waitHeld(&f.transport, 1);
+    const newer = try Raw.open(gpa, f.transport.bound_port);
+    defer newer.close(gpa);
+    try newer.send(request_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, try newer.readResponse(arena), "HTTP/1.1 200 "));
+    try waitHeld(&f.transport, 2);
+    // Both permits are in use. A third connection gets its response without a wait for the
+    // idle time limit, and the server closes the oldest idle connection.
+    const io = std.testing.io;
+    const started = Io.Timestamp.now(io, .awake);
+    const third = try Raw.open(gpa, f.transport.bound_port);
+    defer third.close(gpa);
+    try third.send(request_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, try third.readResponse(arena), "HTTP/1.1 200 "));
+    const took = started.durationTo(Io.Timestamp.now(io, .awake));
+    try std.testing.expect(took.nanoseconds < 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(0, (try oldest.readToEnd(arena)).len);
+    // The newer idle connection stays open and carries one more request.
+    try newer.send(request_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, try newer.readResponse(arena), "HTTP/1.1 200 "));
+}
+
+test "http sse response: the connection carries the next request" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.auto);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"progressToken\":\"p\"},\"name\":\"add\",\"arguments\":{\"a\":1,\"b\":2}}}";
+    const call = try std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\nmcp-protocol-version: 2026-07-28\r\nmcp-method: tools/call\r\nmcp-name: add\r\ncontent-length: {d}\r\n\r\n{s}", .{ body.len, body });
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    try raw.send(call);
+    // The SSE stream has a chunked body. Read up to its last chunk.
+    const r = &raw.reader.interface;
+    var all: std.ArrayList(u8) = .empty;
+    while (!std.mem.endsWith(u8, all.items, "\r\n0\r\n\r\n")) try all.append(arena, try r.takeByte());
+    try std.testing.expect(std.mem.startsWith(u8, all.items, "HTTP/1.1 200 "));
+    try std.testing.expect(std.mem.find(u8, all.items, "text/event-stream") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(all.items, "connection: close") == null);
+    try std.testing.expect(std.mem.find(u8, all.items, "notifications/progress") != null);
+    // The same connection carries the next request.
+    try raw.send(try discoverRequest(arena));
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+}

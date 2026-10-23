@@ -59,8 +59,15 @@ http: struct {
     max_body_bytes: usize = 4 << 20,
     /// Maximum request head bytes. Overflow: HTTP 431.
     max_head_bytes: usize = 16 << 10,
-    /// Maximum open connections. Overflow: the accept loop waits.
+    /// Maximum open connections. Overflow: the server closes the idle keep-alive connection
+    /// that waited longest, and the accept loop waits until it closed. When no connection is
+    /// idle, the accept loop waits for a connection to close.
     max_connections: u32 = 256,
+    /// The queue of the listen socket of the HTTP and WebSocket servers: the connections that
+    /// the kernel completed before the server accepts them. The kernel can make the queue
+    /// shorter (on Linux, `net.core.somaxconn`). Overflow: the kernel drops the connect, and
+    /// the client sends it again after a delay, usually 1 second.
+    listen_backlog: u31 = 1024,
     /// Maximum worker tasks: connections that read a request or run a handler, with the
     /// listen streams. An idle keep-alive connection holds no task. Zero means
     /// `max_connections`. Overflow: a connection with bytes waits for a free worker, up to

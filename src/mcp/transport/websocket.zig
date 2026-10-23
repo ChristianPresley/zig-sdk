@@ -141,7 +141,7 @@ pub const Server = struct {
     /// Bind the listen socket. After this call `bound_port` has the port (useful with port 0).
     pub fn bind(self: *Server) !void {
         var address = try Io.net.IpAddress.parse(self.options.address, self.options.port);
-        self.listener = try address.listen(self.io, .{ .reuse_address = self.limits.http.reuse_address });
+        self.listener = try address.listen(self.io, .{ .reuse_address = self.limits.http.reuse_address, .kernel_backlog = self.limits.http.listen_backlog });
         self.bound_port = self.listener.?.socket.address.getPort();
     }
 

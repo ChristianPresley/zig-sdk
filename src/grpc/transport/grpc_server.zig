@@ -56,6 +56,8 @@ pub const Options = struct {
     max_message_bytes: usize = 4 << 20,
     /// Open connections. Overflow: the accept loop waits.
     max_connections: u32 = 256,
+    /// The queue of the listen socket, as `Limits.http.listen_backlog` is for the HTTP server.
+    listen_backlog: u31 = 1024,
     /// The services of the server. The default is the tunnel only.
     bindings: Bindings = .{},
     /// Set `SO_REUSEADDR` on the listen socket, as `Limits.http.reuse_address` does for the
@@ -115,7 +117,7 @@ pub const Server = struct {
     /// Bind the listen socket. After this call `bound_port` has the port.
     pub fn bind(self: *Server) !void {
         var address = try Io.net.IpAddress.parse(self.options.address, self.options.port);
-        self.listener = try address.listen(self.io, .{ .reuse_address = self.options.reuse_address });
+        self.listener = try address.listen(self.io, .{ .reuse_address = self.options.reuse_address, .kernel_backlog = self.options.listen_backlog });
         self.bound_port = self.listener.?.socket.address.getPort();
     }
 

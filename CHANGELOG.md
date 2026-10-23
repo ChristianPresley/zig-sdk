@@ -4,6 +4,15 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- `Limits.http.listen_backlog` and `mcp_grpc.Server.Options.listen_backlog`, 1024 by default: the queue of the listen socket of the HTTP, WebSocket and gRPC servers. Before, the servers used the default of std, 128. On Linux, 200 clients that connect at the same time filled that queue, the kernel dropped some connects, and the clients sent them again after 1 second. The kernel can make the queue shorter (on Linux, `net.core.somaxconn`). On Linux, 200 clients now connect and make their first call in 71 ms over HTTP and 140 ms over gRPC, before 1,038 and 1,034 ms.
+
+### Fixed
+
+- At `Limits.http.max_connections`, the Streamable HTTP server now closes the parked keep-alive connection that waited longest, and accepts the new connection. Before, the new connection waited until an old connection closed. A client that opens a new connection pool while its old pool stays open thus waited until the old idle connections expired. In the VS Code agent benchmark, which makes a new undici pool for each cold round, cold rounds of 16 and 32 parallel calls stalled for about 3 seconds at p95. On Windows, the p95 of these cold rounds is now 12.8 and 20.8 ms, before 3,085 and 3,529 ms. When no connection is parked, the accept loop waits as before. A TLS connection never parks, thus the server does not close it for a new connection.
+- The SSE response of a request (for example a `tools/call` with progress) now keeps the connection alive when the request does. The chunked body ends with the response, thus the connection can carry the next request. Before, the server sent `connection: close`, and the next request of the client paid for a new TCP connection: on a network, the first progress of the next call took two round trips. At 20 ms RTT on Linux, the p50 of the first progress is now 22.7 ms, before 41.5 ms. A `subscriptions/listen` stream still closes its connection at its end.
+
 ## [0.7.0] - 2026-10-22
 
 ### Added
