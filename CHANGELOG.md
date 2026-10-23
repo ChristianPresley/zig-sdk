@@ -4,6 +4,8 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-23
+
 ### Added
 
 - `Limits.http.listen_backlog` and `mcp_grpc.Server.Options.listen_backlog`, 1024 by default: the queue of the listen socket of the HTTP, WebSocket and gRPC servers. Before, the servers used the default of std, 128. On Linux, 200 clients that connect at the same time filled that queue, the kernel dropped some connects, and the clients sent them again after 1 second. The kernel can make the queue shorter (on Linux, `net.core.somaxconn`). On Linux, 200 clients now connect and make their first call in 71 ms over HTTP and 140 ms over gRPC, before 1,038 and 1,034 ms.
@@ -344,7 +346,8 @@ All notable changes to this project are recorded in this file. The format follow
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.2...v0.5.3
