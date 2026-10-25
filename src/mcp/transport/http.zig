@@ -69,6 +69,8 @@ pub const Server = struct {
     connections_lock: Io.Mutex = .init,
     /// The idle connections without a task, and the cap of the worker tasks.
     parker: Parker = .{},
+    /// The read and write buffers of the connection tasks.
+    buffers: BufferPool,
     /// Wakes the supervisor: a connection has a nearer time limit, a connection ended, or the
     /// server stops.
     supervisor_wake: Io.Event = .unset,
@@ -84,6 +86,7 @@ pub const Server = struct {
             .options = options,
             .limits = server.options.limits,
             .permits = .{ .permits = server.options.limits.http.max_connections },
+            .buffers = .init(server.options.limits),
         };
     }
 
@@ -91,6 +94,7 @@ pub const Server = struct {
         if (self.listener) |*l| l.deinit(self.io);
         self.connections.deinit(self.gpa);
         self.parker.snapshot.deinit(self.gpa);
+        self.buffers.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -342,7 +346,12 @@ pub const Server = struct {
             }
             p.lock.unlock(io);
             if (done) return;
-            const timeout_ms: i32 = if (next == Connection.unlimited) -1 else @intCast(@min(std.math.maxInt(i32), @divFloor(@max(next - now, 0) + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+            // On Windows, a connection that parks during the wait expires `idle_timeout` after
+            // the start of the wait or later. Thus the parker wakes in time for it, and the park
+            // of a connection costs no wake of the parker. On POSIX systems the parker wakes for
+            // each park, to poll the new socket.
+            const wake_at = if (park.is_windows) @min(next, deadlineFrom(io, self.limits.http.idle_timeout)) else next;
+            const timeout_ms: i32 = if (wake_at == Connection.unlimited) -1 else @intCast(@min(std.math.maxInt(i32), @divFloor(@max(wake_at - now, 0) + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
             const n = poller.wait(timeout_ms, p.snapshot.items, &events) catch 0;
             if (n == 0) continue;
             p.lock.lockUncancelable(io);
@@ -630,48 +639,40 @@ const Connection = struct {
     fn serve(conn: *Connection) Io.Cancelable!bool {
         const self = conn.owner;
         if (!conn.startTimer(.head, self.limits.http.head_timeout)) return false;
-        const read_buf = self.gpa.alloc(u8, @max(self.limits.http.max_head_bytes + 4096, tls.Connection.min_input_buffer_len)) catch return false;
-        defer self.gpa.free(read_buf);
-        const write_buf = self.gpa.alloc(u8, tls.Connection.min_output_buffer_len) catch return false;
-        defer self.gpa.free(write_buf);
-        var reader = conn.stream.reader(self.io, read_buf);
-        var writer = conn.stream.writer(self.io, write_buf);
+        // The buffers come from the pool of the server. A new task for a parked connection
+        // thus does not allocate them again.
+        const bufs = self.buffers.take(self) orelse return false;
+        defer self.buffers.give(self, bufs);
+        var reader = conn.stream.reader(self.io, bufs.read);
+        var writer = conn.stream.writer(self.io, bufs.write);
 
         // With TLS, the HTTP server reads and writes plaintext through the TLS connection.
-        var tls_conn: tls.Connection = undefined;
-        var tls_active = false;
-        var tls_read_buf: []u8 = &.{};
-        var tls_write_buf: []u8 = &.{};
-        defer if (tls_active) {
-            tls_conn.end() catch {};
-            tls_conn.deinit();
-            self.gpa.free(tls_read_buf);
-            self.gpa.free(tls_write_buf);
+        // Its state is on the heap. Thus a plaintext connection does not fill it.
+        var tls_state: ?*TlsState = null;
+        defer if (tls_state) |s| {
+            s.conn.end() catch {};
+            s.conn.deinit();
+            self.gpa.destroy(s);
         };
         if (self.options.tls) |tls_server| {
-            tls_read_buf = self.gpa.alloc(u8, tls.Connection.min_read_buffer_len) catch return false;
-            tls_write_buf = self.gpa.alloc(u8, 16 * 1024) catch {
-                self.gpa.free(tls_read_buf);
-                return false;
-            };
-            tls_conn = tls_server.accept(&reader.interface, &writer.interface, .{
+            const s = self.gpa.create(TlsState) catch return false;
+            s.conn = tls_server.accept(&reader.interface, &writer.interface, .{
                 .io = self.io,
-                .read_buffer = tls_read_buf,
-                .write_buffer = tls_write_buf,
+                .read_buffer = &s.read_buf,
+                .write_buffer = &s.write_buf,
                 .allow_truncation_attacks = true,
             }) catch {
-                self.gpa.free(tls_read_buf);
-                self.gpa.free(tls_write_buf);
+                self.gpa.destroy(s);
                 return false;
             };
-            tls_active = true;
+            tls_state = s;
         }
-        const in: *Io.Reader = if (tls_active) &tls_conn.reader else &reader.interface;
-        const out: *Io.Writer = if (tls_active) &tls_conn.writer else &writer.interface;
+        const in: *Io.Reader = if (tls_state) |s| &s.conn.reader else &reader.interface;
+        const out: *Io.Writer = if (tls_state) |s| &s.conn.writer else &writer.interface;
         // The parker watches the socket of a plaintext connection while it is idle, so the
         // connection holds no task between requests. A TLS connection keeps its task: its
         // state is in the buffers.
-        conn.use_poll = !tls_active;
+        conn.use_poll = tls_state == null;
         var http_server: http.Server = .init(in, out);
         var first = true;
         while (!self.closing.load(.acquire)) {
@@ -718,6 +719,95 @@ const Connection = struct {
             if (!reuse) return false;
         }
         return false;
+    }
+};
+
+/// The TLS state of one connection.
+const TlsState = struct {
+    conn: tls.Connection,
+    read_buf: [tls.Connection.min_read_buffer_len]u8,
+    write_buf: [16 * 1024]u8,
+};
+
+/// The read and write buffers of the connection tasks. A task that ends gives its pair of
+/// buffers back, and the next task takes it. Thus a request on a parked connection does not
+/// allocate and fill 36 KiB again. The pool keeps at most `max_kept` free pairs. A parked
+/// connection holds no buffers.
+///
+/// Each buffer is a separate allocation. One block of both is larger than the largest size
+/// class of `std.heap.smp_allocator` (32 KiB). Each allocation of such a block maps memory.
+const BufferPool = struct {
+    lock: Io.Mutex = .init,
+    free: ?*Node = null,
+    free_count: u32 = 0,
+    read_len: usize = 0,
+    write_len: usize = 0,
+
+    const max_kept = 32;
+    const alignment: std.mem.Alignment = .of(Node);
+    /// The first bytes of a free read buffer.
+    const Node = struct { next: ?*Node, write: [*]u8 };
+
+    const Pair = struct {
+        read: []align(alignment.toByteUnits()) u8,
+        write: []u8,
+    };
+
+    fn init(limits: Limits) BufferPool {
+        return .{
+            .read_len = @max(limits.http.max_head_bytes + 4096, tls.Connection.min_input_buffer_len, @sizeOf(Node)),
+            .write_len = tls.Connection.min_output_buffer_len,
+        };
+    }
+
+    fn deinit(pool: *BufferPool, gpa: Allocator) void {
+        while (pool.free) |node| {
+            pool.free = node.next;
+            const pair = pool.pairOf(node);
+            gpa.free(pair.read);
+            gpa.free(pair.write);
+        }
+        pool.free_count = 0;
+    }
+
+    fn pairOf(pool: *BufferPool, node: *Node) Pair {
+        const read: [*]align(alignment.toByteUnits()) u8 = @ptrCast(node);
+        return .{ .read = read[0..pool.read_len], .write = node.write[0..pool.write_len] };
+    }
+
+    /// The buffers for a task, or null when the server has no memory for them.
+    fn take(pool: *BufferPool, self: *Server) ?Pair {
+        {
+            pool.lock.lockUncancelable(self.io);
+            defer pool.lock.unlock(self.io);
+            if (pool.free) |node| {
+                pool.free = node.next;
+                pool.free_count -= 1;
+                return pool.pairOf(node);
+            }
+        }
+        const read = self.gpa.alignedAlloc(u8, alignment, pool.read_len) catch return null;
+        const write = self.gpa.alloc(u8, pool.write_len) catch {
+            self.gpa.free(read);
+            return null;
+        };
+        return .{ .read = read, .write = write };
+    }
+
+    fn give(pool: *BufferPool, self: *Server, pair: Pair) void {
+        {
+            pool.lock.lockUncancelable(self.io);
+            defer pool.lock.unlock(self.io);
+            if (pool.free_count < max_kept) {
+                const node: *Node = @ptrCast(pair.read.ptr);
+                node.* = .{ .next = pool.free, .write = pair.write.ptr };
+                pool.free = node;
+                pool.free_count += 1;
+                return;
+            }
+        }
+        self.gpa.free(pair.read);
+        self.gpa.free(pair.write);
     }
 };
 
@@ -901,7 +991,7 @@ const Parker = struct {
                 if (empty) {
                     p.watching.remove(conn);
                     p.parkLocked(self, conn);
-                    if (p.parked.head == conn) poller.wake();
+                    if (!park.is_windows and p.parked.head == conn) poller.wake();
                     return .parked;
                 }
                 // Bytes wait in the buffer of the task. The poll stays pending and watches
@@ -914,7 +1004,7 @@ const Parker = struct {
                 // No poll ran, for a response without a handler: park with a new poll.
                 poller.arm(&conn.slot, conn.stream.socket.handle) catch return .read_next;
                 p.parkLocked(self, conn);
-                if (!park.is_windows or p.parked.head == conn) poller.wake();
+                if (!park.is_windows) poller.wake();
                 return .parked;
             },
             .idle, .closing => unreachable,

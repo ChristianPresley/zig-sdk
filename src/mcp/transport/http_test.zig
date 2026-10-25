@@ -550,6 +550,39 @@ test "http parker: an idle keep-alive connection holds no task, resumes on the n
     try waitHeld(&f.transport, 0);
 }
 
+test "http parker: quick requests stay on the task of the connection, and a close during the wait ends it" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const request_bytes = try discoverRequest(arena);
+
+    // On POSIX systems the task waits for the next request after a response. Each request
+    // here comes at once, while the task waits, or later from the parker.
+    for (0..3) |_| {
+        const raw = try Raw.open(gpa, f.transport.bound_port);
+        for (0..20) |_| {
+            try raw.send(request_bytes);
+            try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+        }
+        // The close comes while the task waits for the next request.
+        raw.close(gpa);
+    }
+    const io = std.testing.io;
+    var waited: usize = 0;
+    while (true) : (waited += 1) {
+        f.transport.connections_lock.lockUncancelable(io);
+        const with_task = f.transport.connections.items.len;
+        f.transport.connections_lock.unlock(io);
+        if (with_task == 0 and f.transport.parker.held.load(.acquire) == 0) break;
+        if (waited > 2000) return error.ConnectionsNotEnded;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
 test "http parker: the cap of the worker tasks queues connections and serves them in turn" {
     const gpa = std.testing.allocator;
     var limits: mcp.Limits = .{};
