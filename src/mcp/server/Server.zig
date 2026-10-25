@@ -136,6 +136,9 @@ pub const ToolDef = struct {
     /// effect. The handler can send events, for example with `notifyToolsListChanged`. The
     /// gRPC transport keeps an event for a slow subscriber and does not wait. Another
     /// transport can wait for the subscriber, and the reader then waits too.
+    ///
+    /// On Linux, the parker of the Streamable HTTP server runs such a call for an idle plaintext
+    /// connection itself. While the handler runs, the parker reads no other connection.
     quick: bool = false,
     userdata: ?*anyopaque = null,
 };

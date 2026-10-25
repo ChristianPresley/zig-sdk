@@ -20,6 +20,18 @@ fn add(ctx: *mcp.RequestContext, args: AddArgs) anyerror!mcp.Outcome(types.CallT
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "{d}", .{args.a + args.b}) };
 }
 
+const NoArgs = struct {};
+
+/// The size of the text of `big_text`: larger than the socket buffers on loopback.
+const big_text_len = 8 << 20;
+
+fn bigText(ctx: *mcp.RequestContext, args: NoArgs) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    const text = try ctx.arena.alloc(u8, big_text_len);
+    @memset(text, 'x');
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "{s}", .{text}) };
+}
+
 const HeaderArgs = struct {
     region: []const u8,
     priority: i64,
@@ -47,6 +59,7 @@ const Fixture = struct {
         self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "http-test", .version = "1" }, .limits = limits });
         try self.server.addTool(.{ .name = "add" }, add);
         try self.server.addTool(.{ .name = "test_headers" }, echoHeaders);
+        try self.server.addTool(.{ .name = "big_text", .quick = true }, bigText);
         self.transport = .init(io, gpa, &self.server, .{ .port = 0, .response_mode = mode });
         try self.transport.bind();
         self.future = try io.concurrent(serveIgnoringErrors, .{&self.transport});
@@ -581,6 +594,66 @@ test "http parker: quick requests stay on the task of the connection, and a clos
         if (waited > 2000) return error.ConnectionsNotEnded;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
+}
+
+fn bigTextRequest(arena: std.mem.Allocator, id: i64) ![]u8 {
+    const body = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{{s},\"name\":\"big_text\",\"arguments\":{{}}}}}}", .{ id, meta_none });
+    return std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\nmcp-protocol-version: 2026-07-28\r\nmcp-method: tools/call\r\nmcp-name: big_text\r\ncontent-length: {d}\r\n\r\n{s}", .{ body.len, body });
+}
+
+test "http parker: a quick request of a parked connection, with a response that the client reads late" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    try raw.send(try discoverRequest(arena));
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+    try waitHeld(&f.transport, 1);
+    // On Linux the parker runs this quick call itself. The response is larger than the socket
+    // buffers, and the client reads it only later: the task of the connection sends the rest.
+    try raw.send(try bigTextRequest(arena, 2));
+    try io.sleep(.fromMilliseconds(100), .awake);
+    const big = try raw.readResponse(arena);
+    try std.testing.expect(std.mem.startsWith(u8, big, "HTTP/1.1 200 "));
+    try std.testing.expect(big.len > big_text_len);
+    try std.testing.expect(std.mem.endsWith(u8, big, "}"));
+    // The connection carries the next requests.
+    for (0..3) |_| {
+        try waitHeld(&f.transport, 1);
+        try raw.send(try discoverRequest(arena));
+        try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+    }
+    raw.close(gpa);
+    try waitHeld(&f.transport, 0);
+}
+
+test "http parker: a quick request head with a huge Content-Length gets 413, and the server keeps serving" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    try raw.send(try discoverRequest(arena));
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+    try waitHeld(&f.transport, 1);
+    // The parker looks at this head. The sum of its length and the body length overflows.
+    try raw.send("POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\nmcp-protocol-version: 2026-07-28\r\nmcp-method: server/discover\r\ncontent-length: 18446744073709551615\r\n\r\n");
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 413 "));
+    const other = try Raw.open(gpa, f.transport.bound_port);
+    defer other.close(gpa);
+    try other.send(try discoverRequest(arena));
+    try std.testing.expect(std.mem.startsWith(u8, try other.readResponse(arena), "HTTP/1.1 200 "));
 }
 
 test "http parker: the cap of the worker tasks queues connections and serves them in turn" {

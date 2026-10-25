@@ -1,6 +1,7 @@
 //! The Streamable HTTP transport (server side): one `POST` endpoint, JSON or SSE responses,
 //! long-lived listen streams, header mirroring, `Origin` and `Host` validation.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
@@ -209,13 +210,19 @@ pub const Server = struct {
         return true;
     }
 
+    /// Free the memory of a connection that ended.
+    fn freeConnection(self: *Server, conn: *Connection) void {
+        if (conn.pending_out) |pending| self.gpa.free(pending);
+        self.gpa.destroy(conn);
+    }
+
     /// Give a new connection a task, or a place in the queue of the parker when the worker
     /// tasks are at their cap. False when the server has no memory for the connection.
     fn startConnection(self: *Server, stream: Io.net.Stream) bool {
         const conn = self.gpa.create(Connection) catch return false;
         conn.* = .{ .owner = self, .stream = stream };
         if (!self.parker.admit(self, conn)) {
-            self.gpa.destroy(conn);
+            self.freeConnection(conn);
             return false;
         }
         return true;
@@ -251,7 +258,7 @@ pub const Server = struct {
                         .finished => {
                             conn.worker.await(io);
                             self.untrackLocked(conn);
-                            self.gpa.destroy(conn);
+                            self.freeConnection(conn);
                             // At the shutdown the parker waits for the last task to end.
                             if (self.closing.load(.acquire)) self.parker.wakeTask();
                             continue;
@@ -320,6 +327,9 @@ pub const Server = struct {
         const p = &self.parker;
         const poller = &p.poller.?;
         var events: [256]park.Event = undefined;
+        // True after the parker ran requests itself. Other requests can arrive meanwhile, thus
+        // the next wait looks without a wait first.
+        var look_again = false;
         while (true) {
             p.lock.lockUncancelable(io);
             p.freeClosedLocked(self);
@@ -352,11 +362,26 @@ pub const Server = struct {
             // each park, to poll the new socket.
             const wake_at = if (park.is_windows) @min(next, deadlineFrom(io, self.limits.http.idle_timeout)) else next;
             const timeout_ms: i32 = if (wake_at == Connection.unlimited) -1 else @intCast(@min(std.math.maxInt(i32), @divFloor(@max(wake_at - now, 0) + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
-            const n = poller.wait(timeout_ms, p.snapshot.items, &events) catch 0;
+            const n = poller.wait(if (look_again) 0 else timeout_ms, p.snapshot.items, &events) catch 0;
+            look_again = false;
             if (n == 0) continue;
             p.lock.lockUncancelable(io);
             for (events[0..n]) |ev| p.handleEventLocked(self, ev);
             p.lock.unlock(io);
+            var served: usize = 0;
+            while (true) : (served += 1) {
+                p.lock.lockUncancelable(io);
+                if (served == max_inline_per_wait) {
+                    // Many requests at once: the rest get worker tasks, which run in parallel.
+                    while (p.candidates.pop()) |c| p.ready.push(c);
+                    p.lock.unlock(io);
+                    break;
+                }
+                const conn = p.candidates.pop();
+                p.lock.unlock(io);
+                p.serveInline(self, conn orelse break);
+                look_again = true;
+            }
         }
     }
 
@@ -461,6 +486,14 @@ const Connection = struct {
     hangup_seen: bool = false,
     /// The cancel token of the request that runs, for a disconnect that the parker sees.
     cancel_token: ?*Transport.CancelToken = null,
+    /// True while the parker runs a request of the connection itself (see
+    /// `Parker.serveInline`). The time limits then do not apply.
+    inline_mode: bool = false,
+    /// The part of a response that the parker could not send without a wait. The task of
+    /// the connection sends it first.
+    pending_out: ?[]u8 = null,
+    /// Close the connection after `pending_out`.
+    pending_close: bool = false,
     /// True for a plaintext connection: the parker watches its socket. A TLS connection
     /// keeps its task as the watch, and never parks.
     use_poll: bool = false,
@@ -552,6 +585,7 @@ const Connection = struct {
     /// Set the time limit of the next read to `limit` from now. Zero means no limit. False
     /// when the connection expired: the task must stop.
     fn startTimer(conn: *Connection, phase: Phase, limit: Io.Duration) bool {
+        if (conn.inline_mode) return true;
         conn.phase.store(phase, .release);
         const ns = nanoseconds(limit);
         const self = conn.owner;
@@ -564,6 +598,7 @@ const Connection = struct {
 
     /// As `startTimer`, but keep a time limit that runs already.
     fn continueTimer(conn: *Connection, phase: Phase, limit: Io.Duration) bool {
+        if (conn.inline_mode) return true;
         const d = conn.deadline.load(.acquire);
         if (d == expired) return false;
         if (d != busy) return true;
@@ -572,6 +607,7 @@ const Connection = struct {
 
     /// Remove the time limit while the task is busy. False when the connection expired.
     fn stopTimer(conn: *Connection) bool {
+        if (conn.inline_mode) return true;
         conn.phase.store(.busy, .release);
         return conn.setDeadline(busy);
     }
@@ -675,6 +711,21 @@ const Connection = struct {
         conn.use_poll = tls_state == null;
         var http_server: http.Server = .init(in, out);
         var first = true;
+        if (conn.pending_out) |pending| {
+            // The rest of a response of the parker (see `Parker.serveInline`).
+            conn.pending_out = null;
+            defer self.gpa.free(pending);
+            out.writeAll(pending) catch return false;
+            out.flush() catch return false;
+            if (conn.pending_close) return false;
+            first = false;
+            // Then the connection goes back to the parker, as after a request.
+            if (conn.use_poll) switch (self.parker.afterRequest(self, conn, true, in.bufferedLen() == 0)) {
+                .parked => return true,
+                .close => return false,
+                .read_next => {},
+            };
+        }
         while (!self.closing.load(.acquire)) {
             if (!first) {
                 // Wait for the first byte of the next request. A time limit that runs already
@@ -811,6 +862,71 @@ const BufferPool = struct {
     }
 };
 
+/// The head of a request that the parker can run itself (see `Parker.serveInline`).
+const InlineHead = struct {
+    /// The length of the head and the body.
+    len: usize,
+    method: []const u8,
+    name: ?[]const u8,
+};
+
+/// Read the head at the start of `data` for `Parker.serveInline`, or null. The head must end
+/// with the first `"\r\n\r\n"`, as `std.http.HeadParser` finds it, and each line must end
+/// with `"\r\n"`. Thus this scan and the HTTP parser see the same header lines. The body must have a
+/// `Content-Length` of at most `max_body`, without `Transfer-Encoding` and `Expect`. The head
+/// must have `Mcp-Method`.
+fn scanInlineHead(data: []const u8, max_body: usize) ?InlineHead {
+    var parser: http.HeadParser = .{};
+    const head_len = parser.feed(data);
+    if (parser.state != .finished or head_len < 4) return null;
+    const head = data[0..head_len];
+    if (!std.mem.endsWith(u8, head, "\r\n\r\n")) return null;
+    // A bare LF or CR: other parsers can end a line there.
+    for (head, 0..) |c, i| switch (c) {
+        '\n' => if (i == 0 or head[i - 1] != '\r') return null,
+        '\r' => if (i + 1 == head.len or head[i + 1] != '\n') return null,
+        else => {},
+    };
+    var content_length: usize = 0;
+    var have_length = false;
+    var method: ?[]const u8 = null;
+    var name: ?[]const u8 = null;
+    var lines = std.mem.splitSequence(u8, head[0 .. head_len - 4], "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.findScalar(u8, line, ':') orelse return null;
+        const key = line[0..colon];
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(key, "content-length")) {
+            if (have_length) return null;
+            have_length = true;
+            content_length = std.fmt.parseInt(usize, value, 10) catch return null;
+            if (content_length > max_body) return null;
+        } else if (std.ascii.eqlIgnoreCase(key, "transfer-encoding") or std.ascii.eqlIgnoreCase(key, "expect")) {
+            return null;
+        } else if (std.ascii.eqlIgnoreCase(key, envelope.header_method)) {
+            if (method != null) return null;
+            method = value;
+        } else if (std.ascii.eqlIgnoreCase(key, envelope.header_name)) {
+            if (name != null) return null;
+            name = value;
+        }
+    }
+    const len = std.math.add(usize, head_len, content_length) catch return null;
+    return .{ .len = len, .method = method orelse return null, .name = name };
+}
+
+/// The length of the request at the start of `data` when the parker can run it itself (see
+/// `Parker.serveInline`), or null.
+fn inlineRequestLength(self: *Server, data: []const u8) ?usize {
+    const head = scanInlineHead(data, self.limits.http.max_body_bytes) orelse return null;
+    if (!self.server.isQuickMethod(head.method, head.name)) return null;
+    return head.len;
+}
+
+/// The most requests that the parker runs itself after one wait (see `Parker.serveInline`).
+const max_inline_per_wait = 16;
+
 const Peek = enum { bytes, closed, nothing };
 
 /// Look at the socket without a wait (POSIX). The bytes stay in the socket. `closed`: the
@@ -846,6 +962,11 @@ const Parker = struct {
     parked_count: usize = 0,
     /// The connections that wait for a worker task, in the order of arrival.
     ready: List = .{},
+    /// The parked connections with bytes that the parker looks at after its wait (see
+    /// `serveInline`). The list is empty at the start of each loop of the parker.
+    candidates: List = .{},
+    /// The response of a request that the parker runs itself. The parker keeps its memory.
+    inline_out: ?Io.Writer.Allocating = null,
     /// The connections whose socket the parker watches while a handler runs.
     watching: List = .{},
     /// The connections whose socket this side closed while a poll was pending (Windows). The
@@ -901,6 +1022,106 @@ const Parker = struct {
     fn stop(p: *Parker) void {
         if (p.poller) |*poller| poller.deinit();
         p.poller = null;
+        if (p.inline_out) |*aw| aw.deinit();
+        p.inline_out = null;
+    }
+
+    /// True when the parker can run a quick request itself: on Linux, for plaintext without
+    /// authorization. A check of a token can wait for I/O.
+    fn inlineEnabled(p: *Parker, self: *Server) bool {
+        _ = p;
+        return builtin.os.tag == .linux and self.options.tls == null and self.options.auth == null and !self.closing.load(.acquire);
+    }
+
+    const InlineEnd = enum { parked, close, task };
+
+    /// Run the request of a ready connection in the task of the parker, without a new task.
+    /// This happens only when the socket holds exactly one complete request (one look with
+    /// `MSG_PEEK`, without a wait) and `McpServer.isQuickMethod` accepts its `Mcp-Method` and
+    /// `Mcp-Name` headers. The response goes to a buffer, and then to the socket without a
+    /// wait. The connection task sends a rest that does not fit. Each other request gets a
+    /// task, as before. A new task and its thread wake cost more than a quick handler.
+    fn serveInline(p: *Parker, self: *Server, conn: *Connection) void {
+        const end = p.runInline(self, conn);
+        const io = self.io;
+        p.lock.lockUncancelable(io);
+        defer p.lock.unlock(io);
+        switch (end) {
+            .parked => {
+                p.poller.?.arm(&conn.slot, conn.stream.socket.handle) catch {
+                    p.finishLocked(self, conn);
+                    return;
+                };
+                conn.data_seen = false;
+                conn.hangup_seen = false;
+                conn.poll_phase = .idle;
+                conn.park_deadline = deadlineFrom(io, self.limits.http.idle_timeout);
+                conn.state.store(.parked, .release);
+                p.parked.push(conn);
+                p.parked_count += 1;
+            },
+            .close => p.finishLocked(self, conn),
+            .task => {
+                conn.park_deadline = deadlineFrom(io, self.limits.http.head_timeout);
+                p.ready.push(conn);
+            },
+        }
+    }
+
+    fn runInline(p: *Parker, self: *Server, conn: *Connection) InlineEnd {
+        if (builtin.os.tag != .linux) return .task;
+        // At the shutdown, the connection goes the usual way.
+        if (self.closing.load(.acquire)) return .task;
+        const linux = std.os.linux;
+        const bufs = self.buffers.take(self) orelse return .task;
+        defer self.buffers.give(self, bufs);
+        const fd = conn.stream.socket.handle;
+        const rc = linux.recvfrom(fd, bufs.read.ptr, bufs.read.len, linux.MSG.PEEK | linux.MSG.DONTWAIT, null, null);
+        switch (linux.errno(rc)) {
+            .SUCCESS => if (rc == 0) return .close,
+            else => return .task,
+        }
+        if (rc >= bufs.read.len) return .task;
+        const total = inlineRequestLength(self, bufs.read[0..rc]) orelse return .task;
+        if (total != rc) return .task;
+
+        // From here on the bytes leave the socket. An error closes the connection.
+        const aw = if (p.inline_out) |*w| w else blk: {
+            p.inline_out = Io.Writer.Allocating.initCapacity(self.gpa, 16 * 1024) catch return .task;
+            break :blk &p.inline_out.?;
+        };
+        aw.clearRetainingCapacity();
+        defer if (aw.writer.buffer.len > 1024 * 1024) {
+            aw.deinit();
+            p.inline_out = null;
+        };
+        var reader = conn.stream.reader(self.io, bufs.read[0..total]);
+        conn.inline_mode = true;
+        defer conn.inline_mode = false;
+        var http_server: http.Server = .init(&reader.interface, &aw.writer);
+        var request = http_server.receiveHead() catch return .close;
+        const keep_alive = handleRequest(conn, &request, &reader) catch false;
+        const reuse = keep_alive and request.head.keep_alive and reader.interface.bufferedLen() == 0;
+        aw.writer.flush() catch return .close;
+        const data = aw.written();
+        var sent: usize = 0;
+        while (sent < data.len) {
+            const n = linux.sendto(fd, data[sent..].ptr, data.len - sent, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, null, 0);
+            switch (linux.errno(n)) {
+                .SUCCESS => sent += n,
+                .INTR => {},
+                .AGAIN => break,
+                else => return .close,
+            }
+        }
+        if (sent < data.len) {
+            // The client does not read now. The task of the connection sends the rest, and
+            // the parker does not wait.
+            conn.pending_out = self.gpa.dupe(u8, data[sent..]) catch return .close;
+            conn.pending_close = !reuse;
+            return .task;
+        }
+        return if (reuse) .parked else .close;
     }
 
     /// Wake the task of the parker. Safe from any task.
@@ -1117,7 +1338,7 @@ const Parker = struct {
         }
         self.permits.post(io);
         _ = p.held.fetchSub(1, .acq_rel);
-        self.gpa.destroy(conn);
+        self.freeConnection(conn);
         self.supervisor_wake.set(io);
     }
 
@@ -1151,7 +1372,9 @@ const Parker = struct {
                     conn.poll_phase = .none;
                     conn.park_deadline = deadlineFrom(self.io, self.limits.http.head_timeout);
                     conn.state.store(.queued, .release);
-                    p.ready.push(conn);
+                    // The parker looks at the bytes after this wait, and runs a quick request
+                    // itself.
+                    if (p.inlineEnabled(self)) p.candidates.push(conn) else p.ready.push(conn);
                 } else if (ev.hangup) {
                     p.parked.remove(conn);
                     p.parked_count -= 1;
@@ -1481,6 +1704,19 @@ fn handleRpcRequest(conn: *Connection, request: *http.Server.Request, socket: *I
         .force_sse = self.options.response_mode == .sse,
     };
     var dispatch: Dispatch = .{ .conn = conn, .exchange = &exchange, .socket = socket, .req = req, .principal = principal, .arena = arena };
+    // The parker runs a quick request itself (see `Parker.serveInline`). No poll watches the
+    // socket, and nothing cancels the handler, as on the reader of a stream transport.
+    if (conn.inline_mode) {
+        // The headers said quick. The parker runs only a request that is quick by its body
+        // too. A request that is not ends with an error and the close of the connection.
+        const tool = if (req.params) |params| json.getString(params, "name") else null;
+        if (!self.server.isQuickMethod(req.method, tool)) {
+            try respondErrorOptions(request, .service_unavailable, req.id, errors.internalError("the request does not match its Mcp-Method and Mcp-Name headers"), false);
+            return false;
+        }
+        dispatch.run();
+        return exchange.reusable and !token.isCancelled() and request.head.keep_alive;
+    }
     // A disconnect of the client cancels the request, also while the handler does not write.
     // For a plaintext connection, the poll of the parker watches the socket, and the handler
     // runs in this task. A cancel of this task (a time limit or the shutdown) then cancels
@@ -1724,6 +1960,24 @@ test "a rate limit error maps to status 429 and Retry-After in whole seconds" {
         .{ .text = "{\"code\":-31429,\"message\":\"m\"}", .seconds = null },
     };
     for (cases) |c| try std.testing.expectEqual(c.seconds, retryAfterSeconds(try json.parseTree(arena, c.text)));
+}
+
+test "the head scan of the parker accepts only a strict head with a bounded body" {
+    const ok = "POST /mcp HTTP/1.1\r\nmcp-method: tools/call\r\nmcp-name: t\r\ncontent-length: 2\r\n\r\n{}";
+    const head = scanInlineHead(ok, 100).?;
+    try std.testing.expectEqual(ok.len, head.len);
+    try std.testing.expectEqualStrings("tools/call", head.method);
+    try std.testing.expectEqualStrings("t", head.name.?);
+    // A length that overflows, or that is larger than the limit.
+    try std.testing.expect(scanInlineHead("POST /mcp HTTP/1.1\r\nmcp-method: tools/list\r\ncontent-length: 18446744073709551615\r\n\r\n", std.math.maxInt(usize)) == null);
+    try std.testing.expect(scanInlineHead("POST /mcp HTTP/1.1\r\nmcp-method: tools/list\r\ncontent-length: 101\r\n\r\n", 100) == null);
+    // A bare LF ends the head earlier for std: the lines after it are the body.
+    try std.testing.expect(scanInlineHead("POST /mcp HTTP/1.1\nmcp-method: tools/call\nmcp-name: slow\ncontent-length: 40\n\nx\r\nmcp-method: tools/list\r\n\r\n", 100) == null);
+    try std.testing.expect(scanInlineHead("POST /mcp HTTP/1.1\r\nmcp-method: tools/list\ncontent-length: 0\r\n\r\n", 100) == null);
+    // Two values of a header, an incomplete head, and a head without Mcp-Method.
+    try std.testing.expect(scanInlineHead("POST /mcp HTTP/1.1\r\nmcp-method: tools/list\r\nmcp-method: tools/call\r\n\r\n", 100) == null);
+    try std.testing.expect(scanInlineHead("POST /mcp HTTP/1.1\r\nmcp-method: tools/list\r\n", 100) == null);
+    try std.testing.expect(scanInlineHead("POST /mcp HTTP/1.1\r\ncontent-length: 0\r\n\r\n", 100) == null);
 }
 
 test {
