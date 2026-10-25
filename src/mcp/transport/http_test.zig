@@ -419,6 +419,39 @@ test "http limits: the server closes a keep-alive connection after idle_timeout 
     }
 }
 
+test "http limits: an idle_timeout that passes while the connection goes to the parker frees the connection one time" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    // After each response, the supervisor cancels the task of the connection while the task
+    // gives the connection to the parker. Only one of them must end the task, and the parker
+    // must free the connection only after the cancel.
+    limits.http.idle_timeout = .fromMilliseconds(1);
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const request_bytes = try discoverRequest(arena);
+
+    for (0..200) |i| {
+        const raw = try Raw.open(gpa, f.transport.bound_port);
+        defer raw.close(gpa);
+        try raw.send(request_bytes);
+        // The body of the request also has `idle_timeout`. On a slow computer the time limit
+        // can pass before the server reads it: then the server closes the connection without
+        // a response, or sends 408.
+        const response = raw.readResponse(arena) catch |e| switch (e) {
+            error.EndOfStream, error.ReadFailed => continue,
+            else => return e,
+        };
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 ") or std.mem.startsWith(u8, response, "HTTP/1.1 408 "));
+        // Half of the clients close at once: the task closes the connection. The other half
+        // wait: the connection parks, and the parker closes it.
+        if (i % 2 == 0) _ = try raw.readToEnd(arena);
+    }
+}
+
 test "http limits: a request body that does not arrive in idle_timeout gets 408" {
     const gpa = std.testing.allocator;
     var limits: mcp.Limits = .{};

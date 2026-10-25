@@ -504,7 +504,9 @@ const Connection = struct {
     /// What the task waits for.
     phase: std.atomic.Value(Phase) = .init(.busy),
     /// `running` until the task ends by itself (`finished`), or until the supervisor cancels
-    /// it (`canceling`, then `finished`).
+    /// it (`canceling`, then `finished`). The task gives the connection to the parker only
+    /// with a change from `running` (see `Parker.claimLocked`). Thus the parker and the
+    /// supervisor do not both end the task.
     state: std.atomic.Value(State) = .init(.running),
 
     const Phase = enum(u8) {
@@ -569,12 +571,16 @@ const Connection = struct {
     }
 
     /// Cancel the task and mark the end. The supervisor runs it in a task of the group. Thus
-    /// a slow end of one connection does not delay the time limits of the others.
+    /// a slow end of one connection does not delay the time limits of the others. The task
+    /// can give the connection to the parker while the cancel runs (see
+    /// `Parker.takeOverPending`). Then the parker frees the connection after `finished`. Thus
+    /// this function does not touch the connection after it sets `finished`.
     fn cancelWorker(conn: *Connection) void {
         const self = conn.owner;
         conn.worker.cancel(self.io);
         conn.state.store(.finished, .release);
         self.supervisor_wake.set(self.io);
+        self.parker.wakeTask();
     }
 
     /// Mark the deadline `d` as passed. False when the task changed the deadline first.
@@ -973,7 +979,8 @@ const Parker = struct {
     /// completion of the poll frees them.
     closing_count: usize = 0,
     /// On POSIX systems: the connections whose socket this side closed while the parker
-    /// watched it. The parker frees them before its next wait.
+    /// watched it. On all systems: the connections without a poll whose task the supervisor
+    /// still cancels. The parker frees them before its next wait (see `freeClosedLocked`).
     closed: List = .{},
     /// The connections the parker owns: parked, in `ready`, or with a closed socket. The
     /// supervisor ends after the parker gave up the last one.
@@ -1210,6 +1217,8 @@ const Parker = struct {
                 // The poll is pending: nothing arrived while the handler ran.
                 if (!keep) return .close;
                 if (empty) {
+                    // The supervisor cancels the task: the task closes the connection.
+                    if (!claimLocked(conn, .parked)) return .close;
                     p.watching.remove(conn);
                     p.parkLocked(self, conn);
                     if (!park.is_windows and p.parked.head == conn) poller.wake();
@@ -1222,8 +1231,13 @@ const Parker = struct {
             .none => {
                 if (!keep or conn.hangup_seen) return .close;
                 if (conn.data_seen or !empty) return .read_next;
+                if (!claimLocked(conn, .parked)) return .close;
                 // No poll ran, for a response without a handler: park with a new poll.
-                poller.arm(&conn.slot, conn.stream.socket.handle) catch return .read_next;
+                poller.arm(&conn.slot, conn.stream.socket.handle) catch {
+                    // Only the task changes the state from `parked` here.
+                    conn.state.store(.running, .release);
+                    return .read_next;
+                };
                 p.parkLocked(self, conn);
                 if (!park.is_windows) poller.wake();
                 return .parked;
@@ -1232,11 +1246,19 @@ const Parker = struct {
         }
     }
 
-    /// The poll of `conn` runs. Make the connection a parked one and end its task.
+    /// Change the state of a connection with a task from `running` to `to`. False when the
+    /// supervisor cancels the task (`canceling`). Then the canceller ends the task, and the
+    /// parker must not end it too (with `await` in `spawnLocked` or `finishLocked`): one
+    /// `Io.Future` gets one `await` or `cancel` only.
+    fn claimLocked(conn: *Connection, to: Connection.State) bool {
+        return conn.state.cmpxchgStrong(.running, to, .acq_rel, .acquire) == null;
+    }
+
+    /// The poll of `conn` runs, and its state is `parked` (see `claimLocked`). Make the
+    /// connection a parked one and end its task.
     fn parkLocked(p: *Parker, self: *Server, conn: *Connection) void {
         conn.poll_phase = .idle;
         conn.park_deadline = deadlineFrom(self.io, self.limits.http.idle_timeout);
-        conn.state.store(.parked, .release);
         p.parked.push(conn);
         p.parked_count += 1;
         // A new connection waits for a permit: the parker can close this one now.
@@ -1255,6 +1277,11 @@ const Parker = struct {
     /// The task of `conn` ends with a close. When a poll is pending for the socket, the parker
     /// takes the connection and closes the socket. The completion of the poll then frees the
     /// connection. True in that case. False when the task closes the connection itself.
+    ///
+    /// The supervisor can cancel the task at the same time (`canceling`). The parker must
+    /// still take the connection: the poll references it. But the canceller ends the task.
+    /// Thus the parker frees the connection only after the canceller set `finished` (see
+    /// `freeClosedLocked`).
     fn takeOverPending(p: *Parker, self: *Server, conn: *Connection) bool {
         const io = self.io;
         p.lock.lockUncancelable(io);
@@ -1265,6 +1292,8 @@ const Parker = struct {
             .handler => p.watching.remove(conn),
             .idle, .closing => unreachable,
         }
+        // On failure the state stays `canceling`.
+        _ = claimLocked(conn, .parked_closing);
         p.closeWithPollLocked(self, conn);
         p.handOverLocked(self, conn);
         return true;
@@ -1274,12 +1303,12 @@ const Parker = struct {
     /// the poll, and the completion frees the connection. A cancel of the poll would make
     /// the kernel walk every pending poll of the helper handle. That is slow with many
     /// parked connections. On POSIX systems the parker frees the connection in its next
-    /// loop, after the `poll` that can still have the socket returned.
+    /// loop, after the `poll` that can still have the socket returned. The caller sets the
+    /// state.
     fn closeWithPollLocked(p: *Parker, self: *Server, conn: *Connection) void {
         conn.stream.close(self.io);
         conn.closed = true;
         conn.poll_phase = .closing;
-        conn.state.store(.parked_closing, .release);
         p.closing_count += 1;
         if (!park.is_windows) {
             p.closed.push(conn);
@@ -1287,14 +1316,25 @@ const Parker = struct {
         }
     }
 
-    /// Free the connections that `closeWithPollLocked` closed (POSIX). The parker calls it
-    /// between two waits: no `poll` has their slots then.
+    /// Free the connections in `closed`. On POSIX systems, these are the connections that
+    /// `closeWithPollLocked` closed. On all systems, these are also the connections whose
+    /// poll ended while the supervisor canceled their task. The parker calls it between two
+    /// waits: no `poll` has their slots then. A connection whose task the supervisor still
+    /// cancels stays in the list: the canceller wakes the parker after the end of the task.
     fn freeClosedLocked(p: *Parker, self: *Server) void {
+        var later: List = .{};
         while (p.closed.pop()) |conn| {
-            conn.poll_phase = .none;
-            p.closing_count -= 1;
+            if (conn.poll_phase == .closing) {
+                conn.poll_phase = .none;
+                p.closing_count -= 1;
+            }
+            if (conn.state.load(.acquire) == .canceling) {
+                later.push(conn);
+                continue;
+            }
             p.finishLocked(self, conn);
         }
+        p.closed = later;
     }
 
     /// Start the worker task of `conn`, which then has the state `running` and is in
@@ -1305,6 +1345,14 @@ const Parker = struct {
             conn.worker.await(io);
             conn.future_live = false;
         }
+        // The supervisor can have marked the time limit as passed while the last task gave
+        // the connection to the parker (see `claimLocked`). The new task starts without it.
+        conn.deadline.store(Connection.busy, .release);
+        // The supervisor cancels only a `running` connection, through `worker`. The new task
+        // can set a time limit before this function sets `worker`. Thus the state becomes
+        // `running` only after that. The task cannot end before it: its end needs the lock
+        // of the parker (see `release` and `takeOverPending`).
+        conn.state.store(.queued, .release);
         self.track(conn) catch return false;
         conn.worker = io.concurrent(Connection.work, .{conn}) catch {
             self.untrack(conn);
@@ -1348,6 +1396,7 @@ const Parker = struct {
         p.parked.remove(conn);
         p.parked_count -= 1;
         if (park.is_windows) {
+            conn.state.store(.parked_closing, .release);
             p.closeWithPollLocked(self, conn);
         } else {
             conn.poll_phase = .none;
@@ -1363,6 +1412,11 @@ const Parker = struct {
                 if (!park.is_windows) return;
                 conn.poll_phase = .none;
                 p.closing_count -= 1;
+                // The supervisor cancels the task: free the connection after the cancel.
+                if (conn.state.load(.acquire) == .canceling) {
+                    p.closed.push(conn);
+                    return;
+                }
                 p.finishLocked(self, conn);
             },
             .idle => {

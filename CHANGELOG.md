@@ -44,6 +44,7 @@ All notable changes to this project are recorded in this file. The format follow
 
 ### Fixed
 
+- The Streamable HTTP server now ends the task of a connection one time only. Before, the supervisor could cancel the task at a time limit or at the shutdown while the task gave the connection to the parker. The parker then also ended the task and freed the connection, and the cancel freed the memory of the task a second time. A Debug or ReleaseSafe build then stopped with `Invalid free` or a segmentation fault. The connection now goes to the parker only with a change of its state from `running`, and the parker frees a connection in `canceling` only after the cancel. In 0.7.1 the race was possible only when a time limit passed while the connection parked. The watch of the socket during a handler on POSIX systems, which this release adds, made it possible at each shutdown. A new connection also has a task before the supervisor can cancel it, and a time limit that passed while a connection parked no longer ends its next task.
 - The Streamable HTTP server now removes the cancellation token of a request from the parker before the request ends. Before, on Windows, a close by the client between the end of the handler and the next park could cancel a token that was no longer in memory.
 
 ## [0.7.1] - 2026-10-23
