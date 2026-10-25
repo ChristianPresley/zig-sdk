@@ -592,12 +592,12 @@ fn serverOptions(apps: bool) mcp.Server.Options {
 
 /// Register each tool, resource and prompt of the fixture.
 fn register(server: *mcp.Server, io: std.Io) !void {
-    try server.addTool(.{ .name = "test_simple_text", .description = "Returns simple text" }, logged(simpleText));
-    try server.addTool(.{ .name = "test_image_content", .description = "Returns image content" }, logged(imageContent));
-    try server.addTool(.{ .name = "test_audio_content", .description = "Returns audio content" }, logged(audioContent));
-    try server.addTool(.{ .name = "test_embedded_resource", .description = "Returns an embedded resource" }, logged(embeddedResource));
-    try server.addTool(.{ .name = "test_multiple_content_types", .description = "Returns mixed content" }, logged(multipleContentTypes));
-    try server.addTool(.{ .name = "test_error_handling", .description = "Returns an error result" }, logged(errorHandling));
+    try server.addTool(.{ .name = "test_simple_text", .description = "Returns simple text", .quick = true }, logged(simpleText));
+    try server.addTool(.{ .name = "test_image_content", .description = "Returns image content", .quick = true }, logged(imageContent));
+    try server.addTool(.{ .name = "test_audio_content", .description = "Returns audio content", .quick = true }, logged(audioContent));
+    try server.addTool(.{ .name = "test_embedded_resource", .description = "Returns an embedded resource", .quick = true }, logged(embeddedResource));
+    try server.addTool(.{ .name = "test_multiple_content_types", .description = "Returns mixed content", .quick = true }, logged(multipleContentTypes));
+    try server.addTool(.{ .name = "test_error_handling", .description = "Returns an error result", .quick = true }, logged(errorHandling));
     try server.addTool(.{ .name = "test_tool_with_progress", .description = "Sends progress notifications" }, logged(withProgress));
     try server.addTool(.{ .name = "test_tool_with_logging", .description = "Sends log messages" }, logged(withLogging));
     try server.addTool(.{ .name = "test_logging_tool", .description = "Sends log messages" }, logged(withLogging));

@@ -45,6 +45,9 @@ pub const Server = struct {
     /// each instance a new connection identifier.
     peer: Transport.Peer,
     out_lock: Io.Mutex = .init,
+    /// True when the buffer of `out` has frames that `flushPending` must send. Changed only
+    /// under `out_lock`.
+    out_pending: std.atomic.Value(bool) = .init(false),
     in_flight: std.ArrayList(*Slot) = .empty,
     in_flight_lock: Io.Mutex = .init,
     group: Io.Group = .init,
@@ -92,6 +95,9 @@ pub const Server = struct {
         /// True for a `subscriptions/listen` request. Only such a request can end with a
         /// server-sent `notifications/cancelled`.
         listen: bool = false,
+        /// True when the request runs on the reader (`McpServer.isQuick`). Its frames then
+        /// stay in the buffer of `out` until the reader has no complete line to read.
+        on_reader: bool = false,
         done: bool = false,
         message: jsonrpc.Message = undefined,
     };
@@ -170,6 +176,9 @@ pub const Server = struct {
         var line_reader: framer.Framer = .{ .reader = in, .max_line_bytes = self.limits.stdio.max_line_bytes };
         while (true) {
             if (self.stop) |s| if (s.load(.acquire)) break;
+            // Flush the frames of the quick requests before the reader can wait for input.
+            // When more complete lines are in the buffer, the next frames go out with them.
+            if (std.mem.findScalar(u8, in.buffered(), '\n') == null) self.flushPending();
             const slot = try self.newSlot();
             const arena = slot.arena.allocator();
             const line = line_reader.next(arena) catch |e| switch (e) {
@@ -198,6 +207,7 @@ pub const Server = struct {
             };
             try self.dispatch(slot, line);
         }
+        self.flushPending();
         switch (self.on_close) {
             .shutdown_subscriptions => self.server.shutdownSubscriptions(self.io),
             .cancel_requests => self.cancelAll(connection_closed_reason, false),
@@ -236,6 +246,7 @@ pub const Server = struct {
             .request => |req| {
                 slot.id = req.id;
                 slot.listen = std.mem.eql(u8, req.method, "subscriptions/listen");
+                slot.on_reader = self.server.isQuick(slot.message);
                 try self.start(slot, req.id);
             },
             .notification => |n| {
@@ -252,8 +263,10 @@ pub const Server = struct {
     /// Start the task of a request, or answer it when the limit is full. The admission and
     /// the start happen under `in_flight_lock`, so `stopAdmission` sees every started task.
     fn start(self: *Server, slot: *Slot, id: RequestId) !void {
+        // The reader can wait below. Before that, the frames of the quick requests go out.
+        if (!slot.on_reader) self.flushPending();
         if (self.when_full == .wait) self.permits.waitUncancelable(self.io);
-        const Outcome = enum { started, stopped, full, failed };
+        const Outcome = enum { started, on_reader, stopped, full, failed };
         self.in_flight_lock.lockUncancelable(self.io);
         const outcome: Outcome = outcome: {
             if (!self.admitting) break :outcome .stopped;
@@ -262,6 +275,7 @@ pub const Server = struct {
                 .reject => |limit| if (self.in_flight.items.len >= limit) break :outcome .full,
             }
             self.in_flight.append(self.gpa, slot) catch {};
+            if (slot.on_reader) break :outcome .on_reader;
             self.group.concurrent(self.io, runSlot, .{slot}) catch {
                 self.removeLocked(slot);
                 break :outcome .failed;
@@ -271,6 +285,8 @@ pub const Server = struct {
         self.in_flight_lock.unlock(self.io);
         switch (outcome) {
             .started => {},
+            // A quick request runs here. It needs no thread wake-up and no new task.
+            .on_reader => runSlot(slot) catch {},
             .stopped => {
                 self.releasePermit();
                 self.destroySlot(slot);
@@ -374,7 +390,7 @@ pub const Server = struct {
         if (slot.done) return error.Closed;
         // After a cancellation by the peer, the server sends nothing more for the request.
         if (slot.token.isCancelledByPeer()) return error.Closed;
-        try slot.owner.writeFrame(io, frame);
+        try slot.owner.writeFrameMode(io, frame, slot.on_reader);
     }
 
     fn slotFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
@@ -383,7 +399,7 @@ pub const Server = struct {
         slot.done = true;
         // A handler that ignored the cancellation gets no response out.
         if (slot.token.isCancelledByPeer()) return error.Closed;
-        try slot.owner.writeFrame(io, frame);
+        try slot.owner.writeFrameMode(io, frame, slot.on_reader);
         // Only a listen stream that the server ends at shutdown gets a cancellation
         // notification after its result.
         if (slot.listen and slot.token.isCancelled() and slot.token.server_shutdown) {
@@ -402,11 +418,36 @@ pub const Server = struct {
     }
 
     fn writeFrame(self: *Server, io: Io, frame: []const u8) Transport.SendError!void {
+        return self.writeFrameMode(io, frame, false);
+    }
+
+    /// Write one frame. With `deferred` (only on the reader), the frame stays in the buffer
+    /// until `flushPending`. Else the frame and the frames in the buffer go out now.
+    fn writeFrameMode(self: *Server, io: Io, frame: []const u8, deferred: bool) Transport.SendError!void {
         if (self.closed) return error.Closed;
         if (self.sink) |s| return s.write(s.ptr, io, frame);
+        std.debug.assert(std.mem.findScalar(u8, frame, '\n') == null);
         self.out_lock.lockUncancelable(io);
         defer self.out_lock.unlock(io);
-        framer.writeFrame(self.out.?, frame) catch return error.WriteFailed;
+        const out = self.out.?;
+        out.writeAll(frame) catch return error.WriteFailed;
+        out.writeByte('\n') catch return error.WriteFailed;
+        if (deferred) {
+            self.out_pending.store(true, .monotonic);
+            return;
+        }
+        self.out_pending.store(false, .monotonic);
+        out.flush() catch return error.WriteFailed;
+    }
+
+    /// Flush the frames that `writeFrameMode` kept in the buffer.
+    fn flushPending(self: *Server) void {
+        if (self.sink != null or !self.out_pending.load(.monotonic)) return;
+        self.out_lock.lockUncancelable(self.io);
+        defer self.out_lock.unlock(self.io);
+        if (!self.out_pending.load(.monotonic)) return;
+        self.out_pending.store(false, .monotonic);
+        self.out.?.flush() catch {};
     }
 
     fn writeFrameError(self: *Server, id: ?RequestId, err: errors.RpcError) !void {

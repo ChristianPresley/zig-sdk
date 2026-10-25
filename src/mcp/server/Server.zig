@@ -129,6 +129,11 @@ pub const ToolDef = struct {
     /// Each caller has a bucket for this tool alone. A count of zero disables the limit for
     /// each caller. `limits.rate_limits.tool_calls_total` also counts the calls of this tool.
     rate_limit: ?Limits.Rate = null,
+    /// Set it only when the handler does not wait for I/O, a timer or a lock that another
+    /// request holds, and returns in some microseconds. Then a stream transport (stdio, Unix
+    /// socket, WebSocket) runs the call on its reader, without a new task. The reader reads no
+    /// other message while the handler runs, thus a cancellation of the call has no effect.
+    quick: bool = false,
     userdata: ?*anyopaque = null,
 };
 
@@ -174,6 +179,7 @@ const ToolEntry = struct {
     /// The MCP Apps metadata, also present under `def._meta.ui`.
     ui: ?apps_proto.ToolMeta = null,
     rate_limit: ?Limits.Rate = null,
+    quick: bool = false,
     userdata: ?*anyopaque,
     enabled: bool = true,
 };
@@ -457,6 +463,7 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
         .requires_client = def.requires_client,
         .task_support = def.task_support,
         .rate_limit = def.rate_limit,
+        .quick = def.quick,
         .ui = if (def.ui) |ui| .{
             .resourceUri = if (ui.resourceUri) |u| try arena.dupe(u8, u) else null,
             .visibility = if (ui.visibility) |v| try arena.dupe(apps_proto.Visibility, v) else null,
@@ -714,6 +721,28 @@ pub fn handle(self: *Server, io: Io, inbound: Transport.Inbound) void {
         .notification => {},
         .response, .error_response => _ = self.violations.fetchAdd(1, .monotonic),
     }
+}
+
+/// True when `msg` is a request that ends without a wait. These requests are the calls of a
+/// tool with `ToolDef.quick`, and `server/discover`, `tools/list`, `prompts/list` and
+/// `resources/templates/list`, which the server answers without a handler. A stream transport
+/// runs such a request on its reader, without a new task.
+pub fn isQuick(self: *Server, msg: message.Message) bool {
+    const req = switch (msg) {
+        .request => |r| r,
+        else => return false,
+    };
+    if (std.mem.eql(u8, req.method, "tools/call")) {
+        const params = req.params orelse return false;
+        if (params != .object) return false;
+        const name = params.object.get("name") orelse return false;
+        if (name != .string) return false;
+        const entry = self.findTool(name.string) orelse return false;
+        return entry.quick;
+    }
+    const quick_methods = [_][]const u8{ "server/discover", "tools/list", "prompts/list", "resources/templates/list" };
+    for (quick_methods) |m| if (std.mem.eql(u8, req.method, m)) return true;
+    return false;
 }
 
 fn handleRequest(self: *Server, io: Io, inbound: Transport.Inbound, req: message.Message.Request) void {

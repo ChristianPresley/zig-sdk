@@ -252,6 +252,106 @@ test "stdio server writes one valid JSON-RPC message per line and never a reques
     try std.testing.expectEqualStrings("input_required", ask.object.get("result").?.object.get("resultType").?.string);
 }
 
+/// An output that counts its flushes.
+const CountingOut = struct {
+    writer: Io.Writer,
+    bytes: std.ArrayList(u8) = .empty,
+    flushes: usize = 0,
+
+    fn init(buffer: []u8) CountingOut {
+        return .{ .writer = .{ .buffer = buffer, .vtable = &.{ .drain = drain } } };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *CountingOut = @fieldParentPtr("writer", w);
+        const gpa = std.testing.allocator;
+        self.flushes += 1;
+        self.bytes.appendSlice(gpa, w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            self.bytes.appendSlice(gpa, d) catch return error.WriteFailed;
+            n += d.len;
+        }
+        for (0..splat) |_| self.bytes.appendSlice(gpa, data[data.len - 1]) catch return error.WriteFailed;
+        return n + splat * data[data.len - 1].len;
+    }
+};
+
+/// An input that gives one chunk at each read. Before it gives the next chunk, it records
+/// what the output kept in its buffer, because a real read can wait for a long time.
+const ChunkedIn = struct {
+    reader: Io.Reader,
+    chunks: []const []const u8,
+    next: usize = 0,
+    out: *CountingOut,
+    /// For each read after the first: the bytes that the output did not flush.
+    unflushed: [4]usize = @splat(0),
+    flushes: [4]usize = @splat(0),
+
+    fn init(buffer: []u8, chunks: []const []const u8, out: *CountingOut) ChunkedIn {
+        return .{ .reader = .{ .buffer = buffer, .seek = 0, .end = 0, .vtable = &.{ .stream = stream } }, .chunks = chunks, .out = out };
+    }
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        _ = w;
+        _ = limit;
+        const self: *ChunkedIn = @fieldParentPtr("reader", r);
+        self.unflushed[self.next] = self.out.writer.buffered().len;
+        self.flushes[self.next] = self.out.flushes;
+        if (self.next == self.chunks.len) return error.EndOfStream;
+        const chunk = self.chunks[self.next];
+        self.next += 1;
+        // The tests give chunks that fit after the bytes in the buffer.
+        std.mem.copyForwards(u8, r.buffer[0 .. r.end - r.seek], r.buffer[r.seek..r.end]);
+        r.end -= r.seek;
+        r.seek = 0;
+        @memcpy(r.buffer[r.end..][0..chunk.len], chunk);
+        r.end += chunk.len;
+        return 0;
+    }
+};
+
+test "stdio server writes the answers of quick requests together and flushes them before it reads" {
+    const gpa = std.testing.allocator;
+    var server: mcp.Server = undefined;
+    try initServer(&server);
+    defer server.deinit();
+    try server.addToolJson(.{ .name = "quick_text", .quick = true }, multiline);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The first chunk has three quick requests and the second chunk has one. The request of
+    // the third chunk runs in its own task.
+    const first = try std.mem.concat(arena, u8, &.{
+        try request(arena, 1, "server/discover", meta_none, ""),                   "\n",
+        try request(arena, 2, "tools/call", meta_none, "\"name\":\"quick_text\""), "\n",
+        try request(arena, 3, "tools/list", meta_none, ""),                        "\n",
+    });
+    const second = try std.mem.concat(arena, u8, &.{ try request(arena, 4, "tools/call", meta_none, "\"name\":\"quick_text\""), "\n" });
+    const third = try std.mem.concat(arena, u8, &.{ try request(arena, 5, "tools/call", meta_none, "\"name\":\"multiline\""), "\n" });
+    var out_buf: [64 * 1024]u8 = undefined;
+    var out: CountingOut = .init(&out_buf);
+    defer out.bytes.deinit(gpa);
+    var in_buf: [16 * 1024]u8 = undefined;
+    var in: ChunkedIn = .init(&in_buf, &.{ first, second, third }, &out);
+    var transport: mcp.transport.stdio.Server = .init(std.testing.io, gpa, &server, &out.writer);
+    defer transport.deinit();
+    try transport.run(&in.reader);
+    try out.writer.flush();
+
+    // Before each read, no answer waits in the buffer.
+    try std.testing.expectEqual(@as(usize, 0), in.unflushed[1]);
+    try std.testing.expectEqual(@as(usize, 0), in.unflushed[2]);
+    // The three answers of the first chunk go out with one write, the lone answer of the
+    // second chunk with the next one.
+    try std.testing.expectEqual(@as(usize, 1), in.flushes[1]);
+    try std.testing.expectEqual(@as(usize, 2), in.flushes[2]);
+    for (1..6) |id| try std.testing.expect(try responseFor(arena, out.bytes.items, @intCast(id)) != null);
+    try std.testing.expectEqual(5, (try parseLines(arena, out.bytes.items)).len);
+}
+
 test "stdio server answers a message deeper than limits.json_max_depth with a parse error" {
     const gpa = std.testing.allocator;
     var server: mcp.Server = undefined;
