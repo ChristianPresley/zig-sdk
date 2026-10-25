@@ -31,6 +31,7 @@ const timeout = @import("../grpc/timeout.zig");
 const grpc_server = @import("grpc_server.zig");
 const service = @import("../typed/service.zig");
 const convert = @import("../typed/convert.zig");
+const Deadlines = @import("deadlines.zig");
 
 const log = std.log.scoped(.mcp_grpc);
 
@@ -97,11 +98,9 @@ pub fn handleCall(self: *grpc_server.Server, stream: *Stream, arena: Allocator, 
     stream.setOnReset(onReset, &token);
     defer stream.setOnReset(null, null);
     var deadline_hit: std.atomic.Value(bool) = .init(false);
-    var deadline_future: ?Io.Future(void) = null;
-    if (deadline) |d| deadline_future = io.concurrent(deadlineTask, .{ io, d, &token, &deadline_hit }) catch null;
-    defer if (deadline_future) |*f| {
-        _ = f.cancel(io);
-    };
+    var watch: Deadlines.Watch = .{};
+    if (deadline) |d| watch.start(&self.deadlines, io, d, &token, &deadline_hit);
+    defer watch.finish(&self.deadlines, io);
 
     const outcome = try run(self, arena, rpc, params, &token, principal);
     const result = switch (outcome) {
@@ -263,12 +262,6 @@ fn captureAbort(ptr: *anyopaque, io: Io) void {
 fn onReset(userdata: ?*anyopaque, stream: *Stream) void {
     const token: *Transport.CancelToken = @ptrCast(@alignCast(userdata.?));
     token.cancel(stream.conn.io, "stream reset");
-}
-
-fn deadlineTask(io: Io, duration: Io.Duration, token: *Transport.CancelToken, hit: *std.atomic.Value(bool)) void {
-    io.sleep(duration, .awake) catch return;
-    hit.store(true, .release);
-    token.cancel(io, "deadline exceeded");
 }
 
 /// End the call with a JSON-RPC error in headers only. The status follows

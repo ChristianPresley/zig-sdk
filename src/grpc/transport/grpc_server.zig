@@ -27,6 +27,7 @@ const codec = @import("../protobuf/codec.zig");
 const service = @import("../typed/service.zig");
 const typed_server = @import("typed_server.zig");
 const socket_opts = mcp.transport.socket_opts;
+const Deadlines = @import("deadlines.zig");
 
 const log = std.log.scoped(.mcp_grpc);
 
@@ -82,6 +83,10 @@ pub const Server = struct {
     stop_event: Io.Event = .unset,
     connections: std.ArrayList(*Conn) = .empty,
     connections_lock: Io.Mutex = .init,
+    /// The `grpc-timeout` of the calls of every connection.
+    deadlines: Deadlines = .{},
+    /// The arenas of the calls that ended, for the next calls.
+    arenas: ArenaPool = .{},
 
     pub fn init(io: Io, gpa: Allocator, server: *mcp.Server, options: Options) Server {
         return .{
@@ -95,6 +100,11 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         if (self.listener) |*l| l.deinit(self.io);
+        // Normally `serve` stopped the task already.
+        self.deadlines.stop(self.io);
+        // Normally `serve` stopped the task already.
+        self.deadlines.stop(self.io);
+        self.arenas.deinit(self.gpa);
         self.connections.deinit(self.gpa);
         self.* = undefined;
     }
@@ -131,6 +141,7 @@ pub const Server = struct {
         mcp.util.wake.cancelAcceptLoop(self.io, &accept_future, self.listener.?.socket.address, &self.closing);
         self.server.shutdownSubscriptions(self.io);
         self.group.await(self.io) catch {};
+        self.deadlines.stop(self.io);
     }
 
     fn acceptLoop(self: *Server) void {
@@ -179,6 +190,52 @@ pub const Server = struct {
             if (c.h2_ready.load(.acquire)) c.h2.shutdown();
             c.stream.shutdown(self.io, .both) catch {};
         }
+    }
+};
+
+/// The arenas of calls that ended. A call takes one and gives it back with its memory, up to
+/// `keep_bytes`. Before, each call started an empty arena and freed it at the end. A call of
+/// the typed binding that grew its arena past 64 KiB, for example `ListTools`, then mapped
+/// and unmapped pages each time. On Linux that was one `mmap` and one `munmap` for each call.
+const ArenaPool = struct {
+    lock: Io.Mutex = .init,
+    free: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
+
+    /// The memory that an arena keeps for the next call.
+    const keep_bytes = 256 * 1024;
+    /// The most arenas that the pool keeps.
+    const max_kept = 64;
+
+    fn acquire(p: *ArenaPool, io: Io, gpa: Allocator) Allocator.Error!*std.heap.ArenaAllocator {
+        {
+            p.lock.lockUncancelable(io);
+            defer p.lock.unlock(io);
+            if (p.free.pop()) |a| return a;
+        }
+        const a = try gpa.create(std.heap.ArenaAllocator);
+        a.* = .init(gpa);
+        return a;
+    }
+
+    fn release(p: *ArenaPool, io: Io, gpa: Allocator, a: *std.heap.ArenaAllocator) void {
+        _ = a.reset(.{ .retain_with_limit = keep_bytes });
+        {
+            p.lock.lockUncancelable(io);
+            defer p.lock.unlock(io);
+            if (p.free.items.len < max_kept) {
+                if (p.free.append(gpa, a)) |_| return else |_| {}
+            }
+        }
+        a.deinit();
+        gpa.destroy(a);
+    }
+
+    fn deinit(p: *ArenaPool, gpa: Allocator) void {
+        for (p.free.items) |a| {
+            a.deinit();
+            gpa.destroy(a);
+        }
+        p.free.deinit(gpa);
     }
 };
 
@@ -271,8 +328,8 @@ fn handleStream(conn: *Conn, stream: *Stream) void {
 
 fn handleStreamInner(conn: *Conn, stream: *Stream) !void {
     const self = conn.owner;
-    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
-    defer arena_state.deinit();
+    const arena_state = try self.arenas.acquire(self.io, self.gpa);
+    defer self.arenas.release(self.io, self.gpa, arena_state);
     const arena = arena_state.allocator();
     const headers = try stream.waitHeaders();
 
@@ -361,11 +418,9 @@ fn handleRequest(conn: *Conn, stream: *Stream, arena: Allocator, env: envelope.H
     defer stream.setOnReset(null, null);
 
     var exchange: Exchange = .{ .stream = stream, .gpa = self.gpa, .arena = arena };
-    var deadline_future: ?Io.Future(void) = null;
-    if (deadline) |d| deadline_future = io.concurrent(deadlineTask, .{ io, d, &token, &exchange }) catch null;
-    defer if (deadline_future) |*f| {
-        _ = f.cancel(io);
-    };
+    var watch: Deadlines.Watch = .{};
+    if (deadline) |d| watch.start(&self.deadlines, io, d, &token, &exchange.deadline_hit);
+    defer watch.finish(&self.deadlines, io);
     self.server.handle(io, .{
         .kind = .grpc,
         .arena = arena,
@@ -377,7 +432,7 @@ fn handleRequest(conn: *Conn, stream: *Stream, arena: Allocator, env: envelope.H
     });
     if (!exchange.done) {
         // The handler ended without a response: the request was cancelled.
-        const code: status.Code = if (exchange.deadline_hit) .deadline_exceeded else .cancelled;
+        const code: status.Code = if (exchange.deadline_hit.load(.acquire)) .deadline_exceeded else .cancelled;
         if (exchange.started) {
             stream.sendHeaders(&.{.{ .name = "grpc-status", .value = code.wire() }}, true) catch {};
         } else {
@@ -391,12 +446,6 @@ fn handleRequest(conn: *Conn, stream: *Stream, arena: Allocator, env: envelope.H
 fn onReset(userdata: ?*anyopaque, stream: *Stream) void {
     const token: *Transport.CancelToken = @ptrCast(@alignCast(userdata.?));
     token.cancel(stream.conn.io, "stream reset");
-}
-
-fn deadlineTask(io: Io, duration: Io.Duration, token: *Transport.CancelToken, exchange: *Exchange) void {
-    io.sleep(duration, .awake) catch return;
-    exchange.deadline_hit = true;
-    token.cancel(io, "deadline exceeded");
 }
 
 fn toolSchema(self: *Server, params: ?Value) ?Value {
@@ -462,7 +511,7 @@ const Exchange = struct {
     started: bool = false,
     done: bool = false,
     /// Set by the deadline task before it cancels the request.
-    deadline_hit: bool = false,
+    deadline_hit: std.atomic.Value(bool) = .init(false),
 
     fn ensureHeaders(self: *Exchange) Transport.SendError!void {
         if (self.started) return;
@@ -520,7 +569,7 @@ fn exchangeAbort(ptr: *anyopaque, io: Io) void {
     const ex: *Exchange = @ptrCast(@alignCast(ptr));
     if (ex.done) return;
     ex.done = true;
-    const code: status.Code = if (ex.deadline_hit) .deadline_exceeded else .cancelled;
+    const code: status.Code = if (ex.deadline_hit.load(.acquire)) .deadline_exceeded else .cancelled;
     if (ex.started) {
         ex.stream.sendHeaders(&.{.{ .name = "grpc-status", .value = code.wire() }}, true) catch {};
     } else {
