@@ -186,7 +186,11 @@ test "cancelAcceptLoop ends a loop that serves each connection and waits in acce
 test "wakeIp connects also when signals interrupt it" {
     if (comptime !posix_connect or SignalTarget == void) return error.SkipZigTest;
     const io = std.testing.io;
-    var listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+    // The queue of the listener holds all the connects. With the default of 128, a busy
+    // computer that delays the accept loop drops the next connects, and `wakeIp` stops its
+    // wait after 100 ms. `cancelLoop` connects again in that case, but this test counts each
+    // connect.
+    var listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .kernel_backlog = 1024 });
     defer listener.deinit(io);
     const Loop = struct {
         fn run(l: *Io.net.Server, accepted: *std.atomic.Value(u32), stop: *std.atomic.Value(bool)) void {
