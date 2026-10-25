@@ -376,6 +376,35 @@ test "pagination" {
     try std.testing.expectEqual(@as(i64, -32602), errorCode(try f.call(3, "tools/list", meta_none, "\"cursor\":\"garbage!\"")).?);
 }
 
+test "the tools list from the cache has the bytes of a new serialization" {
+    var f: Fixture = undefined;
+    try f.init(.{ .info = .{ .name = "test", .version = "0.1.0" } });
+    defer f.deinit();
+    const io = std.testing.io;
+
+    _ = try f.call(1, "tools/list", meta_none, "");
+    const first = try f.arena().dupe(u8, f.harness.last().?);
+    // The second request gets the text from the cache, with its own id.
+    _ = try f.call(1, "tools/list", meta_none, "");
+    try std.testing.expectEqualStrings(first, f.harness.last().?);
+    const other = try f.call(77, "tools/list", meta_none, "");
+    try std.testing.expectEqual(77, other.object.get("id").?.integer);
+    try std.testing.expectEqual(5, result(other).object.get("tools").?.array.items.len);
+
+    // A disabled tool leaves the list at once.
+    try std.testing.expect(f.server.setToolEnabled(io, "boom", false));
+    const fewer = result(try f.call(2, "tools/list", meta_none, ""));
+    try std.testing.expectEqual(4, fewer.object.get("tools").?.array.items.len);
+    try std.testing.expect(f.server.setToolEnabled(io, "boom", true));
+    _ = try f.call(1, "tools/list", meta_none, "");
+    try std.testing.expectEqualStrings(first, f.harness.last().?);
+
+    // A new tool also makes the cache stale.
+    try f.server.addToolJson(.{ .name = "late" }, boom);
+    const more = result(try f.call(3, "tools/list", meta_none, ""));
+    try std.testing.expectEqual(6, more.object.get("tools").?.array.items.len);
+}
+
 test "subscriptions listen stream" {
     var f: Fixture = undefined;
     try f.init(.{ .info = .{ .name = "test", .version = "0.1.0" } });

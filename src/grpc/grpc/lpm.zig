@@ -37,6 +37,25 @@ pub fn writeNoWait(stream: *Stream, gpa: Allocator, payload: []const u8, end_str
     try stream.sendDataNoWait(buf, end_stream);
 }
 
+/// Write the prefix of a message into the first `prefix_len` bytes of `framed`. The payload
+/// is the rest of `framed`. Give the result to `writeFramed`. A payload longer than the
+/// prefix can tell gives `error.MessageTooLarge`.
+pub fn setPrefix(framed: []u8) error{MessageTooLarge}!void {
+    const len = std.math.cast(u32, framed.len - prefix_len) orelse return error.MessageTooLarge;
+    framed[0] = 0;
+    std.mem.writeInt(u32, framed[1..prefix_len], len, .big);
+}
+
+/// Send one message from `setPrefix` as `write` does, without a copy.
+pub fn writeFramed(stream: *Stream, framed: []const u8, end_stream: bool) Error!void {
+    try stream.sendData(framed, end_stream);
+}
+
+/// Send one message from `setPrefix` as `writeNoWait` does, without a copy.
+pub fn writeFramedNoWait(stream: *Stream, framed: []const u8, end_stream: bool) (Error || error{WouldBlock})!void {
+    try stream.sendDataNoWait(framed, end_stream);
+}
+
 /// Receive one message, or null when the stream ended before a message started.
 pub fn read(stream: *Stream, gpa: Allocator, max_len: usize) Error!?[]u8 {
     var prefix: [prefix_len]u8 = undefined;

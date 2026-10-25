@@ -94,6 +94,8 @@ pub const Server = struct {
     max_workers: u32,
     /// The idle plaintext connections. See `Parker`.
     parker: Parker = .{},
+    /// The encoded responses of recent list results of the typed binding.
+    typed_cache: typed_server.ResultCache = .{},
 
     pub fn init(io: Io, gpa: Allocator, server: *mcp.Server, options: Options) Server {
         const cpus = std.Thread.getCpuCount() catch 4;
@@ -118,6 +120,7 @@ pub const Server = struct {
         self.deadlines.stop(self.io);
         self.arenas.deinit(self.gpa);
         self.parker.deinit(self.gpa);
+        self.typed_cache.deinit(self.gpa);
         self.connections.deinit(self.gpa);
         self.* = undefined;
     }

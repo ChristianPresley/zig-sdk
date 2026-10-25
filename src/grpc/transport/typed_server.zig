@@ -10,6 +10,9 @@
 //! - A list result in pages becomes one response: the server follows `nextCursor` and merges
 //!   the pages, because the messages have no cursor.
 //! - A result that the messages cannot carry ends with `INTERNAL` and the code `-32603`.
+//! - The server keeps the encoded response messages of recent list results. A list result
+//!   with the same JSON text gets the same message without a new parse and encode. See
+//!   `ResultCache`.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -131,43 +134,70 @@ pub fn execute(self: *grpc_server.Server, stream: *Stream, arena: Allocator, p: 
     defer watch.finish(&self.deadlines, io);
 
     const started = Io.Timestamp.now(io, .awake);
-    const outcome = try run(self, arena, rpc, p.params, &token, p.principal);
-    const result = switch (outcome) {
-        .result => |r| r,
-        .rpc_error => |e| return endedSend(rpcError(stream, arena, e)),
-        .cancelled => {
-            const code: status.Code = if (deadline_hit.load(.acquire)) .deadline_exceeded else .cancelled;
-            return endedSend(grpc_server.trailersOnly(stream, arena, code, "The request was cancelled", null, null));
-        },
-    };
-    var cx: convert.Context = .{ .arena = arena, .limits = self.options.typed_limits };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    convert.encodeResult(&cx, gpa, &out, rpc, result) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Unexpressible, error.Invalid => {
-            log.warn("the typed binding cannot express the {s} result: {s}", .{ rpc.method(), cx.reason });
-            const message = try std.fmt.allocPrint(arena, "The typed gRPC binding cannot express {s}", .{cx.reason});
+    // The message with its gRPC prefix. It is in `out` or in the cache.
+    var framed: []const u8 = undefined;
+    // A list result can be the same as a recent one. Then the encoded message is also the same.
+    const list = rpc.listKey() != null;
+    const first = try runOnce(self, arena, rpc.method(), p.params, &token, p.principal, if (list) rpc else null);
+    defer if (first.hit) |h| h.release(gpa);
+    if (first.hit) |h| {
+        framed = h.framed;
+    } else {
+        const cache_key: ?[]const u8 = if (list) first.resultText() else null;
+        const first_outcome = try first.outcome(arena);
+        const one_page = first_outcome == .result and !hasNextPage(first_outcome.result);
+        const outcome = try run(self, arena, rpc, first_outcome, p.params, &token, p.principal);
+        const result = switch (outcome) {
+            .result => |r| r,
+            .rpc_error => |e| return endedSend(rpcError(stream, arena, e)),
+            .cancelled => {
+                const code: status.Code = if (deadline_hit.load(.acquire)) .deadline_exceeded else .cancelled;
+                return endedSend(grpc_server.trailersOnly(stream, arena, code, "The request was cancelled", null, null));
+            },
+        };
+        var cx: convert.Context = .{ .arena = arena, .limits = self.options.typed_limits };
+        // The JSON text is a good estimate of the size of the message.
+        try out.ensureTotalCapacity(gpa, lpm.prefix_len + if (first.frame) |f| f.len else 0);
+        _ = try out.addManyAsSlice(gpa, lpm.prefix_len);
+        convert.encodeResult(&cx, gpa, &out, rpc, result) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unexpressible, error.Invalid => {
+                log.warn("the typed binding cannot express the {s} result: {s}", .{ rpc.method(), cx.reason });
+                const message = try std.fmt.allocPrint(arena, "The typed gRPC binding cannot express {s}", .{cx.reason});
+                return endedSend(rpcError(stream, arena, errors.internalError(message)));
+            },
+        };
+        lpm.setPrefix(out.items) catch {
+            const message = try std.fmt.allocPrint(arena, "The {s} result is too large for one gRPC message", .{rpc.method()});
             return endedSend(rpcError(stream, arena, errors.internalError(message)));
-        },
-    };
+        };
+        framed = out.items;
+        // Only a result of one page goes in the cache: the key is the text of that page.
+        if (cache_key) |key| if (one_page) {
+            // Without memory for the copy, the next call encodes the result again.
+            self.typed_cache.put(io, gpa, rpc, key, framed) catch {};
+        };
+    }
     if (p.cost_slot) |i| self.costs.record(i, grpc_server.nsSince(io, started));
     // The headers, the message and the trailers go out together. See `Stream.cork`.
     stream.cork();
     defer stream.uncork() catch {};
     stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = grpc_server.content_type } }, false) catch return null;
     if (no_wait) {
-        lpm.writeNoWait(stream, gpa, out.items, false) catch |e| switch (e) {
+        lpm.writeFramedNoWait(stream, framed, false) catch |e| switch (e) {
             error.WouldBlock => {
-                // A task sends the message and the trailers.
+                // A task sends the message and the trailers. The message must live in the
+                // call arena.
                 var backlog: grpc_server.Backlog = .{ .started = true, .code = .ok };
-                try backlog.messages.append(arena, try arena.dupe(u8, out.items));
+                try backlog.messages.append(arena, try arena.dupe(u8, framed[lpm.prefix_len..]));
                 return backlog;
             },
             else => return null,
         };
     } else {
-        lpm.write(stream, gpa, out.items, false) catch return null;
+        lpm.writeFramed(stream, framed, false) catch return null;
     }
     stream.sendHeaders(&.{.{ .name = "grpc-status", .value = status.Code.ok.wire() }}, true) catch return null;
     return null;
@@ -212,9 +242,15 @@ const Outcome = union(enum) {
     cancelled,
 };
 
-/// Run the request. A list result with `nextCursor` gets the next pages.
-fn run(self: *grpc_server.Server, arena: Allocator, rpc: service.Rpc, params: Value, token: *Transport.CancelToken, principal: ?*resource_server.Principal) !Outcome {
-    const first = try runOnce(self, arena, rpc.method(), params, token, principal);
+/// True when the list result `r` has a cursor for one more page.
+fn hasNextPage(r: Value) bool {
+    if (r != .object) return false;
+    const next = r.object.get("nextCursor") orelse return false;
+    return next == .string and next.string.len > 0;
+}
+
+/// Get the pages after the result `first` of a list request and merge them into `first`.
+fn run(self: *grpc_server.Server, arena: Allocator, rpc: service.Rpc, first: Outcome, params: Value, token: *Transport.CancelToken, principal: ?*resource_server.Principal) !Outcome {
     const key = rpc.listKey() orelse return first;
     var merged = switch (first) {
         .result => |r| r,
@@ -231,7 +267,8 @@ fn run(self: *grpc_server.Server, arena: Allocator, rpc: service.Rpc, params: Va
         var it = params.object.iterator();
         while (it.next()) |kv| try page_params.put(arena, kv.key_ptr.*, kv.value_ptr.*);
         try page_params.put(arena, "cursor", next);
-        const page = switch (try runOnce(self, arena, rpc.method(), .{ .object = page_params }, token, principal)) {
+        const ran = try runOnce(self, arena, rpc.method(), .{ .object = page_params }, token, principal, null);
+        const page = switch (try ran.outcome(arena)) {
             .result => |r| r,
             else => |other| return other,
         };
@@ -252,34 +289,180 @@ fn run(self: *grpc_server.Server, arena: Allocator, rpc: service.Rpc, params: Va
     return .{ .result = merged };
 }
 
-/// Run one JSON-RPC request through the server engine.
-fn runOnce(self: *grpc_server.Server, arena: Allocator, method: []const u8, params: Value, token: *Transport.CancelToken, principal: ?*resource_server.Principal) !Outcome {
-    if (token.isCancelled()) return .cancelled;
-    var capture: Capture = .{ .arena = arena };
+/// The final frame of one engine call.
+const Ran = struct {
+    id: i64,
+    /// Null when the engine canceled the request, or when `hit` has the response.
+    frame: ?[]const u8,
+    /// The encoded response from the cache. The caller releases it.
+    hit: ?*ResultCache.Shared = null,
+
+    /// The JSON text of the result, or null when the frame is not a response.
+    fn resultText(self: Ran) ?[]const u8 {
+        return resultTextOf(self.frame orelse return null, self.id);
+    }
+
+    /// Parse the frame.
+    fn outcome(self: Ran, arena: Allocator) !Outcome {
+        const frame = self.frame orelse return .cancelled;
+        const msg = jsonrpc.Message.parse(arena, frame) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .rpc_error = errors.internalError("The server engine wrote a response that is not JSON-RPC") },
+        };
+        return switch (msg) {
+            .response => |r| .{ .result = r.result },
+            .error_response => |e| .{ .rpc_error = .{ .code = e.code, .message = e.message, .data = e.data } },
+            else => .{ .rpc_error = errors.internalError("The server engine wrote no response") },
+        };
+    }
+};
+
+/// The JSON text of the result in the response `frame` to the request `id`, or null when
+/// `frame` is not such a response.
+fn resultTextOf(frame: []const u8, id: i64) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    const head = std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"" ++ jsonrpc.message.jsonrpc_version ++ "\",\"id\":{d},\"result\":", .{id}) catch return null;
+    const tail = jsonrpc.message.response_tail;
+    if (frame.len < head.len + tail.len or !std.mem.startsWith(u8, frame, head) or !std.mem.endsWith(u8, frame, tail)) return null;
+    return frame[head.len .. frame.len - tail.len];
+}
+
+/// Run one JSON-RPC request through the server engine. With `lookup`, a result that the
+/// cache knows gives `Ran.hit` instead of a frame.
+fn runOnce(self: *grpc_server.Server, arena: Allocator, method: []const u8, params: Value, token: *Transport.CancelToken, principal: ?*resource_server.Principal, lookup: ?service.Rpc) !Ran {
+    const id = next_id.fetchAdd(1, .monotonic);
+    if (token.isCancelled()) return .{ .id = id, .frame = null };
+    var capture: Capture = .{ .arena = arena, .id = id };
+    if (lookup) |rpc| capture.lookup = .{ .cache = &self.typed_cache, .rpc = rpc };
     self.server.handle(self.io, .{
         .kind = .grpc,
         .arena = arena,
-        .message = .{ .request = .{ .id = .{ .integer = next_id.fetchAdd(1, .monotonic) }, .method = method, .params = params } },
+        .message = .{ .request = .{ .id = .{ .integer = id }, .method = method, .params = params } },
         .responder = .{ .ptr = &capture, .vtable = &capture_vtable },
         .cancel = token,
         .context = principal,
     });
-    const frame = capture.frame orelse return .cancelled;
-    const msg = jsonrpc.Message.parse(arena, frame) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .rpc_error = errors.internalError("The server engine wrote a response that is not JSON-RPC") },
-    };
-    return switch (msg) {
-        .response => |r| .{ .result = r.result },
-        .error_response => |e| .{ .rpc_error = .{ .code = e.code, .message = e.message, .data = e.data } },
-        else => .{ .rpc_error = errors.internalError("The server engine wrote no response") },
-    };
+    return .{ .id = id, .frame = capture.frame, .hit = capture.hit };
 }
 
-/// The responder of one engine call: it keeps the final frame.
+/// The encoded response messages of recent list results. The key is the RPC and the JSON
+/// text of the result. The message is a function of that key. Thus an entry never becomes
+/// stale, and the cache needs no notice of a change of a list. A changed list result gets a
+/// new entry, and the oldest entry goes.
+pub const ResultCache = struct {
+    lock: Io.Mutex = .init,
+    entries: [slots]?*Shared = @splat(null),
+    /// The entry that the next `put` replaces.
+    next: usize = 0,
+
+    /// The count of entries.
+    pub const slots = 8;
+    /// The largest JSON text that the cache keeps.
+    pub const max_key_bytes = 256 * 1024;
+
+    /// One entry. The cache and each call that sends the message have a reference. The
+    /// last `release` frees the entry.
+    pub const Shared = struct {
+        refs: std.atomic.Value(u32) = .init(1),
+        rpc: service.Rpc,
+        key: []u8,
+        /// The message with its gRPC prefix.
+        framed: []u8,
+
+        pub fn release(self: *Shared, gpa: Allocator) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            gpa.free(self.key);
+            gpa.free(self.framed);
+            gpa.destroy(self);
+        }
+    };
+
+    pub fn deinit(self: *ResultCache, gpa: Allocator) void {
+        for (self.entries) |e| if (e) |s| s.release(gpa);
+        self.* = undefined;
+    }
+
+    /// The entry for the result text `key` of `rpc`, or null. Release the entry after use.
+    pub fn acquire(self: *ResultCache, io: Io, rpc: service.Rpc, key: []const u8) ?*Shared {
+        if (key.len > max_key_bytes) return null;
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        for (self.entries) |e| {
+            const s = e orelse continue;
+            if (s.rpc != rpc or !std.mem.eql(u8, s.key, key)) continue;
+            _ = s.refs.fetchAdd(1, .monotonic);
+            return s;
+        }
+        return null;
+    }
+
+    /// Keep a copy of the message `framed` for the result text `key` of `rpc`.
+    pub fn put(self: *ResultCache, io: Io, gpa: Allocator, rpc: service.Rpc, key: []const u8, framed: []const u8) Allocator.Error!void {
+        if (key.len > max_key_bytes) return;
+        const fresh = try gpa.create(Shared);
+        errdefer gpa.destroy(fresh);
+        const key_copy = try gpa.dupe(u8, key);
+        errdefer gpa.free(key_copy);
+        fresh.* = .{ .rpc = rpc, .key = key_copy, .framed = try gpa.dupe(u8, framed) };
+        var old: ?*Shared = fresh;
+        {
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
+            const known = for (self.entries) |e| {
+                const s = e orelse continue;
+                if (s.rpc == rpc and std.mem.eql(u8, s.key, key)) break true;
+            } else false;
+            // Two calls can encode the same result at the same time. The first copy stays.
+            if (!known) {
+                old = self.entries[self.next];
+                self.entries[self.next] = fresh;
+                self.next = (self.next + 1) % slots;
+            }
+        }
+        if (old) |o| o.release(gpa);
+    }
+};
+
+test "the result cache keeps the newest entries" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var cache: ResultCache = .{};
+    defer cache.deinit(gpa);
+    try std.testing.expect(cache.acquire(io, .list_tools, "{}") == null);
+    try cache.put(io, gpa, .list_tools, "{}", "abc");
+    try cache.put(io, gpa, .list_tools, "{}", "abc");
+    const hit = cache.acquire(io, .list_tools, "{}").?;
+    try std.testing.expectEqualStrings("abc", hit.framed);
+    // The key includes the RPC.
+    try std.testing.expect(cache.acquire(io, .list_prompts, "{}") == null);
+    var buf: [8]u8 = undefined;
+    for (0..ResultCache.slots) |i| try cache.put(io, gpa, .list_prompts, try std.fmt.bufPrint(&buf, "{d}", .{i}), "x");
+    try std.testing.expect(cache.acquire(io, .list_tools, "{}") == null);
+    // The entry stays valid until its last reference goes.
+    try std.testing.expectEqualStrings("abc", hit.framed);
+    hit.release(gpa);
+    const last = cache.acquire(io, .list_prompts, "7").?;
+    defer last.release(gpa);
+    try std.testing.expectEqualStrings("x", last.framed);
+}
+
+test "the result text of an engine frame" {
+    const frame = "{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":{\"tools\":[]}}";
+    try std.testing.expectEqualStrings("{\"tools\":[]}", resultTextOf(frame, 12).?);
+    try std.testing.expect(resultTextOf(frame, 13) == null);
+    try std.testing.expect(resultTextOf("{\"jsonrpc\":\"2.0\",\"id\":12,\"error\":{\"code\":1,\"message\":\"m\"}}", 12) == null);
+    const cancelled: Ran = .{ .id = 12, .frame = null };
+    try std.testing.expect(cancelled.resultText() == null);
+}
+
+/// The responder of one engine call: it keeps the final frame. With `lookup`, it first looks
+/// for the result in the cache. A hit needs no copy of the frame.
 const Capture = struct {
     arena: Allocator,
+    id: i64,
     frame: ?[]const u8 = null,
+    lookup: ?struct { cache: *ResultCache, rpc: service.Rpc } = null,
+    hit: ?*ResultCache.Shared = null,
 };
 
 const capture_vtable: Transport.Responder.VTable = .{
@@ -296,9 +479,12 @@ fn captureNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError
 }
 
 fn captureFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
-    _ = io;
     const c: *Capture = @ptrCast(@alignCast(ptr));
-    if (c.frame != null) return error.Closed;
+    if (c.frame != null or c.hit != null) return error.Closed;
+    if (c.lookup) |l| if (resultTextOf(frame, c.id)) |key| {
+        c.hit = l.cache.acquire(io, l.rpc, key);
+        if (c.hit != null) return;
+    };
     c.frame = try c.arena.dupe(u8, frame);
 }
 

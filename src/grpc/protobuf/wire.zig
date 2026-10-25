@@ -118,9 +118,8 @@ pub const Writer = struct {
     gpa: Allocator,
 
     pub fn varint(self: Writer, value: u64) Allocator.Error!void {
-        var v = value;
-        while (v >= 0x80) : (v >>= 7) try self.out.append(self.gpa, @as(u8, @truncate(v)) | 0x80);
-        try self.out.append(self.gpa, @intCast(v));
+        var buf: [10]u8 = undefined;
+        try self.out.appendSlice(self.gpa, buf[0..putVarint(&buf, value)]);
     }
 
     pub fn tag(self: Writer, number: u32, wire_type: WireType) Allocator.Error!void {
@@ -153,39 +152,45 @@ pub const Writer = struct {
     }
 
     /// Start a length-delimited field before the encoder knows its length. The function
-    /// writes the tag and keeps five bytes for the length. Give the result to `endNested`.
+    /// writes the tag and keeps one byte for the length. Give the result to `endNested`.
     pub fn beginNested(self: Writer, number: u32) Allocator.Error!usize {
         try self.tag(number, .length_delimited);
         const start = self.out.items.len;
-        try self.out.appendNTimes(self.gpa, 0, max_nested_prefix);
+        // `endNested` writes the length into this byte.
+        _ = try self.out.addOne(self.gpa);
         return start;
     }
 
-    /// End a field from `beginNested`: write its length and move its bytes next to the length.
-    pub fn endNested(self: Writer, start: usize) error{MessageTooLarge}!void {
-        const body_start = start + max_nested_prefix;
+    /// End a field from `beginNested`: write its length. Most fields have less than 128
+    /// bytes, and their length fits in the byte that `beginNested` kept. For a longer field,
+    /// the function moves the bytes of the field to make space for the length.
+    pub fn endNested(self: Writer, start: usize) (Allocator.Error || error{MessageTooLarge})!void {
+        const body_start = start + 1;
         const len = self.out.items.len - body_start;
+        if (len < 0x80) {
+            self.out.items[start] = @intCast(len);
+            return;
+        }
         if (len > std.math.maxInt(u32)) return error.MessageTooLarge;
-        var prefix: [max_nested_prefix]u8 = undefined;
-        var n: usize = 0;
-        var v: u64 = len;
-        while (v >= 0x80) : (v >>= 7) {
-            prefix[n] = @as(u8, @truncate(v)) | 0x80;
-            n += 1;
-        }
-        prefix[n] = @intCast(v);
-        n += 1;
+        const n = varintLen(len);
+        _ = try self.out.addManyAsSlice(self.gpa, n - 1);
         const items = self.out.items;
-        @memcpy(items[start..][0..n], prefix[0..n]);
-        if (n < max_nested_prefix) {
-            std.mem.copyForwards(u8, items[start + n ..], items[body_start..]);
-            self.out.shrinkRetainingCapacity(items.len - (max_nested_prefix - n));
-        }
+        @memmove(items[start + n ..][0..len], items[body_start..][0..len]);
+        _ = putVarint(items[start..][0..n], len);
     }
 };
 
-/// The bytes that `beginNested` keeps for a length: enough for any length below 2^35.
-const max_nested_prefix = 5;
+/// Write `value` as a varint to the start of `buf`. Returns the count of bytes.
+fn putVarint(buf: []u8, value: u64) usize {
+    var n: usize = 0;
+    var v = value;
+    while (v >= 0x80) : (v >>= 7) {
+        buf[n] = @as(u8, @truncate(v)) | 0x80;
+        n += 1;
+    }
+    buf[n] = @intCast(v);
+    return n + 1;
+}
 
 /// The size of a varint on the wire.
 pub fn varintLen(value: u64) usize {
@@ -249,6 +254,53 @@ test "nested fields get the shortest length prefix" {
     try std.testing.expectEqual(2, try r.fixed64());
     try std.testing.expectError(error.Truncated, r.fixed32());
     try std.testing.expectError(error.Truncated, r.fixed64());
+}
+
+test "nested fields of random sizes and depths" {
+    const gpa = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const random = prng.random();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    // The reference encoder keeps the body of each open field apart and appends it with its
+    // length when the field ends.
+    var bodies: [17]std.ArrayList(u8) = @splat(.empty);
+    defer for (&bodies) |*b| b.deinit(gpa);
+    for (0..300) |_| {
+        out.clearRetainingCapacity();
+        bodies[0].clearRetainingCapacity();
+        // Bytes before the message, as the prefix of a gRPC message.
+        try out.appendSlice(gpa, "abc");
+        try bodies[0].appendSlice(gpa, "abc");
+        const w: Writer = .{ .out = &out, .gpa = gpa };
+        var starts: [16]usize = undefined;
+        var numbers: [16]u32 = undefined;
+        var depth: usize = 0;
+        for (0..random.intRangeAtMost(usize, 1, 60)) |_| {
+            const action = random.intRangeLessThan(u8, 0, 3);
+            if (action == 0 and depth < starts.len) {
+                numbers[depth] = random.intRangeAtMost(u32, 1, 3000);
+                starts[depth] = try w.beginNested(numbers[depth]);
+                depth += 1;
+                bodies[depth].clearRetainingCapacity();
+            } else if (action == 1 and depth > 0) {
+                try w.endNested(starts[depth - 1]);
+                const ref: Writer = .{ .out = &bodies[depth - 1], .gpa = gpa };
+                try ref.bytesField(numbers[depth - 1], bodies[depth].items);
+                depth -= 1;
+            } else {
+                const len = random.intRangeAtMost(usize, 0, 300);
+                try out.appendNTimes(gpa, 'y', len);
+                try bodies[depth].appendNTimes(gpa, 'y', len);
+            }
+        }
+        while (depth > 0) : (depth -= 1) {
+            try w.endNested(starts[depth - 1]);
+            const ref: Writer = .{ .out = &bodies[depth - 1], .gpa = gpa };
+            try ref.bytesField(numbers[depth - 1], bodies[depth].items);
+        }
+        try std.testing.expectEqualSlices(u8, bodies[0].items, out.items);
+    }
 }
 
 test "malformed input" {

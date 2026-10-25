@@ -31,6 +31,7 @@ const skills_proto = @import("../protocol/skills.zig");
 const apps = @import("apps.zig");
 const apps_proto = @import("../protocol/apps.zig");
 const rate_limits = @import("rate_limits.zig");
+const ListCache = @import("list_cache.zig");
 pub const RequestContext = @import("RequestContext.zig");
 pub const Outcome = mrtr.Outcome;
 pub const InputRequired = mrtr.InputRequired;
@@ -251,6 +252,11 @@ rate_limiter: rate_limits.Limiter,
 violations: std.atomic.Value(u64) = .init(0),
 /// Set once `shutdownSubscriptions` ran. Later listen requests end immediately.
 shutting_down: std.atomic.Value(bool) = .init(false),
+/// The JSON text of the first page of `tools/list`, for the client view and for the view of
+/// the MCP Apps fallback. The registration of a tool, `setToolEnabled` and
+/// `notifyToolsListChanged` make it stale. After a change of `options` that changes the
+/// result, for example `info` or `cache`, call `notifyToolsListChanged`.
+tools_list_cache: ListCache = .{},
 
 pub const InitError = error{ OutOfMemory, EntropyUnavailable };
 
@@ -313,6 +319,7 @@ pub fn deinit(self: *Server) void {
         self.gpa.destroy(s);
     }
     self.subscriptions.deinit(self.gpa);
+    self.tools_list_cache.deinit(self.gpa);
     self.registry_arena.deinit();
     self.* = undefined;
 }
@@ -480,6 +487,7 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
     defer self.registry_lock.unlockShared(std.Io.Threaded.global_single_threaded.io());
     for (self.tools.items) |t| if (std.mem.eql(u8, t.def.name, def.name)) return error.DuplicateName;
     try self.tools.append(self.gpa, entry);
+    self.tools_list_cache.invalidate();
     if (self.options.capabilities.tools == null) self.options.capabilities.tools = .{ .listChanged = true };
 }
 
@@ -796,6 +804,45 @@ fn sendError(self: *Server, ctx: *RequestContext, err: errors.RpcError) void {
 }
 
 fn finishResult(self: *Server, ctx: *RequestContext, result: anytype) RequestContext.Error!void {
+    const stamped = self.stamp(result);
+    var aw: Io.Writer.Allocating = .init(ctx.arena);
+    message.writeResponse(&aw.writer, ctx.id, stamped) catch return error.OutOfMemory;
+    return finishFrame(ctx, aw.written());
+}
+
+/// As `finishResult`, and keep the JSON text of the result in `view` of `cache`. `list_version`
+/// is the version of the list before the server read the list.
+fn finishCachedResult(self: *Server, ctx: *RequestContext, cache: *ListCache, view: usize, list_version: u64, result: anytype) RequestContext.Error!void {
+    const stamped = self.stamp(result);
+    var aw: Io.Writer.Allocating = .init(ctx.arena);
+    message.writeResponseHead(&aw.writer, ctx.id) catch return error.OutOfMemory;
+    const start = aw.written().len;
+    json.write(stamped, &aw.writer) catch return error.OutOfMemory;
+    // Without memory for the copy, the next request serializes the list again.
+    cache.put(ctx.io, self.gpa, view, list_version, aw.written()[start..]) catch {};
+    aw.writer.writeAll(message.response_tail) catch return error.OutOfMemory;
+    return finishFrame(ctx, aw.written());
+}
+
+/// Send the result of `view` from `cache`. Returns false when the cache has no current text.
+fn finishFromCache(ctx: *RequestContext, cache: *ListCache, view: usize) RequestContext.Error!bool {
+    var aw: Io.Writer.Allocating = .init(ctx.arena);
+    message.writeResponseHead(&aw.writer, ctx.id) catch return error.OutOfMemory;
+    if (!(cache.writeTo(ctx.io, view, &aw.writer) catch return error.OutOfMemory)) return false;
+    aw.writer.writeAll(message.response_tail) catch return error.OutOfMemory;
+    try finishFrame(ctx, aw.written());
+    return true;
+}
+
+fn finishFrame(ctx: *RequestContext, frame: []const u8) RequestContext.Error!void {
+    ctx.responder.finish(ctx.io, frame) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Canceled,
+    };
+}
+
+/// The result with the metadata and the cache hints that the server adds.
+fn stamp(self: *Server, result: anytype) @TypeOf(result) {
     var stamped = result;
     const T = @TypeOf(stamped);
     if (@hasField(T, "_meta")) {
@@ -818,12 +865,7 @@ fn finishResult(self: *Server, ctx: *RequestContext, result: anytype) RequestCon
         if (stamped.cacheScope == null) stamped.cacheScope = hint.scope;
         if (stamped.ttlMs.? < 0) stamped.ttlMs = 0;
     }
-    var aw: Io.Writer.Allocating = .init(ctx.arena);
-    message.writeResponse(&aw.writer, ctx.id, stamped) catch return error.OutOfMemory;
-    ctx.responder.finish(ctx.io, aw.written()) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.Canceled,
-    };
+    return stamped;
 }
 
 fn dispatch(self: *Server, ctx: *RequestContext) RequestContext.Error!void {
@@ -919,14 +961,22 @@ fn dispatchTyped(self: *Server, ctx: *RequestContext, comptime method: methods.M
             try self.finishResult(ctx, result);
         },
         .@"tools/list" => {
-            var items: std.ArrayList(types.Tool) = .empty;
             const plain = self.plainToolsFor(ctx);
+            // The first page depends only on the tools and on the view of the client. The
+            // server keeps its JSON text.
+            const first_page = if (params.cursor) |c| c.len == 0 else true;
+            const view: usize = @intFromBool(plain);
+            if (first_page and try finishFromCache(ctx, &self.tools_list_cache, view)) return;
+            const list_version = self.tools_list_cache.current();
+            var items: std.ArrayList(types.Tool) = .empty;
             for (self.tools.items) |*t| {
                 if (!t.enabled or self.hiddenFromClient(ctx, t)) continue;
                 try items.append(ctx.arena, if (plain and t.ui != null) try withoutUiMeta(ctx.arena, t.def) else t.def);
             }
             const page = try self.paginate(ctx, types.Tool, items.items, params.cursor);
-            try self.finishResult(ctx, types.ListToolsResult{ .tools = page.items, .nextCursor = page.next_cursor });
+            const result: types.ListToolsResult = .{ .tools = page.items, .nextCursor = page.next_cursor };
+            if (first_page) return self.finishCachedResult(ctx, &self.tools_list_cache, view, list_version, result);
+            try self.finishResult(ctx, result);
         },
         .@"tools/call" => try self.callTool(ctx, params),
         .@"resources/list" => {
@@ -1495,6 +1545,8 @@ pub fn shutdownSubscriptions(self: *Server, io: Io) void {
 }
 
 fn publish(self: *Server, io: Io, event: Event, uri: ?[]const u8) void {
+    // The tools changed. The serialized list is stale, also without a subscriber.
+    if (event == .tools_list_changed) self.tools_list_cache.invalidate();
     self.subscriptions_lock.lockUncancelable(io);
     defer self.subscriptions_lock.unlock(io);
     for (self.subscriptions.items) |sub| {

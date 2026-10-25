@@ -169,6 +169,33 @@ pub fn writeResponse(writer: *std.Io.Writer, id: RequestId, result: anytype) std
     try json.write(OutResponse(@TypeOf(result)){ .id = id, .result = result }, writer);
 }
 
+/// Serialize the start of a response envelope, up to the result. Write the JSON text of the
+/// result and then `response_tail`. The bytes are the same as the bytes of `writeResponse`.
+pub fn writeResponseHead(writer: *std.Io.Writer, id: RequestId) std.Io.Writer.Error!void {
+    try writer.writeAll("{\"jsonrpc\":\"" ++ jsonrpc_version ++ "\",\"id\":");
+    try json.write(id, writer);
+    try writer.writeAll(",\"result\":");
+}
+
+/// The end of a response envelope from `writeResponseHead`.
+pub const response_tail = "}";
+
+test "a response from its head, the result text and the tail" {
+    const gpa = std.testing.allocator;
+    const ids = [_]RequestId{ .{ .integer = 42 }, .{ .string = "a\"b" } };
+    for (ids) |id| {
+        var whole: std.Io.Writer.Allocating = .init(gpa);
+        defer whole.deinit();
+        try writeResponse(&whole.writer, id, types.Error{ .code = 1, .message = "m" });
+        var parts: std.Io.Writer.Allocating = .init(gpa);
+        defer parts.deinit();
+        try writeResponseHead(&parts.writer, id);
+        try json.write(types.Error{ .code = 1, .message = "m" }, &parts.writer);
+        try parts.writer.writeAll(response_tail);
+        try std.testing.expectEqualStrings(whole.written(), parts.written());
+    }
+}
+
 /// Serialize an error envelope. `id` is null only when the request id could not be read.
 pub fn writeErrorResponse(writer: *std.Io.Writer, id: ?RequestId, err: types.Error) std.Io.Writer.Error!void {
     try json.write(OutErrorResponse{ .id = id, .@"error" = err }, writer);
