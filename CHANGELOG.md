@@ -4,6 +4,27 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- `ToolDef.quick`. Set it only for a tool whose handler does not wait for I/O, a timer or a lock, and returns in some microseconds. The stdio, Unix socket and WebSocket servers then run a call of the tool on the reader task, without a new task. They also run `server/discover`, `tools/list`, `prompts/list` and `resources/templates/list` on the reader. The responses of these requests stay in the output buffer while more complete lines are in the input buffer, and then go out in one write. The reader writes the buffer before it waits for input, thus a single response does not wait. While a quick handler runs, the reader does not read a cancellation of the call. The conformance server sets `quick` on its six tools with constant content.
+- `mcp.transport.socket_opts`: `setNoDelay` and `getNoDelay` for a TCP socket of `std.Io.net`. Before, only the gRPC module had this file.
+- In the resource benchmark of the VS Code client (ReleaseSafe, 16 cores, Windows 11 and WSL2 Ubuntu 24.04 on the same computer), the stdio server with 64 calls in flight on Linux now uses 4.3 µs of CPU for each call and 1 thread, and makes 200,048 calls each second. Before, it used 107.6 µs and 260 threads, and made 16,183 calls each second. On Windows it now uses 4.4 µs and makes 201,252 calls each second, before 12.0 µs and 156,542. A sequential call on Linux now uses 40.5 µs of server CPU, before 80.0 µs. Each new thread of `std.Io.Threaded` on Linux also touches the 256 KiB signal stack of std (`std.Options.signal_stack_size`). Thus at 64 calls in flight on Linux, the private memory of the server is now 0.9 MiB, before 74.5 MiB.
+
+### Changed
+
+- The Streamable HTTP server and the WebSocket server now set `TCP_NODELAY` on each connection, as the gRPC server does. An SSE event is now one write, and the last event and the end of the chunked body go out in one write. Before, the Nagle algorithm held each small write after the first until the client acknowledged the data before it. A `tools/call` with progress notifications thus took two round trips. At 20 ms RTT on Linux, such a call now takes 21.3 ms at p50, before 43.7 ms. At 60 ms RTT it takes 64.9 ms, before 131.3 ms.
+- On a POSIX system, the parker of the Streamable HTTP server now watches the socket of a plaintext connection while the handler of a request runs, as on Windows. A readable socket does not tell bytes from a close by the peer, thus the parker reads one byte with `MSG_PEEK`, which leaves the byte in the socket. The handler of a request on a plaintext connection now runs in the task of the connection on all systems. Before, each request on a POSIX system started a task for the handler and a task that read the socket, and the end of the handler canceled the read with a signal. A request on a TLS connection still uses the two tasks.
+- On a POSIX system, the task of a plaintext HTTP connection now waits up to 2 ms for the next request after a response, before the connection goes to the parker. A client under load sends its next request in this time, and the connection then needs no new task.
+- The Streamable HTTP server now parses a JSON response for its error code only when the response contains `"error":`.
+- A sequential HTTP call on Linux now uses 65.5 µs of server CPU, before 278.0 µs. At 64 calls in flight on Linux, the server makes 12,321 calls each second at 153.1 µs for each call, before 6,439 at 287.9 µs. A sequential HTTP call on Windows uses 38.3 µs, before 55.5 µs.
+- The gRPC server now has one task for the `grpc-timeout` deadlines of all calls. The task keeps the calls in a list sorted by deadline, and wakes only for a deadline earlier than its next wake. Before, each call with a deadline started a task that slept until the deadline, and the end of the call canceled that task. The VS Code client sends `grpc-timeout` on each call. When the task cannot start, a call starts its own task, as before.
+- The gRPC server now keeps the arenas of ended calls, up to 64 arenas with up to 256 KiB each, for the next calls. Before, each call made a new arena. A typed `ListTools` call grew its arena past 64 KiB, and on Linux it mapped and unmapped memory for each call.
+- A sequential gRPC tunnel call on Windows now uses 22.7 µs of server CPU, before 28.1 µs. At 64 calls in flight on one connection, the server makes 37,020 calls each second, before 32,474. On Linux, a sequential call uses 85.0 µs, before 89.5 µs.
+
+### Fixed
+
+- The Streamable HTTP server now removes the cancellation token of a request from the parker before the request ends. Before, on Windows, a close by the client between the end of the handler and the next park could cancel a token that was no longer in memory.
+
 ## [0.7.1] - 2026-10-23
 
 ### Added
