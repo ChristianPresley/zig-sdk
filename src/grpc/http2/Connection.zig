@@ -82,6 +82,8 @@ streams: std.AutoHashMapUnmanaged(u31, *Stream) = .empty,
 next_stream_id: u31,
 last_peer_stream_id: u31 = 0,
 peer_streams_open: u32 = 0,
+/// The streams that `Stream.dispatchAtEnd` keeps from their owner. Guarded by `lock`.
+unowned_streams: u32 = 0,
 /// Bytes we can still send on the connection.
 send_window: i64 = frame.default_initial_window,
 /// Bytes the peer can still send on the connection.
@@ -170,7 +172,57 @@ pub fn handshake(self: *Connection) Error!void {
 
 /// Read and dispatch frames until the peer closes the connection or breaks the protocol.
 pub fn run(self: *Connection) void {
+    _ = self.runUntilIdle(null);
+}
+
+/// The calls of `runUntilIdle` to the owner of the connection.
+pub const IdleHooks = struct {
+    userdata: ?*anyopaque,
+    /// Called before a read of the socket while the connection is idle and the read buffer is
+    /// empty. True ends the read: see `runUntilIdle`.
+    idle: *const fn (userdata: ?*anyopaque) bool,
+    /// Called before each other read of the socket that can wait: no complete frame is in the
+    /// read buffer. For example, the connection has open streams, or a part of a frame came.
+    waiting: *const fn (userdata: ?*anyopaque) void,
+    /// Called after the read that followed a call of `idle` or `waiting` gave a frame.
+    resumed: *const fn (userdata: ?*anyopaque) void,
+};
+
+/// The open streams with an owner. A stream that `Stream.dispatchAtEnd` keeps does not count.
+/// Safe from any task.
+pub fn ownedStreams(self: *Connection) usize {
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
+    return self.streams.count() - self.unowned_streams;
+}
+
+/// The end of `runUntilIdle`.
+pub const Exit = enum {
+    /// The connection ended. The read task has nothing more to do.
+    closed,
+    /// `on_idle` ended the read. The connection stays open, and a later call of
+    /// `runUntilIdle` continues it.
+    idle,
+};
+
+/// As `run`, but before each read of the socket with an empty read buffer while the
+/// connection is idle, call `hooks.idle`. Idle means: no open stream with an owner, no header
+/// block under assembly and no held stream. When `hooks.idle` gives true, the function returns `.idle`,
+/// and no task reads the connection. The owner can then watch the socket without a task, and
+/// call the function again when bytes arrive.
+pub fn runUntilIdle(self: *Connection, hooks: ?IdleHooks) Exit {
     while (true) {
+        var waited = false;
+        // The read can wait for the socket: no complete frame is in the read buffer. A part of
+        // a frame can wait there, and the rest can come late or never.
+        if (hooks) |h| if (!self.frameBuffered()) {
+            if (self.reader.bufferedLen() == 0 and self.isIdle()) {
+                if (h.idle(h.userdata)) return .idle;
+            } else {
+                h.waiting(h.userdata);
+            }
+            waited = true;
+        };
         self.readFrame() catch |e| {
             switch (e) {
                 error.ProtocolError => self.sendGoaway(.protocol_error),
@@ -180,9 +232,21 @@ pub fn run(self: *Connection) void {
             }
             break;
         };
+        if (waited) hooks.?.resumed(hooks.?.userdata);
     }
     self.setReadHold(false);
     self.terminate();
+    return .closed;
+}
+
+/// The connection has no open stream with an owner and no partial header block, and the read
+/// task holds no stream. A stream that waits for its request data (`Stream.dispatchAtEnd`)
+/// has no owner: only the read task uses it. Only the read task calls this function.
+fn isIdle(self: *Connection) bool {
+    if (self.hb_active or self.read_hold or self.held_streams.items.len > 0) return false;
+    self.lock.lockUncancelable(self.io);
+    defer self.lock.unlock(self.io);
+    return !self.closed and self.streams.count() == self.unowned_streams;
 }
 
 /// The end of the hold of the read task flushes after each group of this many held streams.
@@ -220,7 +284,7 @@ fn setReadHold(self: *Connection, hold: bool) void {
 }
 
 /// The read buffer has one more complete frame.
-fn frameBuffered(self: *Connection) bool {
+pub fn frameBuffered(self: *Connection) bool {
     const buffered = self.reader.buffered();
     if (buffered.len < frame.header_len) return false;
     const header = frame.Header.parse(buffered[0..frame.header_len]);
@@ -413,6 +477,7 @@ fn onData(self: *Connection, header: frame.Header, payload: []const u8) Error!vo
                     stream.cond.broadcast(self.io);
                     if (stream.undispatched and (stream.end_stream or stream.data.items.len >= self.options.initial_window_size / 2)) {
                         stream.undispatched = false;
+                        self.unowned_streams -= 1;
                         ready = stream;
                     }
                 }
@@ -543,6 +608,7 @@ fn finishHeaderBlock(self: *Connection) Error!void {
                     refused = self.dropLocked(s);
                 } else if (s.end_stream) {
                     s.undispatched = false;
+                    self.unowned_streams -= 1;
                     ready = s;
                 }
             }
@@ -590,6 +656,7 @@ fn dispatch(self: *Connection, s: *Stream) void {
 /// caller frees the stream after the unlock.
 fn dropLocked(self: *Connection, s: *Stream) *Stream {
     s.undispatched = false;
+    self.unowned_streams -= 1;
     _ = self.streams.remove(s.id);
     self.peer_streams_open -|= 1;
     self.rememberReset(s.id);
@@ -1109,6 +1176,7 @@ pub const Stream = struct {
         if (self.end_stream or self.reset != null or conn.closed) return false;
         if (self.data.items.len >= conn.options.initial_window_size / 2) return false;
         self.undispatched = true;
+        conn.unowned_streams += 1;
         return true;
     }
 

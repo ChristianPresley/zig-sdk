@@ -758,3 +758,138 @@ test "grpc: a quick call that sends an event to a listen stream without credit o
     }
     listen.cancel();
 }
+
+/// Wait until the server has at least `want` parked connections, at most 10 s.
+fn waitParked(f: *Fixture, want: usize) !void {
+    const io = std.testing.io;
+    var waited: u32 = 0;
+    while (waited < 10_000) : (waited += 10) {
+        const parker = &f.transport.parker;
+        parker.lock.lockUncancelable(io);
+        const n = parker.parked.items.len;
+        parker.lock.unlock(io);
+        if (n >= want) return;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.Timeout;
+}
+
+test "grpc: an idle connection parks without a task and continues at the next call" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Calls in a fast sequence: the read task reads at once after each call. When the calls
+    // stop, the parker sends a PING, and the connection parks after the answer.
+    for (0..20) |_| _ = try f.client.listTools(arena, null, .{ .timeout = .fromSeconds(10) });
+    try waitParked(&f, 1);
+    // A parked connection gets a new task for the next call.
+    const tools = try f.client.listTools(arena, null, .{ .timeout = .fromSeconds(10) });
+    try std.testing.expectEqual(8, tools.tools.len);
+    try waitParked(&f, 1);
+    // `stop` ends the parked connection.
+}
+
+/// A client connection that makes one call and stays open.
+const IdleClient = struct {
+    stream: Io.net.Stream = undefined,
+    in_buf: [16 << 10]u8 = undefined,
+    out_buf: [16 << 10]u8 = undefined,
+    reader: Io.net.Stream.Reader = undefined,
+    writer: Io.net.Stream.Writer = undefined,
+    conn: *Connection = undefined,
+    run_task: connection_test.RunTask = .{},
+    ok: bool = false,
+
+    fn open(c: *IdleClient, io: Io, port: u16) !void {
+        const gpa = std.testing.allocator;
+        c.stream = try mcp.util.loopback.connect(io, Io.net.IpAddress.parse("127.0.0.1", port) catch unreachable);
+        c.reader = c.stream.reader(io, &c.in_buf);
+        c.writer = c.stream.writer(io, &c.out_buf);
+        c.conn = try Connection.init(gpa, io, &c.reader.interface, &c.writer.interface, .{ .role = .client });
+        try c.conn.handshake();
+        try c.run_task.start(io, c.conn);
+    }
+
+    fn call(c: *IdleClient, io: Io) void {
+        const gpa = std.testing.allocator;
+        const h2 = c.conn.openStream() catch return;
+        defer h2.close();
+        const r = rawExchange(gpa, io, h2, grpc_server.call_path, "application/grpc", &callMetadata("big"), callParams("big"), .{}) catch return;
+        defer freeRaw(gpa, r);
+        c.ok = r.grpc_status != null and std.mem.eql(u8, r.grpc_status.?, "0");
+    }
+
+    fn close(c: *IdleClient, io: Io) void {
+        c.conn.shutdown();
+        c.stream.shutdown(io, .send) catch {};
+        c.run_task.finish(io);
+        c.conn.deinit();
+        c.stream.close(io);
+    }
+};
+
+test "grpc: many clients that make one call at the same time all park" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    const count = 24;
+    const clients = try gpa.alloc(IdleClient, count);
+    defer gpa.free(clients);
+    var opened: usize = 0;
+    defer for (clients[0..opened]) |*c| c.close(io);
+    for (clients) |*c| {
+        c.* = .{};
+        try c.open(io, f.transport.bound_port);
+        opened += 1;
+    }
+    // The calls come at the same time. The runners of the parker serve them.
+    var group: Io.Group = .init;
+    for (clients) |*c| try group.concurrent(io, IdleClient.call, .{ c, io });
+    try group.await(io);
+    for (clients) |c| try std.testing.expect(c.ok);
+    // The new connections park.
+    try waitParked(&f, count);
+}
+
+test "grpc: clients that send a part of the preface or of a frame and stop do not hold the runners" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    // One more stalled client than the parker has runs. Half of them stop in the preface,
+    // the others after the preface and half of a frame header.
+    const count = f.transport.parker.max_runs + 1;
+    const stalled = try gpa.alloc(Io.net.Stream, count);
+    defer gpa.free(stalled);
+    var opened: usize = 0;
+    defer for (stalled[0..opened]) |s| s.close(io);
+    const address = Io.net.IpAddress.parse("127.0.0.1", f.transport.bound_port) catch unreachable;
+    for (stalled, 0..) |*s, i| {
+        s.* = try mcp.util.loopback.connect(io, address);
+        opened += 1;
+        var buf: [64]u8 = undefined;
+        var w = s.writer(io, &buf);
+        if (i % 2 == 0) {
+            try w.interface.writeAll(frame_preface[0..10]);
+        } else {
+            try w.interface.writeAll(frame_preface);
+            try w.interface.writeAll(&.{ 0, 0, 4 });
+        }
+        try w.interface.flush();
+    }
+    try io.sleep(.fromMilliseconds(100), .awake);
+    // A call of another client still gets a runner.
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const tools = try f.client.listTools(arena_state.allocator(), null, .{ .timeout = .fromSeconds(10) });
+    try std.testing.expectEqual(8, tools.tools.len);
+}
+
+const frame_preface = @import("http2/frame.zig").preface;

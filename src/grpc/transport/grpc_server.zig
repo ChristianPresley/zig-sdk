@@ -27,6 +27,7 @@ const codec = @import("../protobuf/codec.zig");
 const service = @import("../typed/service.zig");
 const typed_server = @import("typed_server.zig");
 const socket_opts = mcp.transport.socket_opts;
+const park = mcp.transport.park;
 const Deadlines = @import("deadlines.zig");
 
 const log = std.log.scoped(.mcp_grpc);
@@ -91,6 +92,8 @@ pub const Server = struct {
     costs: CallCosts = .{},
     /// The most workers of one connection. See `Conn.enqueue`.
     max_workers: u32,
+    /// The idle plaintext connections. See `Parker`.
+    parker: Parker = .{},
 
     pub fn init(io: Io, gpa: Allocator, server: *mcp.Server, options: Options) Server {
         const cpus = std.Thread.getCpuCount() catch 4;
@@ -114,6 +117,7 @@ pub const Server = struct {
         // Normally `serve` stopped the task already.
         self.deadlines.stop(self.io);
         self.arenas.deinit(self.gpa);
+        self.parker.deinit(self.gpa);
         self.connections.deinit(self.gpa);
         self.* = undefined;
     }
@@ -144,8 +148,15 @@ pub const Server = struct {
     /// cancel, the server accepts no more connections.
     pub fn serve(self: *Server) !void {
         if (self.listener == null) try self.bind();
-        var accept_future = try self.io.concurrent(acceptLoop, .{self});
+        self.parker.start(self);
+        var accept_future = self.io.concurrent(acceptLoop, .{self}) catch |e| {
+            self.parker.stop(self);
+            self.group.await(self.io) catch {};
+            return e;
+        };
         self.stop_event.wait(self.io) catch {};
+        // The parker ends after the last parked connection.
+        self.parker.stop(self);
         // On Windows a cancel can miss an accept that waits. The wake connection ends it.
         mcp.util.wake.cancelAcceptLoop(self.io, &accept_future, self.listener.?.socket.address, &self.closing);
         self.server.shutdownSubscriptions(self.io);
@@ -179,6 +190,10 @@ pub const Server = struct {
             };
             conn.* = .{ .owner = self, .stream = stream };
             self.track(conn);
+            // A new plaintext connection waits in the parker for its first bytes. When many
+            // clients connect at the same time, a task per connection that waits for the
+            // preface made the thread pool grow to one thread per client.
+            if (self.parker.admit(self, conn)) continue;
             self.group.concurrent(self.io, Conn.run, .{conn}) catch {
                 self.untrack(conn);
                 stream.close(self.io);
@@ -196,11 +211,325 @@ pub const Server = struct {
         self.connections_lock.lockUncancelable(self.io);
         defer self.connections_lock.unlock(self.io);
         for (self.connections.items) |c| {
+            // The parker closed this socket, and the handle can belong to a new socket now.
+            if (c.socket_closed) continue;
             if (c.h2_ready.load(.acquire)) c.h2.shutdown();
             c.stream.shutdown(self.io, .both) catch {};
         }
     }
 };
+
+/// A call that comes sooner than this after the last call or after a park makes the connection
+/// busy. See `Conn.onIdle`.
+const busy_gap_ms = 2;
+/// The length of the HTTP/2 connection preface.
+const frame_preface_len = 24;
+/// The quick calls in a row (see `busy_gap_ms`) that make a connection busy. One quick call
+/// does not. Many clients can make one call each at the same time, and each busy connection
+/// holds a thread until the `PING` of the parker.
+const busy_after_calls = 3;
+/// The parker sends a `PING` to a connection whose read without a park (see `Conn.onIdle`)
+/// waits longer than this.
+const nudge_after_ms = 50;
+
+/// The awake clock in nanoseconds.
+fn nowNs(io: Io) i64 {
+    return @intCast(Io.Timestamp.now(io, .awake).nanoseconds);
+}
+
+/// The idle plaintext connections, without a task. One task of the server, `runParker`, waits
+/// for bytes on their sockets with `park.Poller`, as the parker of the Streamable HTTP server
+/// does. A ready connection gets a new task. Before, each idle connection held a task and its
+/// thread. On Linux, 200 idle clients of VS Code held 206 threads and 70 MiB. A TLS connection
+/// keeps its task.
+const Parker = struct {
+    poller: ?park.Poller = null,
+    lock: Io.Mutex = .init,
+    /// The task runs and accepts parks.
+    running: std.atomic.Value(bool) = .init(false),
+    stopping: bool = false,
+    parked: std.ArrayList(*Conn) = .empty,
+    /// Ready connections that did not get a task yet. The parker tries again.
+    ready: std.ArrayList(*Conn) = .empty,
+    /// The slots of the parked connections for the `poll` of POSIX systems.
+    snapshot: std.ArrayList(*park.Slot) = .empty,
+    /// On Windows, the parked connections that the parker closed at the stop. The parker frees
+    /// each one at the completion of its poll.
+    closing: usize = 0,
+    /// The runners (see `runner`) that do not wait for a socket now. The parker starts a new
+    /// runner only while this count is below `max_runs`. A ready connection waits in `ready`
+    /// until a runner takes it.
+    runs: std.atomic.Value(u32) = .init(0),
+    /// The count of processors.
+    max_runs: u32 = 1,
+    /// The length of `ready`, for the runners that wait for a socket.
+    ready_count: std.atomic.Value(u32) = .init(0),
+
+    fn isRunning(p: *const Parker) bool {
+        return p.running.load(.acquire);
+    }
+
+    /// Start the task. Without it, the connections do not park.
+    fn start(p: *Parker, self: *Server) void {
+        if (self.options.tls != null) return;
+        p.max_runs = @intCast(std.math.clamp(std.Thread.getCpuCount() catch 4, 1, 64));
+        p.poller = park.Poller.init(self.gpa) catch return;
+        p.running.store(true, .release);
+        self.group.concurrent(self.io, runParker, .{self}) catch {
+            p.running.store(false, .release);
+            p.poller.?.deinit();
+            p.poller = null;
+        };
+    }
+
+    /// Accept no more parks, and close the parked connections. The task ends after them.
+    fn stop(p: *Parker, self: *Server) void {
+        const poller = if (p.poller) |*q| q else return;
+        p.lock.lockUncancelable(self.io);
+        p.stopping = true;
+        p.lock.unlock(self.io);
+        poller.wake();
+    }
+
+    fn deinit(p: *Parker, gpa: Allocator) void {
+        if (p.poller) |*q| q.deinit();
+        p.parked.deinit(gpa);
+        p.ready.deinit(gpa);
+        p.snapshot.deinit(gpa);
+    }
+
+    /// Watch the socket of `conn`, which has no task now. False when the parker does not take
+    /// the connection: the task of the connection then continues.
+    fn admit(p: *Parker, self: *Server, conn: *Conn) bool {
+        const poller = if (p.poller) |*q| q else return false;
+        p.lock.lockUncancelable(self.io);
+        defer p.lock.unlock(self.io);
+        if (p.stopping or !p.isRunning()) return false;
+        p.parked.append(self.gpa, conn) catch return false;
+        conn.park_index = p.parked.items.len - 1;
+        conn.parked_at = nowNs(self.io);
+        poller.arm(&conn.slot, conn.stream.socket.handle) catch {
+            _ = p.parked.pop();
+            return false;
+        };
+        // On POSIX systems the parker polls a copy of the parked set: it takes a new copy.
+        if (!park.is_windows) poller.wake();
+        return true;
+    }
+
+    fn removeLocked(p: *Parker, conn: *Conn) void {
+        const i = conn.park_index;
+        _ = p.parked.swapRemove(i);
+        if (i < p.parked.items.len) p.parked.items[i].park_index = i;
+    }
+
+    /// Put a ready connection in `ready`. The parker starts its task when a run is free.
+    fn resumeLocked(p: *Parker, self: *Server, conn: *Conn) void {
+        conn.first_read = true;
+        conn.quick_wake = nowNs(self.io) - conn.parked_at < busy_gap_ms * std.time.ns_per_ms;
+        p.ready.append(self.gpa, conn) catch {
+            // Without memory and without a task, the connection ends.
+            conn.endParked();
+            return;
+        };
+        p.ready_count.store(@intCast(p.ready.items.len), .release);
+    }
+
+    /// Take the ready connections, in their order, that get a run now. The caller starts
+    /// their tasks after the unlock: the start of a thread takes time, and a task that parks
+    /// waits for the lock meanwhile.
+    fn takeStartsLocked(p: *Parker, out: []*Conn) usize {
+        var n: usize = 0;
+        while (n < out.len and n < p.ready.items.len and p.runs.load(.acquire) < p.max_runs) : (n += 1) {
+            const conn = p.ready.items[n];
+            _ = p.runs.fetchAdd(1, .acq_rel);
+            conn.holds_run = true;
+            out[n] = conn;
+        }
+        if (n > 0) {
+            const rest = p.ready.items.len - n;
+            std.mem.copyForwards(*Conn, p.ready.items[0..rest], p.ready.items[n..]);
+            p.ready.shrinkRetainingCapacity(rest);
+            p.ready_count.store(@intCast(rest), .release);
+        }
+        return n;
+    }
+
+    /// Start a runner for each connection of `starts`. A connection without a runner goes back
+    /// to `ready`.
+    fn startTasks(p: *Parker, self: *Server, starts: []*Conn) void {
+        for (starts) |conn| {
+            self.group.concurrent(self.io, runner, .{ self, conn }) catch {
+                conn.holds_run = false;
+                _ = p.runs.fetchSub(1, .acq_rel);
+                p.lock.lockUncancelable(self.io);
+                defer p.lock.unlock(self.io);
+                p.ready.append(self.gpa, conn) catch conn.endParked();
+                p.ready_count.store(@intCast(p.ready.items.len), .release);
+            };
+        }
+    }
+
+    /// A runner waits for the socket of its connection: its run is free until the read ends.
+    fn releaseRun(p: *Parker) void {
+        _ = p.runs.fetchSub(1, .acq_rel);
+        if (p.ready_count.load(.acquire) > 0) p.poller.?.wake();
+    }
+
+    /// The next ready connection for a runner that holds a run, or null. With null, the
+    /// runner ends, and its run is free.
+    fn next(p: *Parker, self: *Server) ?*Conn {
+        p.lock.lockUncancelable(self.io);
+        defer p.lock.unlock(self.io);
+        // A runner took its run again after a read, thus there can be one run too many.
+        if (p.runs.load(.acquire) <= p.max_runs and p.ready.items.len > 0) {
+            const conn = p.ready.orderedRemove(0);
+            p.ready_count.store(@intCast(p.ready.items.len), .release);
+            conn.holds_run = true;
+            return conn;
+        }
+        _ = p.runs.fetchSub(1, .acq_rel);
+        return null;
+    }
+
+    fn handleEventLocked(p: *Parker, self: *Server, ev: park.Event) void {
+        const conn: *Conn = @alignCast(@fieldParentPtr("slot", ev.slot));
+        if (conn.socket_closed) {
+            // Windows: the poll of a socket that the stop closed ended.
+            p.closing -= 1;
+            conn.endParked();
+            return;
+        }
+        if (park.is_windows and !ev.readable and !ev.hangup) {
+            // The wait ended for another reason. Watch the socket again.
+            p.poller.?.arm(&conn.slot, conn.stream.socket.handle) catch {
+                p.removeLocked(conn);
+                p.resumeLocked(self, conn);
+                // No bytes wait: the first read of the task waits without a run.
+                conn.wake_unready = true;
+            };
+            return;
+        }
+        // Bytes or a close of the peer: the new task reads them, or reads the end.
+        p.removeLocked(conn);
+        p.resumeLocked(self, conn);
+    }
+
+    /// At the stop: end the parked connections. On Windows the poll of a socket is pending:
+    /// close the socket, and end the connection at the completion of the poll. On POSIX
+    /// systems no `poll` runs now.
+    fn closeAllLocked(p: *Parker, self: *Server) void {
+        while (p.parked.pop()) |conn| {
+            if (park.is_windows) {
+                // `shutdown` writes to each tracked connection under this lock.
+                self.connections_lock.lockUncancelable(self.io);
+                defer self.connections_lock.unlock(self.io);
+                conn.stream.close(self.io);
+                conn.socket_closed = true;
+                p.closing += 1;
+            } else {
+                conn.endParked();
+            }
+        }
+        for (p.ready.items) |conn| conn.endParked();
+        p.ready.clearRetainingCapacity();
+        p.ready_count.store(0, .release);
+    }
+};
+
+/// Send a `PING` to each connection without open streams whose read without the wait runs
+/// longer than `nudge_after_ms`. The answer of the client ends the read.
+///
+/// The write of a `PING` can wait, for example for a client that does not read. Thus a task of
+/// its own sends each `PING`, and the parker and `connections_lock` never wait for it. The
+/// task holds a reference (`Conn.ping_refs`), and `Conn.endH2` waits for it.
+fn nudgeIdleReads(self: *Server) void {
+    const io = self.io;
+    const now = nowNs(io);
+    var targets: [64]*Conn = undefined;
+    var n: usize = 0;
+    {
+        self.connections_lock.lockUncancelable(io);
+        defer self.connections_lock.unlock(io);
+        for (self.connections.items) |c| {
+            if (n == targets.len) break;
+            if (!c.h2_ready.load(.acquire)) continue;
+            const since = c.read_since.load(.acquire);
+            if (since == 0 or now - since < nudge_after_ms * std.time.ns_per_ms) continue;
+            // A read of a connection with open streams continues: the streams can still get
+            // frames.
+            if (c.h2.ownedStreams() > 0) continue;
+            if (c.pinged.swap(true, .acq_rel)) continue;
+            _ = c.ping_refs.fetchAdd(1, .acq_rel);
+            targets[n] = c;
+            n += 1;
+        }
+    }
+    for (targets[0..n]) |c| {
+        self.group.concurrent(io, sendNudge, .{c}) catch {
+            // Without a task, the next scan tries again.
+            c.pinged.store(false, .release);
+            _ = c.ping_refs.fetchSub(1, .acq_rel);
+        };
+    }
+}
+
+fn sendNudge(conn: *Conn) void {
+    defer _ = conn.ping_refs.fetchSub(1, .acq_rel);
+    conn.h2.ping(.{ 'm', 'c', 'p', 'n', 'u', 'd', 'g', 'e' }) catch {};
+}
+
+/// A task that serves ready connections of the parker, one after the other. The parker starts
+/// at most `Parker.max_runs` runners that do not wait for a socket. A runner ends when no
+/// connection is ready. Before, the parker started a task for each ready connection. Then 50
+/// clients made a call at the same time. The starts came faster than the ends of the tasks,
+/// and the thread pool of `std.Io.Threaded` grew to about one thread for each connection.
+fn runner(self: *Server, first: *Conn) void {
+    var conn = first;
+    while (true) {
+        if (!conn.serveOnce()) return;
+        conn = self.parker.next(self) orelse return;
+    }
+}
+
+/// The task of the parker. See `Parker`.
+fn runParker(self: *Server) void {
+    const io = self.io;
+    const p = &self.parker;
+    const poller = &p.poller.?;
+    var events: [256]park.Event = undefined;
+    while (true) {
+        p.lock.lockUncancelable(io);
+        if (p.stopping) p.closeAllLocked(self);
+        var starts: [64]*Conn = undefined;
+        const n_starts = p.takeStartsLocked(&starts);
+        const done = p.stopping and p.parked.items.len == 0 and p.ready.items.len == 0 and p.closing == 0;
+        if (done) p.running.store(false, .release);
+        if (!park.is_windows) {
+            p.snapshot.clearRetainingCapacity();
+            for (p.parked.items) |c| p.snapshot.append(self.gpa, &c.slot) catch break;
+        }
+        const parked = p.parked.items.len;
+        const waiting = p.ready.items.len;
+        p.lock.unlock(io);
+        p.startTasks(self, starts[0..n_starts]);
+        if (done) return;
+        // A connection without a task waits for the next try. A connection with a task can
+        // need a `PING` (see `Conn.onIdle`).
+        const active = active: {
+            self.connections_lock.lockUncancelable(io);
+            defer self.connections_lock.unlock(io);
+            break :active self.connections.items.len > parked;
+        };
+        const timeout_ms: i32 = if (waiting > 0) 10 else if (active) nudge_after_ms / 2 else -1;
+        const n = poller.wait(timeout_ms, p.snapshot.items, &events) catch 0;
+        nudgeIdleReads(self);
+        if (n == 0) continue;
+        p.lock.lockUncancelable(io);
+        for (events[0..n]) |ev| p.handleEventLocked(self, ev);
+        p.lock.unlock(io);
+    }
+}
 
 /// The arenas of calls that ended. A call takes one and gives it back with its memory, up to
 /// `keep_bytes`. Before, each call started an empty arena and freed it at the end. A call of
@@ -302,6 +631,48 @@ const Conn = struct {
     /// The time that the calls of this burst took in the read task. Only the read task uses
     /// the field.
     reader_spent_ns: u64 = 0,
+    /// The socket buffers. They stay in place while the connection parks.
+    in_buf: []u8 = &.{},
+    out_buf: []u8 = &.{},
+    reader: Io.net.Stream.Reader = undefined,
+    writer: Io.net.Stream.Writer = undefined,
+    /// The state of the connection in the poll of the parker.
+    slot: park.Slot = .{},
+    /// The place of the connection in `Parker.parked`.
+    park_index: usize = 0,
+    /// The connection does not park again, because a park failed.
+    park_off: bool = false,
+    /// The parker closed the socket at the shutdown.
+    socket_closed: bool = false,
+    /// A task ran `run`: the buffers and the HTTP/2 state exist.
+    started: bool = false,
+    /// The task of the connection holds a run of the parker (`Parker.runs`).
+    holds_run: bool = false,
+    /// The task gave its run back for a read, and takes it again after the read.
+    run_lent: bool = false,
+    /// The last idle read of the connection started a call in less than `busy_gap_ms`. See
+    /// `onIdle`.
+    busy: bool = false,
+    /// The next idle read is the first read of a new task: the new connection or the
+    /// connection after a park. It does not park.
+    first_read: bool = true,
+    /// The bytes after the last park came in less than `busy_gap_ms`.
+    quick_wake: bool = false,
+    /// The calls in a row that came less than `busy_gap_ms` after the call or the park
+    /// before them.
+    quick_calls: u8 = 0,
+    /// The parker gave the connection a task without bytes in the socket.
+    wake_unready: bool = false,
+    /// When the connection parked.
+    parked_at: i64 = 0,
+    /// The last stream of the peer at the start of the last idle read.
+    idle_stream_id: u31 = 0,
+    /// The start of an idle read without the wait before a park, or zero. See `onIdle`.
+    read_since: std.atomic.Value(i64) = .init(0),
+    /// The parker sent a `PING` for the idle read that runs.
+    pinged: std.atomic.Value(bool) = .init(false),
+    /// The `PING` tasks that use the HTTP/2 state. See `nudgeIdleReads`.
+    ping_refs: std.atomic.Value(u32) = .init(0),
     /// Guards the queue and `workers`.
     queue_lock: Io.Mutex = .init,
     /// The quick calls for the workers, in order. See `enqueue`.
@@ -368,67 +739,274 @@ const Conn = struct {
         while (conn.dequeue()) |m| m.runQueued();
     }
 
+    /// The task of a connection that does not use the parker: a TLS connection, or a
+    /// plaintext connection without the parker.
     fn run(conn: *Conn) Io.Cancelable!void {
-        const self = conn.owner;
-        const io = self.io;
-        defer {
-            self.untrack(conn);
-            conn.stream.close(io);
-            self.permits.post(io);
-            self.gpa.destroy(conn);
+        if (conn.owner.options.tls) |tls_server| {
+            if (!conn.allocBuffers()) return conn.end();
+            return conn.runTls(tls_server);
         }
-        const in_buf = self.gpa.alloc(u8, tls.Connection.min_input_buffer_len) catch return;
-        defer self.gpa.free(in_buf);
-        const out_buf = self.gpa.alloc(u8, tls.Connection.min_output_buffer_len) catch return;
-        defer self.gpa.free(out_buf);
-        var reader = conn.stream.reader(io, in_buf);
-        var writer = conn.stream.writer(io, out_buf);
+        if (conn.setup()) _ = conn.serveLoop();
+    }
 
-        var tls_conn: tls.Connection = undefined;
-        var tls_active = false;
-        var tls_read_buf: []u8 = &.{};
-        var tls_write_buf: []u8 = &.{};
-        defer if (tls_active) {
-            tls_conn.end() catch {};
-            writer.interface.flush() catch {};
-            tls_conn.deinit();
-            self.gpa.free(tls_read_buf);
-            self.gpa.free(tls_write_buf);
-        };
-        if (self.options.tls) |tls_server| {
-            tls_read_buf = self.gpa.alloc(u8, tls.Connection.min_read_buffer_len) catch return;
-            tls_write_buf = self.gpa.alloc(u8, 16 * 1024) catch {
-                self.gpa.free(tls_read_buf);
-                return;
-            };
-            tls_conn = tls_server.accept(&reader.interface, &writer.interface, .{
-                .io = io,
-                .read_buffer = tls_read_buf,
-                .write_buffer = tls_write_buf,
-                .allow_truncation_attacks = true,
-            }) catch {
-                self.gpa.free(tls_read_buf);
-                self.gpa.free(tls_write_buf);
-                return;
-            };
-            tls_active = true;
-            // A client that negotiated another protocol gets no HTTP/2.
-            if (tls_conn.alpn()) |alpn| if (!std.mem.eql(u8, alpn, "h2")) return;
+    fn allocBuffers(conn: *Conn) bool {
+        const self = conn.owner;
+        conn.started = true;
+        conn.in_buf = self.gpa.alloc(u8, tls.Connection.min_input_buffer_len) catch return false;
+        conn.out_buf = self.gpa.alloc(u8, tls.Connection.min_output_buffer_len) catch return false;
+        conn.reader = conn.stream.reader(self.io, conn.in_buf);
+        conn.writer = conn.stream.writer(self.io, conn.out_buf);
+        return true;
+    }
+
+    /// Make the buffers and the HTTP/2 state, and read the preface. False when the connection
+    /// ended: then it is free.
+    fn setup(conn: *Conn) bool {
+        if (!conn.allocBuffers()) {
+            conn.end();
+            return false;
         }
-        const in: *Io.Reader = if (tls_active) &tls_conn.reader else &reader.interface;
-        const out: *Io.Writer = if (tls_active) &tls_conn.writer else &writer.interface;
-        conn.h2 = Connection.init(self.gpa, io, in, out, .{
+        return conn.setupH2();
+    }
+
+    /// The part of `setup` after the buffers.
+    fn setupH2(conn: *Conn) bool {
+        const self = conn.owner;
+        conn.h2 = Connection.init(self.gpa, self.io, &conn.reader.interface, &conn.writer.interface, conn.h2Options()) catch {
+            conn.end();
+            return false;
+        };
+        conn.h2_ready.store(true, .release);
+        conn.h2.handshake() catch {
+            conn.endH2();
+            return false;
+        };
+        // The handshake read the bytes of the client. A client sends its first call after it
+        // read the settings of the server. Until then the connection parks: a task that waits
+        // for the call holds a thread.
+        conn.first_read = false;
+        return true;
+    }
+
+    /// Serve a connection that the parker gave to a runner, until it parks or ends. True when
+    /// the runner still holds its run of the parker.
+    fn serveOnce(conn: *Conn) bool {
+        if (!conn.started) {
+            if (!conn.allocBuffers()) {
+                conn.end();
+                return true;
+            }
+            // The socket is ready, thus the first read does not wait. When the preface is not
+            // complete after it, the handshake can wait long: the runner gives its run back
+            // for that time.
+            conn.reader.interface.fillMore() catch {};
+            const lent = conn.reader.interface.bufferedLen() < frame_preface_len;
+            if (lent) conn.lendRun();
+            // When the run went back, the connection ends without it.
+            if (!conn.setupH2()) return !lent;
+            if (lent) conn.retakeRun();
+        }
+        return conn.serveLoop();
+    }
+
+    /// End a connection that has no task, in the parker.
+    fn endParked(conn: *Conn) void {
+        if (conn.started) return conn.endH2();
+        conn.end();
+    }
+
+    fn h2Options(conn: *Conn) Connection.Options {
+        return .{
             .role = .server,
             .on_stream = onStream,
             .userdata = conn,
-            .max_concurrent_streams = self.server.options.limits.max_in_flight_requests,
+            .max_concurrent_streams = conn.owner.server.options.limits.max_in_flight_requests,
+        };
+    }
+
+    /// Read the connection until it ends or until it parks. See `onIdle`. True when the task
+    /// holds a run of the parker at the end (see `runner`).
+    fn serveLoop(conn: *Conn) bool {
+        const self = conn.owner;
+        while (true) {
+            switch (conn.h2.runUntilIdle(.{ .userdata = conn, .idle = onIdle, .waiting = onWaiting, .resumed = onResumed })) {
+                .idle => {
+                    // After the park, another task can own the connection at once.
+                    const had_run = conn.takeRun();
+                    if (self.parker.admit(self, conn)) return had_run;
+                    conn.holds_run = had_run;
+                    conn.park_off = true;
+                },
+                .closed => break,
+            }
+        }
+        const had_run = conn.takeRun();
+        conn.endH2();
+        return had_run;
+    }
+
+    /// Take the run of the parker from the connection, for its runner.
+    fn takeRun(conn: *Conn) bool {
+        const had = conn.holds_run;
+        conn.holds_run = false;
+        conn.run_lent = false;
+        return had;
+    }
+
+    /// The read ended: the task takes its run again. It can go over `max_runs` for a short time.
+    fn retakeRun(conn: *Conn) void {
+        if (!conn.run_lent) return;
+        conn.run_lent = false;
+        conn.holds_run = true;
+        _ = conn.owner.parker.runs.fetchAdd(1, .acq_rel);
+    }
+
+    /// The task waits for the socket: its run of the parker is free until the read ends.
+    fn lendRun(conn: *Conn) void {
+        if (!conn.holds_run) return;
+        conn.holds_run = false;
+        conn.run_lent = true;
+        conn.owner.parker.releaseRun();
+    }
+
+    /// The read task asks if the connection can park: it has no open stream. True when the
+    /// connection parks at once. Then the read task ends, and the parker of the server watches
+    /// the socket. A connection with a worker that runs does not park.
+    ///
+    /// A busy connection does not park: `busy_after_calls` calls in a row came less than
+    /// `busy_gap_ms` after the call or the park before them. A park and the new task after it
+    /// cost two wakes of other threads, thus a sequential client pays for a few parks only.
+    /// The read task then reads the socket.
+    ///
+    /// When such a read waits long, the parker sends a `PING` (`nudge_after_ms`). The answer
+    /// of the client ends the read, and the connection parks. Before, the read task waited
+    /// 2 ms for bytes before each park, and kept its thread for that time. When 200 clients
+    /// made their first call at the same time, the thread pool grew to 200 threads.
+    fn onIdle(userdata: ?*anyopaque) bool {
+        const conn: *Conn = @ptrCast(@alignCast(userdata.?));
+        const self = conn.owner;
+        // Each read without a park can wait long, thus the runner gives its run back first.
+        if (conn.park_off or !self.parker.isRunning() or self.closing.load(.acquire)) {
+            conn.lendRun();
+            return false;
+        }
+        {
+            conn.queue_lock.lockUncancelable(self.io);
+            defer conn.queue_lock.unlock(self.io);
+            if (conn.workers > 0 or conn.queue_head != null) {
+                onWaiting(conn);
+                return false;
+            }
+        }
+        conn.idle_stream_id = conn.h2.last_peer_stream_id;
+        // The bytes that woke the connection, or the first bytes of a new connection.
+        if (conn.first_read) {
+            conn.first_read = false;
+            if (conn.wake_unready) {
+                conn.wake_unready = false;
+                conn.lendRun();
+                return false;
+            }
+            // The socket is ready, thus this read does not wait. A client can send a part of
+            // a frame and stop: then the read of the rest waits without the run.
+            conn.reader.interface.fillMore() catch {};
+            if (!conn.h2.frameBuffered()) conn.lendRun();
+            return false;
+        }
+        if (conn.busy) {
+            conn.read_since.store(nowNs(self.io), .release);
+            conn.lendRun();
+            return false;
+        }
+        return true;
+    }
+
+    /// A read of a connection with open streams starts. When the streams end during the read,
+    /// the connection is idle, and the parker sends a `PING` to end the read.
+    fn onWaiting(userdata: ?*anyopaque) void {
+        const conn: *Conn = @ptrCast(@alignCast(userdata.?));
+        conn.lendRun();
+        if (conn.park_off or !conn.owner.parker.isRunning()) return;
+        conn.idle_stream_id = conn.h2.last_peer_stream_id;
+        conn.read_since.store(nowNs(conn.owner.io), .release);
+    }
+
+    /// The read after `onIdle` or `onWaiting` gave a frame. The connection is busy when the
+    /// frame came in less than `busy_gap_ms` and a new call started. A control frame, for
+    /// example the answer to a `PING` or to the settings, does not count.
+    fn onResumed(userdata: ?*anyopaque) void {
+        const conn: *Conn = @ptrCast(@alignCast(userdata.?));
+        conn.retakeRun();
+        const since = conn.read_since.swap(0, .acq_rel);
+        const quick = if (since != 0) nowNs(conn.owner.io) - since < busy_gap_ms * std.time.ns_per_ms else conn.quick_wake;
+        conn.quick_wake = false;
+        if (!quick) {
+            conn.quick_calls = 0;
+        } else if (conn.h2.last_peer_stream_id != conn.idle_stream_id) {
+            conn.quick_calls +|= 1;
+        }
+        conn.busy = conn.quick_calls >= busy_after_calls;
+        conn.pinged.store(false, .release);
+    }
+
+    /// The TLS connection keeps its task, also while it is idle: the TLS state can hold bytes
+    /// that the socket does not show.
+    fn runTls(conn: *Conn, tls_server: *const tls.Server) void {
+        const self = conn.owner;
+        const io = self.io;
+        defer conn.end();
+        const tls_read_buf = self.gpa.alloc(u8, tls.Connection.min_read_buffer_len) catch return;
+        defer self.gpa.free(tls_read_buf);
+        const tls_write_buf = self.gpa.alloc(u8, 16 * 1024) catch return;
+        defer self.gpa.free(tls_write_buf);
+        var tls_conn = tls_server.accept(&conn.reader.interface, &conn.writer.interface, .{
+            .io = io,
+            .read_buffer = tls_read_buf,
+            .write_buffer = tls_write_buf,
+            .allow_truncation_attacks = true,
         }) catch return;
+        defer {
+            tls_conn.end() catch {};
+            conn.writer.interface.flush() catch {};
+            tls_conn.deinit();
+        }
+        // A client that negotiated another protocol gets no HTTP/2.
+        if (tls_conn.alpn()) |alpn| if (!std.mem.eql(u8, alpn, "h2")) return;
+        conn.h2 = Connection.init(self.gpa, io, &tls_conn.reader, &tls_conn.writer, conn.h2Options()) catch return;
         defer conn.h2.deinit();
         conn.h2_ready.store(true, .release);
         defer conn.h2_ready.store(false, .release);
         conn.h2.handshake() catch return;
         conn.h2.run();
         conn.group.await(io) catch {};
+    }
+
+    /// End a plaintext connection with its HTTP/2 state.
+    fn endH2(conn: *Conn) void {
+        const self = conn.owner;
+        conn.group.await(self.io) catch {};
+        {
+            // The parker and `shutdown` use the HTTP/2 state under this lock.
+            self.connections_lock.lockUncancelable(self.io);
+            defer self.connections_lock.unlock(self.io);
+            conn.h2_ready.store(false, .release);
+        }
+        // A `PING` of the parker can still use the HTTP/2 state. No new one starts now.
+        while (conn.ping_refs.load(.acquire) != 0) self.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        conn.h2.deinit();
+        conn.end();
+    }
+
+    /// Free the connection. A socket that the parker closed stays closed.
+    fn end(conn: *Conn) void {
+        const self = conn.owner;
+        const io = self.io;
+        if (conn.in_buf.len > 0) self.gpa.free(conn.in_buf);
+        if (conn.out_buf.len > 0) self.gpa.free(conn.out_buf);
+        self.untrack(conn);
+        if (!conn.socket_closed) conn.stream.close(io);
+        self.permits.post(io);
+        self.gpa.destroy(conn);
     }
 
     /// The read task calls this function for each new call. A complete request that can be
