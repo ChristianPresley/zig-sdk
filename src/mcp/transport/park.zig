@@ -48,6 +48,17 @@ const OverlappedEntry = extern struct { key: usize, overlapped: ?*anyopaque, int
 extern "kernel32" fn CreateIoCompletionPort(file: windows.HANDLE, port: ?windows.HANDLE, key: usize, threads: u32) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn GetQueuedCompletionStatusEx(port: windows.HANDLE, entries: [*]OverlappedEntry, count: u32, removed: *u32, timeout_ms: u32, alertable: c_int) callconv(.winapi) c_int;
 extern "kernel32" fn PostQueuedCompletionStatus(port: windows.HANDLE, bytes: u32, key: usize, overlapped: ?*anyopaque) callconv(.winapi) c_int;
+extern "kernel32" fn CreateEventW(attributes: ?*anyopaque, manual_reset: c_int, initial_state: c_int, name: ?[*:0]const u16) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn WaitForSingleObject(handle: windows.HANDLE, milliseconds: u32) callconv(.winapi) u32;
+
+/// The result of `Poller.peekNow` and `Poller.sendNow`.
+pub const Now = union(enum) {
+    /// The count of bytes. Zero from `peekNow`: the peer closed the connection.
+    done: usize,
+    /// The operation must wait: no bytes, or no space in the send buffer.
+    would_block,
+    failed,
+};
 
 const helper_name = windows.AFD.DEVICE_NAME ++ [_]u16{ '\\', 'M', 'c', 'p', 'P', 'a', 'r', 'k' };
 
@@ -57,6 +68,8 @@ pub const Poller = struct {
     const Impl = if (is_windows) struct {
         port: windows.HANDLE,
         helper: windows.HANDLE,
+        /// The event of `peekNow` and `sendNow`, for an operation that pends after all.
+        now_event: windows.HANDLE,
     } else struct {
         gpa: std.mem.Allocator,
         wake_read: posix.fd_t,
@@ -89,7 +102,8 @@ pub const Poller = struct {
             }
             errdefer windows.CloseHandle(helper);
             if (CreateIoCompletionPort(helper, port, 1, 0) == null) return error.Unexpected;
-            return .{ .impl = .{ .port = port, .helper = helper } };
+            const now_event = CreateEventW(null, 0, 0, null) orelse return error.SystemResources;
+            return .{ .impl = .{ .port = port, .helper = helper, .now_event = now_event } };
         } else {
             var fds: [2]posix.fd_t = undefined;
             const rc = if (builtin.os.tag == .linux) posix.system.pipe2(&fds, .{ .CLOEXEC = true }) else posix.system.pipe(&fds);
@@ -104,6 +118,7 @@ pub const Poller = struct {
 
     pub fn deinit(p: *Poller) void {
         if (is_windows) {
+            windows.CloseHandle(p.impl.now_event);
             windows.CloseHandle(p.impl.helper);
             windows.CloseHandle(p.impl.port);
         } else {
@@ -183,6 +198,86 @@ pub const Poller = struct {
         }
     }
 
+    /// Make `peekNow` and `sendNow` possible on `handle`. On Windows this sets the AFD
+    /// option `NONBLOCKING_MODE` of the socket. With it an AFD request without `AFD_OVERLAPPED`
+    /// returns `STATUS_DEVICE_NOT_READY` and does not wait. The reads and writes of `std.Io`
+    /// use `AFD_OVERLAPPED`, thus they wait as before. Call it one time for each socket.
+    pub fn prepareNow(p: *Poller, handle: Io.net.Socket.Handle) bool {
+        if (!is_windows) return true;
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        var info: windows.AFD.INFORMATION = .{ .InformationType = .NONBLOCKING_MODE, .Information = .{ .Ulong = 1 } };
+        const event = p.impl.now_event;
+        var status = windows.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, windows.IOCTL.AFD.SET_INFORMATION, &info, @sizeOf(windows.AFD.INFORMATION), null, 0);
+        // AFD completes this request at once. If it does not, the kernel writes into `iosb`
+        // until the request ends, thus wait for the end.
+        if (status == .PENDING) {
+            _ = WaitForSingleObject(event, std.math.maxInt(u32));
+            status = iosb.u.Status;
+        }
+        return status == .SUCCESS;
+    }
+
+    /// Copy the bytes that wait in the socket into `buf`, without a wait, and leave them in
+    /// the socket. Call `prepareNow` first.
+    pub fn peekNow(p: *Poller, handle: Io.net.Socket.Handle, buf: []u8) Now {
+        if (is_windows) {
+            const bufs = [1]windows.AFD.WSABUF(.@"var"){.{ .len = @intCast(@min(buf.len, std.math.maxInt(u32))), .buf = buf.ptr }};
+            var info: windows.AFD.RECV_INFO = .{ .BufferArray = &bufs, .BufferCount = 1, .AfdFlags = .{}, .TdiFlags = .{ .NORMAL = true, .PEEK = true } };
+            return p.afdNow(handle, windows.IOCTL.AFD.RECEIVE, &info, @sizeOf(windows.AFD.RECV_INFO));
+        }
+        while (true) {
+            const rc = posix.system.recvfrom(handle, buf.ptr, buf.len, posix.MSG.PEEK | posix.MSG.DONTWAIT, null, null);
+            return switch (posix.errno(rc)) {
+                .SUCCESS => .{ .done = @intCast(rc) },
+                .INTR => continue,
+                .AGAIN => .would_block,
+                else => .failed,
+            };
+        }
+    }
+
+    /// Send a part of `data` without a wait. Call `prepareNow` first.
+    pub fn sendNow(p: *Poller, handle: Io.net.Socket.Handle, data: []const u8) Now {
+        if (is_windows) {
+            const bufs = [1]windows.AFD.WSABUF(.@"const"){.{ .len = @intCast(@min(data.len, std.math.maxInt(u32))), .buf = data.ptr }};
+            var info: windows.AFD.SEND_INFO = .{ .BufferArray = &bufs, .BufferCount = 1, .AfdFlags = .{}, .TdiFlags = .{} };
+            return p.afdNow(handle, windows.IOCTL.AFD.SEND, &info, @sizeOf(windows.AFD.SEND_INFO));
+        }
+        const flags: u32 = posix.MSG.DONTWAIT | (if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0);
+        while (true) {
+            const rc = posix.system.sendto(handle, data.ptr, data.len, flags, null, 0);
+            return switch (posix.errno(rc)) {
+                .SUCCESS => .{ .done = @intCast(rc) },
+                .INTR => continue,
+                .AGAIN => .would_block,
+                else => .failed,
+            };
+        }
+    }
+
+    /// One AFD request without `AFD_OVERLAPPED` (Windows).
+    fn afdNow(p: *Poller, handle: windows.HANDLE, code: windows.CTL_CODE, info: *anyopaque, info_len: u32) Now {
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        const event = p.impl.now_event;
+        var status = windows.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, code, info, info_len, null, 0);
+        if (status == .PENDING) {
+            // The socket is not in the non-blocking mode after all. End the request, and wait
+            // for its end: the kernel writes into `iosb` and the buffer until then.
+            var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
+            _ = windows.ntdll.NtCancelIoFileEx(handle, &iosb, &cancel_iosb);
+            _ = WaitForSingleObject(event, std.math.maxInt(u32));
+            status = iosb.u.Status;
+            // A cancel of a send can make AFD end the connection. Thus a cancelled request
+            // without bytes fails, and the connection closes.
+            if (status == .CANCELLED) return if (iosb.Information > 0) .{ .done = iosb.Information } else .failed;
+        }
+        return switch (status) {
+            .SUCCESS => .{ .done = iosb.Information },
+            .DEVICE_NOT_READY => .would_block,
+            else => .failed,
+        };
+    }
+
     /// End a wait that runs. Safe from any task.
     pub fn wake(p: *Poller) void {
         if (is_windows) {
@@ -192,3 +287,76 @@ pub const Poller = struct {
         }
     }
 };
+
+fn drainAll(reader: *Io.net.Stream.Reader, want: usize, got: *usize) void {
+    while (got.* < want) {
+        reader.interface.fillMore() catch return;
+        got.* += reader.interface.bufferedLen();
+        reader.interface.tossBuffered();
+    }
+}
+
+test "peekNow and sendNow do not wait, and the reads and writes of std still wait" {
+    if (!is_windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var address = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    var client = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    var conn = try server.accept(io);
+    defer conn.close(io);
+    var poller = try Poller.init(std.testing.allocator);
+    defer poller.deinit();
+    const h = conn.socket.handle;
+    try std.testing.expect(poller.prepareNow(h));
+
+    // No bytes: the peek returns at once.
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqual(Now.would_block, poller.peekNow(h, &buf));
+    // Bytes: the peek copies them and leaves them in the socket.
+    var cw = client.writer(io, &.{});
+    try cw.interface.writeAll("hello");
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        switch (poller.peekNow(h, &buf)) {
+            .done => |n| {
+                try std.testing.expectEqualStrings("hello", buf[0..n]);
+                break;
+            },
+            .would_block => {
+                if (tries > 1000) return error.NoBytes;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            },
+            .failed => return error.PeekFailed,
+        }
+    }
+    var rb: [16]u8 = undefined;
+    var reader = conn.reader(io, &rb);
+    try std.testing.expectEqualStrings("hello", try reader.interface.takeArray(5));
+
+    // The client does not read: a send stops at a full buffer, without a wait.
+    const big = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    var sent: usize = 0;
+    var full = false;
+    for (0..256) |_| switch (poller.sendNow(h, big)) {
+        .done => |n| sent += n,
+        .would_block => {
+            full = true;
+            break;
+        },
+        .failed => return error.SendFailed,
+    };
+    try std.testing.expect(full);
+    // A write of std waits until the client reads.
+    var db: [65536]u8 = undefined;
+    var client_reader = client.reader(io, &db);
+    var got: usize = 0;
+    var drain = try io.concurrent(drainAll, .{ &client_reader, sent + 4, &got });
+    var w = conn.writer(io, &.{});
+    try w.interface.writeAll("tail");
+    drain.await(io);
+    try std.testing.expectEqual(sent + 4, got);
+}

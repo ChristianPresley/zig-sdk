@@ -489,6 +489,8 @@ const Connection = struct {
     /// True while the parker runs a request of the connection itself (see
     /// `Parker.serveInline`). The time limits then do not apply.
     inline_mode: bool = false,
+    /// `park.Poller.prepareNow` ran for the socket.
+    now_ready: bool = false,
     /// The part of a response that the parker could not send without a wait. The task of
     /// the connection sends it first.
     pending_out: ?[]u8 = null,
@@ -1033,18 +1035,18 @@ const Parker = struct {
         p.inline_out = null;
     }
 
-    /// True when the parker can run a quick request itself: on Linux, for plaintext without
+    /// True when the parker can run a quick request itself: on Linux and Windows, for plaintext without
     /// authorization. A check of a token can wait for I/O.
     fn inlineEnabled(p: *Parker, self: *Server) bool {
         _ = p;
-        return builtin.os.tag == .linux and self.options.tls == null and self.options.auth == null and !self.closing.load(.acquire);
+        return (builtin.os.tag == .linux or builtin.os.tag == .windows) and self.options.tls == null and self.options.auth == null and !self.closing.load(.acquire);
     }
 
     const InlineEnd = enum { parked, close, task };
 
     /// Run the request of a ready connection in the task of the parker, without a new task.
     /// This happens only when the socket holds exactly one complete request (one look with
-    /// `MSG_PEEK`, without a wait) and `McpServer.isQuickMethod` accepts its `Mcp-Method` and
+    /// `park.Poller.peekNow`, without a wait) and `McpServer.isQuickMethod` accepts its `Mcp-Method` and
     /// `Mcp-Name` headers. The response goes to a buffer, and then to the socket without a
     /// wait. The connection task sends a rest that does not fit. Each other request gets a
     /// task, as before. A new task and its thread wake cost more than a quick handler.
@@ -1076,18 +1078,20 @@ const Parker = struct {
     }
 
     fn runInline(p: *Parker, self: *Server, conn: *Connection) InlineEnd {
-        if (builtin.os.tag != .linux) return .task;
         // At the shutdown, the connection goes the usual way.
         if (self.closing.load(.acquire)) return .task;
-        const linux = std.os.linux;
+        const poller = &p.poller.?;
+        const fd = conn.stream.socket.handle;
+        if (!conn.now_ready) {
+            if (!poller.prepareNow(fd)) return .task;
+            conn.now_ready = true;
+        }
         const bufs = self.buffers.take(self) orelse return .task;
         defer self.buffers.give(self, bufs);
-        const fd = conn.stream.socket.handle;
-        const rc = linux.recvfrom(fd, bufs.read.ptr, bufs.read.len, linux.MSG.PEEK | linux.MSG.DONTWAIT, null, null);
-        switch (linux.errno(rc)) {
-            .SUCCESS => if (rc == 0) return .close,
-            else => return .task,
-        }
+        const rc = switch (poller.peekNow(fd, bufs.read)) {
+            .done => |n| if (n == 0) return .close else n,
+            .would_block, .failed => return .task,
+        };
         if (rc >= bufs.read.len) return .task;
         const total = inlineRequestLength(self, bufs.read[0..rc]) orelse return .task;
         if (total != rc) return .task;
@@ -1113,12 +1117,13 @@ const Parker = struct {
         const data = aw.written();
         var sent: usize = 0;
         while (sent < data.len) {
-            const n = linux.sendto(fd, data[sent..].ptr, data.len - sent, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, null, 0);
-            switch (linux.errno(n)) {
-                .SUCCESS => sent += n,
-                .INTR => {},
-                .AGAIN => break,
-                else => return .close,
+            switch (poller.sendNow(fd, data[sent..])) {
+                .done => |n| {
+                    if (n == 0) break;
+                    sent += n;
+                },
+                .would_block => break,
+                .failed => return .close,
             }
         }
         if (sent < data.len) {
@@ -2036,4 +2041,5 @@ test "the head scan of the parker accepts only a strict head with a bounded body
 
 test {
     std.testing.refAllDecls(@This());
+    _ = park;
 }

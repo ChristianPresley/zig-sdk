@@ -648,7 +648,7 @@ test "http parker: a quick request of a parked connection, with a response that 
     try raw.send(try discoverRequest(arena));
     try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
     try waitHeld(&f.transport, 1);
-    // On Linux the parker runs this quick call itself. The response is larger than the socket
+    // On Linux and Windows the parker runs this quick call itself. The response is larger than the socket
     // buffers, and the client reads it only later: the task of the connection sends the rest.
     try raw.send(try bigTextRequest(arena, 2));
     try io.sleep(.fromMilliseconds(100), .awake);
