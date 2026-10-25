@@ -82,14 +82,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("conformance-server", "Build the conformance everything server").dependOn(&b.addInstallArtifact(conformance_server, .{}).step);
-    // The tests of the conformance server run with the other tests, after the module tests.
-    // On Windows, Zig 0.16.0 makes the pipes of a child inheritable and starts each child with
-    // all inheritable handles, so a child that starts at the same time can keep the stdout pipe
-    // of another test binary open. The long module tests then hold the pipe of the short
-    // conformance tests, and the build runner stops them after one minute without an answer.
-    const run_conformance_tests = b.addRunArtifact(b.addTest(.{ .root_module = conformance_server.root_module }));
-    run_conformance_tests.step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_conformance_tests.step);
+    // The tests of the conformance server run with the other tests.
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = conformance_server.root_module })).step);
     const conformance_client = b.addExecutable(.{
         .name = "mcp-conformance-client",
         .root_module = b.createModule(.{
@@ -187,6 +181,19 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "tools/extract_requirements.zig", "tools/gen_spec_matrix.zig", "tools/changelog_section.zig" }) |path| {
         const tool_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(path), .target = b.graph.host }) });
         test_step.dependOn(&b.addRunArtifact(tool_tests).step);
+    }
+
+    // On Windows, Zig 0.16.0 makes the pipes of a child inheritable and starts each child with
+    // all inheritable handles. Thus a child that starts at the same time as a different child
+    // can keep the stdout pipe of that child open after it stops. If the long module tests (about
+    // one minute) keep the pipe of a short test binary, the build runner gets no end of the
+    // output from that binary and stops it with "test runner failed to respond for 1m". Thus
+    // on a Windows host, the module tests start only after all the other tests are complete.
+    // Keep this after the last `test_step.dependOn`.
+    if (b.graph.host.result.os.tag == .windows) {
+        for (test_step.dependencies.items) |step| {
+            if (step != &run_mod_tests.step) run_mod_tests.step.dependOn(step);
+        }
     }
 }
 
