@@ -26,6 +26,17 @@ pub fn write(stream: *Stream, gpa: Allocator, payload: []const u8, end_stream: b
     try stream.sendData(buf, end_stream);
 }
 
+/// Send one message as `write` does, but without a wait for flow control credit. See
+/// `Stream.sendDataNoWait`.
+pub fn writeNoWait(stream: *Stream, gpa: Allocator, payload: []const u8, end_stream: bool) (Error || error{WouldBlock})!void {
+    const buf = try gpa.alloc(u8, prefix_len + payload.len);
+    defer gpa.free(buf);
+    buf[0] = 0;
+    std.mem.writeInt(u32, buf[1..5], @intCast(payload.len), .big);
+    @memcpy(buf[prefix_len..], payload);
+    try stream.sendDataNoWait(buf, end_stream);
+}
+
 /// Receive one message, or null when the stream ended before a message started.
 pub fn read(stream: *Stream, gpa: Allocator, max_len: usize) Error!?[]u8 {
     var prefix: [prefix_len]u8 = undefined;

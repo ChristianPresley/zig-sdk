@@ -28,6 +28,7 @@ pub const Options = struct {
     /// The largest header block under assembly across `CONTINUATION` frames.
     max_header_block_size: u32 = 32 << 10,
     /// Called from the read task when a stream the peer opened has all its request headers.
+    /// See also `Stream.dispatchAtEnd`.
     on_stream: ?*const fn (userdata: ?*anyopaque, stream: *Stream) void = null,
     userdata: ?*anyopaque = null,
 };
@@ -71,6 +72,9 @@ read_hold: bool = false,
 /// end of the burst, after the frames with their request data. Thus a handler does not wait
 /// for its data, and the handlers of a burst start together. Only the read task uses the field.
 held_streams: std.ArrayList(*Stream) = .empty,
+/// The number of bursts of frames that the read task read. A burst is the frames that it reads
+/// without a wait for the socket. Only the read task uses the field. See `burst`.
+bursts: u32 = 0,
 decoder: hpack.Decoder,
 encoder: hpack.Encoder = .{},
 peer: frame.Settings = .{},
@@ -325,6 +329,8 @@ pub fn ping(self: *Connection, data: [8]u8) Error!void {
 // -- Reading ---------------------------------------------------------------------------------
 
 fn readFrame(self: *Connection) ReadError!void {
+    // Without the hold, the last frame ended a burst, thus this frame starts the next one.
+    if (!self.read_hold) self.bursts +%= 1;
     const header_bytes = self.reader.takeArray(frame.header_len) catch |e| switch (e) {
         error.EndOfStream => return error.Closed,
         error.ReadFailed => return error.ReadFailed,
@@ -376,6 +382,10 @@ fn onData(self: *Connection, header: frame.Header, payload: []const u8) Error!vo
     }
     var reply_conn_update: ?u32 = null;
     var reset: ?frame.ErrorCode = null;
+    // A stream that `Stream.dispatchAtEnd` kept from its owner: it is complete now, or the
+    // connection frees it after a reset.
+    var ready: ?*Stream = null;
+    var dropped: ?*Stream = null;
     {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
@@ -396,10 +406,15 @@ fn onData(self: *Connection, header: frame.Header, payload: []const u8) Error!vo
                 if (stream.recv_window < 0) {
                     reset = .flow_control_error;
                     stream.setReset(.flow_control_error);
+                    if (stream.undispatched) dropped = self.dropLocked(stream);
                 } else {
                     try stream.data.appendSlice(self.gpa, data);
                     if (header.has(frame.Flags.end_stream)) stream.end_stream = true;
                     stream.cond.broadcast(self.io);
+                    if (stream.undispatched and (stream.end_stream or stream.data.items.len >= self.options.initial_window_size / 2)) {
+                        stream.undispatched = false;
+                        ready = stream;
+                    }
                 }
             }
         } else if (header.stream_id > self.last_peer_stream_id and self.options.role == .server) {
@@ -408,6 +423,8 @@ fn onData(self: *Connection, header: frame.Header, payload: []const u8) Error!vo
     }
     if (reply_conn_update) |inc| self.sendWindowUpdate(0, inc);
     if (reset) |code| self.sendRst(header.stream_id, code);
+    if (dropped) |s| s.destroy();
+    if (ready) |s| self.handOver(s);
 }
 
 fn onHeaders(self: *Connection, header: frame.Header, payload: []const u8) Error!void {
@@ -454,6 +471,8 @@ fn finishHeaderBlock(self: *Connection) Error!void {
     var new_stream: ?*Stream = null;
     var refused: ?*Stream = null;
     var reset: ?frame.ErrorCode = null;
+    // The trailers completed a stream that `Stream.dispatchAtEnd` kept from its owner.
+    var ready: ?*Stream = null;
     {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
@@ -491,6 +510,8 @@ fn finishHeaderBlock(self: *Connection) Error!void {
                     // lock comes before `lock` (see `sendHeaders`).
                     reset = .enhance_your_calm;
                     s.setReset(.enhance_your_calm);
+                    // Trailers over the limit on a stream without an owner yet.
+                    if (s.undispatched and opened == null) refused = self.dropLocked(s);
                     break :decoded;
                 },
                 else => return error.ProtocolError, // a compression error ends the connection
@@ -517,6 +538,14 @@ fn finishHeaderBlock(self: *Connection) Error!void {
                 }
             }
             s.cond.broadcast(self.io);
+            if (s.undispatched and opened == null) {
+                if (s.reset != null) {
+                    refused = self.dropLocked(s);
+                } else if (s.end_stream) {
+                    s.undispatched = false;
+                    ready = s;
+                }
+            }
         }
         // A stream that this block opened and refused gets no owner, because `on_stream` does
         // not run. Thus the connection frees it, as for `REFUSED_STREAM`. Else the stream counts
@@ -535,15 +564,36 @@ fn finishHeaderBlock(self: *Connection) Error!void {
     self.hb_buf.clearRetainingCapacity();
     if (refused) |s| s.destroy();
     if (reset) |code| self.sendRst(stream_id, code);
-    if (new_stream) |s| {
-        if (!self.read_hold) return self.dispatch(s);
-        self.held_streams.append(self.gpa, s) catch self.dispatch(s);
-    }
+    if (new_stream) |s| self.handOver(s);
+    if (ready) |s| self.handOver(s);
+}
+
+/// Give a stream that the peer opened to `on_stream`, at once or at the end of the hold of
+/// the read task. See `held_streams`.
+fn handOver(self: *Connection, s: *Stream) void {
+    if (!self.read_hold) return self.dispatch(s);
+    self.held_streams.append(self.gpa, s) catch self.dispatch(s);
+}
+
+/// The number of the burst of frames that the read task reads now. The streams of a burst go
+/// to `on_stream` with the same number. Only `on_stream` calls this function.
+pub fn burst(self: *const Connection) u32 {
+    return self.bursts;
 }
 
 /// Give a stream that the peer opened to `on_stream`.
 fn dispatch(self: *Connection, s: *Stream) void {
     if (self.options.on_stream) |f| f(self.options.userdata, s);
+}
+
+/// Unregister a stream that has no owner yet, after its reset. Called under `lock`. The
+/// caller frees the stream after the unlock.
+fn dropLocked(self: *Connection, s: *Stream) *Stream {
+    s.undispatched = false;
+    _ = self.streams.remove(s.id);
+    self.peer_streams_open -|= 1;
+    self.rememberReset(s.id);
+    return s;
 }
 
 /// Remember `id`, a peer stream that this side reset. Called under `lock`.
@@ -613,10 +663,14 @@ fn onRstStream(self: *Connection, header: frame.Header, payload: []const u8) Rea
     if (header.stream_id == 0) return error.ProtocolError;
     if (header.length != 4) return error.FrameSizeError;
     const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
+    var dropped: ?*Stream = null;
+    defer if (dropped) |s| s.destroy();
     self.lock.lockUncancelable(self.io);
     defer self.lock.unlock(self.io);
     if (self.streams.get(header.stream_id)) |s| {
         s.setReset(code);
+        // A stream without an owner: no task closes it.
+        if (s.undispatched) dropped = self.dropLocked(s);
     } else if (self.options.role == .server and header.stream_id > self.last_peer_stream_id) {
         return error.ProtocolError;
     }
@@ -676,6 +730,9 @@ fn onWindowUpdate(self: *Connection, header: frame.Header, payload: []const u8) 
         self.sendRst(header.stream_id, .protocol_error);
         return;
     }
+    // A stream without an owner after its reset. It is freed after the unlock.
+    var dropped: ?*Stream = null;
+    defer if (dropped) |s| s.destroy();
     self.lock.lockUncancelable(self.io);
     defer self.lock.unlock(self.io);
     if (header.stream_id == 0) {
@@ -688,6 +745,7 @@ fn onWindowUpdate(self: *Connection, header: frame.Header, payload: []const u8) 
         s.send_window += increment;
         if (s.send_window > frame.max_window) {
             s.setReset(.flow_control_error);
+            if (s.undispatched) dropped = self.dropLocked(s);
             self.lock.unlock(self.io);
             self.sendRst(header.stream_id, .flow_control_error);
             self.lock.lockUncancelable(self.io);
@@ -756,6 +814,9 @@ pub const Stream = struct {
     recv_credit: u32 = 0,
     /// See `cork`. Only the task that sends on the stream uses the field.
     corked: bool = false,
+    /// `dispatchAtEnd` keeps the stream from `on_stream`. Changed under `lock` by the read
+    /// task only.
+    undispatched: bool = false,
 
     fn create(conn: *Connection, id: u31) Allocator.Error!*Stream {
         const s = try conn.gpa.create(Stream);
@@ -1001,6 +1062,62 @@ pub const Stream = struct {
             offset += n;
             if (last) return;
         }
+    }
+
+    /// Send data as `sendData` does, but do not wait for flow control credit. When the
+    /// windows have less credit than `bytes.len`, nothing goes out and the result is
+    /// `error.WouldBlock`. Only the read task gets more credit from the peer. Thus the read
+    /// task uses this function, because it must not wait for that credit.
+    pub fn sendDataNoWait(self: *Stream, bytes: []const u8, end_stream: bool) (Error || error{WouldBlock})!void {
+        const conn = self.conn;
+        {
+            conn.lock.lockUncancelable(conn.io);
+            defer conn.lock.unlock(conn.io);
+            if (self.answered()) {
+                self.local_closed = true;
+                return;
+            }
+            try self.checkOpen();
+            if (@min(self.send_window, conn.send_window) < @as(i64, @intCast(bytes.len))) return error.WouldBlock;
+            self.send_window -= @intCast(bytes.len);
+            conn.send_window -= @intCast(bytes.len);
+            if (end_stream) self.local_closed = true;
+        }
+        const max = conn.peer.max_frame_size;
+        var offset: usize = 0;
+        while (true) {
+            const n = @min(bytes.len - offset, max);
+            const last = offset + n == bytes.len;
+            const flags: u8 = if (last and end_stream) frame.Flags.end_stream else 0;
+            try conn.writeFrameFlush(.data, flags, self.id, bytes[offset..][0..n], last and !self.corked);
+            offset += n;
+            if (last) return;
+        }
+    }
+
+    /// Give the stream to `on_stream` again when the request is complete: at END_STREAM, or
+    /// when its data fills half of the stream window. Then the owner of a small request does
+    /// not wait for its data. Also, the read task does not wake the owner for each frame.
+    /// Only `on_stream` calls this function, in the read task. When the result is false, the
+    /// request is complete, has that much data or has a reset, and the caller keeps the
+    /// stream. A stream that gets a reset before the end has no owner, and the connection
+    /// frees it.
+    pub fn dispatchAtEnd(self: *Stream) bool {
+        const conn = self.conn;
+        conn.lock.lockUncancelable(conn.io);
+        defer conn.lock.unlock(conn.io);
+        if (self.end_stream or self.reset != null or conn.closed) return false;
+        if (self.data.items.len >= conn.options.initial_window_size / 2) return false;
+        self.undispatched = true;
+        return true;
+    }
+
+    /// The peer ended its side of the stream: the request or the response is complete.
+    pub fn peerEnded(self: *Stream) bool {
+        const conn = self.conn;
+        conn.lock.lockUncancelable(conn.io);
+        defer conn.lock.unlock(conn.io);
+        return self.end_stream;
     }
 
     /// Wait until the request or response headers arrived.

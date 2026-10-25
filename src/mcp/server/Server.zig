@@ -131,8 +131,11 @@ pub const ToolDef = struct {
     rate_limit: ?Limits.Rate = null,
     /// Set it only when the handler does not wait for I/O, a timer or a lock that another
     /// request holds, and returns in some microseconds. Then a stream transport (stdio, Unix
-    /// socket, WebSocket) runs the call on its reader, without a new task. The reader reads no
-    /// other message while the handler runs, thus a cancellation of the call has no effect.
+    /// socket, WebSocket, gRPC) runs the call on its reader, without a new task. The reader
+    /// reads no other message while the handler runs, thus a cancellation of the call has no
+    /// effect. The handler can send events, for example with `notifyToolsListChanged`. The
+    /// gRPC transport keeps an event for a slow subscriber and does not wait. Another
+    /// transport can wait for the subscriber, and the reader then waits too.
     quick: bool = false,
     userdata: ?*anyopaque = null,
 };
@@ -732,16 +735,23 @@ pub fn isQuick(self: *Server, msg: message.Message) bool {
         .request => |r| r,
         else => return false,
     };
-    if (std.mem.eql(u8, req.method, "tools/call")) {
-        const params = req.params orelse return false;
-        if (params != .object) return false;
-        const name = params.object.get("name") orelse return false;
-        if (name != .string) return false;
-        const entry = self.findTool(name.string) orelse return false;
+    var tool: ?[]const u8 = null;
+    if (req.params) |params| if (params == .object) if (params.object.get("name")) |name| if (name == .string) {
+        tool = name.string;
+    };
+    return self.isQuickMethod(req.method, tool);
+}
+
+/// As `isQuick`, for a request of `method`. For `tools/call`, `tool` is the name of the tool.
+/// A transport can use this function before it reads the request. For example, the method
+/// and the tool name can come from the metadata of the request.
+pub fn isQuickMethod(self: *Server, method: []const u8, tool: ?[]const u8) bool {
+    if (std.mem.eql(u8, method, "tools/call")) {
+        const entry = self.findTool(tool orelse return false) orelse return false;
         return entry.quick;
     }
     const quick_methods = [_][]const u8{ "server/discover", "tools/list", "prompts/list", "resources/templates/list" };
-    for (quick_methods) |m| if (std.mem.eql(u8, req.method, m)) return true;
+    for (quick_methods) |m| if (std.mem.eql(u8, method, m)) return true;
     return false;
 }
 

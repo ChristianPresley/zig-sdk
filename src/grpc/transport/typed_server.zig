@@ -42,39 +42,47 @@ pub const max_list_pages = 1024;
 /// The JSON-RPC ids of the requests that the typed binding gives to the server engine.
 var next_id: std.atomic.Value(i64) = .init(1);
 
-/// Serve one call of `rpc`. The caller checked the method, the content type, the encoding and
-/// the bearer token.
-pub fn handleCall(self: *grpc_server.Server, stream: *Stream, arena: Allocator, headers: []const Header, rpc: service.Rpc, principal: ?*resource_server.Principal) !void {
-    const io = self.io;
-    const gpa = self.gpa;
+/// A request of the typed binding that `prepare` read and checked.
+pub const Prepared = struct {
+    rpc: service.Rpc,
+    /// The params of the JSON-RPC request. They point into the payload in the call arena.
+    params: Value,
+    deadline: ?Io.Duration,
+    principal: ?*resource_server.Principal,
+    /// The slot of a quick request in `grpc_server.Server.costs`. Null for other requests.
+    cost_slot: ?usize = null,
+};
+
+/// Read the request message of `rpc` and check it against the metadata. Null when the call
+/// ended with an error. The caller checked the method, the content type, the encoding and the
+/// bearer token.
+pub fn prepare(self: *grpc_server.Server, stream: *Stream, arena: Allocator, headers: []const Header, rpc: service.Rpc, principal: ?*resource_server.Principal) !?Prepared {
     var deadline: ?Io.Duration = null;
     if (Connection.findHeader(headers, "grpc-timeout")) |t| {
-        deadline = timeout.parse(t) catch return grpc_server.trailersOnly(stream, arena, .invalid_argument, "Invalid grpc-timeout", null, null);
+        deadline = timeout.parse(t) catch return ended(grpc_server.trailersOnly(stream, arena, .invalid_argument, "Invalid grpc-timeout", null, null));
     }
 
-    // The one request message.
-    const payload = lpm.read(stream, gpa, self.options.max_message_bytes) catch |e| switch (e) {
-        error.MessageTooLarge => return grpc_server.trailersOnly(stream, arena, .resource_exhausted, "Message too large", null, null),
-        error.Compressed => return grpc_server.trailersOnly(stream, arena, .unimplemented, "Compression is not supported", null, null),
-        error.Truncated => return grpc_server.trailersOnly(stream, arena, .invalid_argument, "Truncated message", null, null),
+    // The one request message. It is in the call arena, because the params point into it.
+    const payload = lpm.read(stream, arena, self.options.max_message_bytes) catch |e| switch (e) {
+        error.MessageTooLarge => return ended(grpc_server.trailersOnly(stream, arena, .resource_exhausted, "Message too large", null, null)),
+        error.Compressed => return ended(grpc_server.trailersOnly(stream, arena, .unimplemented, "Compression is not supported", null, null)),
+        error.Truncated => return ended(grpc_server.trailersOnly(stream, arena, .invalid_argument, "Truncated message", null, null)),
         error.OutOfMemory => return error.OutOfMemory,
-        else => return,
-    } orelse return grpc_server.trailersOnly(stream, arena, .invalid_argument, "The call carried no message", null, null);
-    // The params point into the payload.
-    defer gpa.free(payload);
+        else => return null,
+    } orelse return ended(grpc_server.trailersOnly(stream, arena, .invalid_argument, "The call carried no message", null, null));
 
     var cx: convert.Context = .{ .arena = arena, .limits = self.options.typed_limits };
     var params = convert.decodeRequest(&cx, rpc, payload) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Invalid, error.Unexpressible => return rpcError(stream, arena, errors.invalidParams(cx.reason)),
-        else => return rpcError(stream, arena, errors.parseError(try std.fmt.allocPrint(arena, "The message is not a valid {s}: {t}", .{ requestName(rpc), e }))),
+        error.Invalid, error.Unexpressible => return ended(rpcError(stream, arena, errors.invalidParams(cx.reason))),
+        else => return ended(rpcError(stream, arena, errors.parseError(try std.fmt.allocPrint(arena, "The message is not a valid {s}: {t}", .{ requestName(rpc), e })))),
     };
 
     // A different revision in `mcp-protocol-version` gets -32022 before the other metadata
     // checks, as on the tunnel. Without the metadata, the version of this SDK applies.
     if (Connection.findHeader(headers, envelope.header_protocol_version)) |pv| {
         if (try envelope.verifyVersion(arena, pv, envelope.metaVersion(params))) |rejection| {
-            if (rejection.unsupported_version != null) return rpcError(stream, arena, try rejection.rpcError(arena));
+            if (rejection.unsupported_version != null) return ended(rpcError(stream, arena, try rejection.rpcError(arena)));
         }
     }
     // The routing metadata must agree with the message, as `mcp-name` on the tunnel.
@@ -84,33 +92,55 @@ pub fn handleCall(self: *grpc_server.Server, stream: *Stream, arena: Allocator, 
             if (!std.mem.eql(u8, h.name, name)) continue;
             if (expected == null or !std.mem.eql(u8, h.value, expected.?)) {
                 const message = try std.fmt.allocPrint(arena, "Header mismatch: {s} value '{s}' does not match the message value '{s}'", .{ name, h.value, expected orelse "" });
-                return rpcError(stream, arena, errors.headerMismatch(message));
+                return ended(rpcError(stream, arena, errors.headerMismatch(message)));
             }
         }
     }
     if (try completeMeta(arena, &params, Connection.findHeader(headers, envelope.header_protocol_version))) |message| {
-        return rpcError(stream, arena, errors.headerMismatch(message));
+        return ended(rpcError(stream, arena, errors.headerMismatch(message)));
     }
+    return .{ .rpc = rpc, .params = params, .deadline = deadline, .principal = principal };
+}
 
+/// The result of a function that ends the call.
+fn ended(result: anyerror!void) !?Prepared {
+    try result;
+    return null;
+}
+
+/// True when the request of `p` ends without a wait. See `mcp.Server.isQuick`.
+pub fn isQuick(self: *grpc_server.Server, p: Prepared) bool {
+    return self.server.isQuick(.{ .request = .{ .id = .{ .integer = 0 }, .method = p.rpc.method(), .params = p.params } });
+}
+
+/// Run the request of `p` and send the response. With `no_wait` the read task or a worker runs
+/// it: the request is quick and has no reset hook and no deadline. The result is then the
+/// response message when it must wait for flow control credit.
+pub fn execute(self: *grpc_server.Server, stream: *Stream, arena: Allocator, p: Prepared, no_wait: bool) !?grpc_server.Backlog {
+    const io = self.io;
+    const gpa = self.gpa;
+    const rpc = p.rpc;
     var token: Transport.CancelToken = .{};
     // The connection cancels the request when the client resets the stream or the connection
     // ends. The hook goes before the token does. Before, a second task waited on the stream.
-    stream.setOnReset(onReset, &token);
-    defer stream.setOnReset(null, null);
+    if (!no_wait) stream.setOnReset(onReset, &token);
+    defer if (!no_wait) stream.setOnReset(null, null);
     var deadline_hit: std.atomic.Value(bool) = .init(false);
     var watch: Deadlines.Watch = .{};
-    if (deadline) |d| watch.start(&self.deadlines, io, d, &token, &deadline_hit);
+    if (p.deadline) |d| if (!no_wait) watch.start(&self.deadlines, io, d, &token, &deadline_hit);
     defer watch.finish(&self.deadlines, io);
 
-    const outcome = try run(self, arena, rpc, params, &token, principal);
+    const started = Io.Timestamp.now(io, .awake);
+    const outcome = try run(self, arena, rpc, p.params, &token, p.principal);
     const result = switch (outcome) {
         .result => |r| r,
-        .rpc_error => |e| return rpcError(stream, arena, e),
+        .rpc_error => |e| return endedSend(rpcError(stream, arena, e)),
         .cancelled => {
             const code: status.Code = if (deadline_hit.load(.acquire)) .deadline_exceeded else .cancelled;
-            return grpc_server.trailersOnly(stream, arena, code, "The request was cancelled", null, null);
+            return endedSend(grpc_server.trailersOnly(stream, arena, code, "The request was cancelled", null, null));
         },
     };
+    var cx: convert.Context = .{ .arena = arena, .limits = self.options.typed_limits };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     convert.encodeResult(&cx, gpa, &out, rpc, result) catch |e| switch (e) {
@@ -118,15 +148,35 @@ pub fn handleCall(self: *grpc_server.Server, stream: *Stream, arena: Allocator, 
         error.Unexpressible, error.Invalid => {
             log.warn("the typed binding cannot express the {s} result: {s}", .{ rpc.method(), cx.reason });
             const message = try std.fmt.allocPrint(arena, "The typed gRPC binding cannot express {s}", .{cx.reason});
-            return rpcError(stream, arena, errors.internalError(message));
+            return endedSend(rpcError(stream, arena, errors.internalError(message)));
         },
     };
+    if (p.cost_slot) |i| self.costs.record(i, grpc_server.nsSince(io, started));
     // The headers, the message and the trailers go out together. See `Stream.cork`.
     stream.cork();
     defer stream.uncork() catch {};
-    stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = grpc_server.content_type } }, false) catch return;
-    lpm.write(stream, gpa, out.items, false) catch return;
-    stream.sendHeaders(&.{.{ .name = "grpc-status", .value = status.Code.ok.wire() }}, true) catch return;
+    stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "content-type", .value = grpc_server.content_type } }, false) catch return null;
+    if (no_wait) {
+        lpm.writeNoWait(stream, gpa, out.items, false) catch |e| switch (e) {
+            error.WouldBlock => {
+                // A task sends the message and the trailers.
+                var backlog: grpc_server.Backlog = .{ .started = true, .code = .ok };
+                try backlog.messages.append(arena, try arena.dupe(u8, out.items));
+                return backlog;
+            },
+            else => return null,
+        };
+    } else {
+        lpm.write(stream, gpa, out.items, false) catch return null;
+    }
+    stream.sendHeaders(&.{.{ .name = "grpc-status", .value = status.Code.ok.wire() }}, true) catch return null;
+    return null;
+}
+
+/// The result of a function that ends the call in `execute`.
+fn endedSend(result: anyerror!void) !?grpc_server.Backlog {
+    try result;
+    return null;
 }
 
 fn requestName(rpc: service.Rpc) []const u8 {

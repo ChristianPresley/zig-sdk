@@ -62,6 +62,32 @@ fn slow(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallTo
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "late", .{}) };
 }
 
+/// The text of the quick tool `big`: larger than the flow control window of the client.
+const big_len = 100_000;
+
+fn big(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    const text = try ctx.arena.alloc(u8, big_len);
+    @memset(text, 'x');
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "{s}", .{text}) };
+}
+
+/// A quick tool that takes some time without a wait. The read task gives such calls to the
+/// workers of the connection.
+/// A quick tool that sends an event to the listen streams.
+fn touch(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    ctx.server.notifyToolsListChanged(ctx.io);
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "touched", .{}) };
+}
+
+fn spin(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    const start = Io.Timestamp.now(ctx.io, .awake);
+    while (start.durationTo(Io.Timestamp.now(ctx.io, .awake)).nanoseconds < 300 * std.time.ns_per_us) {}
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "spun", .{}) };
+}
+
 fn hidden(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(types.CallToolResult) {
     _ = args;
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "hidden", .{}) };
@@ -106,6 +132,9 @@ const Fixture = struct {
         try self.server.addToolJson(.{ .name = "ask_name" }, askName);
         try self.server.addToolJson(.{ .name = "slow" }, slow);
         try self.server.addToolJson(.{ .name = "hidden" }, hidden);
+        try self.server.addToolJson(.{ .name = "big", .quick = true }, big);
+        try self.server.addToolJson(.{ .name = "spin", .quick = true }, spin);
+        try self.server.addToolJson(.{ .name = "touch", .quick = true }, touch);
         try self.server.addToolJson(.{ .name = "nested_headers", .input_schema = nested_schema }, echoNested);
         _ = self.server.setToolEnabled(io, "hidden", false);
         self.transport = .init(io, gpa, &self.server, .{ .port = 0, .tls = server_tls });
@@ -170,7 +199,7 @@ test "grpc: discover, tools, progress, header mirroring, mrtr and errors" {
     const disc = try f.client.discover(arena, .{ .timeout = .fromSeconds(10) });
     try std.testing.expectEqualStrings("2026-07-28", disc.supportedVersions[0]);
     const tools = try f.client.listTools(arena, null, .{ .timeout = .fromSeconds(10) });
-    try std.testing.expectEqual(5, tools.tools.len);
+    try std.testing.expectEqual(8, tools.tools.len);
 
     var rec: Recorder = .{};
     const sum = try f.client.callTool(arena, "add", .{ .a = 40, .b = 2 }, .{ .timeout = .fromSeconds(10), .on_progress = Recorder.onProgress, .userdata = &rec });
@@ -316,6 +345,8 @@ const RawCall = struct {
     grpc_status: ?[]const u8,
     error_code: ?[]const u8,
     error_bin: ?[]const u8,
+    /// The bytes of the response messages.
+    message_bytes: usize = 0,
 };
 
 /// How `rawCallWith` sends the request message.
@@ -323,6 +354,8 @@ const RawOptions = struct {
     /// Send the message only after the complete response and the reset of the server
     /// arrived. The server answers some calls before it reads the message.
     after_answer: bool = false,
+    /// The receive window of each stream of the client.
+    initial_window_size: u32 = 1 << 20,
 };
 
 fn rawCall(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, content_type: []const u8, metadata: []const Connection.Header, body: []const u8) !RawCall {
@@ -339,7 +372,7 @@ fn rawCallWith(gpa: std.mem.Allocator, io: Io, port: u16, path: []const u8, cont
     defer gpa.free(out_buf);
     var reader = stream.reader(io, in_buf);
     var writer = stream.writer(io, out_buf);
-    const conn = try Connection.init(gpa, io, &reader.interface, &writer.interface, .{ .role = .client });
+    const conn = try Connection.init(gpa, io, &reader.interface, &writer.interface, .{ .role = .client, .initial_window_size = options.initial_window_size });
     defer conn.deinit();
     try conn.handshake();
     var run_task: connection_test.RunTask = .{};
@@ -392,7 +425,10 @@ fn rawExchange(gpa: std.mem.Allocator, io: Io, h2: *Connection.Stream, path: []c
     errdefer freeRaw(gpa, result);
     var source = response;
     if (Connection.findHeader(response, "grpc-status") == null) {
-        while (try lpm.read(h2, gpa, 1 << 20)) |payload| gpa.free(payload);
+        while (try lpm.read(h2, gpa, 1 << 20)) |payload| {
+            result.message_bytes += payload.len;
+            gpa.free(payload);
+        }
         source = try h2.waitEnd();
     }
     if (Connection.findHeader(source, "grpc-status")) |v| result.grpc_status = try gpa.dupe(u8, v);
@@ -558,4 +594,167 @@ test "grpc: reuse_address binds the port again while a connection of the port is
         .windows => try std.testing.expect(without),
         else => {},
     }
+}
+
+fn callParams(comptime tool: []const u8) []const u8 {
+    return "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}},\"name\":\"" ++ tool ++ "\",\"arguments\":{}}}";
+}
+
+fn callMetadata(comptime tool: []const u8) [3]Connection.Header {
+    return .{
+        .{ .name = "mcp-protocol-version", .value = "2026-07-28" },
+        .{ .name = "mcp-method", .value = "tools/call" },
+        .{ .name = "mcp-name", .value = tool },
+    };
+}
+
+test "grpc: a quick call with a response larger than the window of the client" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    // The read task cannot wait for the credit of the client, thus a task sends the rest.
+    const r = try rawCallWith(gpa, io, f.transport.bound_port, grpc_server.call_path, "application/grpc", &callMetadata("big"), callParams("big"), .{ .initial_window_size = 16 << 10 });
+    defer freeRaw(gpa, r);
+    try std.testing.expectEqualStrings("0", r.grpc_status.?);
+    try std.testing.expect(r.message_bytes > big_len);
+}
+
+test "grpc: a burst of quick calls on one connection that the read task and the workers run" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    const address = Io.net.IpAddress.parse("127.0.0.1", f.transport.bound_port) catch unreachable;
+    const stream = try mcp.util.loopback.connect(io, address);
+    defer stream.close(io);
+    const in_buf = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(in_buf);
+    const out_buf = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(out_buf);
+    var reader = stream.reader(io, in_buf);
+    var writer = stream.writer(io, out_buf);
+    const conn = try Connection.init(gpa, io, &reader.interface, &writer.interface, .{ .role = .client });
+    defer conn.deinit();
+    try conn.handshake();
+    var run_task: connection_test.RunTask = .{};
+    try run_task.start(io, conn);
+    defer {
+        conn.shutdown();
+        stream.shutdown(io, .send) catch {};
+        run_task.finish(io);
+    }
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    try messages.encodeJsonRpcMessage(gpa, &msg, callParams("spin"));
+    const headers = [_]Connection.Header{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = grpc_server.call_path },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "te", .value = "trailers" },
+        .{ .name = "grpc-timeout", .value = "10S" },
+    } ++ callMetadata("spin");
+    // The calls go out in one write: the frames of a corked stream stay in the buffer.
+    const count = 32;
+    var streams: [count]*Connection.Stream = undefined;
+    var opened: usize = 0;
+    defer for (streams[0..opened]) |s| s.close();
+    for (&streams, 0..) |*s, i| {
+        s.* = try conn.openStream();
+        opened += 1;
+        s.*.cork();
+        try s.*.sendHeaders(&headers, false);
+        try lpm.write(s.*, gpa, msg.items, true);
+        if (i == count - 1) try s.*.uncork();
+    }
+    for (streams) |s| {
+        var watchdog: connection_test.Watchdog = .{ .stream = s };
+        try watchdog.start(io);
+        const response = s.waitHeaders();
+        var got: usize = 0;
+        while (lpm.read(s, gpa, 1 << 20) catch null) |payload| {
+            got += payload.len;
+            gpa.free(payload);
+        }
+        const trailers = s.waitEnd();
+        try watchdog.finish(io);
+        try std.testing.expectEqualStrings("200", Connection.findHeader(try response, ":status").?);
+        try std.testing.expectEqualStrings("0", Connection.findHeader(try trailers, "grpc-status").?);
+        try std.testing.expect(got > 0);
+    }
+}
+
+test "grpc: a quick call that sends an event to a listen stream without credit on the same connection" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    const address = Io.net.IpAddress.parse("127.0.0.1", f.transport.bound_port) catch unreachable;
+    const stream = try mcp.util.loopback.connect(io, address);
+    defer stream.close(io);
+    const in_buf = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(in_buf);
+    const out_buf = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(out_buf);
+    var reader = stream.reader(io, in_buf);
+    var writer = stream.writer(io, out_buf);
+    // A small window for each stream. The test does not read the listen stream, thus its
+    // window stays empty after the first event.
+    const conn = try Connection.init(gpa, io, &reader.interface, &writer.interface, .{ .role = .client, .initial_window_size = 64 });
+    defer conn.deinit();
+    try conn.handshake();
+    var run_task: connection_test.RunTask = .{};
+    try run_task.start(io, conn);
+    defer {
+        conn.shutdown();
+        stream.shutdown(io, .send) catch {};
+        run_task.finish(io);
+    }
+
+    const listen_body = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"subscriptions/listen\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}},\"notifications\":{\"toolsListChanged\":true}}}";
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    try messages.encodeJsonRpcMessage(gpa, &msg, listen_body);
+    const listen = try conn.openStream();
+    defer listen.close();
+    var listen_watchdog: connection_test.Watchdog = .{ .stream = listen };
+    try listen_watchdog.start(io);
+    defer listen_watchdog.finish(io) catch {};
+    try listen.sendHeaders(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":path", .value = grpc_server.call_path },
+        .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "content-type", .value = "application/grpc" },
+        .{ .name = "te", .value = "trailers" },
+        .{ .name = "mcp-protocol-version", .value = "2026-07-28" },
+        .{ .name = "mcp-method", .value = "subscriptions/listen" },
+    }, false);
+    try lpm.write(listen, gpa, msg.items, true);
+    // The headers go out with the acknowledgment.
+    _ = try listen.waitHeaders();
+    try io.sleep(.fromMilliseconds(50), .awake);
+
+    // Before, the first event made the read task wait for credit on the listen stream, and
+    // only the read task reads that credit: the connection stopped.
+    for (0..10) |_| {
+        const h2 = try conn.openStream();
+        defer h2.close();
+        var watchdog: connection_test.Watchdog = .{ .stream = h2 };
+        try watchdog.start(io);
+        const r = rawExchange(gpa, io, h2, grpc_server.call_path, "application/grpc", &callMetadata("touch"), callParams("touch"), .{});
+        watchdog.finish(io) catch |err| {
+            if (r) |c| freeRaw(gpa, c) else |_| {}
+            return err;
+        };
+        const call = try r;
+        defer freeRaw(gpa, call);
+        try std.testing.expectEqualStrings("0", call.grpc_status.?);
+    }
+    listen.cancel();
 }

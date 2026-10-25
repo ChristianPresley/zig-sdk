@@ -1353,3 +1353,78 @@ test "the answers to a burst of frames go out in a small number of writes" {
         try std.testing.expectEqual(1, data[2 * i + 1]);
     }
 }
+
+/// Asks for each stream again at the end of its request, then answers and closes it.
+const AtEnd = struct {
+    /// The ids of the first calls, in order.
+    first: [8]u31 = undefined,
+    first_len: usize = 0,
+    /// The ids and the request data of the second calls, in order.
+    second: [8]u31 = undefined,
+    data: [8][8]u8 = undefined,
+    data_len: [8]usize = undefined,
+    second_len: usize = 0,
+
+    fn onStream(userdata: ?*anyopaque, stream: *Connection.Stream) void {
+        const self: *AtEnd = @ptrCast(@alignCast(userdata.?));
+        if (!stream.peerEnded()) {
+            self.first[self.first_len] = stream.id;
+            self.first_len += 1;
+            if (stream.dispatchAtEnd()) return;
+        }
+        const i = self.second_len;
+        self.second[i] = stream.id;
+        // The data is complete, thus the reads do not wait.
+        var n: usize = 0;
+        while (true) {
+            const got = stream.read(self.data[i][n..]) catch 0;
+            if (got == 0) break;
+            n += got;
+        }
+        self.data_len[i] = n;
+        self.second_len += 1;
+        stream.sendHeaders(&.{.{ .name = ":status", .value = "200" }}, true) catch {};
+        stream.close();
+    }
+};
+
+test "dispatchAtEnd gives a stream again at the end of its request and frees a stream with a reset" {
+    const gpa = std.testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    try appendHeaders(gpa, &script, 1, 0, &(post ++ [_]Header{.{ .name = ":path", .value = "/1" }}), "");
+    try appendHeaders(gpa, &script, 3, 0, &(post ++ [_]Header{.{ .name = ":path", .value = "/3" }}), "");
+    try appendHeaders(gpa, &script, 5, 0, &(post ++ [_]Header{.{ .name = ":path", .value = "/5" }}), "");
+    const split = script.items.len;
+    // Stream 1 ends with its data, stream 3 gets a reset and stream 5 ends with trailers.
+    try appendFrame(gpa, &script, .data, 0, 1, "ab");
+    try appendFrame(gpa, &script, .data, frame.Flags.end_stream, 1, "cd");
+    var code: [4]u8 = undefined;
+    std.mem.writeInt(u32, &code, @intFromEnum(frame.ErrorCode.cancel), .big);
+    try appendFrame(gpa, &script, .rst_stream, 0, 3, &code);
+    try appendFrame(gpa, &script, .data, 0, 5, "e");
+    try appendHeaders(gpa, &script, 5, frame.Flags.end_stream, &trailer, "");
+
+    const calls = [_]std.testing.Reader.Call{ .{ .buffer = script.items[0..split] }, .{ .buffer = script.items[split..] } };
+    const read_buffer = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(read_buffer);
+    var chunks: std.testing.Reader = .init(read_buffer, &calls);
+    const written = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(written);
+    var writer: Io.Writer = .fixed(written);
+    var at_end: AtEnd = .{};
+    const conn = try Connection.init(gpa, std.testing.io, &chunks.interface, &writer, .{ .role = .server, .on_stream = AtEnd.onStream, .userdata = &at_end });
+    defer conn.deinit();
+    try conn.handshake();
+    conn.run();
+
+    try std.testing.expectEqualSlices(u31, &.{ 1, 3, 5 }, at_end.first[0..at_end.first_len]);
+    try std.testing.expectEqualSlices(u31, &.{ 1, 5 }, at_end.second[0..at_end.second_len]);
+    try std.testing.expectEqualStrings("abcd", at_end.data[0][0..at_end.data_len[0]]);
+    try std.testing.expectEqualStrings("e", at_end.data[1][0..at_end.data_len[1]]);
+    // The connection freed stream 3, which had no owner.
+    try std.testing.expectEqual(0, conn.streams.count());
+    try std.testing.expectEqual(0, conn.peer_streams_open);
+}
