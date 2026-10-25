@@ -21,7 +21,7 @@ const status = @import("../grpc/status.zig");
 const timeout = @import("../grpc/timeout.zig");
 const messages = @import("../protobuf/messages.zig");
 const grpc_server = @import("grpc_server.zig");
-const socket_opts = @import("socket_opts.zig");
+const socket_opts = mcp.transport.socket_opts;
 
 const log = std.log.scoped(.mcp_grpc_client);
 

@@ -26,7 +26,7 @@ const messages = @import("../protobuf/messages.zig");
 const codec = @import("../protobuf/codec.zig");
 const service = @import("../typed/service.zig");
 const typed_server = @import("typed_server.zig");
-const socket_opts = @import("socket_opts.zig");
+const socket_opts = mcp.transport.socket_opts;
 
 const log = std.log.scoped(.mcp_grpc);
 

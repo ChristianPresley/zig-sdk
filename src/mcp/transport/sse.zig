@@ -5,18 +5,17 @@ const Allocator = std.mem.Allocator;
 
 pub const content_type = "text/event-stream";
 
-/// Write one event whose data is `data`. `data` must not contain a raw newline.
+/// Write one event whose data is `data`. `data` must not contain a raw newline. The event goes
+/// to `writer` in one write. Thus a chunked HTTP body without a buffer sends it as one chunk.
 pub fn writeEvent(writer: *Io.Writer, data: []const u8) Io.Writer.Error!void {
-    try writer.writeAll("event: message\ndata: ");
-    try writer.writeAll(data);
-    try writer.writeAll("\n\n");
+    var parts: [3][]const u8 = .{ "event: message\ndata: ", data, "\n\n" };
+    try writer.writeVecAll(&parts);
 }
 
-/// Write a comment line, used as keep-alive.
+/// Write a comment line, used as keep-alive, in one write.
 pub fn writeComment(writer: *Io.Writer, text: []const u8) Io.Writer.Error!void {
-    try writer.writeAll(": ");
-    try writer.writeAll(text);
-    try writer.writeAll("\n\n");
+    var parts: [3][]const u8 = .{ ": ", text, "\n\n" };
+    try writer.writeVecAll(&parts);
 }
 
 pub const Event = struct {

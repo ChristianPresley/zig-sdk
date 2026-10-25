@@ -1,6 +1,7 @@
-//! The TCP socket options that `std.Io.net` does not expose. The gRPC server and client
-//! disable the Nagle algorithm on each connection. The server writes a response in three
-//! parts: the response headers, the data and the trailers. Without the option, the Nagle
+//! The TCP socket options that `std.Io.net` does not expose. The gRPC server, the gRPC client
+//! and the Streamable HTTP server disable the Nagle algorithm on each connection. The gRPC
+//! server writes a response in three parts: the response headers, the data and the trailers.
+//! An SSE response writes each event when it is ready. Without the option, the Nagle
 //! algorithm holds the second and the third part until the client acknowledges the first.
 //! On Linux, each call then took about 40 ms on a loopback connection.
 //!
@@ -14,7 +15,7 @@ const posix = std.posix;
 const windows = std.os.windows;
 const ws2_32 = windows.ws2_32;
 
-const log = std.log.scoped(.mcp_grpc);
+const log = std.log.scoped(.mcp_transport);
 
 pub const Error = error{OptionRejected} || Io.Cancelable;
 
@@ -27,7 +28,7 @@ const tcp_nodelay: u32 = switch (builtin.os.tag) {
 
 /// Disable the Nagle algorithm on `socket`, a connected TCP socket: set `TCP_NODELAY`. A
 /// failure gives `error.OptionRejected` after a message at debug level in the scope
-/// `mcp_grpc`. On Windows, a cancel of the task gives `error.Canceled`.
+/// `mcp_transport`. On Windows, a cancel of the task gives `error.Canceled`.
 pub fn setNoDelay(io: Io, socket: Io.net.Socket) Error!void {
     var value: u32 = 1;
     return control(io, socket, .set, &value);
@@ -93,7 +94,7 @@ fn control(io: Io, socket: Io.net.Socket, mode: Mode, value: *u32) Error!void {
 
 test "TCP_NODELAY is off on a new socket and on after setNoDelay" {
     const io = std.testing.io;
-    const loopback = @import("mcp").util.loopback;
+    const loopback = @import("../util/loopback.zig");
     const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try loopback.listen(io, address, .{});
     defer server.deinit(io);

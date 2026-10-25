@@ -26,6 +26,7 @@ const McpServer = @import("../server/Server.zig");
 const log = std.log.scoped(.mcp_http);
 const wake = @import("../util/wake.zig");
 const park = @import("park.zig");
+const socket_opts = @import("socket_opts.zig");
 
 pub const ResponseMode = enum { auto, sse, json };
 
@@ -172,6 +173,11 @@ pub const Server = struct {
                 stream.close(self.io);
                 break;
             }
+            // Without `TCP_NODELAY`, the Nagle algorithm holds each SSE event after the first,
+            // and the end of the stream, until the client acknowledges the data before it. That
+            // costs one round trip for each part, or the delayed acknowledgement of the client
+            // (40 ms on Linux). A failure costs latency only.
+            socket_opts.setNoDelay(self.io, stream.socket) catch {};
             if (!self.tryTakePermit()) {
                 // At `max_connections`, the parker closes the oldest idle connection. Thus a
                 // client that opens a new pool while its old pool stays open does not wait
@@ -312,6 +318,7 @@ pub const Server = struct {
         var events: [256]park.Event = undefined;
         while (true) {
             p.lock.lockUncancelable(io);
+            p.freeClosedLocked(self);
             if (self.closing.load(.acquire)) p.closeAllLocked(self);
             const now = nowNanoseconds(io);
             p.expireLocked(self, now);
@@ -568,6 +575,18 @@ const Connection = struct {
         return false;
     }
 
+    /// On a POSIX system, wait at most `park_linger_ms` for bytes of the next request. True
+    /// when bytes arrived. A park and the new task after it cost two wakes of other threads.
+    /// On Windows the function returns false at once: the parker there costs no wake.
+    fn lingerForNext(conn: *Connection) bool {
+        if (park.is_windows) return false;
+        const posix = std.posix;
+        var fds = [_]posix.pollfd{.{ .fd = conn.stream.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
+        const rc = posix.system.poll(&fds, fds.len, park_linger_ms);
+        if (posix.errno(rc) != .SUCCESS or rc == 0) return false;
+        return fds[0].revents & posix.POLL.IN != 0;
+    }
+
     fn timedOut(conn: *Connection) bool {
         return conn.deadline.load(.acquire) == expired;
     }
@@ -685,8 +704,12 @@ const Connection = struct {
             if (timed_out) conn.sendTimeout(out);
             const reuse = keep_alive and request.head.keep_alive and !timed_out;
             if (conn.use_poll) {
+                const idle = in.bufferedLen() == 0;
+                // A client under load sends its next request at once. Then the task reads
+                // it, and the connection does not go to the parker and back to a new task.
+                if (reuse and idle and conn.lingerForNext()) continue;
                 // An idle plaintext connection goes to the parker and holds no task.
-                switch (self.parker.afterRequest(self, conn, reuse, in.bufferedLen() == 0)) {
+                switch (self.parker.afterRequest(self, conn, reuse, idle)) {
                     .parked => return true,
                     .close => return false,
                     .read_next => continue,
@@ -697,6 +720,22 @@ const Connection = struct {
         return false;
     }
 };
+
+const Peek = enum { bytes, closed, nothing };
+
+/// Look at the socket without a wait (POSIX). The bytes stay in the socket. `closed`: the
+/// peer closed or reset the connection.
+fn peekSocket(handle: Io.net.Socket.Handle) Peek {
+    if (park.is_windows) unreachable;
+    const posix = std.posix;
+    var byte: [1]u8 = undefined;
+    const rc = posix.system.recvfrom(handle, &byte, 1, posix.MSG.PEEK | posix.MSG.DONTWAIT, null, null);
+    return switch (posix.errno(rc)) {
+        .SUCCESS => if (rc == 0) .closed else .bytes,
+        .AGAIN, .INTR => .nothing,
+        else => .closed,
+    };
+}
 
 /// The awake time in nanoseconds `limit` from now, or `unlimited` for a zero limit.
 fn deadlineFrom(io: Io, limit: Io.Duration) i64 {
@@ -722,6 +761,9 @@ const Parker = struct {
     /// The connections whose socket this side closed while a poll was pending (Windows). The
     /// completion of the poll frees them.
     closing_count: usize = 0,
+    /// On POSIX systems: the connections whose socket this side closed while the parker
+    /// watched it. The parker frees them before its next wait.
+    closed: List = .{},
     /// The connections the parker owns: parked, in `ready`, or with a closed socket. The
     /// supervisor ends after the parker gave up the last one.
     held: std.atomic.Value(usize) = .init(0),
@@ -804,11 +846,9 @@ const Parker = struct {
     /// read after the handler. False when the parker cannot watch the socket now. The task
     /// then reads the socket itself.
     fn watchHandler(p: *Parker, self: *Server, conn: *Connection, token: *Transport.CancelToken) bool {
-        // The parker watches the socket during a handler only on Windows, where `AFD_POLL`
-        // tells a disconnect from bytes. On a POSIX system `poll` cannot tell them apart
-        // without a read, so the task of the connection reads the socket as the base does.
-        // Then no other task touches the socket of a connection the parker watches.
-        if (!park.is_windows) return false;
+        // On Windows `AFD_POLL` tells a disconnect from bytes. On a POSIX system `poll` gives
+        // only "readable", and the parker peeks at one byte (`MSG_PEEK`) to tell them apart.
+        // The peek does not take bytes from the socket.
         p.lock.lockUncancelable(self.io);
         defer p.lock.unlock(self.io);
         const poller = &(p.poller orelse return false);
@@ -827,6 +867,13 @@ const Parker = struct {
         p.watching.push(conn);
         if (!park.is_windows) poller.wake();
         return true;
+    }
+
+    /// The handler of `conn` ended. A disconnect from now on cancels no request.
+    fn forgetToken(p: *Parker, self: *Server, conn: *Connection) void {
+        p.lock.lockUncancelable(self.io);
+        defer p.lock.unlock(self.io);
+        conn.cancel_token = null;
     }
 
     const After = enum {
@@ -916,13 +963,27 @@ const Parker = struct {
     /// the poll, and the completion frees the connection. A cancel of the poll would make
     /// the kernel walk every pending poll of the helper handle. That is slow with many
     /// parked connections. On POSIX systems the parker frees the connection in its next
-    /// loop.
+    /// loop, after the `poll` that can still have the socket returned.
     fn closeWithPollLocked(p: *Parker, self: *Server, conn: *Connection) void {
         conn.stream.close(self.io);
         conn.closed = true;
         conn.poll_phase = .closing;
         conn.state.store(.parked_closing, .release);
         p.closing_count += 1;
+        if (!park.is_windows) {
+            p.closed.push(conn);
+            p.wakeTask();
+        }
+    }
+
+    /// Free the connections that `closeWithPollLocked` closed (POSIX). The parker calls it
+    /// between two waits: no `poll` has their slots then.
+    fn freeClosedLocked(p: *Parker, self: *Server) void {
+        while (p.closed.pop()) |conn| {
+            conn.poll_phase = .none;
+            p.closing_count -= 1;
+            p.finishLocked(self, conn);
+        }
     }
 
     /// Start the worker task of `conn`, which then has the state `running` and is in
@@ -987,6 +1048,8 @@ const Parker = struct {
         const conn: *Connection = @alignCast(@fieldParentPtr("slot", ev.slot));
         switch (conn.poll_phase) {
             .closing => {
+                // On POSIX systems `freeClosedLocked` frees the connection after this wait.
+                if (!park.is_windows) return;
                 conn.poll_phase = .none;
                 p.closing_count -= 1;
                 p.finishLocked(self, conn);
@@ -1015,11 +1078,23 @@ const Parker = struct {
                 }
             },
             .handler => {
-                if (ev.readable or ev.hangup) {
+                var readable = ev.readable;
+                var hangup = ev.hangup;
+                // `poll` gives "readable" for bytes and for the close by the peer. A peek
+                // tells them apart and leaves the bytes for the task of the connection.
+                if (!park.is_windows and readable and !hangup) switch (peekSocket(conn.stream.socket.handle)) {
+                    .bytes => {},
+                    .closed => {
+                        readable = false;
+                        hangup = true;
+                    },
+                    .nothing => readable = false,
+                };
+                if (readable or hangup) {
                     conn.poll_phase = .none;
                     p.watching.remove(conn);
-                    if (ev.readable) conn.data_seen = true;
-                    if (ev.hangup) {
+                    if (readable) conn.data_seen = true;
+                    if (hangup) {
                         conn.hangup_seen = true;
                         if (conn.cancel_token) |token| {
                             log.debug("the client of a request disconnected", .{});
@@ -1316,19 +1391,22 @@ fn handleRpcRequest(conn: *Connection, request: *http.Server.Request, socket: *I
         .force_sse = self.options.response_mode == .sse,
     };
     var dispatch: Dispatch = .{ .conn = conn, .exchange = &exchange, .socket = socket, .req = req, .principal = principal, .arena = arena };
-    // The handler runs in a task of its own. Meanwhile this task reads the socket: a
-    // disconnect of the client cancels the request, also while the handler does not write.
+    // A disconnect of the client cancels the request, also while the handler does not write.
+    // For a plaintext connection, the poll of the parker watches the socket, and the handler
+    // runs in this task. A cancel of this task (a time limit or the shutdown) then cancels
+    // the handler. Each other task would cost a thread wake and a cancel per request.
+    if (conn.use_poll and self.parker.watchHandler(self, conn, &token)) {
+        // `token` is in this frame. The parker must not cancel it after the return.
+        defer self.parker.forgetToken(self, conn);
+        dispatch.run();
+        return exchange.reusable and !token.isCancelled() and request.head.keep_alive;
+    }
+    // Otherwise (TLS) the handler runs in a task of its own. Meanwhile a watch task reads the
+    // socket, and the task of the connection cancels it when the handler ends.
     var handler: ?Io.Future(void) = self.io.concurrent(Dispatch.run, .{&dispatch}) catch null;
     if (handler) |*h| {
-        // A disconnect by the peer cancels the request while the handler runs. On Windows
-        // the parker's poll watches the socket with no task. Otherwise a watch task reads
-        // the socket, and the task of the connection cancels it when the handler ends. Thus
-        // the task of the connection does not block in a read, and the connection can park.
-        var watcher: ?Io.Future(void) = null;
-        if (!(conn.use_poll and self.parker.watchHandler(self, conn, &token))) {
-            watcher = self.io.concurrent(Connection.watch, .{ conn, socket, &dispatch }) catch null;
-            if (watcher == null) conn.watch(socket, &dispatch);
-        }
+        var watcher: ?Io.Future(void) = self.io.concurrent(Connection.watch, .{ conn, socket, &dispatch }) catch null;
+        if (watcher == null) conn.watch(socket, &dispatch);
         if (conn.timedOut()) {
             // A time limit or the shutdown canceled this task. The handler gets the cancel.
             h.cancel(self.io);
@@ -1350,6 +1428,9 @@ fn handleRpcRequest(conn: *Connection, request: *http.Server.Request, socket: *I
 
 /// The cancellation reason of a request whose client closed the connection.
 pub const disconnect_reason = "client disconnected";
+
+/// The time that a connection waits for its next request before it goes to the parker.
+const park_linger_ms = 2;
 
 /// The part of a request that runs in a task of its own: the handler and the end of the
 /// response. Meanwhile the task of the connection reads the socket.
@@ -1488,8 +1569,9 @@ fn exchangeFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendErro
     self.done = true;
     if (self.body_writer != null or self.force_sse or self.long_lived) {
         try self.startSse();
-        try self.writeSse(frame);
+        // The last event and the end of the chunked body go out in one write.
         const bw = &self.body_writer.?;
+        sse.writeEvent(&bw.writer, frame) catch return error.WriteFailed;
         bw.end() catch return error.WriteFailed;
         return;
     }
@@ -1497,7 +1579,10 @@ fn exchangeFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendErro
     // limit error also gets `Retry-After`.
     var status: http.Status = .ok;
     var retry_after: ?u64 = null;
-    if (json.parseTree(self.arena, frame)) |tree| {
+    // Only an error response has a status other than 200. A frame without the `"error":` key
+    // is a result: it needs no parse. A result that has the text gets the parse, as before.
+    const maybe_error = std.mem.find(u8, frame, "\"error\":") != null;
+    if (maybe_error) if (json.parseTree(self.arena, frame)) |tree| {
         if (tree == .object) {
             if (tree.object.get("error")) |e| {
                 if (e == .object) {
@@ -1508,7 +1593,7 @@ fn exchangeFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendErro
                 }
             }
         }
-    } else |_| {}
+    } else |_| {};
     var headers: [2]http.Header = .{ json_headers[0], undefined };
     var count: usize = 1;
     var seconds_buf: [20]u8 = undefined;

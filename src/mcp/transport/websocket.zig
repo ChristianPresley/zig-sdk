@@ -64,6 +64,7 @@ const types = @import("../protocol/types.zig");
 const Limits = @import("../Limits.zig");
 const McpServer = @import("../server/Server.zig");
 const wake = @import("../util/wake.zig");
+const socket_opts = @import("socket_opts.zig");
 
 const log = std.log.scoped(.mcp_websocket);
 
@@ -201,6 +202,9 @@ pub const Server = struct {
                 stream.close(self.io);
                 break;
             }
+            // Without `TCP_NODELAY`, the Nagle algorithm holds a small frame after the first
+            // until the client acknowledges the data before it. A failure costs latency only.
+            socket_opts.setNoDelay(self.io, stream.socket) catch {};
             if (!self.startConnection(stream)) {
                 var s = stream;
                 s.close(self.io);

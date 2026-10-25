@@ -24,3 +24,5 @@ pub const tool_headers = @import("transport/tool_headers.zig");
 /// HTTP proxies of the client connections: the `CONNECT` tunnel, the proxy variables of the
 /// environment and the `NO_PROXY` match.
 pub const proxy = @import("transport/proxy.zig");
+/// The TCP socket options that `std.Io.net` does not expose: `TCP_NODELAY`.
+pub const socket_opts = @import("transport/socket_opts.zig");
