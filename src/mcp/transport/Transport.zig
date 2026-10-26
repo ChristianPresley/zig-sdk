@@ -96,6 +96,12 @@ pub const Responder = struct {
         finish: *const fn (ptr: *anyopaque, io: Io, frame: []const u8) SendError!void,
         /// Close the request stream without a response (after a cancellation).
         abort: *const fn (ptr: *anyopaque, io: Io) void,
+        /// Optional. Send the final result as a `Value` tree, in place of a response frame.
+        /// The tree is the same as the `result` of the frame that `finish` gets. The tree and
+        /// its strings are in the arena of the request. A responder that needs a tree, for
+        /// example the typed gRPC binding, then does not parse the frame. The server engine
+        /// uses `finish` for an error, and when it cannot make the tree.
+        finishValue: ?*const fn (ptr: *anyopaque, io: Io, result: std.json.Value) SendError!void = null,
     };
 
     pub fn notify(self: Responder, io: Io, frame: []const u8) SendError!void {

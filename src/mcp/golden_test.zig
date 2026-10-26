@@ -139,3 +139,54 @@ test "golden fixtures round trip" {
     try std.testing.expect(checked > 100);
     try std.testing.expectEqual(0, failures);
 }
+
+/// The typed value of a data or result fixture, or null for the other roles.
+fn typedTree(arena: std.mem.Allocator, comptime entry: export_map.Entry, text: []const u8) !?entry.T {
+    const tree = try json.parseTree(arena, text);
+    return switch (entry.role) {
+        .data => try json.parseValue(entry.T, arena, tree),
+        .response => try json.parseValue(entry.T, arena, (try message.Message.fromValue(arena, tree)).response.result),
+        else => null,
+    };
+}
+
+test "toValue gives the tree of the serialized text for every fixture type" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var root = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{ .iterate = true });
+    defer root.close(io);
+    var checked: usize = 0;
+    var it = root.iterate();
+    while (try it.next(io)) |type_entry| {
+        if (type_entry.kind != .directory) continue;
+        const index = export_map.find(type_entry.name) orelse continue;
+        var dir = try root.openDir(io, type_entry.name, .{ .iterate = true });
+        defer dir.close(io);
+        var files = dir.iterate();
+        while (try files.next(io)) |file| {
+            if (file.kind != .file or !std.mem.endsWith(u8, file.name, ".json")) continue;
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const text = try dir.readFileAlloc(io, file.name, arena, .limited(1 << 20));
+            switch (index) {
+                inline 0...export_map.entries.len - 1 => |i| {
+                    const entry = export_map.entries[i];
+                    // A type without data, for example a notification without params.
+                    if (entry.T == void) continue;
+                    if (try typedTree(arena, entry, text)) |typed| {
+                        const expected = try json.parseTree(arena, try json.writeAlloc(arena, typed));
+                        const actual = try json.toValue(arena, typed, json.max_message_depth);
+                        json.expectSameTree(expected, actual) catch |e| {
+                            std.debug.print("toValue: {s}/{s}\n", .{ type_entry.name, file.name });
+                            return e;
+                        };
+                        checked += 1;
+                    }
+                },
+                else => unreachable,
+            }
+        }
+    }
+    try std.testing.expect(checked > 50);
+}

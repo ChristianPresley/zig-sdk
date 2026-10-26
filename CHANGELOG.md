@@ -18,6 +18,8 @@ This file records all notable changes to this project. The format follows Keep a
 - On Windows the stdio server now uses 4.4 µs and makes 201,252 calls each second, before 12.0 µs and 156,542. A sequential call on Linux now uses 40.5 µs of server CPU, before 80.0 µs. Each new thread of `std.Io.Threaded` on Linux also touches the 256 KiB signal stack of std (`std.Options.signal_stack_size`). Thus at 64 calls in flight on Linux, the private memory of the server is now 0.9 MiB, before 74.5 MiB.
 - `Limits.http.shards`: the count of shard tasks of the plaintext Streamable HTTP server. Zero means one shard for each 8 processors, at least 1 and at most 4. The conformance server has `--http-shards N`.
 - `http.Server.stats`: the open connections, the connections that the shards hold, and the worker tasks that run now.
+- `Transport.Responder.VTable.finishValue`: an optional function that gets the final result as a `Value` tree, in place of a response frame. The server engine uses it for a result when the responder has it, and uses `finish` for an error.
+- `json.toValue` and `json.value_writer.ValueWriter`: a writer with the API of `std.json.Stringify` that builds a `Value` tree. The tree is the same as the parse of the text that `json.write` gives. A value that the text path refuses also fails here.
 
 ### Changed
 
@@ -90,6 +92,8 @@ This file records all notable changes to this project. The format follows Keep a
 - The resource benchmark of the VS Code client used ReleaseSafe, 16 cores and 4 interleaved rounds. At 64 calls in flight on Linux, a stdio call now uses 3.4 µs of server CPU, and the server makes 245,000 calls each second. Before, a call used 4.3 µs, and the server made 198,000. On Windows a stdio call uses 2.9 µs, and the server makes 273,000 calls each second, before 3.7 µs and 251,000. A gRPC call at 64 in flight on Linux uses 7.2 to 7.3 µs, before 7.9 µs. HTTP calls and sequential calls do not change.
 - The pollers of the plaintext HTTP shards and of the parker keep their array of events in the poller. The Streamable HTTP server reads a request body without a buffer of its own. A safe build fills an `undefined` array on the stack on each call, and these arrays were 3 KiB to 8 KiB. On Linux, the time goes to the spin of the shard, thus the CPU for each call does not change.
 - A server in ReleaseFast uses about a quarter less CPU for each call than in ReleaseSafe. In the same benchmark on Linux, a stdio call at 64 calls in flight uses 3.1 µs and a gRPC call uses 5.8 µs. An HTTP call does not change.
+- The typed gRPC binding now gets the result of a call from the server engine as a tree. Before, the engine serialized the result to JSON text, and the binding parsed the text again before the protobuf encode. A list call keeps the text, because the key of the typed result cache is that text. When the tree fails, the engine sends the text as before. The typed responses do not change, byte for byte. A test compares the tree with the parse of the text for each type of the schema examples.
+- The resource benchmark of the VS Code client used ReleaseSafe, 16 cores and interleaved rounds. A typed `CallTool` at 64 calls in flight on Linux now uses 6.5 µs of server CPU for each call. Before, it used 8.1 µs. On Windows it uses 5.8 µs, before 6.4 µs. Tunnel calls and sequential calls do not change.
 
 ### Fixed
 

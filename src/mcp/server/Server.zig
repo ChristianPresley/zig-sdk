@@ -805,6 +805,19 @@ fn sendError(self: *Server, ctx: *RequestContext, err: errors.RpcError) void {
 
 fn finishResult(self: *Server, ctx: *RequestContext, result: anytype) RequestContext.Error!void {
     const stamped = self.stamp(result);
+    if (ctx.responder.vtable.finishValue) |finishValue| {
+        // The result is a member of the response object: one level less than a message.
+        if (json.toValue(ctx.arena, stamped, json.max_message_depth - 1)) |tree| {
+            return finishValue(ctx.responder.ptr, ctx.io, tree) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Canceled,
+            };
+        } else |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // The response frame gives the same answer as before, for example an error.
+            else => {},
+        }
+    }
     var aw: Io.Writer.Allocating = .init(ctx.arena);
     message.writeResponse(&aw.writer, ctx.id, stamped) catch return error.OutOfMemory;
     return finishFrame(ctx, aw.written());

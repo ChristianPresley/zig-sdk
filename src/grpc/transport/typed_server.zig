@@ -159,8 +159,9 @@ pub fn execute(self: *grpc_server.Server, stream: *Stream, arena: Allocator, p: 
             },
         };
         var cx: convert.Context = .{ .arena = arena, .limits = self.options.typed_limits };
-        // The JSON text is a good estimate of the size of the message.
-        try out.ensureTotalCapacity(gpa, lpm.prefix_len + if (first.frame) |f| f.len else 0);
+        // The JSON text is a good estimate of the size of the message. A result that came as a
+        // tree has no text: start with a small buffer.
+        try out.ensureTotalCapacity(gpa, lpm.prefix_len + if (first.frame) |f| f.len else 512);
         _ = try out.addManyAsSlice(gpa, lpm.prefix_len);
         convert.encodeResult(&cx, gpa, &out, rpc, result) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -290,11 +291,14 @@ fn run(self: *grpc_server.Server, arena: Allocator, rpc: service.Rpc, first: Out
     return .{ .result = merged };
 }
 
-/// The final frame of one engine call.
+/// The final frame or result of one engine call.
 const Ran = struct {
     id: i64,
-    /// Null when the engine canceled the request, or when `hit` has the response.
+    /// Null when the engine canceled the request, when `result` has the result, or when
+    /// `hit` has the response.
     frame: ?[]const u8,
+    /// The result tree that the engine gave without a frame (`Responder.finishValue`).
+    result: ?Value = null,
     /// The encoded response from the cache. The caller releases it.
     hit: ?*ResultCache.Shared = null,
 
@@ -303,8 +307,9 @@ const Ran = struct {
         return resultTextOf(self.frame orelse return null, self.id);
     }
 
-    /// Parse the frame.
+    /// The result tree, or the parse of the frame.
     fn outcome(self: Ran, arena: Allocator) !Outcome {
+        if (self.result) |r| return .{ .result = r };
         const frame = self.frame orelse return .cancelled;
         const msg = jsonrpc.Message.parse(arena, frame) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -329,7 +334,9 @@ fn resultTextOf(frame: []const u8, id: i64) ?[]const u8 {
 }
 
 /// Run one JSON-RPC request through the server engine. With `lookup`, a result that the
-/// cache knows gives `Ran.hit` instead of a frame.
+/// cache knows gives `Ran.hit` instead of a frame. Without `lookup`, the engine gives the
+/// result as a tree when it can (`Ran.result`). The cache needs the JSON text of a list
+/// result as its key, thus a call with `lookup` gets the frame.
 fn runOnce(self: *grpc_server.Server, arena: Allocator, method: []const u8, params: Value, token: *Transport.CancelToken, principal: ?*resource_server.Principal, lookup: ?service.Rpc) !Ran {
     const id = next_id.fetchAdd(1, .monotonic);
     if (token.isCancelled()) return .{ .id = id, .frame = null };
@@ -339,11 +346,11 @@ fn runOnce(self: *grpc_server.Server, arena: Allocator, method: []const u8, para
         .kind = .grpc,
         .arena = arena,
         .message = .{ .request = .{ .id = .{ .integer = id }, .method = method, .params = params } },
-        .responder = .{ .ptr = &capture, .vtable = &capture_vtable },
+        .responder = .{ .ptr = &capture, .vtable = if (lookup == null) &capture_value_vtable else &capture_vtable },
         .cancel = token,
         .context = principal,
     });
-    return .{ .id = id, .frame = capture.frame, .hit = capture.hit };
+    return .{ .id = id, .frame = capture.frame, .result = capture.result, .hit = capture.hit };
 }
 
 /// The encoded response messages of recent list results. The key is the RPC and the JSON
@@ -472,14 +479,27 @@ const Capture = struct {
     arena: Allocator,
     id: i64,
     frame: ?[]const u8 = null,
+    result: ?Value = null,
     lookup: ?struct { cache: *ResultCache, gpa: Allocator, rpc: service.Rpc } = null,
     hit: ?*ResultCache.Shared = null,
+
+    fn done(c: *const Capture) bool {
+        return c.frame != null or c.result != null or c.hit != null;
+    }
 };
 
 const capture_vtable: Transport.Responder.VTable = .{
     .notify = captureNotify,
     .finish = captureFinish,
     .abort = captureAbort,
+};
+
+/// As `capture_vtable`, and the engine can give the result as a tree.
+const capture_value_vtable: Transport.Responder.VTable = .{
+    .notify = captureNotify,
+    .finish = captureFinish,
+    .abort = captureAbort,
+    .finishValue = captureFinishValue,
 };
 
 /// A unary response has no place for a notification related to the request.
@@ -492,12 +512,20 @@ fn captureNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError
 fn captureFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
     _ = io;
     const c: *Capture = @ptrCast(@alignCast(ptr));
-    if (c.frame != null or c.hit != null) return error.Closed;
+    if (c.done()) return error.Closed;
     if (c.lookup) |l| if (resultTextOf(frame, c.id)) |key| {
         c.hit = l.cache.acquire(l.gpa, l.rpc, key);
         if (c.hit != null) return;
     };
     c.frame = try c.arena.dupe(u8, frame);
+}
+
+/// The tree is in the arena of the call, as the frame of `captureFinish`.
+fn captureFinishValue(ptr: *anyopaque, io: Io, result: Value) Transport.SendError!void {
+    _ = io;
+    const c: *Capture = @ptrCast(@alignCast(ptr));
+    if (c.done()) return error.Closed;
+    c.result = result;
 }
 
 fn captureAbort(ptr: *anyopaque, io: Io) void {

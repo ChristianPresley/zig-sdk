@@ -4,6 +4,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 pub const Value = std.json.Value;
 pub const ParseOptions = std.json.ParseOptions;
+pub const value_writer = @import("value_writer.zig");
+/// The `Value` tree of a value as `write` serializes it. See `value_writer.toValue`.
+pub const toValue = value_writer.toValue;
 
 /// Stringify options used for every wire message: minified, optional `null` fields omitted.
 pub const wire_options: std.json.Stringify.Options = .{
@@ -337,9 +340,9 @@ fn stdTree(arena: Allocator, text: []const u8, max_depth: u16) ParseTreeError!Va
     return std.json.parseFromSliceLeaky(Value, arena, text, .{ .allocate = .alloc_always });
 }
 
-/// Fail when the trees are not identical: the same kinds, the same float bits and the same
-/// order of the object members.
-fn expectSameTree(expected: Value, actual: Value) !void {
+/// A test helper. It fails when the trees are not identical. Identical trees have the same
+/// kinds, the same float bits and the same order of the object members.
+pub fn expectSameTree(expected: Value, actual: Value) !void {
     try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
     switch (expected) {
         .null => {},
