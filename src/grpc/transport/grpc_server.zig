@@ -1662,7 +1662,9 @@ fn runsIn(self: *Server, mode: Mode, cost_slot: ?usize) bool {
 fn handleRequest(conn: *Conn, stream: *Stream, arena: Allocator, env: envelope.Headers, deadline: ?Io.Duration, req: jsonrpc.Message.Request, principal: ?*resource_server.Principal, no_wait: bool, cost_slot: ?usize) !?Backlog {
     const self = conn.owner;
     const io = self.io;
-    const annotations = toolHeaders(self, req.params);
+    // Only a tool call has header annotations, as on HTTP. A prompt or a resource can have the
+    // name of a tool, and its request must not get the checks of that tool.
+    const annotations = if (std.mem.eql(u8, req.method, "tools/call")) toolHeaders(self, req.params) else null;
     if (try envelope.verifyAnnotated(arena, env, req.method, req.params, annotations)) |rejection| {
         if (env.protocol_version == null and std.mem.eql(u8, req.method, "initialize")) {
             const err = try errors.unsupportedProtocolVersion(arena, &version.supported_versions, "unknown");

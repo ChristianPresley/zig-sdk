@@ -884,7 +884,9 @@ const Evaluator = struct {
     }
 
     /// Evaluate `node` against `inst`. When `marks` is not null and the instance is valid,
-    /// add the locations that this schema evaluated to `marks`.
+    /// add the locations that this schema evaluated to `marks`. Each keyword that this
+    /// function reads must be in `evaluated_keywords`, else the quick check can accept an
+    /// instance that this function refuses.
     fn eval(self: *Evaluator, node: Value, inst: Value, depth: u16, collect: bool, marks: ?Marks) ValidateError!bool {
         switch (node) {
             .bool => |b| {

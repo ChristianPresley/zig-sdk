@@ -480,6 +480,25 @@ test "grpc: nested header parameters, the safe integer range and one retry after
     try std.testing.expectEqualStrings("0", encoded.grpc_status.?);
 }
 
+test "grpc: a request that is not a tool call does not get the header checks of a tool with its name" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    // A prompts/get with the name of the tool nested_headers and the argument that the tool
+    // mirrors in Mcp-Param-Region, without that header. Before, the server refused it with -32020.
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"prompts/get\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}},\"name\":\"nested_headers\",\"arguments\":{\"target\":{\"region\":\"eu\"}}}}";
+    const headers = [_]Connection.Header{
+        .{ .name = "mcp-protocol-version", .value = "2026-07-28" },
+        .{ .name = "mcp-method", .value = "prompts/get" },
+        .{ .name = "mcp-name", .value = "nested_headers" },
+    };
+    const raw = try rawCall(gpa, io, f.transport.bound_port, grpc_server.call_path, "application/grpc", &headers, body);
+    defer freeRaw(gpa, raw);
+    if (raw.error_code) |code| try std.testing.expect(!std.mem.eql(u8, code, "-32020"));
+}
+
 test "grpc: unknown path, wrong content type and missing metadata" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
