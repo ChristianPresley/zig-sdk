@@ -351,6 +351,8 @@ pub const Server = struct {
                 p.snapshot.clearRetainingCapacity();
                 var it = p.parked.head;
                 while (it) |c| : (it = c.next) p.snapshot.append(self.gpa, &c.slot) catch break;
+                it = p.fresh.head;
+                while (it) |c| : (it = c.next) p.snapshot.append(self.gpa, &c.slot) catch break;
                 it = p.watching.head;
                 while (it) |c| : (it = c.next) p.snapshot.append(self.gpa, &c.slot) catch break;
             }
@@ -368,21 +370,52 @@ pub const Server = struct {
             p.lock.lockUncancelable(io);
             for (events[0..n]) |ev| p.handleEventLocked(self, ev);
             p.lock.unlock(io);
-            var served: usize = 0;
-            while (true) : (served += 1) {
+            while (true) {
                 p.lock.lockUncancelable(io);
-                if (served == max_inline_per_wait) {
-                    // Many requests at once: the rest get worker tasks, which run in parallel.
-                    while (p.candidates.pop()) |c| p.ready.push(c);
-                    p.lock.unlock(io);
-                    break;
-                }
-                const conn = p.candidates.pop();
+                const conn = p.popCandidateLocked();
+                // Many requests at once: inline runners take a part of them, in parallel.
+                const starts = if (conn != null) p.runnerStartsLocked() else 0;
                 p.lock.unlock(io);
-                p.serveInline(self, conn orelse break);
+                for (0..starts) |_| self.group.concurrent(io, inlineRunner, .{self}) catch {
+                    p.lock.lockUncancelable(io);
+                    p.runners -= 1;
+                    p.lock.unlock(io);
+                };
+                p.serveInline(self, conn orelse break, &p.inline_out);
                 look_again = true;
             }
         }
+    }
+
+    /// A task that runs the requests of `Parker.candidates` beside the parker, one after the
+    /// other, as `Parker.serveInline` does. It ends when the list is empty. The parker starts
+    /// at most `Parker.max_runners` of them, one for each `requests_per_runner` requests in the
+    /// list. Before, the parker ran at most 16 requests after one wait, and each other request
+    /// got a task of its own. With 256 busy connections, the thread pool of `std.Io.Threaded`
+    /// then grew to about one thread for each connection.
+    fn inlineRunner(self: *Server) void {
+        const io = self.io;
+        const p = &self.parker;
+        var out: ?Io.Writer.Allocating = null;
+        defer if (out) |*w| w.deinit();
+        while (true) {
+            p.lock.lockUncancelable(io);
+            const conn = p.popCandidateLocked() orelse {
+                p.runners -= 1;
+                p.lock.unlock(io);
+                break;
+            };
+            p.lock.unlock(io);
+            p.serveInline(self, conn, &out);
+            // On POSIX systems the parker polls a copy of the parked set. It takes the
+            // connection that this runner parked again into its next copy at once: a client
+            // sends its next request on it at once. A wake after each 8 requests cost about
+            // 15 % of the calls each second with 256 connections on Linux.
+            if (!park.is_windows) p.wakeTask();
+        }
+        // The parker gives the connections that need a task their task, and watches the
+        // parked ones.
+        p.wakeTask();
     }
 
     fn originAllowed(self: *Server, origin: []const u8) bool {
@@ -489,6 +522,8 @@ const Connection = struct {
     /// True while the parker runs a request of the connection itself (see
     /// `Parker.serveInline`). The time limits then do not apply.
     inline_mode: bool = false,
+    /// The connection is in `Parker.fresh`, not in `Parker.parked`.
+    fresh: bool = false,
     /// `park.Poller.prepareNow` ran for the socket.
     now_ready: bool = false,
     /// The part of a response that the parker could not send without a wait. The task of
@@ -932,8 +967,8 @@ fn inlineRequestLength(self: *Server, data: []const u8) ?usize {
     return head.len;
 }
 
-/// The most requests that the parker runs itself after one wait (see `Parker.serveInline`).
-const max_inline_per_wait = 16;
+/// The count of requests in `Parker.candidates` for each inline runner (see `inlineRunner`).
+const requests_per_runner = 8;
 
 const Peek = enum { bytes, closed, nothing };
 
@@ -968,11 +1003,19 @@ const Parker = struct {
     /// The parked connections in the order of their park time: the head expires first.
     parked: List = .{},
     parked_count: usize = 0,
+    /// New plaintext connections that wait for their first request, in the order of their
+    /// accept: the head expires first (`limits.http.head_timeout`).
+    fresh: List = .{},
     /// The connections that wait for a worker task, in the order of arrival.
     ready: List = .{},
-    /// The parked connections with bytes that the parker looks at after its wait (see
-    /// `serveInline`). The list is empty at the start of each loop of the parker.
+    /// The parked connections with bytes that the parker and the inline runners serve after a
+    /// wait of the parker (see `serveInline`). The parker empties the list before its next
+    /// wait, and the runners can take a part of it.
     candidates: List = .{},
+    candidates_count: usize = 0,
+    /// The inline runners that run now (see `Server.inlineRunner`), and their maximum.
+    runners: u32 = 0,
+    max_runners: u32 = 1,
     /// The response of a request that the parker runs itself. The parker keeps its memory.
     inline_out: ?Io.Writer.Allocating = null,
     /// The connections whose socket the parker watches while a handler runs.
@@ -1026,6 +1069,7 @@ const Parker = struct {
     fn start(p: *Parker, gpa: Allocator, cap: u32) !void {
         p.poller = try park.Poller.init(gpa);
         p.cap = @max(cap, 1);
+        p.max_runners = @intCast(std.math.clamp((std.Thread.getCpuCount() catch 4) / 2, 1, 8));
     }
 
     fn stop(p: *Parker) void {
@@ -1044,14 +1088,35 @@ const Parker = struct {
 
     const InlineEnd = enum { parked, close, task };
 
+    fn pushCandidateLocked(p: *Parker, conn: *Connection) void {
+        p.candidates.push(conn);
+        p.candidates_count += 1;
+    }
+
+    fn popCandidateLocked(p: *Parker) ?*Connection {
+        const conn = p.candidates.pop() orelse return null;
+        p.candidates_count -= 1;
+        return conn;
+    }
+
+    /// The count of inline runners to start now for the requests in `candidates`. The
+    /// caller starts them, and gives a run back when a start fails.
+    fn runnerStartsLocked(p: *Parker) u32 {
+        const want: u32 = @intCast(@min(p.max_runners, p.candidates_count / requests_per_runner));
+        if (want <= p.runners) return 0;
+        const starts = want - p.runners;
+        p.runners += starts;
+        return starts;
+    }
+
     /// Run the request of a ready connection in the task of the parker, without a new task.
     /// This happens only when the socket holds exactly one complete request (one look with
     /// `park.Poller.peekNow`, without a wait) and `McpServer.isQuickMethod` accepts its `Mcp-Method` and
     /// `Mcp-Name` headers. The response goes to a buffer, and then to the socket without a
     /// wait. The connection task sends a rest that does not fit. Each other request gets a
     /// task, as before. A new task and its thread wake cost more than a quick handler.
-    fn serveInline(p: *Parker, self: *Server, conn: *Connection) void {
-        const end = p.runInline(self, conn);
+    fn serveInline(p: *Parker, self: *Server, conn: *Connection, out: *?Io.Writer.Allocating) void {
+        const end = p.runInline(self, conn, out);
         const io = self.io;
         p.lock.lockUncancelable(io);
         defer p.lock.unlock(io);
@@ -1068,6 +1133,8 @@ const Parker = struct {
                 conn.state.store(.parked, .release);
                 p.parked.push(conn);
                 p.parked_count += 1;
+                // A new connection waits for a permit: the parker can close this one now.
+                if (p.evict.load(.acquire)) p.wakeTask();
             },
             .close => p.finishLocked(self, conn),
             .task => {
@@ -1077,7 +1144,7 @@ const Parker = struct {
         }
     }
 
-    fn runInline(p: *Parker, self: *Server, conn: *Connection) InlineEnd {
+    fn runInline(p: *Parker, self: *Server, conn: *Connection, out: *?Io.Writer.Allocating) InlineEnd {
         // At the shutdown, the connection goes the usual way.
         if (self.closing.load(.acquire)) return .task;
         const poller = &p.poller.?;
@@ -1097,14 +1164,14 @@ const Parker = struct {
         if (total != rc) return .task;
 
         // From here on the bytes leave the socket. An error closes the connection.
-        const aw = if (p.inline_out) |*w| w else blk: {
-            p.inline_out = Io.Writer.Allocating.initCapacity(self.gpa, 16 * 1024) catch return .task;
-            break :blk &p.inline_out.?;
+        const aw = if (out.*) |*w| w else blk: {
+            out.* = Io.Writer.Allocating.initCapacity(self.gpa, 16 * 1024) catch return .task;
+            break :blk &out.*.?;
         };
         aw.clearRetainingCapacity();
         defer if (aw.writer.buffer.len > 1024 * 1024) {
             aw.deinit();
-            p.inline_out = null;
+            out.* = null;
         };
         var reader = conn.stream.reader(self.io, bufs.read[0..total]);
         conn.inline_mode = true;
@@ -1147,6 +1214,24 @@ const Parker = struct {
         const io = self.io;
         p.lock.lockUncancelable(io);
         defer p.lock.unlock(io);
+        // A plaintext connection waits for its first request in the parker, as a parked one.
+        // Thus a quick first request runs on the parker too, and many connections that open
+        // at once do not start a task each.
+        if (p.inlineEnabled(self)) if (p.poller) |*poller| {
+            if (poller.arm(&conn.slot, conn.stream.socket.handle)) |_| {
+                conn.poll_phase = .idle;
+                conn.fresh = true;
+                conn.park_deadline = deadlineFrom(io, self.limits.http.head_timeout);
+                conn.state.store(.parked, .release);
+                p.fresh.push(conn);
+                _ = p.held.fetchAdd(1, .acq_rel);
+                // On POSIX systems the parker polls a copy of the set: it takes a new copy. On
+                // Windows the poll of the socket runs, but the wait of the parker can end later
+                // than `head_timeout` of the first fresh connection: it wakes for that time.
+                if (!park.is_windows or p.fresh.head == conn) poller.wake();
+                return true;
+            } else |_| {}
+        };
         if (p.active < p.cap) return p.spawnLocked(self, conn, false);
         conn.park_deadline = deadlineFrom(io, self.limits.http.head_timeout);
         conn.state.store(.queued, .release);
@@ -1395,11 +1480,21 @@ const Parker = struct {
         self.supervisor_wake.set(io);
     }
 
+    /// Remove a parked connection from its list.
+    fn unparkLocked(p: *Parker, conn: *Connection) void {
+        if (conn.fresh) {
+            p.fresh.remove(conn);
+            conn.fresh = false;
+        } else {
+            p.parked.remove(conn);
+            p.parked_count -= 1;
+        }
+    }
+
     /// Close a parked connection. On Windows the poll of the socket is pending: close the
     /// socket, and free the connection when the completion arrives.
     fn closeParkedLocked(p: *Parker, self: *Server, conn: *Connection) void {
-        p.parked.remove(conn);
-        p.parked_count -= 1;
+        p.unparkLocked(conn);
         if (park.is_windows) {
             conn.state.store(.parked_closing, .release);
             p.closeWithPollLocked(self, conn);
@@ -1426,24 +1521,21 @@ const Parker = struct {
             },
             .idle => {
                 if (ev.readable) {
-                    p.parked.remove(conn);
-                    p.parked_count -= 1;
+                    p.unparkLocked(conn);
                     conn.poll_phase = .none;
                     conn.park_deadline = deadlineFrom(self.io, self.limits.http.head_timeout);
                     conn.state.store(.queued, .release);
                     // The parker looks at the bytes after this wait, and runs a quick request
                     // itself.
-                    if (p.inlineEnabled(self)) p.candidates.push(conn) else p.ready.push(conn);
+                    if (p.inlineEnabled(self)) p.pushCandidateLocked(conn) else p.ready.push(conn);
                 } else if (ev.hangup) {
-                    p.parked.remove(conn);
-                    p.parked_count -= 1;
+                    p.unparkLocked(conn);
                     conn.poll_phase = .none;
                     p.finishLocked(self, conn);
                 } else {
                     // The wait ended for another reason. Watch the socket again.
                     p.poller.?.arm(&conn.slot, conn.stream.socket.handle) catch {
-                        p.parked.remove(conn);
-                        p.parked_count -= 1;
+                        p.unparkLocked(conn);
                         conn.poll_phase = .none;
                         p.finishLocked(self, conn);
                     };
@@ -1491,6 +1583,18 @@ const Parker = struct {
             if (c.park_deadline > now) break;
             p.closeParkedLocked(self, c);
         }
+        while (p.fresh.head) |c| {
+            if (c.park_deadline > now) break;
+            // A connection without a request in `head_timeout` gets 408, as from a task. The
+            // response is small, and the parker does not wait for the send.
+            const poller = &p.poller.?;
+            const fd = c.stream.socket.handle;
+            if (c.now_ready or poller.prepareNow(fd)) {
+                c.now_ready = true;
+                _ = poller.sendNow(fd, request_timeout_response);
+            }
+            p.closeParkedLocked(self, c);
+        }
         while (p.ready.head) |c| {
             if (c.park_deadline > now) break;
             p.ready.remove(c);
@@ -1511,6 +1615,7 @@ const Parker = struct {
     fn nextDeadlineLocked(p: *Parker) i64 {
         var next: i64 = Connection.unlimited;
         if (p.parked.head) |c| next = @min(next, c.park_deadline);
+        if (p.fresh.head) |c| next = @min(next, c.park_deadline);
         if (p.ready.head) |c| next = @min(next, c.park_deadline);
         return next;
     }
@@ -1518,6 +1623,7 @@ const Parker = struct {
     /// At the shutdown: close every parked and queued connection at once.
     fn closeAllLocked(p: *Parker, self: *Server) void {
         while (p.parked.head) |c| p.closeParkedLocked(self, c);
+        while (p.fresh.head) |c| p.closeParkedLocked(self, c);
         while (p.ready.pop()) |c| p.finishLocked(self, c);
     }
 };

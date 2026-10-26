@@ -361,11 +361,16 @@ test "http limits: a request head that does not arrive in head_timeout gets 408"
         try std.testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 408 "));
         try std.testing.expectEqual(1, countResponses(reply));
     }
-    // A client that sends no byte also gets 408 after the time limit.
+    // A client that sends no byte also gets 408 after the time limit, also when the server was
+    // idle before: the time limit of the new connection wakes the parker (`idle_timeout` is
+    // 60 s here, and the 408 must not wait for it).
     {
+        const io = std.testing.io;
+        const start = std.Io.Clock.awake.now(io);
         const raw = try Raw.open(gpa, f.transport.bound_port);
         defer raw.close(gpa);
         try std.testing.expect(std.mem.startsWith(u8, try raw.readToEnd(arena), "HTTP/1.1 408 "));
+        try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 5_000);
     }
     // A complete request in time gets its response.
     const reply = try f.post(arena, discover_body, &(std_headers ++ [_]http.Header{.{ .name = "mcp-method", .value = "server/discover" }}));
@@ -687,6 +692,31 @@ test "http parker: a quick request head with a huge Content-Length gets 413, and
     defer other.close(gpa);
     try other.send(try discoverRequest(arena));
     try std.testing.expect(std.mem.startsWith(u8, try other.readResponse(arena), "HTTP/1.1 200 "));
+}
+
+test "http parker: many connections with quick requests at once all get their responses, without a task each" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const request_bytes = try discoverRequest(arena);
+
+    const n = 64;
+    var raws: [n]*Raw = undefined;
+    var opened: usize = 0;
+    defer for (raws[0..opened]) |r| r.close(gpa);
+    while (opened < n) : (opened += 1) raws[opened] = try Raw.open(gpa, f.transport.bound_port);
+    // The new connections wait in the parker for their first request.
+    try waitHeld(&f.transport, n);
+    for (0..3) |_| {
+        // All requests at once: the parker and its inline runners run them.
+        for (raws) |r| try r.send(request_bytes);
+        for (raws) |r| try std.testing.expect(std.mem.startsWith(u8, try r.readResponse(arena), "HTTP/1.1 200 "));
+        try waitHeld(&f.transport, n);
+    }
 }
 
 test "http parker: the cap of the worker tasks queues connections and serves them in turn" {

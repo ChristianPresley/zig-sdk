@@ -48,7 +48,6 @@ const OverlappedEntry = extern struct { key: usize, overlapped: ?*anyopaque, int
 extern "kernel32" fn CreateIoCompletionPort(file: windows.HANDLE, port: ?windows.HANDLE, key: usize, threads: u32) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn GetQueuedCompletionStatusEx(port: windows.HANDLE, entries: [*]OverlappedEntry, count: u32, removed: *u32, timeout_ms: u32, alertable: c_int) callconv(.winapi) c_int;
 extern "kernel32" fn PostQueuedCompletionStatus(port: windows.HANDLE, bytes: u32, key: usize, overlapped: ?*anyopaque) callconv(.winapi) c_int;
-extern "kernel32" fn CreateEventW(attributes: ?*anyopaque, manual_reset: c_int, initial_state: c_int, name: ?[*:0]const u16) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn WaitForSingleObject(handle: windows.HANDLE, milliseconds: u32) callconv(.winapi) u32;
 
 /// The result of `Poller.peekNow` and `Poller.sendNow`.
@@ -68,8 +67,6 @@ pub const Poller = struct {
     const Impl = if (is_windows) struct {
         port: windows.HANDLE,
         helper: windows.HANDLE,
-        /// The event of `peekNow` and `sendNow`, for an operation that pends after all.
-        now_event: windows.HANDLE,
     } else struct {
         gpa: std.mem.Allocator,
         wake_read: posix.fd_t,
@@ -102,8 +99,7 @@ pub const Poller = struct {
             }
             errdefer windows.CloseHandle(helper);
             if (CreateIoCompletionPort(helper, port, 1, 0) == null) return error.Unexpected;
-            const now_event = CreateEventW(null, 0, 0, null) orelse return error.SystemResources;
-            return .{ .impl = .{ .port = port, .helper = helper, .now_event = now_event } };
+            return .{ .impl = .{ .port = port, .helper = helper } };
         } else {
             var fds: [2]posix.fd_t = undefined;
             const rc = if (builtin.os.tag == .linux) posix.system.pipe2(&fds, .{ .CLOEXEC = true }) else posix.system.pipe(&fds);
@@ -112,13 +108,19 @@ pub const Poller = struct {
                 .MFILE, .NFILE, .NOMEM => return error.SystemResources,
                 else => return error.Unexpected,
             }
+            // A wake must never block: the tasks write to the pipe under the lock of the parker.
+            // A full pipe means that a wake waits already.
+            const status = posix.system.fcntl(fds[1], posix.F.GETFL, @as(usize, 0));
+            if (posix.errno(status) == .SUCCESS) {
+                const nonblock: usize = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+                _ = posix.system.fcntl(fds[1], posix.F.SETFL, @as(usize, @intCast(status)) | nonblock);
+            }
             return .{ .impl = .{ .gpa = gpa, .wake_read = fds[0], .wake_write = fds[1] } };
         }
     }
 
     pub fn deinit(p: *Poller) void {
         if (is_windows) {
-            windows.CloseHandle(p.impl.now_event);
             windows.CloseHandle(p.impl.helper);
             windows.CloseHandle(p.impl.port);
         } else {
@@ -206,12 +208,14 @@ pub const Poller = struct {
         if (!is_windows) return true;
         var iosb: windows.IO_STATUS_BLOCK = undefined;
         var info: windows.AFD.INFORMATION = .{ .InformationType = .NONBLOCKING_MODE, .Information = .{ .Ulong = 1 } };
-        const event = p.impl.now_event;
-        var status = windows.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, windows.IOCTL.AFD.SET_INFORMATION, &info, @sizeOf(windows.AFD.INFORMATION), null, 0);
+        _ = p;
+        var status = windows.ntdll.NtDeviceIoControlFile(handle, null, null, null, &iosb, windows.IOCTL.AFD.SET_INFORMATION, &info, @sizeOf(windows.AFD.INFORMATION), null, 0);
         // AFD completes this request at once. If it does not, the kernel writes into `iosb`
         // until the request ends, thus wait for the end.
         if (status == .PENDING) {
-            _ = WaitForSingleObject(event, std.math.maxInt(u32));
+            // Without an event, the socket handle signals the end. No other request of the
+            // connection runs now.
+            _ = WaitForSingleObject(handle, std.math.maxInt(u32));
             status = iosb.u.Status;
         }
         return status == .SUCCESS;
@@ -258,14 +262,14 @@ pub const Poller = struct {
     /// One AFD request without `AFD_OVERLAPPED` (Windows).
     fn afdNow(p: *Poller, handle: windows.HANDLE, code: windows.CTL_CODE, info: *anyopaque, info_len: u32) Now {
         var iosb: windows.IO_STATUS_BLOCK = undefined;
-        const event = p.impl.now_event;
-        var status = windows.ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, code, info, info_len, null, 0);
+        _ = p;
+        var status = windows.ntdll.NtDeviceIoControlFile(handle, null, null, null, &iosb, code, info, info_len, null, 0);
         if (status == .PENDING) {
             // The socket is not in the non-blocking mode after all. End the request, and wait
             // for its end: the kernel writes into `iosb` and the buffer until then.
             var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
             _ = windows.ntdll.NtCancelIoFileEx(handle, &iosb, &cancel_iosb);
-            _ = WaitForSingleObject(event, std.math.maxInt(u32));
+            _ = WaitForSingleObject(handle, std.math.maxInt(u32));
             status = iosb.u.Status;
             // A cancel of a send can make AFD end the connection. Thus a cancelled request
             // without bytes fails, and the connection closes.

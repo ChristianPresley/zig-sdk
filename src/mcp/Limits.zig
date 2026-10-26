@@ -69,7 +69,8 @@ http: struct {
     /// the client sends it again after a delay, usually 1 second.
     listen_backlog: u31 = 1024,
     /// Maximum worker tasks: connections that read a request or run a handler, with the
-    /// listen streams. An idle keep-alive connection holds no task. Zero means
+    /// listen streams. An idle keep-alive connection holds no task. On Linux and Windows, a
+    /// new plaintext connection holds no task until its first bytes arrive. Zero means
     /// `max_connections`. Overflow: a connection with bytes waits for a free worker, up to
     /// `head_timeout`. With `std.Io.Threaded`, each worker task is a thread.
     max_in_flight: u32 = 256,
