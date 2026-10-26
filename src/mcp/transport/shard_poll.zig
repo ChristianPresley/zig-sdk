@@ -456,6 +456,9 @@ pub const Poller = struct {
             var info: windows.AFD.RECV_INFO = .{ .BufferArray = &bufs, .BufferCount = 1, .AfdFlags = .{}, .TdiFlags = .{ .NORMAL = true, .PEEK = peek } };
             return afdNow(handle, windows.IOCTL.AFD.RECEIVE, &info, @sizeOf(windows.AFD.RECV_INFO));
         }
+        // Off Linux, `MSG_DONTWAIT` does not always stop a wait (macOS). A socket that is
+        // readable has bytes or the end of the input: then the receive returns at once.
+        if (!is_linux and !pollNow(handle, posix.POLL.IN)) return .would_block;
         const flags: u32 = posix.MSG.DONTWAIT | (if (peek) @as(u32, posix.MSG.PEEK) else 0);
         while (true) {
             const rc = posix.system.recvfrom(handle, buf.ptr, buf.len, flags, null, null);
@@ -475,9 +478,19 @@ pub const Poller = struct {
             var info: windows.AFD.SEND_INFO = .{ .BufferArray = &bufs, .BufferCount = 1, .AfdFlags = .{}, .TdiFlags = .{} };
             return afdNow(handle, windows.IOCTL.AFD.SEND, &info, @sizeOf(windows.AFD.SEND_INFO));
         }
+        // Off Linux, `MSG_DONTWAIT` does not always stop a wait (macOS), and a send on a socket
+        // that blocks waits until all its bytes are in the send buffer. Thus the send takes
+        // only the free space of a writable socket: on macOS `SO_SNDBUF` less `SO_NWRITE`,
+        // elsewhere `SO_SNDLOWAT`, which `POLLOUT` guarantees.
+        var len = data.len;
+        if (!is_linux) {
+            if (!pollNow(handle, posix.POLL.OUT)) return .would_block;
+            len = @min(len, freeSendSpace(handle));
+            if (len == 0) return .would_block;
+        }
         const flags: u32 = posix.MSG.DONTWAIT | (if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0);
         while (true) {
-            const rc = posix.system.sendto(handle, data.ptr, data.len, flags, null, 0);
+            const rc = posix.system.sendto(handle, data.ptr, len, flags, null, 0);
             return switch (posix.errno(rc)) {
                 .SUCCESS => .{ .done = @intCast(rc) },
                 .INTR => continue,
@@ -485,6 +498,37 @@ pub const Poller = struct {
                 else => .failed,
             };
         }
+    }
+
+    /// True when `poll` reports `events` (or an error or a hangup) on `handle` now (POSIX).
+    fn pollNow(handle: Io.net.Socket.Handle, events: i16) bool {
+        var fds = [1]posix.pollfd{.{ .fd = handle, .events = events, .revents = 0 }};
+        while (true) {
+            const rc = posix.system.poll(&fds, 1, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return rc > 0 and fds[0].revents != 0,
+                .INTR => continue,
+                else => return false,
+            }
+        }
+    }
+
+    /// The bytes that a send to the writable socket `handle` can take without a wait (POSIX
+    /// systems other than Linux).
+    fn freeSendSpace(handle: Io.net.Socket.Handle) usize {
+        if (@hasDecl(posix.SO, "NWRITE")) {
+            const size = sockOption(handle, posix.SO.SNDBUF) orelse 0;
+            const queued = sockOption(handle, posix.SO.NWRITE) orelse size;
+            if (size > queued) return size - queued;
+        }
+        return sockOption(handle, posix.SO.SNDLOWAT) orelse 2048;
+    }
+
+    fn sockOption(handle: Io.net.Socket.Handle, name: u32) ?usize {
+        var value: c_int = 0;
+        var len: posix.socklen_t = @sizeOf(c_int);
+        if (posix.errno(posix.system.getsockopt(handle, posix.SOL.SOCKET, name, @ptrCast(&value), &len)) != .SUCCESS) return null;
+        return if (value > 0) @intCast(value) else null;
     }
 
     /// One AFD request without `AFD_OVERLAPPED` (Windows).
