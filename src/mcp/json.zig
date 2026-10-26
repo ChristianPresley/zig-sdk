@@ -477,6 +477,31 @@ test "parseTree applies the depth limit" {
     try std.testing.expectError(error.TooDeep, parseTreeMaxDepth(arena, "{\"a\":{\"b\":{}}}", 2));
 }
 
+test "parseTree and std.json agree on an object with many keys and on a long escaped string" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // 5000 keys: each key needs a check for a duplicate.
+    var many: std.ArrayList(u8) = .empty;
+    try many.append(arena, '{');
+    for (0..5000) |i| {
+        if (i > 0) try many.append(arena, ',');
+        try many.print(arena, "\"k{d}\":{d}", .{ i, i });
+    }
+    try many.append(arena, '}');
+    try expectSameParse(many.items, max_message_depth);
+    // The same key at the end of many keys is a duplicate.
+    many.items.len -= 1;
+    try many.appendSlice(arena, ",\"k0\":1}");
+    try expectSameParse(many.items, max_message_depth);
+    // A string of about 200 KiB with escapes: the builder makes its own copy of it.
+    var long: std.ArrayList(u8) = .empty;
+    try long.append(arena, '"');
+    for (0..20000) |_| try long.appendSlice(arena, "ab\\n\\u00e9\\\"");
+    try long.append(arena, '"');
+    try expectSameParse(long.items, max_message_depth);
+}
+
 test "parseTree gives the specific errors" {
     const gpa = std.testing.allocator;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);

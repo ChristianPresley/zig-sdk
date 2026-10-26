@@ -1144,6 +1144,45 @@ test "http limits: a client that does not read a large quick response loses the 
     }
 }
 
+test "http shards: a chunked body with trailers gets its response" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const head = "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\nmcp-protocol-version: 2026-07-28\r\nmcp-method: server/discover\r\ntransfer-encoding: chunked\r\n\r\n";
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    try raw.send(try std.fmt.allocPrint(arena, "{s}{x}\r\n{s}\r\n0\r\nx-trailer-one: 1\r\nx-trailer-two: 2\r\n\r\n", .{ head, discover_body.len, discover_body }));
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+    // The connection reads the next request after the trailers.
+    try raw.send(try discoverRequest(arena));
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+}
+
+test "http limits: a chunked body with more data than max_body_bytes gets 413" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    limits.http.max_body_bytes = 64;
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const head = "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n";
+    // Two chunks of 40 bytes: each is under the limit, together they are over it.
+    const data = "x" ** 40;
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    try raw.send(try std.fmt.allocPrint(arena, "{s}28\r\n{s}\r\n28\r\n{s}\r\n0\r\n\r\n", .{ head, data, data }));
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readToEnd(arena), "HTTP/1.1 413 "));
+}
+
 test "http limits: a chunked body whose framing passes the buffer gets 413" {
     const gpa = std.testing.allocator;
     var limits: mcp.Limits = .{};
