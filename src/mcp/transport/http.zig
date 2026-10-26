@@ -31,6 +31,10 @@ const socket_opts = @import("socket_opts.zig");
 
 pub const ResponseMode = enum { auto, sse, json };
 
+/// True on the systems where the parker serves quick requests itself and admits new plaintext
+/// connections (Linux and Windows). On the other systems each connection has a task, as before.
+pub const inline_supported = builtin.os.tag == .linux or builtin.os.tag == .windows;
+
 pub const Options = struct {
     /// Address to bind. The default is loopback only.
     address: []const u8 = "127.0.0.1",
@@ -1083,7 +1087,7 @@ const Parker = struct {
     /// authorization. A check of a token can wait for I/O.
     fn inlineEnabled(p: *Parker, self: *Server) bool {
         _ = p;
-        return (builtin.os.tag == .linux or builtin.os.tag == .windows) and self.options.tls == null and self.options.auth == null and !self.closing.load(.acquire);
+        return inline_supported and self.options.tls == null and self.options.auth == null and !self.closing.load(.acquire);
     }
 
     const InlineEnd = enum { parked, close, task };

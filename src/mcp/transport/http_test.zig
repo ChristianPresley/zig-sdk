@@ -695,6 +695,8 @@ test "http parker: a quick request head with a huge Content-Length gets 413, and
 }
 
 test "http parker: many connections with quick requests at once all get their responses, without a task each" {
+    // Elsewhere a new connection gets a task that waits for its first request.
+    if (!mcp.transport.http.inline_supported) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
     try f.start(.json);
