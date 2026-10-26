@@ -9,6 +9,7 @@
 //! listener and on the gRPC listener. `--log-requests` logs one JSON line for each handler call.
 //! `--apps` adds a fixture of the MCP Apps extension: a `ui://` view and a tool that names it.
 //! `--reuse-address` lets a new server bind a port at once after the old one stops.
+//! `--http-shards N` sets the count of shard tasks of the HTTP listener.
 //!
 //! Usage: mcp-conformance-server [--port N] [--grpc-port N] [--grpc-typed] [--no-tunnel] [--ws-port N]
 //!        [--tls-cert cert.pem --tls-key key.pem] [--log-requests] [--apps] [--reuse-address]
@@ -682,6 +683,9 @@ const Config = struct {
     /// `--max-in-flight N`: `Limits.http.max_in_flight`, the worker tasks of the HTTP
     /// listener. Null keeps the default of the library.
     max_in_flight: ?u32 = null,
+    /// `--http-shards N`: `Limits.http.shards`, the shard tasks of the HTTP listener, zero for
+    /// the default count. Null keeps the default of the library.
+    http_shards: ?u32 = null,
     /// `--idle-timeout S`: `Limits.http.idle_timeout` in seconds, zero for no limit. Null
     /// keeps the default of the library.
     idle_timeout_s: ?u32 = null,
@@ -748,6 +752,9 @@ fn parseArgs(args: []const []const u8) !Config {
         } else if (std.mem.eql(u8, args[i], "--max-in-flight") and i + 1 < args.len) {
             i += 1;
             config.max_in_flight = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidMaxInFlight;
+        } else if (std.mem.eql(u8, args[i], "--http-shards") and i + 1 < args.len) {
+            i += 1;
+            config.http_shards = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidHttpShards;
         } else if (std.mem.eql(u8, args[i], "--idle-timeout") and i + 1 < args.len) {
             i += 1;
             config.idle_timeout_s = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidIdleTimeout;
@@ -805,6 +812,7 @@ pub fn main(init: std.process.Init) !void {
     if (config.reuse_address and !config.reuseAddress()) std.log.info("--reuse-address has no effect on Windows", .{});
     if (config.max_connections) |n| options.limits.http.max_connections = n;
     if (config.max_in_flight) |n| options.limits.http.max_in_flight = n;
+    if (config.http_shards) |n| options.limits.http.shards = n;
     if (config.idle_timeout_s) |s| options.limits.http.idle_timeout = .fromSeconds(s);
     var server = try mcp.Server.init(gpa, io, options);
     defer server.deinit();
@@ -1143,6 +1151,13 @@ test "--max-in-flight: the worker tasks of the HTTP listener, zero for the conne
     try testing.expectEqual(64, (try parseArgs(&.{ "server", "--max-in-flight", "64" })).max_in_flight);
     try testing.expectEqual(0, (try parseArgs(&.{ "server", "--max-in-flight", "0" })).max_in_flight);
     try testing.expectError(error.InvalidMaxInFlight, parseArgs(&.{ "server", "--max-in-flight", "all" }));
+}
+
+test "--http-shards: the shard tasks of the HTTP listener, zero for the default count" {
+    try testing.expectEqual(null, (try parseArgs(&.{"server"})).http_shards);
+    try testing.expectEqual(4, (try parseArgs(&.{ "server", "--http-shards", "4" })).http_shards);
+    try testing.expectEqual(0, (try parseArgs(&.{ "server", "--http-shards", "0" })).http_shards);
+    try testing.expectError(error.InvalidHttpShards, parseArgs(&.{ "server", "--http-shards", "some" }));
 }
 
 test "--idle-timeout: the idle limit of the HTTP listener in seconds, zero for no limit" {

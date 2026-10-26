@@ -32,6 +32,27 @@ fn bigText(ctx: *mcp.RequestContext, args: NoArgs) anyerror!mcp.Outcome(types.Ca
     return .{ .complete = try types.CallToolResult.text(ctx.arena, "{s}", .{text}) };
 }
 
+fn plain(ctx: *mcp.RequestContext, args: NoArgs) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "plain", .{}) };
+}
+
+/// Set by `waitCancel` when the cancel of its request arrived.
+var saw_cancel: std.atomic.Value(bool) = .init(false);
+
+fn waitCancel(ctx: *mcp.RequestContext, args: NoArgs) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    ctx.cancel.wait(ctx.io) catch {};
+    saw_cancel.store(true, .release);
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "cancelled", .{}) };
+}
+
+fn sleepy(ctx: *mcp.RequestContext, args: NoArgs) anyerror!mcp.Outcome(types.CallToolResult) {
+    _ = args;
+    ctx.io.sleep(.fromSeconds(60), .awake) catch {};
+    return .{ .complete = try types.CallToolResult.text(ctx.arena, "slept", .{}) };
+}
+
 const HeaderArgs = struct {
     region: []const u8,
     priority: i64,
@@ -54,14 +75,23 @@ const Fixture = struct {
     }
 
     fn startWith(self: *Fixture, mode: mcp.transport.http.ResponseMode, limits: mcp.Limits) !void {
+        try self.startWithHook(mode, limits, null);
+    }
+
+    /// As `startWith`, and `hook` changes the transport before it serves.
+    fn startWithHook(self: *Fixture, mode: mcp.transport.http.ResponseMode, limits: mcp.Limits, hook: ?*const fn (*HttpServer) void) !void {
         const gpa = std.testing.allocator;
         const io = std.testing.io;
         self.server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "http-test", .version = "1" }, .limits = limits });
         try self.server.addTool(.{ .name = "add" }, add);
         try self.server.addTool(.{ .name = "test_headers" }, echoHeaders);
         try self.server.addTool(.{ .name = "big_text", .quick = true }, bigText);
+        try self.server.addTool(.{ .name = "plain" }, plain);
+        try self.server.addTool(.{ .name = "wait_cancel" }, waitCancel);
+        try self.server.addTool(.{ .name = "sleepy" }, sleepy);
         self.transport = .init(io, gpa, &self.server, .{ .port = 0, .response_mode = mode });
         try self.transport.bind();
+        if (hook) |h| h(&self.transport);
         self.future = try io.concurrent(serveIgnoringErrors, .{&self.transport});
         self.client = .{ .allocator = gpa, .io = io };
         self.base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/mcp", .{self.transport.bound_port});
@@ -362,7 +392,7 @@ test "http limits: a request head that does not arrive in head_timeout gets 408"
         try std.testing.expectEqual(1, countResponses(reply));
     }
     // A client that sends no byte also gets 408 after the time limit, also when the server was
-    // idle before: the time limit of the new connection wakes the parker (`idle_timeout` is
+    // idle before: the time limit of the new connection wakes the shard (`idle_timeout` is
     // 60 s here, and the 408 must not wait for it).
     {
         const io = std.testing.io;
@@ -424,12 +454,10 @@ test "http limits: the server closes a keep-alive connection after idle_timeout 
     }
 }
 
-test "http limits: an idle_timeout that passes while the connection goes to the parker frees the connection one time" {
+test "http limits: an idle_timeout that passes at once after each response frees the connection one time" {
     const gpa = std.testing.allocator;
     var limits: mcp.Limits = .{};
-    // After each response, the supervisor cancels the task of the connection while the task
-    // gives the connection to the parker. Only one of them must end the task, and the parker
-    // must free the connection only after the cancel.
+    // After each response, the idle time limit passes at once.
     limits.http.idle_timeout = .fromMilliseconds(1);
     var f: Fixture = undefined;
     try f.startWith(.json, limits);
@@ -451,8 +479,8 @@ test "http limits: an idle_timeout that passes while the connection goes to the 
             else => return e,
         };
         try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 ") or std.mem.startsWith(u8, response, "HTTP/1.1 408 "));
-        // Half of the clients close at once: the task closes the connection. The other half
-        // wait: the connection parks, and the parker closes it.
+        // Half of the clients close at once. The other half wait: the shard closes the
+        // connection at its time limit.
         if (i % 2 == 0) _ = try raw.readToEnd(arena);
     }
 }
@@ -563,17 +591,20 @@ test "http limits: a message deeper than json_max_depth gets -32700" {
     try std.testing.expectEqual(http.Status.ok, answer.status);
 }
 
-/// Wait until the parker of `t` holds `count` connections, for at most two seconds.
+/// Wait until the shards of `t` hold `count` connections without a worker task, for at most
+/// two seconds.
 fn waitHeld(t: *HttpServer, count: usize) !void {
     const io = std.testing.io;
     var waited: usize = 0;
-    while (t.parker.held.load(.acquire) != count) : (waited += 1) {
+    while (true) : (waited += 1) {
+        const st = t.stats();
+        if (st.held == count and st.tasks == 0) break;
         if (waited > 2000) return error.ParkerCountNotReached;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
 }
 
-test "http parker: an idle keep-alive connection holds no task, resumes on the next request and ends with the peer" {
+test "http shards: an idle keep-alive connection holds no task, resumes on the next request and ends with the peer" {
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
     try f.start(.json);
@@ -586,12 +617,9 @@ test "http parker: an idle keep-alive connection holds no task, resumes on the n
     const request_bytes = try discoverRequest(arena);
     try raw.send(request_bytes);
     try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
-    // After the response, the parker owns the connection and no task does.
+    // After the response, a shard owns the connection and no task does.
     try waitHeld(&f.transport, 1);
-    f.transport.connections_lock.lockUncancelable(std.testing.io);
-    const with_task = f.transport.connections.items.len;
-    f.transport.connections_lock.unlock(std.testing.io);
-    try std.testing.expectEqual(0, with_task);
+    try std.testing.expectEqual(0, f.transport.stats().tasks);
     // The next request wakes the connection, and it parks again.
     try raw.send(request_bytes);
     try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
@@ -601,7 +629,7 @@ test "http parker: an idle keep-alive connection holds no task, resumes on the n
     try waitHeld(&f.transport, 0);
 }
 
-test "http parker: quick requests stay on the task of the connection, and a close during the wait ends it" {
+test "http shards: quick requests run in the shard, and a close during the wait ends the connection" {
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
     try f.start(.json);
@@ -611,8 +639,6 @@ test "http parker: quick requests stay on the task of the connection, and a clos
     const arena = arena_state.allocator();
     const request_bytes = try discoverRequest(arena);
 
-    // On POSIX systems the task waits for the next request after a response. Each request
-    // here comes at once, while the task waits, or later from the parker.
     for (0..3) |_| {
         const raw = try Raw.open(gpa, f.transport.bound_port);
         for (0..20) |_| {
@@ -625,10 +651,8 @@ test "http parker: quick requests stay on the task of the connection, and a clos
     const io = std.testing.io;
     var waited: usize = 0;
     while (true) : (waited += 1) {
-        f.transport.connections_lock.lockUncancelable(io);
-        const with_task = f.transport.connections.items.len;
-        f.transport.connections_lock.unlock(io);
-        if (with_task == 0 and f.transport.parker.held.load(.acquire) == 0) break;
+        const st = f.transport.stats();
+        if (st.tasks == 0 and st.held == 0 and st.connections == 0) break;
         if (waited > 2000) return error.ConnectionsNotEnded;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
@@ -639,7 +663,7 @@ fn bigTextRequest(arena: std.mem.Allocator, id: i64) ![]u8 {
     return std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\nmcp-protocol-version: 2026-07-28\r\nmcp-method: tools/call\r\nmcp-name: big_text\r\ncontent-length: {d}\r\n\r\n{s}", .{ body.len, body });
 }
 
-test "http parker: a quick request of a parked connection, with a response that the client reads late" {
+test "http shards: a quick request of a parked connection, with a response that the client reads late" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var f: Fixture = undefined;
@@ -653,8 +677,8 @@ test "http parker: a quick request of a parked connection, with a response that 
     try raw.send(try discoverRequest(arena));
     try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
     try waitHeld(&f.transport, 1);
-    // On Linux and Windows the parker runs this quick call itself. The response is larger than the socket
-    // buffers, and the client reads it only later: the task of the connection sends the rest.
+    // The shard runs this quick call itself. The response is larger than the socket buffers,
+    // and the client reads it only later: the shard sends the rest when the socket has space.
     try raw.send(try bigTextRequest(arena, 2));
     try io.sleep(.fromMilliseconds(100), .awake);
     const big = try raw.readResponse(arena);
@@ -671,7 +695,7 @@ test "http parker: a quick request of a parked connection, with a response that 
     try waitHeld(&f.transport, 0);
 }
 
-test "http parker: a quick request head with a huge Content-Length gets 413, and the server keeps serving" {
+test "http shards: a quick request head with a huge Content-Length gets 413, and the server keeps serving" {
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
     try f.start(.json);
@@ -685,7 +709,7 @@ test "http parker: a quick request head with a huge Content-Length gets 413, and
     try raw.send(try discoverRequest(arena));
     try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
     try waitHeld(&f.transport, 1);
-    // The parker looks at this head. The sum of its length and the body length overflows.
+    // The shard looks at this head. The body is larger than the limit.
     try raw.send("POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\nmcp-protocol-version: 2026-07-28\r\nmcp-method: server/discover\r\ncontent-length: 18446744073709551615\r\n\r\n");
     try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 413 "));
     const other = try Raw.open(gpa, f.transport.bound_port);
@@ -694,34 +718,7 @@ test "http parker: a quick request head with a huge Content-Length gets 413, and
     try std.testing.expect(std.mem.startsWith(u8, try other.readResponse(arena), "HTTP/1.1 200 "));
 }
 
-test "http parker: many connections with quick requests at once all get their responses, without a task each" {
-    // Elsewhere a new connection gets a task that waits for its first request.
-    if (!mcp.transport.http.inline_supported) return error.SkipZigTest;
-    const gpa = std.testing.allocator;
-    var f: Fixture = undefined;
-    try f.start(.json);
-    defer f.stop();
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const request_bytes = try discoverRequest(arena);
-
-    const n = 64;
-    var raws: [n]*Raw = undefined;
-    var opened: usize = 0;
-    defer for (raws[0..opened]) |r| r.close(gpa);
-    while (opened < n) : (opened += 1) raws[opened] = try Raw.open(gpa, f.transport.bound_port);
-    // The new connections wait in the parker for their first request.
-    try waitHeld(&f.transport, n);
-    for (0..3) |_| {
-        // All requests at once: the parker and its inline runners run them.
-        for (raws) |r| try r.send(request_bytes);
-        for (raws) |r| try std.testing.expect(std.mem.startsWith(u8, try r.readResponse(arena), "HTTP/1.1 200 "));
-        try waitHeld(&f.transport, n);
-    }
-}
-
-test "http parker: the cap of the worker tasks queues connections and serves them in turn" {
+test "http shards: the cap of the worker tasks queues connections and serves them in turn" {
     const gpa = std.testing.allocator;
     var limits: mcp.Limits = .{};
     limits.http.max_in_flight = 1;
@@ -736,8 +733,7 @@ test "http parker: the cap of the worker tasks queues connections and serves the
     for (&raws) |*r| r.* = try Raw.open(gpa, f.transport.bound_port);
     defer for (raws) |r| r.close(gpa);
     const request_bytes = try discoverRequest(arena);
-    // Three requests at once share one worker task: each connection parks after its response,
-    // and the next queued connection gets the task.
+    // Three quick requests at once: the shards run them without a worker task.
     for (raws) |r| try r.send(request_bytes);
     for (raws) |r| try std.testing.expect(std.mem.startsWith(u8, try r.readResponse(arena), "HTTP/1.1 200 "));
     for (raws) |r| try r.send(request_bytes);
@@ -808,4 +804,372 @@ test "http sse response: the connection carries the next request" {
     // The same connection carries the next request.
     try raw.send(try discoverRequest(arena));
     try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+}
+
+fn toolRequest(arena: std.mem.Allocator, id: i64, tool: []const u8) ![]u8 {
+    const body = try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{{s},\"name\":\"{s}\",\"arguments\":{{}}}}}}", .{ id, meta_none, tool });
+    return std.fmt.allocPrint(arena, "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\nmcp-protocol-version: 2026-07-28\r\nmcp-method: tools/call\r\nmcp-name: {s}\r\ncontent-length: {d}\r\n\r\n{s}", .{ tool, body.len, body });
+}
+
+/// Wait until `t` has `count` worker tasks, for at most two seconds.
+fn waitTasks(t: *HttpServer, count: u32) !void {
+    const io = std.testing.io;
+    var waited: usize = 0;
+    while (t.stats().tasks != count) : (waited += 1) {
+        if (waited > 2000) return error.TaskCountNotReached;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+test "http shards: a request that is not quick runs in a worker task, and the connection comes back to its shard" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    for (0..5) |i| {
+        try raw.send(try toolRequest(arena, @intCast(i), "plain"));
+        const reply = try raw.readResponse(arena);
+        try std.testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200 "));
+        try std.testing.expect(std.mem.find(u8, reply, "plain") != null);
+        // The task ended, and the shard holds the connection again.
+        try waitHeld(&f.transport, 1);
+        try raw.send(try discoverRequest(arena));
+        try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+    }
+}
+
+test "http shards: a disconnect of the client cancels its request in a worker task" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for (0..3) |i| {
+        saw_cancel.store(false, .release);
+        const raw = try Raw.open(gpa, f.transport.bound_port);
+        try raw.send(try toolRequest(arena, @intCast(i), "wait_cancel"));
+        try waitTasks(&f.transport, 1);
+        raw.close(gpa);
+        var waited: usize = 0;
+        while (!saw_cancel.load(.acquire)) : (waited += 1) {
+            if (waited > 2000) return error.NoCancel;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try waitHeld(&f.transport, 0);
+    }
+}
+
+test "http shards: the shutdown cancels a request in a worker task after shutdown_grace" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var limits: mcp.Limits = .{};
+    limits.shutdown_grace = .fromMilliseconds(200);
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const busy = try Raw.open(gpa, f.transport.bound_port);
+    defer busy.close(gpa);
+    const idle = try Raw.open(gpa, f.transport.bound_port);
+    defer idle.close(gpa);
+    try idle.send(try discoverRequest(arena));
+    try std.testing.expect(std.mem.startsWith(u8, try idle.readResponse(arena), "HTTP/1.1 200 "));
+    try busy.send(try toolRequest(arena, 1, "sleepy"));
+    try waitTasks(&f.transport, 1);
+    const started = Io.Timestamp.now(io, .awake);
+    f.stop();
+    const took = started.durationTo(Io.Timestamp.now(io, .awake));
+    try std.testing.expect(took.nanoseconds < 5 * std.time.ns_per_s);
+    // Both connections end.
+    _ = try idle.readToEnd(arena);
+    _ = try busy.readToEnd(arena);
+}
+
+test "http shards: pipelined requests get their responses in order, also around a worker task" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    const quick = try discoverRequest(arena);
+    const slow = try toolRequest(arena, 7, "plain");
+    try raw.send(try std.mem.concat(arena, u8, &.{ quick, slow, quick, quick, slow }));
+    for ([_]bool{ false, true, false, false, true }) |is_slow| {
+        const reply = try raw.readResponse(arena);
+        try std.testing.expect(std.mem.startsWith(u8, reply, "HTTP/1.1 200 "));
+        try std.testing.expectEqual(is_slow, std.mem.find(u8, reply, "plain") != null);
+    }
+    try waitHeld(&f.transport, 1);
+}
+
+test "http shards: a request in single bytes, a chunked body, and Expect: 100-continue" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    const request_bytes = try discoverRequest(arena);
+    for (request_bytes) |b| try raw.send(&.{b});
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+
+    const head = "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\naccept: application/json, text/event-stream\r\nmcp-protocol-version: 2026-07-28\r\nmcp-method: server/discover\r\n";
+    const half = discover_body.len / 2;
+    try raw.send(try std.fmt.allocPrint(arena, "{s}transfer-encoding: chunked\r\n\r\n{x}\r\n{s}\r\n", .{ head, half, discover_body[0..half] }));
+    try raw.send(try std.fmt.allocPrint(arena, "{x};ext=1\r\n{s}\r\n0\r\n\r\n", .{ discover_body.len - half, discover_body[half..] }));
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+
+    try raw.send(try std.fmt.allocPrint(arena, "{s}expect: 100-continue\r\ncontent-length: {d}\r\n\r\n", .{ head, discover_body.len }));
+    const cont_text = "HTTP/1.1 100 Continue\r\n\r\n";
+    var cont: [cont_text.len]u8 = undefined;
+    try raw.reader.interface.readSliceAll(&cont);
+    try std.testing.expectEqualStrings(cont_text, &cont);
+    try raw.send(discover_body);
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readResponse(arena), "HTTP/1.1 200 "));
+
+    // A head with a bare LF gets 400, and the connection closes.
+    try raw.send("POST /mcp HTTP/1.1\nhost: 127.0.0.1\r\n\r\n");
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readToEnd(arena), "HTTP/1.1 400 "));
+}
+
+/// One connection of the test below: `rounds` of a quick and a slow request.
+fn manyRound(port: u16, rounds: usize, failures: *std.atomic.Value(u32)) void {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const raw = Raw.open(gpa, port) catch {
+        _ = failures.fetchAdd(1, .monotonic);
+        return;
+    };
+    defer raw.close(gpa);
+    const quick = discoverRequest(arena) catch return;
+    const slow = toolRequest(arena, 3, "plain") catch return;
+    for (0..rounds) |_| {
+        for ([_][]const u8{ quick, slow }) |bytes| {
+            raw.send(bytes) catch {
+                _ = failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            const reply = raw.readResponse(arena) catch {
+                _ = failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (!std.mem.startsWith(u8, reply, "HTTP/1.1 200 ")) _ = failures.fetchAdd(1, .monotonic);
+        }
+    }
+}
+
+test "http shards: many connections on several shards, with a cap of one worker task" {
+    const io = std.testing.io;
+    var limits: mcp.Limits = .{};
+    limits.http.shards = 3;
+    limits.http.max_in_flight = 1;
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+
+    const n = 24;
+    var failures: std.atomic.Value(u32) = .init(0);
+    var group: Io.Group = .init;
+    for (0..n) |_| try group.concurrent(io, manyRound, .{ f.transport.bound_port, 10, &failures });
+    try group.await(io);
+    try std.testing.expectEqual(0, failures.load(.acquire));
+    try waitHeld(&f.transport, 0);
+}
+
+test "http shards: many connections with quick requests at once all get their responses, without a task each" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(.json);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const request_bytes = try discoverRequest(arena);
+
+    const n = 64;
+    var raws: [n]*Raw = undefined;
+    var opened: usize = 0;
+    defer for (raws[0..opened]) |r| r.close(gpa);
+    while (opened < n) : (opened += 1) raws[opened] = try Raw.open(gpa, f.transport.bound_port);
+    // The new connections wait in the shards for their first request.
+    try waitHeld(&f.transport, n);
+    for (0..3) |_| {
+        // All requests at once: the shards run them.
+        for (raws) |r| try r.send(request_bytes);
+        for (raws) |r| try std.testing.expect(std.mem.startsWith(u8, try r.readResponse(arena), "HTTP/1.1 200 "));
+        try waitHeld(&f.transport, n);
+    }
+}
+
+test "http shards: connections that move between shards after each request keep their requests and responses" {
+    const io = std.testing.io;
+    var limits: mcp.Limits = .{};
+    limits.http.shards = 3;
+    limits.http.max_in_flight = 2;
+    var f: Fixture = undefined;
+    // Each shard gives each idle connection to the next shard. Thus each request runs on
+    // another shard than the one before it, also while other connections move.
+    try f.startWithHook(.json, limits, setForceMoves);
+    defer f.stop();
+
+    const n = 24;
+    var failures: std.atomic.Value(u32) = .init(0);
+    var group: Io.Group = .init;
+    for (0..n) |_| try group.concurrent(io, manyRound, .{ f.transport.bound_port, 20, &failures });
+    try group.await(io);
+    try std.testing.expectEqual(0, failures.load(.acquire));
+    try waitHeld(&f.transport, 0);
+}
+
+fn setForceMoves(t: *HttpServer) void {
+    t.force_moves = true;
+}
+
+test "http shards: moves at each request with a short idle_timeout: the time limits close moved and queued connections one time" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var limits: mcp.Limits = .{};
+    limits.http.shards = 2;
+    limits.http.idle_timeout = .fromMilliseconds(2);
+    limits.http.head_timeout = .fromMilliseconds(300);
+    var f: Fixture = undefined;
+    try f.startWithHook(.json, limits, setForceMoves);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const request_bytes = try discoverRequest(arena);
+
+    // A silent connection gets 408, also while other connections move.
+    const silent = try Raw.open(gpa, f.transport.bound_port);
+    defer silent.close(gpa);
+    for (0..100) |i| {
+        const raw = try Raw.open(gpa, f.transport.bound_port);
+        defer raw.close(gpa);
+        try raw.send(request_bytes);
+        // The idle time limit can close the connection while it waits to move.
+        const response = raw.readResponse(arena) catch |e| switch (e) {
+            error.EndOfStream, error.ReadFailed => continue,
+            else => return e,
+        };
+        try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 ") or std.mem.startsWith(u8, response, "HTTP/1.1 408 "));
+        if (i % 2 == 0) _ = try raw.readToEnd(arena);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, try silent.readToEnd(arena), "HTTP/1.1 408 "));
+    var waited: usize = 0;
+    while (f.transport.stats().connections != 0) : (waited += 1) {
+        if (waited > 2000) return error.ConnectionsNotEnded;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+test "http limits: without idle_timeout, a new connection at max_connections still closes the oldest idle connection" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    limits.http.max_connections = 2;
+    limits.http.idle_timeout = .zero;
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const request_bytes = try discoverRequest(arena);
+    const oldest = try Raw.open(gpa, f.transport.bound_port);
+    defer oldest.close(gpa);
+    try oldest.send(request_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, try oldest.readResponse(arena), "HTTP/1.1 200 "));
+    try waitHeld(&f.transport, 1);
+    const newer = try Raw.open(gpa, f.transport.bound_port);
+    defer newer.close(gpa);
+    try newer.send(request_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, try newer.readResponse(arena), "HTTP/1.1 200 "));
+    try waitHeld(&f.transport, 2);
+    const third = try Raw.open(gpa, f.transport.bound_port);
+    defer third.close(gpa);
+    try third.send(request_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, try third.readResponse(arena), "HTTP/1.1 200 "));
+    try std.testing.expectEqual(0, (try oldest.readToEnd(arena)).len);
+}
+
+test "http limits: a client that does not read a large quick response loses the connection after idle_timeout" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var limits: mcp.Limits = .{};
+    limits.http.idle_timeout = .fromMilliseconds(300);
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // One client reads nothing. The other also ends its side: on Windows the poll of the
+    // send must not complete at once for the end of the input of the peer.
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    try raw.send(try bigTextRequest(arena, 1));
+    const ended = try Raw.open(gpa, f.transport.bound_port);
+    defer ended.close(gpa);
+    try ended.send(try bigTextRequest(arena, 2));
+    try ended.stream.shutdown(io, .send);
+    var waited: usize = 0;
+    while (f.transport.stats().connections != 0) : (waited += 1) {
+        if (waited > 5000) return error.ConnectionNotClosed;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+test "http limits: a chunked body whose framing passes the buffer gets 413" {
+    const gpa = std.testing.allocator;
+    var limits: mcp.Limits = .{};
+    limits.http.max_head_bytes = 200;
+    limits.http.max_body_bytes = 100;
+    var f: Fixture = undefined;
+    try f.startWith(.json, limits);
+    defer f.stop();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The buffer of a request holds `max_head_bytes + max_body_bytes + 4096` bytes. Chunks of
+    // one byte with long extensions fill it with few data bytes. The last chunk line is not
+    // complete. The request has exactly the size of the buffer, thus the server reads all of
+    // it before its answer, and the close sends no reset.
+    const limit = 200 + 100 + 4096;
+    const head = "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n";
+    const chunk = "1;" ++ "a" ** 900 ++ "\r\nx\r\n";
+    var bytes: std.ArrayList(u8) = .empty;
+    try bytes.appendSlice(arena, head);
+    for (0..4) |_| try bytes.appendSlice(arena, chunk);
+    try bytes.appendSlice(arena, "1;");
+    try bytes.appendNTimes(arena, 'a', limit - bytes.items.len);
+    const raw = try Raw.open(gpa, f.transport.bound_port);
+    defer raw.close(gpa);
+    try raw.send(bytes.items);
+    try std.testing.expect(std.mem.startsWith(u8, try raw.readToEnd(arena), "HTTP/1.1 413 "));
 }

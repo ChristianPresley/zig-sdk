@@ -26,5 +26,7 @@ pub const tool_headers = @import("transport/tool_headers.zig");
 pub const proxy = @import("transport/proxy.zig");
 /// The TCP socket options that `std.Io.net` does not expose: `TCP_NODELAY`.
 pub const socket_opts = @import("transport/socket_opts.zig");
-/// The readiness of parked sockets, for the parkers of the HTTP and gRPC servers.
+/// The readiness of parked sockets, for the parker of the gRPC server.
 pub const park = @import("transport/park.zig");
+/// The readiness poller of one shard of the Streamable HTTP server.
+pub const shard_poll = @import("transport/shard_poll.zig");

@@ -68,12 +68,19 @@ http: struct {
     /// shorter (on Linux, `net.core.somaxconn`). Overflow: the kernel drops the connect, and
     /// the client sends it again after a delay, usually 1 second.
     listen_backlog: u31 = 1024,
-    /// Maximum worker tasks: connections that read a request or run a handler, with the
-    /// listen streams. An idle keep-alive connection holds no task. On Linux and Windows, a
-    /// new plaintext connection holds no task until its first bytes arrive. Zero means
-    /// `max_connections`. Overflow: a connection with bytes waits for a free worker, up to
-    /// `head_timeout`. With `std.Io.Threaded`, each worker task is a thread.
+    /// Maximum worker tasks of the plaintext server: requests that are not quick, with the
+    /// listen streams. A quick request, an idle connection and a request that is not complete
+    /// hold no worker task: a shard serves them. Zero means `max_connections`. Overflow: a
+    /// complete request waits for a free worker, up to `head_timeout`. With `std.Io.Threaded`,
+    /// each worker task is a thread. A TLS connection holds one task of its own, and this
+    /// limit does not apply to it.
     max_in_flight: u32 = 256,
+    /// The shard tasks of the plaintext server. Each shard owns its connections. It waits for
+    /// their bytes and reads their requests. It runs the quick requests, and starts a worker
+    /// task for each other request. A new connection goes to the first shard that is not
+    /// busy, thus the connections of one client stay on few shards. Zero means one shard for
+    /// each 8 processors, at least 1 and at most 4.
+    shards: u32 = 0,
     /// Set `SO_REUSEADDR` on the listen socket of the HTTP and WebSocket servers.
     reuse_address: bool = false,
     /// The time that the server waits for the next request on a keep-alive connection. It is
