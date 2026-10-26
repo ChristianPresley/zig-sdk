@@ -249,3 +249,22 @@ test "write error response with null id" {
     try writeErrorResponse(&aw.writer, null, .{ .code = -32700, .message = "Parse error" });
     try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}", aw.written());
 }
+
+test "a message that is too deep or not valid JSON is a syntax error" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // The parser reports the first problem in the text. For each of these texts the problem
+    // can be the depth or the syntax, and the message parser gives `error.Syntax` for both,
+    // thus the response is the same -32700 as before.
+    const texts = [_][]const u8{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"m\",\"params\":{\"a\":[[[1]]]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"m\",\"params\":{\"a\":[[[1]]]}} x",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"m\",\"params\":{\"a\":[[[1",
+        "{\"jsonrpc\":\"2.0\",\"id\":1 \"method\":\"m\",\"params\":{\"a\":[[[1]]]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"\\q\",\"method\":\"m\",\"params\":{\"a\":[[[1]]]}}",
+    };
+    for (texts) |text| try std.testing.expectError(error.Syntax, Message.parseMaxDepth(arena, text, 3));
+    // At the limit the message parses.
+    _ = try Message.parseMaxDepth(arena, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"m\",\"params\":{\"a\":[1]}}", 3);
+}

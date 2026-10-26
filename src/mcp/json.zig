@@ -63,12 +63,21 @@ pub fn parseTree(arena: Allocator, text: []const u8) ParseTreeError!Value {
 /// errors are the same. The function copies the text into `arena` one time. A string or a
 /// number without an escape is a slice of that copy. Only a string with an escape gets
 /// its own memory.
+///
+/// The depth limit is the limit of `checkDepth`, but the parser applies it while it reads
+/// the text, without a pass before the parse. Thus a text that is too deep and also not
+/// valid JSON can give a syntax error in place of `error.TooDeep`. The error is the first
+/// problem in the text. A valid text that is too deep always gives `error.TooDeep`.
 pub fn parseTreeMaxDepth(arena: Allocator, text: []const u8, max_depth: u16) ParseTreeError!Value {
-    try checkDepth(text, @min(max_depth, max_tree_depth));
     const copy = try arena.dupe(u8, text);
     var scanner: std.json.Scanner = .initCompleteInput(arena, copy);
     defer scanner.deinit();
-    var builder: TreeBuilder = .{ .arena = arena, .scanner = &scanner, .max_value_len = copy.len };
+    var builder: TreeBuilder = .{
+        .arena = arena,
+        .scanner = &scanner,
+        .max_value_len = copy.len,
+        .max_depth = @min(max_depth, max_tree_depth),
+    };
     const root = try builder.build();
     // The scanner gives an error for a token after the root value.
     if (try scanner.next() != .end_of_document) return error.UnexpectedToken;
@@ -81,6 +90,8 @@ const TreeBuilder = struct {
     arena: Allocator,
     scanner: *std.json.Scanner,
     max_value_len: usize,
+    /// The most arrays and objects inside each other. The stack has one entry for each.
+    max_depth: u16,
     stack: std.ArrayList(Open) = .empty,
 
     /// An array or an object that is not complete. `key` is the key of the next member of
@@ -125,16 +136,24 @@ const TreeBuilder = struct {
             .false => return .{ .bool = false },
             .null => return .null,
             .array_begin => {
+                try b.open();
                 try b.stack.append(b.arena, .{ .array = .init(b.arena) });
                 return null;
             },
             .object_begin => {
+                try b.open();
                 try b.stack.append(b.arena, .{ .object = .{ .members = .empty, .key = null } });
                 return null;
             },
             .array_end => return .{ .array = b.stack.pop().?.array },
             else => return error.UnexpectedToken,
         }
+    }
+
+    /// Refuse an array or an object past `max_depth`, as `checkDepth` does: the depth of
+    /// `[]` and of `{}` is 1.
+    fn open(b: *TreeBuilder) error{TooDeep}!void {
+        if (b.stack.items.len >= b.max_depth) return error.TooDeep;
     }
 
     /// Put a complete value into the array or the object at the top of the stack. The
@@ -365,8 +384,11 @@ pub fn expectSameTree(expected: Value, actual: Value) !void {
     }
 }
 
-/// Fail when `parseTreeMaxDepth` and the `std.json` parser do not give the same tree or the
-/// same error for `text`.
+/// Fail when `parseTreeMaxDepth` and the old way (`checkDepth`, then the `std.json` parser)
+/// do not give the same tree or the same error for `text`. One difference is correct. For a
+/// text that is too deep and also not valid JSON, the old way gives `error.TooDeep`. The
+/// parser can give the syntax error first. The test then checks that the text is not valid
+/// JSON.
 fn expectSameParse(text: []const u8, max_depth: u16) !void {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -379,10 +401,18 @@ fn expectSameParse(text: []const u8, max_depth: u16) !void {
             return err;
         });
     } else |e| {
-        if (actual) |_| {
+        const a = if (actual) |_| {
             std.debug.print("text {s}: std gives {t}, parseTree gives a tree\n", .{ text, e });
             return error.TestUnexpectedResult;
-        } else |a| try std.testing.expectEqual(e, a);
+        } else |a| a;
+        if (e == a) return;
+        if (e == error.TooDeep and a != error.OutOfMemory) {
+            // Without the depth limit, the text must not parse.
+            const unlimited = std.json.parseFromSliceLeaky(Value, arena, text, .{});
+            if (std.meta.isError(unlimited)) return;
+        }
+        std.debug.print("text {s}: std gives {t}, parseTree gives {t}\n", .{ text, e, a });
+        return error.TestUnexpectedResult;
     }
 }
 
@@ -611,4 +641,58 @@ test "parseTree and std.json agree on every JSON fixture" {
         checked += 1;
     }
     try std.testing.expect(checked >= 200);
+}
+
+test "parseTree applies the depth limit at each edge, also on damaged texts" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Valid texts at the limit, one under it and one over it: the same result as before.
+    const valid = [_][]const u8{ "1", "[]", "{}", "[[]]", "{\"a\":[1,{\"b\":{}}]}", "[\"[[[[\",{\"{\":\"]]\"}]", "[\"\\\"[[\",[1]]", "[[],[],[[]]]" };
+    for (valid) |text| for (0..6) |limit| try expectSameParse(text, @intCast(limit));
+    try std.testing.expectError(error.TooDeep, parseTreeMaxDepth(arena, "[]", 0));
+    // The depth of this text is 4.
+    _ = try parseTreeMaxDepth(arena, "{\"a\":[1,{\"b\":{}}]}", 4);
+    try std.testing.expectError(error.TooDeep, parseTreeMaxDepth(arena, "{\"a\":[1,{\"b\":{}}]}", 3));
+    // Too deep and not valid JSON: the old way said TooDeep. Now the first problem in the
+    // text decides. Both are errors, thus a JSON-RPC message still gets -32700.
+    const damaged = [_]struct { text: []const u8, now: ParseTreeError }{
+        .{ .text = "[[[[x", .now = error.TooDeep },
+        .{ .text = "[[[[1]]]] x", .now = error.TooDeep },
+        .{ .text = "x [[[[1]]]]", .now = error.SyntaxError },
+        .{ .text = "1 [[[[1]]]]", .now = error.SyntaxError },
+        .{ .text = "[\"\\q\",[[[[1]]]]]", .now = error.SyntaxError },
+        .{ .text = "[\"\xff\",[[[[1]]]]]", .now = error.SyntaxError },
+        .{ .text = "{1:[[[[1]]]]}", .now = error.SyntaxError },
+        .{ .text = "[1,,[[[[1]]]]]", .now = error.SyntaxError },
+        .{ .text = "[[[", .now = error.TooDeep },
+    };
+    for (damaged) |case| {
+        try std.testing.expectError(error.TooDeep, stdTree(arena, case.text, 2));
+        try std.testing.expectError(case.now, parseTreeMaxDepth(arena, case.text, 2));
+        try expectSameParse(case.text, 2);
+    }
+}
+
+test "parseTree and std.json agree on random texts with small depth limits" {
+    const gpa = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x64657074);
+    const random = prng.random();
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    const damage = "{}[]\":,\\ \xff0e-";
+    for (0..3000) |_| {
+        text.clearRetainingCapacity();
+        try randomText(random, gpa, &text, 6);
+        const limit = random.uintLessThan(u16, 7);
+        try expectSameParse(text.items, limit);
+        const at = random.uintLessThan(usize, text.items.len);
+        switch (random.uintLessThan(u8, 3)) {
+            0 => text.items[at] = random.int(u8),
+            1 => _ = text.orderedRemove(at),
+            else => try text.insert(gpa, at, damage[random.uintLessThan(usize, damage.len)]),
+        }
+        try expectSameParse(text.items, limit);
+    }
 }
