@@ -85,7 +85,178 @@ pub const Schema = struct {
     patterns: std.StringHashMapUnmanaged(regex.Regex) = .empty,
     /// The largest match buffer that one of `patterns` needs, in `u32` items.
     pattern_buffer_len: usize = 0,
+    /// The check that accepts an instance without the walk of the keywords, when the
+    /// schema is simple enough. See `Quick`.
+    quick: ?Quick = null,
 };
+
+/// A short check for a simple schema, for example the input schema of a tool that
+/// `derive` makes. `validate` gives `valid` when the check accepts the instance, without the
+/// walk of the keywords. In all other cases `validate` does the walk, thus the failures and
+/// their messages do not change.
+///
+/// In a simple schema, the root has only `type`, `properties`, `required` and a boolean
+/// `additionalProperties`. It can also have keywords that the evaluator does not read, for
+/// example `title`. Each subschema in `properties` is a boolean, or has only `type` and
+/// such keywords.
+pub const Quick = struct {
+    /// The names in `type` of the root, or null without `type`.
+    types: ?[]const []const u8,
+    /// The subschemas of `properties`.
+    properties: std.StringArrayHashMapUnmanaged(Property) = .empty,
+    required: []const []const u8 = &.{},
+    /// The value of `additionalProperties`, or null without the keyword.
+    additional: ?bool = null,
+
+    pub const Property = union(enum) {
+        /// A boolean subschema.
+        boolean: bool,
+        /// The names in `type`, or null without `type`. The subschema is an object.
+        types: ?[]const []const u8,
+    };
+
+    /// True when the walk of the keywords surely gives a valid instance with the limits of
+    /// the walk. False does not mean invalid.
+    pub fn accepts(q: *const Quick, limits: Limits.Schema, instance: Value) bool {
+        // The root costs one unit of the budget.
+        if (limits.eval_budget < 1) return false;
+        if (q.types) |names| if (!anyTypeMatches(names, instance)) return false;
+        // The other keywords apply only to an object.
+        if (instance != .object) return true;
+        const members = instance.object;
+        if (members.count() > 0) {
+            // Each member that a subschema checks costs one unit and one level of depth.
+            if (limits.max_depth < 1 or limits.eval_budget - 1 < members.count()) return false;
+        }
+        for (q.required) |name| if (!members.contains(name)) return false;
+        for (members.keys(), members.values()) |name, value| {
+            if (q.properties.get(name)) |p| {
+                switch (p) {
+                    .boolean => |b| if (!b) return false,
+                    .types => |t| if (t) |names| if (!anyTypeMatches(names, value)) return false,
+                }
+            } else if (q.additional) |a| if (!a) return false;
+        }
+        return true;
+    }
+};
+
+fn anyTypeMatches(names: []const []const u8, v: Value) bool {
+    for (names) |n| if (typeMatches(n, v)) return true;
+    return false;
+}
+
+/// The keywords that the evaluator reads, also through the compiled nodes (`$ref` and
+/// `$dynamicRef`). A schema with one of these keywords, other than the keywords that `Quick`
+/// handles, gets no `Quick`. Keep this list complete when the evaluator reads a new keyword.
+const evaluated_keywords = [_][]const u8{
+    "$ref",        "$dynamicRef",      "additionalProperties",  "allOf",            "anyOf",
+    "const",       "contains",         "dependentRequired",     "dependentSchemas", "else",
+    "enum",        "exclusiveMaximum", "exclusiveMinimum",      "if",               "items",
+    "maxContains", "maxItems",         "maxLength",             "maxProperties",    "maximum",
+    "minContains", "minItems",         "minLength",             "minProperties",    "minimum",
+    "multipleOf",  "not",              "oneOf",                 "pattern",          "patternProperties",
+    "prefixItems", "properties",       "propertyNames",         "required",         "then",
+    "type",        "unevaluatedItems", "unevaluatedProperties", "uniqueItems",
+};
+
+fn isEvaluated(key: []const u8) bool {
+    for (evaluated_keywords) |k| if (std.mem.eql(u8, k, key)) return true;
+    return false;
+}
+
+const QuickError = error{ OutOfMemory, NotSimple };
+
+/// The names of a `type` value.
+fn quickTypes(arena: Allocator, t: Value) QuickError![]const []const u8 {
+    switch (t) {
+        .string => |s| {
+            const names = try arena.alloc([]const u8, 1);
+            names[0] = s;
+            return names;
+        },
+        .array => |a| {
+            const names = try arena.alloc([]const u8, a.items.len);
+            for (a.items, names) |item, *n| {
+                if (item != .string) return error.NotSimple;
+                n.* = item.string;
+            }
+            return names;
+        },
+        else => return error.NotSimple,
+    }
+}
+
+/// The `Quick` of `root`, or null when the schema is not simple.
+fn quickOf(arena: Allocator, root: Value) Allocator.Error!?Quick {
+    return quickRoot(arena, root) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NotSimple => return null,
+    };
+}
+
+fn quickRoot(arena: Allocator, root: Value) QuickError!Quick {
+    // A boolean root is rare. It keeps the walk.
+    if (root != .object) return error.NotSimple;
+    var q: Quick = .{ .types = null };
+    var it = root.object.iterator();
+    while (it.next()) |kv| {
+        const key = kv.key_ptr.*;
+        const v = kv.value_ptr.*;
+        if (std.mem.eql(u8, key, "type")) {
+            q.types = try quickTypes(arena, v);
+        } else if (std.mem.eql(u8, key, "properties")) {
+            if (v != .object) return error.NotSimple;
+            var pit = v.object.iterator();
+            while (pit.next()) |p| try q.properties.put(arena, p.key_ptr.*, try quickProperty(arena, p.value_ptr.*));
+        } else if (std.mem.eql(u8, key, "additionalProperties")) {
+            if (v != .bool) return error.NotSimple;
+            q.additional = v.bool;
+        } else if (std.mem.eql(u8, key, "required")) {
+            if (v != .array) return error.NotSimple;
+            const names = try arena.alloc([]const u8, v.array.items.len);
+            for (v.array.items, names) |item, *n| {
+                if (item != .string) return error.NotSimple;
+                n.* = item.string;
+            }
+            q.required = names;
+        } else if (isEvaluated(key) or !quietKeyword(key, &root_dollar_keywords)) {
+            return error.NotSimple;
+        }
+    }
+    return q;
+}
+
+fn quickProperty(arena: Allocator, sub: Value) QuickError!Quick.Property {
+    switch (sub) {
+        .bool => |b| return .{ .boolean = b },
+        .object => |o| {
+            var types: ?[]const []const u8 = null;
+            var it = o.iterator();
+            while (it.next()) |kv| {
+                const key = kv.key_ptr.*;
+                if (std.mem.eql(u8, key, "type")) {
+                    types = try quickTypes(arena, kv.value_ptr.*);
+                } else if (isEvaluated(key) or !quietKeyword(key, &.{"$comment"})) {
+                    return error.NotSimple;
+                }
+            }
+            return .{ .types = types };
+        },
+        else => return error.NotSimple,
+    }
+}
+
+/// The keywords with `$` that a simple root can have. They do not change the walk of a
+/// schema without references.
+const root_dollar_keywords = [_][]const u8{ "$schema", "$comment", "$id", "$anchor", "$defs" };
+
+/// True for a keyword without `$`, and for a keyword in `allowed`.
+fn quietKeyword(key: []const u8, allowed: []const []const u8) bool {
+    if (key.len == 0 or key[0] != '$') return true;
+    for (allowed) |k| if (std.mem.eql(u8, k, key)) return true;
+    return false;
+}
 
 /// A schema resource: the root schema or a subschema with `$id`.
 pub const Resource = struct {
@@ -465,6 +636,7 @@ pub fn compile(arena: Allocator, root: Value, options: Options) CompileError!Sch
         .nodes = c.nodes,
         .patterns = c.patterns,
         .pattern_buffer_len = c.pattern_buffer_len,
+        .quick = try quickOf(arena, root),
     };
 }
 
@@ -1022,6 +1194,7 @@ const Evaluator = struct {
 
 /// Validate an instance against a compiled schema. Failure messages live in `arena`.
 pub fn validate(arena: Allocator, schema: *const Schema, instance: Value) ValidateError!Result {
+    if (schema.quick) |*q| if (q.accepts(schema.options.limits, instance)) return .{ .valid = true, .failures = &.{} };
     var ev: Evaluator = .{
         .arena = arena,
         .schema = schema,
@@ -1558,4 +1731,124 @@ test "failure report and evaluation limits" {
     const deep = try compileText(arena, "{\"properties\":{\"n\":{\"$ref\":\"#\"}}}", .{ .limits = .{ .max_depth = 2 } });
     const nested = try std.json.parseFromSliceLeaky(Value, arena, "{\"n\":{\"n\":{\"n\":{}}}}", .{});
     try std.testing.expectError(error.InstanceTooDeep, validate(arena, &deep, nested));
+}
+
+/// Fail when the `Quick` check changes the result of `validate` for `instance`. The walk
+/// without the check is the reference.
+fn expectQuickSame(arena: Allocator, schema: *const Schema, instance_text: []const u8) !void {
+    const instance = try std.json.parseFromSliceLeaky(Value, arena, instance_text, .{});
+    var slow = schema.*;
+    slow.quick = null;
+    const expected = validate(arena, &slow, instance);
+    const actual = validate(arena, schema, instance);
+    if (expected) |e| {
+        const a = try actual;
+        try std.testing.expectEqual(e.valid, a.valid);
+        try std.testing.expectEqual(e.truncated, a.truncated);
+        try std.testing.expectEqual(e.failures.len, a.failures.len);
+        for (e.failures, a.failures) |x, y| {
+            try std.testing.expectEqualStrings(x.instance_path, y.instance_path);
+            try std.testing.expectEqualStrings(x.keyword, y.keyword);
+            try std.testing.expectEqualStrings(x.message, y.message);
+        }
+    } else |e| try std.testing.expectError(e, actual);
+}
+
+const quick_schemas = [_]struct { text: []const u8, quick: bool }{
+    .{ .text = "{}", .quick = true },
+    .{ .text = "{\"type\":\"object\"}", .quick = true },
+    .{ .text = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}", .quick = true },
+    .{ .text = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"d\"}},\"required\":[\"name\"],\"additionalProperties\":false}", .quick = true },
+    .{ .text = "{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"},\"x\":{\"type\":[\"number\",\"null\"]},\"l\":{\"type\":\"array\"},\"o\":{\"type\":\"object\"},\"b\":{\"type\":\"boolean\"},\"any\":{},\"no\":false,\"yes\":true},\"additionalProperties\":true}", .quick = true },
+    .{ .text = "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"title\":\"t\",\"type\":\"object\",\"properties\":{\"region\":{\"type\":\"string\",\"x-mcp-header\":\"Region\",\"format\":\"email\"}},\"$defs\":{\"unused\":{\"type\":\"string\"}}}", .quick = true },
+    .{ .text = "{\"type\":[\"object\",\"string\"],\"properties\":{\"a\":{\"type\":\"string\"}}}", .quick = true },
+    .{ .text = "{\"type\":\"object\",\"properties\":{\"color\":{\"enum\":[\"red\",\"green\"]}}}", .quick = false },
+    .{ .text = "{\"type\":\"object\",\"properties\":{\"v\":{\"const\":1}}}", .quick = false },
+    .{ .text = "{\"type\":\"object\",\"properties\":{\"s\":{\"type\":\"string\",\"minLength\":2}}}", .quick = false },
+    .{ .text = "{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}", .quick = false },
+    .{ .text = "{\"type\":\"object\",\"minProperties\":1}", .quick = false },
+    .{ .text = "{\"$defs\":{\"n\":{\"type\":\"integer\"}},\"type\":\"object\",\"properties\":{\"a\":{\"$ref\":\"#/$defs/n\"}}}", .quick = false },
+    .{ .text = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"object\",\"properties\":{\"b\":{\"type\":\"string\"}}}}}", .quick = false },
+    .{ .text = "{\"type\":\"object\",\"unevaluatedProperties\":false}", .quick = false },
+    .{ .text = "{\"type\":\"object\",\"enum\":[{}]}", .quick = false },
+};
+
+const quick_instances = [_][]const u8{
+    "{}",                                "{\"name\":\"Ada\"}",   "{\"name\":1}",  "{\"extra\":1}",
+    "{\"name\":\"Ada\",\"extra\":true}", "{\"n\":1}",            "{\"n\":1.0}",   "{\"n\":1.5}",
+    "{\"n\":12345678901234567890123}",   "{\"x\":null}",         "{\"x\":\"s\"}", "{\"l\":[1,[2]]}",
+    "{\"o\":{\"deep\":[[[[1]]]]}}",      "{\"b\":false}",        "{\"no\":1}",    "{\"yes\":1,\"any\":[]}",
+    "{\"color\":\"red\"}",               "{\"color\":\"blue\"}", "{\"v\":1}",     "{\"v\":2}",
+    "{\"s\":\"a\"}",                     "{\"a\":{\"b\":1}}",    "{\"a\":\"x\"}", "{\"a\":1}",
+    "{\"region\":\"eu\"}",               "[]",                   "\"text\"",      "1",
+    "null",
+};
+
+test "the Quick check gives the result of the walk" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (quick_schemas) |case| {
+        const schema = try compileText(arena, case.text, .{});
+        std.testing.expectEqual(case.quick, schema.quick != null) catch |e| {
+            std.debug.print("schema {s}\n", .{case.text});
+            return e;
+        };
+        for (quick_instances) |instance| expectQuickSame(arena, &schema, instance) catch |e| {
+            std.debug.print("schema {s} instance {s}\n", .{ case.text, instance });
+            return e;
+        };
+    }
+}
+
+test "the Quick check keeps the limits of the walk" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"},\"b\":true},\"additionalProperties\":true}";
+    const limits = [_]Limits.Schema{
+        .{ .max_depth = 0 },
+        .{ .max_depth = 1 },
+        .{ .eval_budget = 0 },
+        .{ .eval_budget = 1 },
+        .{ .eval_budget = 2 },
+        .{ .eval_budget = 3 },
+    };
+    const compiled = try compileText(arena, text, .{});
+    try std.testing.expect(compiled.quick != null);
+    for (limits) |l| {
+        // The compiler needs a depth for the schema itself, thus the limits change after it.
+        var schema = compiled;
+        schema.options.limits = l;
+        for ([_][]const u8{ "{}", "{\"a\":1}", "{\"a\":1,\"c\":2}", "{\"a\":1,\"b\":2,\"c\":3}", "{\"a\":\"x\"}", "[]" }) |instance| {
+            expectQuickSame(arena, &schema, instance) catch |e| {
+                std.debug.print("limits {any} instance {s}\n", .{ l, instance });
+                return e;
+            };
+        }
+    }
+}
+
+test "every keyword of the evaluator stops the Quick check" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // `Quick` handles four keywords itself, with operands of a simple form.
+    const handled = [_][]const u8{ "type", "properties", "additionalProperties", "required" };
+    for (evaluated_keywords) |keyword| {
+        const is_handled = for (handled) |h| {
+            if (std.mem.eql(u8, h, keyword)) break true;
+        } else false;
+        if (is_handled) continue;
+        var root: std.json.ObjectMap = .empty;
+        try root.put(arena, keyword, .{ .bool = true });
+        try std.testing.expect(try quickOf(arena, .{ .object = root }) == null);
+        var sub: std.json.ObjectMap = .empty;
+        try sub.put(arena, keyword, .{ .bool = true });
+        var props: std.json.ObjectMap = .empty;
+        try props.put(arena, "a", .{ .object = sub });
+        var outer: std.json.ObjectMap = .empty;
+        try outer.put(arena, "properties", .{ .object = props });
+        try std.testing.expect(try quickOf(arena, .{ .object = outer }) == null);
+    }
 }

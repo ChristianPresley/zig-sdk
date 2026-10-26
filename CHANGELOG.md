@@ -20,6 +20,7 @@ This file records all notable changes to this project. The format follows Keep a
 - `http.Server.stats`: the open connections, the connections that the shards hold, and the worker tasks that run now.
 - `Transport.Responder.VTable.finishValue`: an optional function that gets the final result as a `Value` tree, in place of a response frame. The server engine uses it for a result when the responder has it, and uses `finish` for an error.
 - `json.toValue` and `json.value_writer.ValueWriter`: a writer with the API of `std.json.Stringify` that builds a `Value` tree. The tree is the same as the parse of the text that `json.write` gives. A value that the text path refuses also fails here.
+- `validator.Quick` and the field `Schema.quick`: a short check of a simple schema. `envelope.verifyAnnotated`: `envelope.verify` with the `x-mcp-header` annotations in place of the schema.
 
 ### Changed
 
@@ -94,6 +95,9 @@ This file records all notable changes to this project. The format follows Keep a
 - A server in ReleaseFast uses about a quarter less CPU for each call than in ReleaseSafe. In the same benchmark on Linux, a stdio call at 64 calls in flight uses 3.1 µs and a gRPC call uses 5.8 µs. An HTTP call does not change.
 - The typed gRPC binding now gets the result of a call from the server engine as a tree. Before, the engine serialized the result to JSON text, and the binding parsed the text again before the protobuf encode. A list call keeps the text, because the key of the typed result cache is that text. When the tree fails, the engine sends the text as before. The typed responses do not change, byte for byte. A test compares the tree with the parse of the text for each type of the schema examples.
 - The resource benchmark of the VS Code client used ReleaseSafe, 16 cores and interleaved rounds. A typed `CallTool` at 64 calls in flight on Linux now uses 6.5 µs of server CPU for each call. Before, it used 8.1 µs. On Windows it uses 5.8 µs, before 6.4 µs. Tunnel calls and sequential calls do not change.
+- The JSON Schema validator now compiles a short check for a simple schema, for example the input schema of a tool that `derive` makes. In a simple schema, the root has only `type`, `properties`, `required`, a boolean `additionalProperties` and keywords that the validator does not read. Each property has only `type` and such keywords. When the check accepts the instance, `validate` gives `valid` without the walk of the keywords. In all other cases the walk runs as before, thus each failure and each -32602 message stays the same. A test compares the two ways on many schemas, instances and limits.
+- The server engine now keeps the `x-mcp-header` annotations of each tool from its registration. The Streamable HTTP and gRPC servers use them for the header check of a call, without a walk of the input schema. A tool cannot register again with another schema, thus the annotations cannot become stale.
+- A stdio call at 64 calls in flight on Linux used 6 % of its server CPU for the validation of the arguments. It now uses less than 0.1 %. The header check of a gRPC tunnel call used 3.3 %, and now uses 1.8 %. In the resource benchmark of the VS Code client (5 interleaved rounds), a stdio call on Linux now uses 3.3 µs, before 3.5 µs. On Windows it uses 2.9 µs, before 3.1 µs. A gRPC call on Linux uses 6.9 µs in the tunnel and 5.7 µs typed, before 7.2 µs and 5.9 µs.
 
 ### Fixed
 

@@ -1024,3 +1024,56 @@ test "tasks extension: input required inside a task" {
     try std.testing.expect(done.object.get("inputRequests") == null);
     try std.testing.expectEqualStrings("task greets Alice", done.object.get("result").?.object.get("content").?.array.items[0].object.get("text").?.string);
 }
+
+fn errorMessage(v: Value) []const u8 {
+    return v.object.get("error").?.object.get("message").?.string;
+}
+
+test "the quick schema check keeps the argument errors" {
+    var g: Fixture = undefined;
+    try g.init(.{ .info = .{ .name = "test", .version = "0.1.0" }, .invalid_args_policy = .rpc_error });
+    defer g.deinit();
+    try g.server.addToolJson(.{ .name = "any", .input_schema = "{\"type\":\"object\"}" }, boom);
+    try g.server.addToolJson(.{ .name = "req", .input_schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}" }, boom);
+    try g.server.addToolJson(.{ .name = "color", .input_schema = "{\"type\":\"object\",\"properties\":{\"c\":{\"enum\":[\"red\"]}}}" }, boom);
+    try g.server.addToolJson(.{ .name = "one", .input_schema = "{\"type\":\"object\",\"properties\":{\"v\":{\"const\":1}}}" }, boom);
+    try g.server.addToolJson(.{ .name = "region", .input_schema = "{\"type\":\"object\",\"properties\":{\"region\":{\"type\":\"string\",\"x-mcp-header\":\"Region\"}}}" }, boom);
+
+    // The simple schemas get the quick check, the others keep the walk.
+    for (g.server.tools.items) |t| {
+        const simple = std.mem.eql(u8, t.def.name, "any") or std.mem.eql(u8, t.def.name, "req") or std.mem.eql(u8, t.def.name, "region");
+        if (simple) try std.testing.expect(t.input.quick != null);
+        if (std.mem.eql(u8, t.def.name, "color") or std.mem.eql(u8, t.def.name, "one")) try std.testing.expect(t.input.quick == null);
+    }
+
+    // A valid call reaches the handler, which fails: a tool error, not -32602.
+    try std.testing.expect(errorCode(try g.call(1, "tools/call", meta_none, "\"name\":\"any\",\"arguments\":{\"x\":[1]}")) == null);
+    try std.testing.expect(errorCode(try g.call(2, "tools/call", meta_none, "\"name\":\"req\",\"arguments\":{\"name\":\"Ada\"}")) == null);
+    try std.testing.expect(errorCode(try g.call(3, "tools/call", meta_none, "\"name\":\"color\",\"arguments\":{\"c\":\"red\"}")) == null);
+    try std.testing.expect(errorCode(try g.call(4, "tools/call", meta_none, "\"name\":\"one\",\"arguments\":{\"v\":1}")) == null);
+
+    // An invalid call gets the same -32602 message as with the walk alone.
+    const cases = [_]struct { args: []const u8, message: []const u8 }{
+        .{ .args = "\"name\":\"req\",\"arguments\":{}", .message = "Invalid arguments for tool req: missing required property \"name\"" },
+        .{ .args = "\"name\":\"req\",\"arguments\":{\"name\":1}", .message = "Invalid arguments for tool req: at \"/name\": expected string, found number" },
+        .{ .args = "\"name\":\"req\",\"arguments\":{\"name\":\"Ada\",\"x\":1}", .message = "Invalid arguments for tool req: at \"/x\": the schema rejects every value" },
+        .{ .args = "\"name\":\"color\",\"arguments\":{\"c\":\"blue\"}", .message = "Invalid arguments for tool color: at \"/c\": value is not one of the allowed values" },
+        .{ .args = "\"name\":\"one\",\"arguments\":{\"v\":2}", .message = "Invalid arguments for tool one: at \"/v\": value is not the required constant" },
+        .{ .args = "\"name\":\"region\",\"arguments\":{\"region\":5}", .message = "Invalid arguments for tool region: at \"/region\": expected string, found number" },
+    };
+    for (cases, 10..) |case, id| {
+        const v = try g.call(@intCast(id), "tools/call", meta_none, case.args);
+        try std.testing.expectEqual(@as(i64, -32602), errorCode(v).?);
+        try std.testing.expectEqualStrings(case.message, errorMessage(v));
+    }
+
+    // The server keeps the header annotations from the registration. A tool cannot register
+    // again with another schema, thus the kept data cannot become stale.
+    for (g.server.tools.items) |t| if (std.mem.eql(u8, t.def.name, "region")) {
+        try std.testing.expectEqual(1, t.header_annotations.len);
+        try std.testing.expectEqualStrings("Region", t.header_annotations[0].header);
+    };
+    try std.testing.expectError(error.DuplicateName, g.server.addToolJson(.{ .name = "req", .input_schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"integer\"}}}" }, boom));
+    const again = try g.call(30, "tools/call", meta_none, "\"name\":\"req\",\"arguments\":{\"name\":1}");
+    try std.testing.expectEqualStrings("Invalid arguments for tool req: at \"/name\": expected string, found number", errorMessage(again));
+}

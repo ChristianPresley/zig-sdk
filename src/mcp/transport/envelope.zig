@@ -167,6 +167,18 @@ pub const Headers = struct {
 /// `tools/call` and the tool exists. The version check of `verifyVersion` comes first, so a
 /// request with no rejection has the version of this SDK.
 pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?Value, schema: ?Value) Allocator.Error!?Rejection {
+    const annotations: ?[]const HeaderAnnotation = if (schema) |s| switch (try headerAnnotations(arena, s)) {
+        .valid => |list| list,
+        // Registration rejects such a schema. The server mirrors no parameter of it.
+        .invalid => &.{},
+    } else null;
+    return verifyAnnotated(arena, headers, method, params, annotations);
+}
+
+/// As `verify`, with the `x-mcp-header` annotations of the tool input schema in place of the
+/// schema. The server engine keeps the annotations of each tool from its registration,
+/// thus a call does not walk the schema.
+pub fn verifyAnnotated(arena: Allocator, headers: Headers, method: []const u8, params: ?Value, header_annotations: ?[]const HeaderAnnotation) Allocator.Error!?Rejection {
     const hv = headers.protocol_version orelse return .{ .message = "Header mismatch: the MCP-Protocol-Version header is missing" };
     if (try verifyVersion(arena, hv, metaVersion(params))) |rejection| return rejection;
     const hm = headers.method orelse return .{ .message = "Header mismatch: the Mcp-Method header is missing" };
@@ -194,12 +206,7 @@ pub fn verify(arena: Allocator, headers: Headers, method: []const u8, params: ?V
     }
 
     // Mcp-Param-* headers declared by the tool schema.
-    if (schema) |s| {
-        const annotations = switch (try headerAnnotations(arena, s)) {
-            .valid => |list| list,
-            // Registration rejects such a schema. The server mirrors no parameter of it.
-            .invalid => &.{},
-        };
+    if (header_annotations) |annotations| {
         const arguments: ?Value = blk: {
             const p = params orelse break :blk null;
             if (p != .object) break :blk null;

@@ -1662,8 +1662,8 @@ fn runsIn(self: *Server, mode: Mode, cost_slot: ?usize) bool {
 fn handleRequest(conn: *Conn, stream: *Stream, arena: Allocator, env: envelope.Headers, deadline: ?Io.Duration, req: jsonrpc.Message.Request, principal: ?*resource_server.Principal, no_wait: bool, cost_slot: ?usize) !?Backlog {
     const self = conn.owner;
     const io = self.io;
-    const schema = toolSchema(self, req.params);
-    if (try envelope.verify(arena, env, req.method, req.params, schema)) |rejection| {
+    const annotations = toolHeaders(self, req.params);
+    if (try envelope.verifyAnnotated(arena, env, req.method, req.params, annotations)) |rejection| {
         if (env.protocol_version == null and std.mem.eql(u8, req.method, "initialize")) {
             const err = try errors.unsupportedProtocolVersion(arena, &version.supported_versions, "unknown");
             try rpcErrorOnly(stream, arena, err, req.id);
@@ -1719,10 +1719,12 @@ fn onReset(userdata: ?*anyopaque, stream: *Stream) void {
     token.cancel(stream.conn.io, "stream reset");
 }
 
-fn toolSchema(self: *Server, params: ?Value) ?Value {
+/// The `x-mcp-header` annotations of the tool that `params` names, or null when no tool has
+/// that name.
+fn toolHeaders(self: *Server, params: ?Value) ?[]const envelope.HeaderAnnotation {
     const p = params orelse return null;
     const name = json.getString(p, "name") orelse return null;
-    for (self.server.tools.items) |t| if (std.mem.eql(u8, t.def.name, name)) return t.def.inputSchema;
+    for (self.server.tools.items) |t| if (std.mem.eql(u8, t.def.name, name)) return t.header_annotations;
     return null;
 }
 

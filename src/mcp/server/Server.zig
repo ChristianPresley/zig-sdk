@@ -189,6 +189,9 @@ const ToolEntry = struct {
     quick: bool = false,
     userdata: ?*anyopaque,
     enabled: bool = true,
+    /// The `x-mcp-header` annotations of the input schema, from the registration. The schema
+    /// of a tool does not change after the registration.
+    header_annotations: []const envelope.HeaderAnnotation = &.{},
 };
 
 const ResourceEntry = struct {
@@ -451,11 +454,10 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
     const arena = self.registry_arena.allocator();
     const input_schema = try self.parseSchemaObject(def.input_schema orelse "{\"type\":\"object\"}", true);
     const output_schema: ?Value = if (def.output_schema) |t| try self.parseSchemaObject(t, false) else null;
-    {
-        var scratch: std.heap.ArenaAllocator = .init(self.gpa);
-        defer scratch.deinit();
-        if (!try envelope.schemaHeadersValid(scratch.allocator(), input_schema)) return error.InvalidHeaderAnnotation;
-    }
+    const header_annotations = switch (try envelope.headerAnnotations(arena, input_schema)) {
+        .valid => |list| list,
+        .invalid => return error.InvalidHeaderAnnotation,
+    };
     const input = try self.compileSchema(input_schema);
     const output: ?validator.Schema = if (output_schema) |o| try self.compileSchema(o) else null;
     const meta = try self.toolMetaValue(def);
@@ -482,6 +484,7 @@ pub fn addToolJson(self: *Server, def: ToolDef, handler: ToolHandler) RegisterEr
             .visibility = if (ui.visibility) |v| try arena.dupe(apps_proto.Visibility, v) else null,
         } else null,
         .userdata = def.userdata,
+        .header_annotations = header_annotations,
     };
     self.registry_lock.lockSharedUncancelable(std.Io.Threaded.global_single_threaded.io());
     defer self.registry_lock.unlockShared(std.Io.Threaded.global_single_threaded.io());

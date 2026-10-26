@@ -2268,8 +2268,8 @@ fn respondErrorOptions(request: *http.Server.Request, status: http.Status, id: ?
 fn handleRpcRequest(rc: *RequestContext, request: *http.Server.Request, arena: Allocator, head: Head, req: jsonrpc.Message.Request, principal: ?*resource_server.Principal) !bool {
     const self = rc.owner;
     // Header presence, mirror validation and version support run before dispatch on HTTP.
-    const schema = if (std.mem.eql(u8, req.method, "tools/call")) toolSchema(self, req.params) else null;
-    if (try envelope.verify(arena, head.envelope_headers, req.method, req.params, schema)) |rejection| {
+    const annotations = if (std.mem.eql(u8, req.method, "tools/call")) toolHeaders(self, req.params) else null;
+    if (try envelope.verifyAnnotated(arena, head.envelope_headers, req.method, req.params, annotations)) |rejection| {
         // A legacy client without headers gets a clear version message.
         if (head.envelope_headers.protocol_version == null and std.mem.eql(u8, req.method, "initialize")) {
             const err = try errors.unsupportedProtocolVersion(arena, &version.supported_versions, "unknown");
@@ -2383,10 +2383,12 @@ const Dispatch = struct {
     }
 };
 
-fn toolSchema(self: *Server, params: ?Value) ?Value {
+/// The `x-mcp-header` annotations of the tool that `params` names, or null when no tool has
+/// that name.
+fn toolHeaders(self: *Server, params: ?Value) ?[]const envelope.HeaderAnnotation {
     const p = params orelse return null;
     const name = json.getString(p, "name") orelse return null;
-    for (self.server.tools.items) |t| if (std.mem.eql(u8, t.def.name, name)) return t.def.inputSchema;
+    for (self.server.tools.items) |t| if (std.mem.eql(u8, t.def.name, name)) return t.header_annotations;
     return null;
 }
 
