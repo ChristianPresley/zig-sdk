@@ -2214,8 +2214,9 @@ fn handleRequest(rc: *RequestContext, request: *http.Server.Request) !bool {
     }
     // The body obeys `limits.http.idle_timeout` from the end of the head.
     if (rc.tls) |t| t.startTimer(.body, self.limits.http.idle_timeout);
-    var body_buf: [4096]u8 = undefined;
-    const body_reader = request.readerExpectNone(&body_buf);
+    // `allocRemaining` streams the body into `arena` and does not use the buffer of the
+    // reader. Without a buffer, a safe build does not fill one on each request.
+    const body_reader = request.readerExpectNone(&.{});
     const body = body_reader.allocRemaining(arena, .limited(self.limits.http.max_body_bytes)) catch |e| switch (e) {
         error.StreamTooLong => {
             try request.respond("", .{ .status = .payload_too_large, .keep_alive = false });

@@ -55,10 +55,101 @@ pub fn parseTree(arena: Allocator, text: []const u8) ParseTreeError!Value {
 
 /// Parse a complete JSON text into a `Value` tree. A text that nests deeper than
 /// `max_depth` gives `error.TooDeep`. All memory comes from `arena`.
+///
+/// The tree is the same as the tree of `std.json.parseFromSliceLeaky(Value, ...)`, and the
+/// errors are the same. The function copies the text into `arena` one time. A string or a
+/// number without an escape is a slice of that copy. Only a string with an escape gets
+/// its own memory.
 pub fn parseTreeMaxDepth(arena: Allocator, text: []const u8, max_depth: u16) ParseTreeError!Value {
     try checkDepth(text, @min(max_depth, max_tree_depth));
-    return std.json.parseFromSliceLeaky(Value, arena, text, .{ .allocate = .alloc_always });
+    const copy = try arena.dupe(u8, text);
+    var scanner: std.json.Scanner = .initCompleteInput(arena, copy);
+    defer scanner.deinit();
+    var builder: TreeBuilder = .{ .arena = arena, .scanner = &scanner, .max_value_len = copy.len };
+    const root = try builder.build();
+    // The scanner gives an error for a token after the root value.
+    if (try scanner.next() != .end_of_document) return error.UnexpectedToken;
+    return root;
 }
+
+/// Builds a `Value` tree from the tokens of a scanner without recursion. The `stack` holds
+/// the arrays and objects that are not complete.
+const TreeBuilder = struct {
+    arena: Allocator,
+    scanner: *std.json.Scanner,
+    max_value_len: usize,
+    stack: std.ArrayList(Open) = .empty,
+
+    /// An array or an object that is not complete. `key` is the key of the next member of
+    /// an object, or null before the key.
+    const Open = union(enum) {
+        array: std.json.Array,
+        object: struct { members: std.json.ObjectMap, key: ?[]const u8 },
+    };
+
+    fn build(b: *TreeBuilder) ParseTreeError!Value {
+        while (true) {
+            const value = try b.step() orelse continue;
+            if (try b.attach(value)) |root| return root;
+        }
+    }
+
+    fn token(b: *TreeBuilder) ParseTreeError!std.json.Token {
+        return b.scanner.nextAllocMax(b.arena, .alloc_if_needed, b.max_value_len);
+    }
+
+    /// Read one token. The result is a complete value, or null after a key or after the
+    /// start of an array or an object.
+    fn step(b: *TreeBuilder) ParseTreeError!?Value {
+        if (b.stack.items.len > 0) {
+            const top = &b.stack.items[b.stack.items.len - 1];
+            if (top.* == .object and top.object.key == null) {
+                switch (try b.token()) {
+                    .string, .allocated_string => |key| {
+                        top.object.key = key;
+                        return null;
+                    },
+                    .object_end => return .{ .object = b.stack.pop().?.object.members },
+                    // The scanner gives a syntax error for each other token here.
+                    else => return error.UnexpectedToken,
+                }
+            }
+        }
+        switch (try b.token()) {
+            .string, .allocated_string => |s| return .{ .string = s },
+            .number, .allocated_number => |n| return Value.parseFromNumberSlice(n),
+            .true => return .{ .bool = true },
+            .false => return .{ .bool = false },
+            .null => return .null,
+            .array_begin => {
+                try b.stack.append(b.arena, .{ .array = .init(b.arena) });
+                return null;
+            },
+            .object_begin => {
+                try b.stack.append(b.arena, .{ .object = .{ .members = .empty, .key = null } });
+                return null;
+            },
+            .array_end => return .{ .array = b.stack.pop().?.array },
+            else => return error.UnexpectedToken,
+        }
+    }
+
+    /// Put a complete value into the array or the object at the top of the stack. The
+    /// result is the value when it is the root.
+    fn attach(b: *TreeBuilder, value: Value) ParseTreeError!?Value {
+        if (b.stack.items.len == 0) return value;
+        switch (b.stack.items[b.stack.items.len - 1]) {
+            .array => |*array| try array.append(value),
+            .object => |*object| {
+                const entry = try object.members.getOrPut(b.arena, object.key.?);
+                if (entry.found_existing) return error.DuplicateField;
+                entry.value_ptr.* = value;
+                object.key = null;
+            },
+        }
+        return null;
+    }
+};
 
 pub const ParseTreeError = std.json.ParseError(std.json.Scanner) || error{TooDeep};
 
@@ -237,4 +328,259 @@ test "Raw round trip" {
     const out = try writeAlloc(gpa, raw);
     defer gpa.free(out);
     try std.testing.expectEqualStrings("{\"a\":[1,2,{\"b\":null}]}", out);
+}
+
+/// The tree of the `std.json` parser, which `parseTreeMaxDepth` used before. The tests
+/// compare the two trees.
+fn stdTree(arena: Allocator, text: []const u8, max_depth: u16) ParseTreeError!Value {
+    try checkDepth(text, @min(max_depth, max_tree_depth));
+    return std.json.parseFromSliceLeaky(Value, arena, text, .{ .allocate = .alloc_always });
+}
+
+/// Fail when the trees are not identical: the same kinds, the same float bits and the same
+/// order of the object members.
+fn expectSameTree(expected: Value, actual: Value) !void {
+    try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .null => {},
+        .bool => |x| try std.testing.expectEqual(x, actual.bool),
+        .integer => |x| try std.testing.expectEqual(x, actual.integer),
+        .float => |x| try std.testing.expectEqual(@as(u64, @bitCast(x)), @as(u64, @bitCast(actual.float))),
+        .number_string => |x| try std.testing.expectEqualStrings(x, actual.number_string),
+        .string => |x| try std.testing.expectEqualStrings(x, actual.string),
+        .array => |x| {
+            try std.testing.expectEqual(x.items.len, actual.array.items.len);
+            for (x.items, actual.array.items) |a, b| try expectSameTree(a, b);
+        },
+        .object => |x| {
+            try std.testing.expectEqual(x.count(), actual.object.count());
+            for (x.keys(), x.values(), actual.object.keys(), actual.object.values()) |ka, va, kb, vb| {
+                try std.testing.expectEqualStrings(ka, kb);
+                try expectSameTree(va, vb);
+            }
+        },
+    }
+}
+
+/// Fail when `parseTreeMaxDepth` and the `std.json` parser do not give the same tree or the
+/// same error for `text`.
+fn expectSameParse(text: []const u8, max_depth: u16) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const expected = stdTree(arena, text, max_depth);
+    const actual = parseTreeMaxDepth(arena, text, max_depth);
+    if (expected) |e| {
+        try expectSameTree(e, actual catch |err| {
+            std.debug.print("text {s}: std gives a tree, parseTree gives {t}\n", .{ text, err });
+            return err;
+        });
+    } else |e| {
+        if (actual) |_| {
+            std.debug.print("text {s}: std gives {t}, parseTree gives a tree\n", .{ text, e });
+            return error.TestUnexpectedResult;
+        } else |a| try std.testing.expectEqual(e, a);
+    }
+}
+
+test "parseTree gives the trees and the errors of std.json" {
+    const texts = [_][]const u8{
+        // Scalars, empty containers and white space.
+        "null",
+        "true",
+        "false",
+        "0",
+        "\"\"",
+        "{}",
+        "[]",
+        " \t\r\n{ \"a\" : [ 1 , 2 ] , \"b\" : { } }\n",
+        "[[],{},[{}],{\"x\":[]}]",
+        // Escapes in values and in keys.
+        "\"line\\nbreak\\ttab\\rcr\\b\\f\"",
+        "\"quote \\\" slash \\/ backslash \\\\\"",
+        "{\"k\\\"ey\":\"v\\\"al\"}",
+        "{\"\\n\":1,\"\\\\\":2}",
+        "\"\\u0041\\u00e9\\u4e2d\"",
+        "\"\\ud83d\\ude00 pair\"",
+        "{\"\\ud83d\\ude00\":\"\\ud83d\\ude00\"}",
+        "\"\\u0000 nul\"",
+        "\"\xc3\xa9 \xe4\xb8\xad \xf0\x9f\x98\x80 without escapes\"",
+        // Numbers: integers, floats, exponents and numbers that do not fit.
+        "9223372036854775807",
+        "-9223372036854775808",
+        "9223372036854775808",
+        "-9223372036854775809",
+        "123456789012345678901234567890",
+        "1.5",
+        "-0",
+        "-0.0",
+        "1e2",
+        "1E+2",
+        "1.5e-7",
+        "2.5E-308",
+        "1e400",
+        "-1e400",
+        "[1,1.0,1e0,-1,10000000000000000000000]",
+        // Duplicate keys, also when an escape gives the same key.
+        "{\"a\":1,\"a\":2}",
+        "{\"o\":{\"b\":1,\"b\":1}}",
+        "{\"a\":1,\"\\u0061\":2}",
+        "[{\"a\":1},{\"a\":2}]",
+        "{\"a\":{\"a\":{\"a\":1}}}",
+        // Syntax errors, data after the value and incomplete texts.
+        "",
+        " ",
+        "{",
+        "[1,",
+        "{\"a\"}",
+        "{\"a\":}",
+        "{1:2}",
+        "[1,]",
+        "{\"a\":1,}",
+        "{} x",
+        "[] []",
+        "1 2",
+        "01",
+        "1.",
+        ".5",
+        "+1",
+        "1e",
+        "nul",
+        "\"open",
+        "\"\\x\"",
+        "\"\\u12\"",
+        "\"\\ud800\"",
+        "\"\\udc00\\ud800\"",
+        "\"tab\tin string\"",
+        // Invalid UTF-8 in a value and in a key.
+        "\"\xff\"",
+        "{\"\xc3\x28\":1}",
+        "\"\xed\xa0\x80\"",
+        "\"\xf0\x9f\x98\"",
+    };
+    for (texts) |text| try expectSameParse(text, max_tree_depth);
+}
+
+test "parseTree applies the depth limit" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try expectSameParse("[[1]]", 2);
+    try expectSameParse("[[1]]", 1);
+    try expectSameParse("{\"a\":{\"b\":{}}}", 3);
+    try expectSameParse("{\"a\":{\"b\":{}}}", 2);
+    try expectSameParse(try nestedArrays(arena, max_message_depth), max_message_depth);
+    try expectSameParse(try nestedArrays(arena, max_message_depth + 1), max_message_depth);
+    _ = try parseTreeMaxDepth(arena, try nestedArrays(arena, max_message_depth), max_message_depth);
+    try std.testing.expectError(error.TooDeep, parseTreeMaxDepth(arena, try nestedArrays(arena, max_message_depth + 1), max_message_depth));
+    try std.testing.expectError(error.TooDeep, parseTreeMaxDepth(arena, "{\"a\":{\"b\":{}}}", 2));
+}
+
+test "parseTree gives the specific errors" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectError(error.DuplicateField, parseTree(arena, "{\"a\":1,\"a\":2}"));
+    try std.testing.expectError(error.DuplicateField, parseTree(arena, "[{\"x\":{\"b\":1,\"b\":2}}]"));
+    try std.testing.expectError(error.SyntaxError, parseTree(arena, "{} x"));
+    try std.testing.expectError(error.SyntaxError, parseTree(arena, "\"\xff\""));
+    try std.testing.expectError(error.UnexpectedEndOfInput, parseTree(arena, "[1,"));
+}
+
+test "parseTree values do not use the memory of the text" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = try gpa.dupe(u8, "{\"plain\":\"abc\",\"esc\\\"aped\":\"a\\nb\",\"n\":12345678901234567890123,\"f\":2.5,\"i\":-7}");
+    const tree = try parseTree(arena, text);
+    // The caller can change or free the text after the parse.
+    @memset(text, 'x');
+    gpa.free(text);
+    try std.testing.expectEqualStrings("abc", tree.object.get("plain").?.string);
+    try std.testing.expectEqualStrings("a\nb", tree.object.get("esc\"aped").?.string);
+    try std.testing.expectEqualStrings("12345678901234567890123", tree.object.get("n").?.number_string);
+    try std.testing.expectEqual(@as(f64, 2.5), tree.object.get("f").?.float);
+    try std.testing.expectEqual(@as(i64, -7), tree.object.get("i").?.integer);
+}
+
+/// Write a random JSON text into `out`, with values of all kinds, escapes in keys and in
+/// strings, and sometimes a duplicate key.
+fn randomText(random: std.Random, gpa: Allocator, out: *std.ArrayList(u8), depth: u8) !void {
+    const pieces = [_][]const u8{ "a", "b", "\\n", "\\\"", "\\\\", "\\u00e9", "\\ud83d\\ude00", "\xc3\xa9", "\xf0\x9f\x98\x80", " ", "\\/", "\\u0000" };
+    const numbers = [_][]const u8{ "0", "-1", "42", "9223372036854775807", "9223372036854775808", "-9223372036854775809", "1.5", "-0.0", "1e3", "2.5E-3", "1e400", "123456789012345678901234567890" };
+    switch (random.uintLessThan(u8, if (depth == 0) 5 else 7)) {
+        0 => try out.appendSlice(gpa, ([_][]const u8{ "null", "true", "false" })[random.uintLessThan(usize, 3)]),
+        1, 2 => try out.appendSlice(gpa, numbers[random.uintLessThan(usize, numbers.len)]),
+        3, 4 => {
+            try out.append(gpa, '"');
+            for (0..random.uintLessThan(usize, 5)) |_| try out.appendSlice(gpa, pieces[random.uintLessThan(usize, pieces.len)]);
+            try out.append(gpa, '"');
+        },
+        5 => {
+            try out.append(gpa, '[');
+            for (0..random.uintLessThan(usize, 4)) |i| {
+                if (i > 0) try out.append(gpa, ',');
+                try randomText(random, gpa, out, depth - 1);
+            }
+            try out.append(gpa, ']');
+        },
+        else => {
+            try out.append(gpa, '{');
+            for (0..random.uintLessThan(usize, 4)) |i| {
+                if (i > 0) try out.appendSlice(gpa, " , ");
+                try out.append(gpa, '"');
+                // Few different keys: some objects get a duplicate key.
+                try out.appendSlice(gpa, pieces[random.uintLessThan(usize, 6)]);
+                try out.appendSlice(gpa, "\":");
+                try randomText(random, gpa, out, depth - 1);
+            }
+            try out.append(gpa, '}');
+        },
+    }
+}
+
+test "parseTree and std.json agree on random texts and on damaged texts" {
+    const gpa = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x6a736f6e);
+    const random = prng.random();
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    const damage = "{}[]\":,\\ \xff0e-";
+    for (0..3000) |_| {
+        text.clearRetainingCapacity();
+        try randomText(random, gpa, &text, 5);
+        try expectSameParse(text.items, max_tree_depth);
+        // Change, remove or add one byte.
+        const at = random.uintLessThan(usize, text.items.len);
+        switch (random.uintLessThan(u8, 3)) {
+            0 => text.items[at] = random.int(u8),
+            1 => _ = text.orderedRemove(at),
+            else => try text.insert(gpa, at, damage[random.uintLessThan(usize, damage.len)]),
+        }
+        try expectSameParse(text.items, max_tree_depth);
+    }
+}
+
+test "parseTree and std.json agree on every JSON fixture" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var root = try std.Io.Dir.cwd().openDir(io, "test/fixtures", .{ .iterate = true });
+    defer root.close(io);
+    var walker = try root.walk(gpa);
+    defer walker.deinit();
+    var checked: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".json")) continue;
+        const text = try entry.dir.readFileAlloc(io, entry.basename, gpa, .limited(16 << 20));
+        defer gpa.free(text);
+        expectSameParse(text, max_tree_depth) catch |e| {
+            std.debug.print("fixture {s}\n", .{entry.path});
+            return e;
+        };
+        checked += 1;
+    }
+    try std.testing.expect(checked >= 200);
 }

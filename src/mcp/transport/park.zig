@@ -67,6 +67,9 @@ pub const Poller = struct {
     const Impl = if (is_windows) struct {
         port: windows.HANDLE,
         helper: windows.HANDLE,
+        /// The completions of one wait. A safe build fills an `undefined` array on the stack
+        /// on each call, thus the array is here.
+        entries: [256]OverlappedEntry = undefined,
     } else struct {
         gpa: std.mem.Allocator,
         wake_read: posix.fd_t,
@@ -154,11 +157,11 @@ pub const Poller = struct {
     /// count is zero after a timeout or a wake.
     pub fn wait(p: *Poller, timeout_ms: i32, parked: []const *Slot, out: []Event) Error!usize {
         if (is_windows) {
-            var entries: [256]OverlappedEntry = undefined;
+            const entries = &p.impl.entries;
             const want: u32 = @intCast(@min(entries.len, out.len));
             var removed: u32 = 0;
             const timeout: u32 = if (timeout_ms < 0) std.math.maxInt(u32) else @intCast(timeout_ms);
-            if (GetQueuedCompletionStatusEx(p.impl.port, &entries, want, &removed, timeout, 0) == 0) return 0;
+            if (GetQueuedCompletionStatusEx(p.impl.port, entries, want, &removed, timeout, 0) == 0) return 0;
             var n: usize = 0;
             for (entries[0..removed]) |entry| {
                 const slot: *Slot = @ptrCast(@alignCast(entry.overlapped orelse continue));

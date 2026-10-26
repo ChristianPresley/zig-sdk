@@ -125,9 +125,15 @@ pub const Poller = struct {
     const Impl = if (is_windows) struct {
         port: windows.HANDLE,
         helper: windows.HANDLE,
+        /// The completions of one wait. A safe build fills an `undefined` array on the stack
+        /// on each call, thus the array is here.
+        entries: [256]OverlappedEntry = undefined,
     } else if (is_linux) struct {
         epfd: i32,
         wake_fd: i32,
+        /// The events of one wait. A safe build fills an `undefined` array on the stack on
+        /// each call, thus the array is here.
+        evs: [256]linux.epoll_event = undefined,
     } else struct {
         gpa: std.mem.Allocator,
         wake_read: posix.fd_t,
@@ -327,11 +333,11 @@ pub const Poller = struct {
     /// `out`. The count is zero after a timeout or a wake.
     pub fn wait(p: *Poller, timeout_ms: i32, out: []Event) Error!usize {
         if (is_windows) {
-            var entries: [256]OverlappedEntry = undefined;
+            const entries = &p.impl.entries;
             const want_count: u32 = @intCast(@min(entries.len, out.len));
             var removed: u32 = 0;
             const timeout: u32 = if (timeout_ms < 0) std.math.maxInt(u32) else @intCast(timeout_ms);
-            if (GetQueuedCompletionStatusEx(p.impl.port, &entries, want_count, &removed, timeout, 0) == 0) return 0;
+            if (GetQueuedCompletionStatusEx(p.impl.port, entries, want_count, &removed, timeout, 0) == 0) return 0;
             var n: usize = 0;
             for (entries[0..removed]) |entry| {
                 const poll: *WinPoll = @ptrCast(@alignCast(entry.overlapped orelse continue));
@@ -355,9 +361,9 @@ pub const Poller = struct {
             }
             return n;
         } else if (is_linux) {
-            var evs: [256]linux.epoll_event = undefined;
+            const evs = &p.impl.evs;
             const max: u32 = @intCast(@min(evs.len, out.len));
-            const rc = linux.epoll_wait(p.impl.epfd, &evs, max, timeout_ms);
+            const rc = linux.epoll_wait(p.impl.epfd, evs, max, timeout_ms);
             switch (linux.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => return 0,
