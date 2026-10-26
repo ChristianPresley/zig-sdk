@@ -15,6 +15,7 @@ const Limits = @import("../Limits.zig");
 const McpServer = @import("../server/Server.zig");
 const router_mod = @import("router.zig");
 const Router = router_mod.Router;
+const lockfree = @import("../util/lockfree.zig");
 
 const log = std.log.scoped(.mcp_stdio);
 
@@ -44,17 +45,30 @@ pub const Server = struct {
     /// The caller of the requests of this peer for the rate limits of the server. `init` gives
     /// each instance a new connection identifier.
     peer: Transport.Peer,
-    out_lock: Io.Mutex = .init,
-    /// True when the buffer of `out` has frames that `flushPending` must send. Changed only
-    /// under `out_lock`.
+    /// True while a task writes to `out`. See `writeFrameMode`.
+    out_busy: std.atomic.Value(bool) = .init(false),
+    /// The frames of the tasks that found `out` busy, the newest first.
+    out_queue: lockfree.Stack(Line, "next") = .{},
+    /// A flush is due: a frame that does not wait for `flushPending` is in the buffer, or
+    /// `flushPending` came.
+    flush_due: std.atomic.Value(bool) = .init(false),
+    /// True when the buffer of `out` has frames that `flushPending` must send.
     out_pending: std.atomic.Value(bool) = .init(false),
-    in_flight: std.ArrayList(*Slot) = .empty,
-    in_flight_lock: Io.Mutex = .init,
+    /// A write to `out` failed. Each later write fails at once.
+    out_failed: std.atomic.Value(bool) = .init(false),
+    /// The requests in flight, also the requests on the reader.
+    in_flight: std.atomic.Value(u32) = .init(0),
+    /// The requests that run in a task of their own, for a cancellation by id. The reader makes
+    /// the table at the first such request. See `track`.
+    table: std.atomic.Value(?*Table) = .init(null),
+    /// The slots that left the table. They are freed when no task reads the table.
+    retired: lockfree.Retired(Slot, "next_retired") = .{},
     group: Io.Group = .init,
-    permits: Io.Semaphore,
-    /// False after `stopAdmission`. Then the server drops each new request. Guarded by
-    /// `in_flight_lock`.
-    admitting: bool = true,
+    permits: lockfree.Permits,
+    /// False after `stopAdmission`. Then the server drops each new request.
+    admitting: std.atomic.Value(bool) = .init(true),
+    /// The admissions that run now. `stopAdmission` waits until it is zero.
+    admissions: std.atomic.Value(u32) = .init(0),
     closed: bool = false,
 
     /// The action at the end of the input.
@@ -87,9 +101,47 @@ pub const Server = struct {
     /// The message of the error for a request above the limit of `WhenFull.reject`.
     pub const too_many_requests_message = "The connection has too many requests in flight";
 
+    /// The places of the requests that run in a task of their own. A place changes with one
+    /// atomic operation. A task that reads the table counts itself in `retired`.
+    const Table = struct {
+        places: []std.atomic.Value(?*Slot),
+        /// The place where the next search for a free place starts.
+        next: std.atomic.Value(usize) = .init(0),
+    };
+
+    /// One frame that waits for the writer of `out`. The bytes follow the struct.
+    const Line = struct {
+        next: ?*Line = null,
+        len: usize,
+        deferred: bool,
+
+        fn create(gpa: Allocator, frame: []const u8, deferred: bool) Allocator.Error!*Line {
+            const mem = try gpa.alignedAlloc(u8, .of(Line), @sizeOf(Line) + frame.len);
+            const line: *Line = @ptrCast(mem.ptr);
+            line.* = .{ .len = frame.len, .deferred = deferred };
+            @memcpy(mem[@sizeOf(Line)..], frame);
+            return line;
+        }
+
+        fn bytes(line: *Line) []const u8 {
+            const base: [*]u8 = @ptrCast(line);
+            return base[@sizeOf(Line)..][0..line.len];
+        }
+
+        fn free(line: *Line, gpa: Allocator) void {
+            const base: [*]align(@alignOf(Line)) u8 = @ptrCast(line);
+            gpa.free(base[0 .. @sizeOf(Line) + line.len]);
+        }
+    };
+
     const Slot = struct {
         owner: *Server,
         arena: std.heap.ArenaAllocator,
+        /// The place of the slot in `table`.
+        place: usize = 0,
+        /// The reason of a cancellation by the peer, from the general-purpose allocator.
+        cancel_reason: ?[]u8 = null,
+        next_retired: ?*Slot = null,
         token: Transport.CancelToken = .{},
         id: ?RequestId = null,
         /// True for a `subscriptions/listen` request. Only such a request can end with a
@@ -110,7 +162,7 @@ pub const Server = struct {
             .limits = server.options.limits,
             .out = out,
             .peer = .{ .connection = Transport.nextConnectionId() },
-            .permits = .{ .permits = server.options.limits.max_in_flight_requests },
+            .permits = .init(server.options.limits.max_in_flight_requests),
         };
     }
 
@@ -124,7 +176,16 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        self.in_flight.deinit(self.gpa);
+        self.retired.deinit(self.gpa, freeSlot);
+        if (self.table.load(.acquire)) |t| {
+            self.gpa.free(t.places);
+            self.gpa.destroy(t);
+        }
+        var line = self.out_queue.takeAll();
+        while (line) |l| {
+            line = l.next;
+            l.free(self.gpa);
+        }
     }
 
     fn newSlot(self: *Server) Allocator.Error!*Slot {
@@ -144,11 +205,16 @@ pub const Server = struct {
         try self.dispatch(slot, line);
     }
 
-    /// Drop each request that arrives from now on. The requests in flight continue.
+    /// Drop each request that arrives from now on. The requests in flight continue. After this
+    /// call, no new request starts.
     pub fn stopAdmission(self: *Server) void {
-        self.in_flight_lock.lockUncancelable(self.io);
-        defer self.in_flight_lock.unlock(self.io);
-        self.admitting = false;
+        self.admitting.store(false, .seq_cst);
+        // An admission that saw `admitting` true ends soon: it does not wait.
+        while (true) {
+            const n = self.admissions.load(.seq_cst);
+            if (n == 0) return;
+            self.io.futexWaitUncancelable(u32, &self.admissions.raw, n);
+        }
     }
 
     /// Wait for the requests in flight, at most `grace`. Then cancel the tasks that remain
@@ -166,9 +232,7 @@ pub const Server = struct {
     }
 
     fn inFlightCount(self: *Server) usize {
-        self.in_flight_lock.lockUncancelable(self.io);
-        defer self.in_flight_lock.unlock(self.io);
-        return self.in_flight.items.len;
+        return self.in_flight.load(.seq_cst);
     }
 
     /// Read frames from `in` until end of stream, then drain in-flight requests.
@@ -260,29 +324,38 @@ pub const Server = struct {
         }
     }
 
-    /// Start the task of a request, or answer it when the limit is full. The admission and
-    /// the start happen under `in_flight_lock`, so `stopAdmission` sees every started task.
+    /// Start the task of a request, or answer it when the limit is full. The admission counts
+    /// in `admissions`, so `stopAdmission` sees every started task. Only the reader calls this
+    /// function.
     fn start(self: *Server, slot: *Slot, id: RequestId) !void {
         // The reader can wait below. Before that, the frames of the quick requests go out.
         if (!slot.on_reader) self.flushPending();
-        if (self.when_full == .wait) self.permits.waitUncancelable(self.io);
+        if (self.when_full == .wait) self.permits.take(self.io);
         const Outcome = enum { started, on_reader, stopped, full, failed };
-        self.in_flight_lock.lockUncancelable(self.io);
+        _ = self.admissions.fetchAdd(1, .seq_cst);
         const outcome: Outcome = outcome: {
-            if (!self.admitting) break :outcome .stopped;
+            if (!self.admitting.load(.seq_cst)) break :outcome .stopped;
             switch (self.when_full) {
                 .wait => {},
-                .reject => |limit| if (self.in_flight.items.len >= limit) break :outcome .full,
+                .reject => |limit| if (self.in_flight.load(.seq_cst) >= limit) break :outcome .full,
             }
-            self.in_flight.append(self.gpa, slot) catch {};
+            _ = self.in_flight.fetchAdd(1, .seq_cst);
+            // A quick request runs on the reader, thus no cancellation by id can reach it.
             if (slot.on_reader) break :outcome .on_reader;
+            if (!self.track(slot)) {
+                _ = self.in_flight.fetchSub(1, .seq_cst);
+                break :outcome .failed;
+            }
             self.group.concurrent(self.io, runSlot, .{slot}) catch {
-                self.removeLocked(slot);
+                self.untrack(slot);
+                _ = self.in_flight.fetchSub(1, .seq_cst);
                 break :outcome .failed;
             };
             break :outcome .started;
         };
-        self.in_flight_lock.unlock(self.io);
+        if (self.admissions.fetchSub(1, .seq_cst) == 1 and !self.admitting.load(.seq_cst)) {
+            self.io.futexWake(u32, &self.admissions.raw, 1);
+        }
         switch (outcome) {
             .started => {},
             // A quick request runs here. It needs no thread wake-up and no new task.
@@ -297,22 +370,26 @@ pub const Server = struct {
             },
             .failed => {
                 self.releasePermit();
-                defer self.destroySlot(slot);
+                // The slot was in the table for a short time: a task that reads the table can
+                // still use it.
+                defer self.retired.retire(slot, self.gpa, freeSlot);
                 try self.writeFrameError(id, errors.internalError("Server busy"));
             },
         }
     }
 
     fn releasePermit(self: *Server) void {
-        if (self.when_full == .wait) self.permits.post(self.io);
+        if (self.when_full == .wait) self.permits.give(self.io);
     }
 
     /// Cancel every request in flight that has no cancel signal yet. With `by_server`, the
     /// requests end as at a server shutdown: a listen stream then ends with its result.
     pub fn cancelAll(self: *Server, reason: []const u8, by_server: bool) void {
-        self.in_flight_lock.lockUncancelable(self.io);
-        defer self.in_flight_lock.unlock(self.io);
-        for (self.in_flight.items) |slot| {
+        const table = self.table.load(.acquire) orelse return;
+        self.retired.enter();
+        defer self.retired.leave(self.gpa, freeSlot);
+        for (table.places) |*place| {
+            const slot = place.load(.seq_cst) orelse continue;
             if (slot.token.isCancelled()) continue;
             if (by_server) slot.token.shutdown(self.io, reason) else slot.token.cancel(self.io, reason);
         }
@@ -330,44 +407,95 @@ pub const Server = struct {
         const params = n.params orelse return;
         const parsed = json.parseValue(types.CancelledNotificationParams, arena, params) catch return;
         Transport.logCancellation(parsed.requestId, parsed.reason);
-        self.in_flight_lock.lockUncancelable(self.io);
-        defer self.in_flight_lock.unlock(self.io);
-        for (self.in_flight.items) |slot| {
+        const table = self.table.load(.acquire) orelse return;
+        self.retired.enter();
+        defer self.retired.leave(self.gpa, freeSlot);
+        for (table.places) |*place| {
+            const slot = place.load(.seq_cst) orelse continue;
             const id = slot.id orelse continue;
             if (!id.eql(parsed.requestId)) continue;
-            const reason: ?[]const u8 = if (parsed.reason) |r| slot.arena.allocator().dupe(u8, r) catch null else null;
+            // The task of the request allocates from the arena of the slot, thus the copy of the
+            // reason comes from the general-purpose allocator. Only the reader writes the field.
+            var reason: ?[]const u8 = null;
+            if (parsed.reason) |r| if (slot.cancel_reason == null) {
+                slot.cancel_reason = self.gpa.dupe(u8, r) catch null;
+                reason = slot.cancel_reason;
+            };
             slot.token.cancel(self.io, reason);
             return;
         }
     }
 
-    fn untrack(self: *Server, slot: *Slot) void {
-        self.in_flight_lock.lockUncancelable(self.io);
-        defer self.in_flight_lock.unlock(self.io);
-        self.removeLocked(slot);
-    }
-
-    fn removeLocked(self: *Server, slot: *Slot) void {
-        for (self.in_flight.items, 0..) |s, i| {
-            if (s == slot) {
-                _ = self.in_flight.swapRemove(i);
-                return;
+    /// Put `slot` in a free place of the table, for a cancellation by id. False when the
+    /// table is full or has no memory. Only the reader calls this function.
+    fn track(self: *Server, slot: *Slot) bool {
+        const table = self.table.load(.acquire) orelse self.makeTable() orelse return false;
+        const len = table.places.len;
+        const first = table.next.fetchAdd(1, .monotonic);
+        for (0..len) |i| {
+            const at = (first + i) % len;
+            if (table.places[at].load(.monotonic) != null) continue;
+            if (table.places[at].cmpxchgStrong(null, slot, .seq_cst, .monotonic) == null) {
+                slot.place = at;
+                return true;
             }
         }
+        return false;
+    }
+
+    /// Make the table. The limits bound the requests in flight, thus a full table is rare.
+    fn makeTable(self: *Server) ?*Table {
+        const len: usize = switch (self.when_full) {
+            .wait => self.limits.max_in_flight_requests,
+            .reject => |limit| @max(limit, self.limits.max_in_flight_requests),
+        } + 1;
+        const table = self.gpa.create(Table) catch return null;
+        const places = self.gpa.alloc(std.atomic.Value(?*Slot), len) catch {
+            self.gpa.destroy(table);
+            return null;
+        };
+        @memset(places, .init(null));
+        table.* = .{ .places = places };
+        self.table.store(table, .release);
+        return table;
+    }
+
+    fn untrack(self: *Server, slot: *Slot) void {
+        const table = self.table.load(.acquire).?;
+        table.places[slot.place].store(null, .seq_cst);
     }
 
     fn destroySlot(self: *Server, slot: *Slot) void {
+        freeSlot(self.gpa, slot);
+    }
+
+    fn freeSlot(gpa: Allocator, slot: *Slot) void {
+        if (slot.cancel_reason) |r| gpa.free(r);
         slot.arena.deinit();
-        self.gpa.destroy(slot);
+        gpa.destroy(slot);
     }
 
     fn runSlot(slot: *Slot) Io.Cancelable!void {
         const self = slot.owner;
+        if (slot.on_reader) {
+            defer {
+                _ = self.in_flight.fetchSub(1, .seq_cst);
+                self.releasePermit();
+                self.destroySlot(slot);
+            }
+            return self.handleSlot(slot);
+        }
         defer {
             self.untrack(slot);
+            _ = self.in_flight.fetchSub(1, .seq_cst);
             self.releasePermit();
-            self.destroySlot(slot);
+            // A task that reads the table can still use the slot.
+            self.retired.retire(slot, self.gpa, freeSlot);
         }
+        return self.handleSlot(slot);
+    }
+
+    fn handleSlot(self: *Server, slot: *Slot) Io.Cancelable!void {
         self.server.handle(self.io, .{
             .kind = self.kind,
             .arena = slot.arena.allocator(),
@@ -423,31 +551,94 @@ pub const Server = struct {
 
     /// Write one frame. With `deferred` (only on the reader), the frame stays in the buffer
     /// until `flushPending`. Else the frame and the frames in the buffer go out now.
+    ///
+    /// No task waits for another task that writes. The task that finds `out` free writes the
+    /// frames of the queue and its own frame. A task that finds `out` busy puts a copy of its
+    /// frame in the queue, and the task that writes sends it.
     fn writeFrameMode(self: *Server, io: Io, frame: []const u8, deferred: bool) Transport.SendError!void {
         if (self.closed) return error.Closed;
         if (self.sink) |s| return s.write(s.ptr, io, frame);
         std.debug.assert(std.mem.findScalar(u8, frame, '\n') == null);
-        self.out_lock.lockUncancelable(io);
-        defer self.out_lock.unlock(io);
+        if (self.out_failed.load(.acquire)) return error.WriteFailed;
+        if (self.tryTakeOut()) {
+            self.writeQueue();
+            const result = self.writeLine(frame, deferred);
+            const released = self.releaseOut();
+            try result;
+            return released;
+        }
+        self.out_queue.push(try Line.create(self.gpa, frame, deferred));
+        // The writer can stop between the push and here. Then this task writes the queue.
+        self.kickOut() catch {};
+    }
+
+    fn tryTakeOut(self: *Server) bool {
+        return self.out_busy.cmpxchgStrong(false, true, .seq_cst, .monotonic) == null;
+    }
+
+    /// Write one frame to the buffer. Only the task that holds `out_busy` calls this function.
+    fn writeLine(self: *Server, frame: []const u8, deferred: bool) Transport.SendError!void {
+        errdefer self.out_failed.store(true, .release);
         const out = self.out.?;
         out.writeAll(frame) catch return error.WriteFailed;
         out.writeByte('\n') catch return error.WriteFailed;
-        if (deferred) {
-            self.out_pending.store(true, .monotonic);
-            return;
+        if (deferred) self.out_pending.store(true, .seq_cst) else self.flush_due.store(true, .seq_cst);
+    }
+
+    /// Write the frames of the queue, the oldest first. Only the task that holds `out_busy`
+    /// calls this function.
+    fn writeQueue(self: *Server) void {
+        var line = self.out_queue.takeAllInOrder();
+        while (line) |l| {
+            line = l.next;
+            // The reader looked for deferred frames before this task wrote this one, thus it
+            // does not wait for a flush of the reader.
+            if (!self.out_failed.load(.monotonic)) self.writeLine(l.bytes(), false) catch {};
+            l.free(self.gpa);
         }
-        self.out_pending.store(false, .monotonic);
-        out.flush() catch return error.WriteFailed;
+    }
+
+    /// Flush when a flush is due, and give `out` back. Write the frames that came meanwhile.
+    fn releaseOut(self: *Server) Transport.SendError!void {
+        var result: Transport.SendError!void = {};
+        while (true) {
+            if (self.flush_due.swap(false, .seq_cst)) {
+                self.out_pending.store(false, .seq_cst);
+                if (!self.out_failed.load(.monotonic)) self.out.?.flush() catch {
+                    self.out_failed.store(true, .release);
+                    result = error.WriteFailed;
+                };
+            }
+            self.out_busy.store(false, .seq_cst);
+            // A task that found `out` busy pushed its frame or asked for a flush before its own
+            // check of `out_busy`. Thus this check or that task sees the change.
+            if (self.out_queue.isEmpty() and !self.flush_due.load(.seq_cst)) return result;
+            if (!self.tryTakeOut()) return result;
+            self.writeQueue();
+        }
+    }
+
+    /// Write the queue when `out` is free.
+    fn kickOut(self: *Server) Transport.SendError!void {
+        if (!self.tryTakeOut()) return;
+        self.writeQueue();
+        try self.releaseOut();
+    }
+
+    /// Count the bytes `byte` in the output while no task writes to it. Tests read the output
+    /// of a transport that runs with this function. The call waits while a task writes.
+    pub fn countInOutput(self: *Server, written: *Io.Writer.Allocating, byte: u8) usize {
+        while (!self.tryTakeOut()) self.io.sleep(.fromMicroseconds(50), .awake) catch {};
+        const n = std.mem.count(u8, written.written(), &.{byte});
+        self.releaseOut() catch {};
+        return n;
     }
 
     /// Flush the frames that `writeFrameMode` kept in the buffer.
     fn flushPending(self: *Server) void {
-        if (self.sink != null or !self.out_pending.load(.monotonic)) return;
-        self.out_lock.lockUncancelable(self.io);
-        defer self.out_lock.unlock(self.io);
-        if (!self.out_pending.load(.monotonic)) return;
-        self.out_pending.store(false, .monotonic);
-        self.out.?.flush() catch {};
+        if (self.sink != null or !self.out_pending.load(.seq_cst)) return;
+        self.flush_due.store(true, .seq_cst);
+        self.kickOut() catch {};
     }
 
     fn writeFrameError(self: *Server, id: ?RequestId, err: errors.RpcError) !void {

@@ -39,6 +39,7 @@ pub const util = struct {
     pub const loopback = @import("mcp/util/loopback.zig");
     pub const rate_limit = @import("mcp/util/rate_limit.zig");
     pub const http_syntax = @import("mcp/util/http_syntax.zig");
+    pub const lockfree = @import("mcp/util/lockfree.zig");
 };
 
 pub const types = protocol.types;
@@ -70,6 +71,7 @@ test {
     _ = @import("mcp/transport/router.zig");
     _ = @import("mcp/util/rate_limit.zig");
     _ = @import("mcp/util/http_syntax.zig");
+    _ = @import("mcp/util/lockfree.zig");
     _ = @import("mcp/util/wake.zig");
     _ = @import("mcp/util/loopback.zig");
     _ = @import("mcp/transport/unix_test.zig");

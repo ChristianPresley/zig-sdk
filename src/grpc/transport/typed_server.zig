@@ -35,6 +35,7 @@ const grpc_server = @import("grpc_server.zig");
 const service = @import("../typed/service.zig");
 const convert = @import("../typed/convert.zig");
 const Deadlines = @import("deadlines.zig");
+const lockfree = @import("mcp").util.lockfree;
 
 const log = std.log.scoped(.mcp_grpc);
 
@@ -130,7 +131,7 @@ pub fn execute(self: *grpc_server.Server, stream: *Stream, arena: Allocator, p: 
     defer if (!no_wait) stream.setOnReset(null, null);
     var deadline_hit: std.atomic.Value(bool) = .init(false);
     var watch: Deadlines.Watch = .{};
-    if (p.deadline) |d| if (!no_wait) watch.start(&self.deadlines, io, d, &token, &deadline_hit);
+    if (p.deadline) |d| if (!no_wait) watch.start(&self.deadlines, io, self.gpa, d, &token, &deadline_hit);
     defer watch.finish(&self.deadlines, io);
 
     const started = Io.Timestamp.now(io, .awake);
@@ -177,7 +178,7 @@ pub fn execute(self: *grpc_server.Server, stream: *Stream, arena: Allocator, p: 
         // Only a result of one page goes in the cache: the key is the text of that page.
         if (cache_key) |key| if (one_page) {
             // Without memory for the copy, the next call encodes the result again.
-            self.typed_cache.put(io, gpa, rpc, key, framed) catch {};
+            self.typed_cache.put(gpa, rpc, key, framed) catch {};
         };
     }
     if (p.cost_slot) |i| self.costs.record(i, grpc_server.nsSince(io, started));
@@ -333,7 +334,7 @@ fn runOnce(self: *grpc_server.Server, arena: Allocator, method: []const u8, para
     const id = next_id.fetchAdd(1, .monotonic);
     if (token.isCancelled()) return .{ .id = id, .frame = null };
     var capture: Capture = .{ .arena = arena, .id = id };
-    if (lookup) |rpc| capture.lookup = .{ .cache = &self.typed_cache, .rpc = rpc };
+    if (lookup) |rpc| capture.lookup = .{ .cache = &self.typed_cache, .gpa = self.gpa, .rpc = rpc };
     self.server.handle(self.io, .{
         .kind = .grpc,
         .arena = arena,
@@ -349,11 +350,17 @@ fn runOnce(self: *grpc_server.Server, arena: Allocator, method: []const u8, para
 /// text of the result. The message is a function of that key. Thus an entry never becomes
 /// stale, and the cache needs no notice of a change of a list. A changed list result gets a
 /// new entry, and the oldest entry goes.
+///
+/// The cache is lock-free. An entry that leaves its place goes to `retired`, and the cache
+/// releases it when no task reads the places. Thus a task can take a reference to an entry
+/// that it found in a place. Two calls can put the same result at the same time. Then the
+/// cache keeps two copies for a short time.
 pub const ResultCache = struct {
-    lock: Io.Mutex = .init,
-    entries: [slots]?*Shared = @splat(null),
-    /// The entry that the next `put` replaces.
-    next: usize = 0,
+    entries: [slots]std.atomic.Value(?*Shared) = @splat(.init(null)),
+    /// The place that the next `put` replaces.
+    next: std.atomic.Value(usize) = .init(0),
+    /// The entries that left their places, with the reference of the cache.
+    retired: lockfree.Retired(Shared, "next_retired") = .{},
 
     /// The count of entries.
     pub const slots = 8;
@@ -368,6 +375,7 @@ pub const ResultCache = struct {
         key: []u8,
         /// The message with its gRPC prefix.
         framed: []u8,
+        next_retired: ?*Shared = null,
 
         pub fn release(self: *Shared, gpa: Allocator) void {
             if (self.refs.fetchSub(1, .acq_rel) != 1) return;
@@ -378,70 +386,73 @@ pub const ResultCache = struct {
     };
 
     pub fn deinit(self: *ResultCache, gpa: Allocator) void {
-        for (self.entries) |e| if (e) |s| s.release(gpa);
+        for (&self.entries) |*e| if (e.load(.acquire)) |s| s.release(gpa);
+        self.retired.deinit(gpa, releaseShared);
         self.* = undefined;
     }
 
-    /// The entry for the result text `key` of `rpc`, or null. Release the entry after use.
-    pub fn acquire(self: *ResultCache, io: Io, rpc: service.Rpc, key: []const u8) ?*Shared {
-        if (key.len > max_key_bytes) return null;
-        self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
-        for (self.entries) |e| {
-            const s = e orelse continue;
-            if (s.rpc != rpc or !std.mem.eql(u8, s.key, key)) continue;
-            _ = s.refs.fetchAdd(1, .monotonic);
-            return s;
+    /// The entry in a place for the result text `key` of `rpc`. Call between `retired.enter`
+    /// and `retired.leave`.
+    fn find(self: *ResultCache, rpc: service.Rpc, key: []const u8) ?*Shared {
+        for (&self.entries) |*e| {
+            const s = e.load(.seq_cst) orelse continue;
+            if (s.rpc == rpc and std.mem.eql(u8, s.key, key)) return s;
         }
         return null;
     }
 
+    fn releaseShared(gpa: Allocator, s: *Shared) void {
+        s.release(gpa);
+    }
+
+    /// The entry for the result text `key` of `rpc`, or null. Release the entry after use.
+    pub fn acquire(self: *ResultCache, gpa: Allocator, rpc: service.Rpc, key: []const u8) ?*Shared {
+        if (key.len > max_key_bytes) return null;
+        self.retired.enter();
+        defer self.retired.leave(gpa, releaseShared);
+        const s = self.find(rpc, key) orelse return null;
+        _ = s.refs.fetchAdd(1, .monotonic);
+        return s;
+    }
+
     /// Keep a copy of the message `framed` for the result text `key` of `rpc`.
-    pub fn put(self: *ResultCache, io: Io, gpa: Allocator, rpc: service.Rpc, key: []const u8, framed: []const u8) Allocator.Error!void {
+    pub fn put(self: *ResultCache, gpa: Allocator, rpc: service.Rpc, key: []const u8, framed: []const u8) Allocator.Error!void {
         if (key.len > max_key_bytes) return;
+        {
+            self.retired.enter();
+            defer self.retired.leave(gpa, releaseShared);
+            // Two calls can encode the same result at the same time. The first copy stays.
+            if (self.find(rpc, key) != null) return;
+        }
         const fresh = try gpa.create(Shared);
         errdefer gpa.destroy(fresh);
         const key_copy = try gpa.dupe(u8, key);
         errdefer gpa.free(key_copy);
         fresh.* = .{ .rpc = rpc, .key = key_copy, .framed = try gpa.dupe(u8, framed) };
-        var old: ?*Shared = fresh;
-        {
-            self.lock.lockUncancelable(io);
-            defer self.lock.unlock(io);
-            const known = for (self.entries) |e| {
-                const s = e orelse continue;
-                if (s.rpc == rpc and std.mem.eql(u8, s.key, key)) break true;
-            } else false;
-            // Two calls can encode the same result at the same time. The first copy stays.
-            if (!known) {
-                old = self.entries[self.next];
-                self.entries[self.next] = fresh;
-                self.next = (self.next + 1) % slots;
-            }
-        }
-        if (old) |o| o.release(gpa);
+        const place = self.next.fetchAdd(1, .monotonic) % slots;
+        const old = self.entries[place].swap(fresh, .seq_cst) orelse return;
+        self.retired.retire(old, gpa, releaseShared);
     }
 };
 
 test "the result cache keeps the newest entries" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
     var cache: ResultCache = .{};
     defer cache.deinit(gpa);
-    try std.testing.expect(cache.acquire(io, .list_tools, "{}") == null);
-    try cache.put(io, gpa, .list_tools, "{}", "abc");
-    try cache.put(io, gpa, .list_tools, "{}", "abc");
-    const hit = cache.acquire(io, .list_tools, "{}").?;
+    try std.testing.expect(cache.acquire(gpa, .list_tools, "{}") == null);
+    try cache.put(gpa, .list_tools, "{}", "abc");
+    try cache.put(gpa, .list_tools, "{}", "abc");
+    const hit = cache.acquire(gpa, .list_tools, "{}").?;
     try std.testing.expectEqualStrings("abc", hit.framed);
     // The key includes the RPC.
-    try std.testing.expect(cache.acquire(io, .list_prompts, "{}") == null);
+    try std.testing.expect(cache.acquire(gpa, .list_prompts, "{}") == null);
     var buf: [8]u8 = undefined;
-    for (0..ResultCache.slots) |i| try cache.put(io, gpa, .list_prompts, try std.fmt.bufPrint(&buf, "{d}", .{i}), "x");
-    try std.testing.expect(cache.acquire(io, .list_tools, "{}") == null);
+    for (0..ResultCache.slots) |i| try cache.put(gpa, .list_prompts, try std.fmt.bufPrint(&buf, "{d}", .{i}), "x");
+    try std.testing.expect(cache.acquire(gpa, .list_tools, "{}") == null);
     // The entry stays valid until its last reference goes.
     try std.testing.expectEqualStrings("abc", hit.framed);
     hit.release(gpa);
-    const last = cache.acquire(io, .list_prompts, "7").?;
+    const last = cache.acquire(gpa, .list_prompts, "7").?;
     defer last.release(gpa);
     try std.testing.expectEqualStrings("x", last.framed);
 }
@@ -461,7 +472,7 @@ const Capture = struct {
     arena: Allocator,
     id: i64,
     frame: ?[]const u8 = null,
-    lookup: ?struct { cache: *ResultCache, rpc: service.Rpc } = null,
+    lookup: ?struct { cache: *ResultCache, gpa: Allocator, rpc: service.Rpc } = null,
     hit: ?*ResultCache.Shared = null,
 };
 
@@ -479,10 +490,11 @@ fn captureNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError
 }
 
 fn captureFinish(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+    _ = io;
     const c: *Capture = @ptrCast(@alignCast(ptr));
     if (c.frame != null or c.hit != null) return error.Closed;
     if (c.lookup) |l| if (resultTextOf(frame, c.id)) |key| {
-        c.hit = l.cache.acquire(io, l.rpc, key);
+        c.hit = l.cache.acquire(l.gpa, l.rpc, key);
         if (c.hit != null) return;
     };
     c.frame = try c.arena.dupe(u8, frame);

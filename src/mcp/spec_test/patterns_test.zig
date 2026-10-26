@@ -520,10 +520,7 @@ const Script = struct {
     }
 
     fn frames(self: *Script) usize {
-        const io = std.testing.io;
-        self.transport.out_lock.lockUncancelable(io);
-        defer self.transport.out_lock.unlock(io);
-        return std.mem.count(u8, self.out.written(), "\n");
+        return self.transport.countInOutput(self.out, '\n');
     }
 
     fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
@@ -559,7 +556,7 @@ fn runStdio(arena: Allocator, server: *Server, steps: []const Script.Step) ![]Va
     var script: Script = .init(&buffer, &transport, &aw, steps);
     try transport.run(&script.reader);
     // Every request slot was released.
-    try std.testing.expectEqual(0, transport.in_flight.items.len);
+    try std.testing.expectEqual(0, transport.in_flight.load(.seq_cst));
     var out: std.ArrayList(Value) = .empty;
     var it = std.mem.splitScalar(u8, aw.written(), '\n');
     while (it.next()) |line| {

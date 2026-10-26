@@ -292,11 +292,11 @@ test "grpc: the server and the client set TCP_NODELAY" {
     };
     try std.testing.expect(try socket_opts.getNoDelay(io, client_socket));
 
+    // The connection stays open until the end of the test, thus its place stays valid.
     const server_socket = blk: {
-        f.transport.connections_lock.lockUncancelable(io);
-        defer f.transport.connections_lock.unlock(io);
-        try std.testing.expectEqual(1, f.transport.connections.items.len);
-        break :blk f.transport.connections.items[0].stream.socket;
+        try std.testing.expectEqual(1, f.transport.connection_count.load(.seq_cst));
+        for (f.transport.connections) |*place| if (place.load(.seq_cst)) |c| break :blk c.stream.socket;
+        return error.TestUnexpectedResult;
     };
     try std.testing.expect(try socket_opts.getNoDelay(io, server_socket));
 }
@@ -764,11 +764,7 @@ fn waitParked(f: *Fixture, want: usize) !void {
     const io = std.testing.io;
     var waited: u32 = 0;
     while (waited < 10_000) : (waited += 10) {
-        const parker = &f.transport.parker;
-        parker.lock.lockUncancelable(io);
-        const n = parker.parked.items.len;
-        parker.lock.unlock(io);
-        if (n >= want) return;
+        if (f.transport.parker.parked_count.load(.acquire) >= want) return;
         try io.sleep(.fromMilliseconds(10), .awake);
     }
     return error.Timeout;
@@ -893,3 +889,60 @@ test "grpc: clients that send a part of the preface or of a frame and stop do no
 }
 
 const frame_preface = @import("http2/frame.zig").preface;
+
+/// A task that writes to the socket of a connection of the server until a write waits. The
+/// client reads nothing, thus the buffers of the socket fill. `sent` counts the writes.
+fn Filler(comptime C: type) type {
+    return struct {
+        fn run(conn: *C, sent: *std.atomic.Value(u64)) void {
+            const io = std.testing.io;
+            var buf: [256]u8 = undefined;
+            var w = conn.stream.writer(io, &buf);
+            const chunk: [16 << 10]u8 = @splat(0);
+            while (true) {
+                w.interface.writeAll(&chunk) catch return;
+                w.interface.flush() catch return;
+                _ = sent.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+}
+
+test "grpc: the shutdown ends a connection whose GOAWAY waits for a client that does not read" {
+    const io = std.testing.io;
+    var f: Fixture = undefined;
+    try f.start(null, null);
+    defer f.stop();
+    // A client that sends the preface and its settings, and then reads nothing.
+    const address = Io.net.IpAddress.parse("127.0.0.1", f.transport.bound_port) catch unreachable;
+    const raw = try mcp.util.loopback.connect(io, address);
+    defer raw.close(io);
+    var buf: [64]u8 = undefined;
+    var w = raw.writer(io, &buf);
+    try w.interface.writeAll(frame_preface);
+    try w.interface.writeAll(&.{ 0, 0, 0, 4, 0, 0, 0, 0, 0 });
+    try w.interface.flush();
+    try waitParked(&f, 1);
+    const conn = blk: {
+        for (f.transport.connections) |*place| if (place.load(.seq_cst)) |c| if (c.h2_ready.load(.seq_cst)) break :blk c;
+        return error.TestUnexpectedResult;
+    };
+    // Fill the buffers of the socket until a write waits, then stop that write. The next
+    // write of the server, the `GOAWAY` of the shutdown, waits too.
+    var sent: std.atomic.Value(u64) = .init(0);
+    var filler = try io.concurrent(Filler(@TypeOf(conn.*)).run, .{ conn, &sent });
+    var last: u64 = 0;
+    var still: u32 = 0;
+    var rounds: u32 = 0;
+    while (still < 5 and rounds < 400) : (rounds += 1) {
+        try io.sleep(.fromMilliseconds(50), .awake);
+        const now = sent.load(.monotonic);
+        still = if (now == last) still + 1 else 0;
+        last = now;
+    }
+    filler.cancel(io);
+    try std.testing.expect(still >= 5);
+    // The shutdown cancels the waiting `GOAWAY` after a short time, and `serve` returns.
+    f.transport.shutdown();
+    try connection_test.waitSet(io, &f.served);
+}

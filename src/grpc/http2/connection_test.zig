@@ -32,7 +32,7 @@ pub const Watchdog = struct {
         if (self.future) |*f| f.cancel(io);
         self.future = null;
         if (!self.fired.load(.acquire)) return;
-        std.log.err("no answer from the peer on stream {d} after {d} s", .{ self.stream.id, wait_limit.toSeconds() });
+        std.log.err("no answer from the peer on stream {d} after {d} s", .{ self.stream.id_word.load(.seq_cst), wait_limit.toSeconds() });
         return error.Timeout;
     }
 
@@ -42,10 +42,7 @@ pub const Watchdog = struct {
         self.stream.cancel();
         // Also wake the waits here, thus a defect in the wake-up of `cancel` cannot stop the
         // test binary.
-        const conn = self.stream.conn;
-        conn.lock.lockUncancelable(conn.io);
-        self.stream.cond.broadcast(conn.io);
-        conn.lock.unlock(conn.io);
+        self.stream.wake();
     }
 };
 
@@ -113,15 +110,29 @@ fn isZero(count: *const std.atomic.Value(u32)) bool {
     return count.load(.acquire) == 0;
 }
 
-/// A task waits on the condition of the stream. The waiter count is a field of
-/// `std.Io.Condition` in Zig 0.16.0.
-fn hasWaiter(stream: *Connection.Stream) bool {
-    return stream.cond.state.load(.monotonic).waiters != 0;
+/// The writer gave the stream its id: its headers went to the buffer of the connection.
+fn hasId(stream: *Connection.Stream) bool {
+    return stream.id_word.load(.seq_cst) != 0;
 }
 
-/// A task waits for the mutex. The state is a field of `std.Io.Mutex` in Zig 0.16.0.
-fn isContended(mutex: *Io.Mutex) bool {
-    return mutex.state.load(.monotonic) == .contended;
+/// A task waits on the stream.
+fn hasWaiter(stream: *Connection.Stream) bool {
+    return stream.waiters.load(.seq_cst) != 0;
+}
+
+/// Become the writer of `conn`, as a task that writes a large frame does. The sends of other
+/// tasks then wait in the queue of the writer. Give the writer back with `releaseWriter`.
+fn holdWriter(conn: *Connection) !void {
+    try pollUntil(std.testing.io, "the writer is free", conn, takeWriter);
+}
+
+fn takeWriter(conn: *Connection) bool {
+    return conn.writer_busy.cmpxchgStrong(false, true, .seq_cst, .monotonic) == null;
+}
+
+/// Give back the writer of `holdWriter`. The next send writes the frames of the queue.
+fn releaseWriter(conn: *Connection) void {
+    conn.writer_busy.store(false, .seq_cst);
 }
 
 /// The read task of a connection, which runs `Connection.run`. The wait for its end has a
@@ -571,6 +582,9 @@ test "the server cannot answer after the client ended the request and reset the 
         .{ .name = "content-type", .value = "application/grpc" },
     }, false);
     try stream.sendData("the request", true);
+    // A busy writer can send the headers after `sendHeaders` returns. A cancel before that
+    // keeps the stream from the server. The test needs the stream on the server.
+    try pollUntil(io, "the stream has an id", stream, hasId);
     stream.cancel();
     // On the server, a reset after the end of the request tells that the client canceled.
     // Thus a send fails, also when the request is complete.
@@ -620,12 +634,7 @@ fn waitOn(stream: *Connection.Stream, kind: WaitKind) Connection.Error!void {
 /// Wake the waits on `stream` until `stop` is set, as frames on the stream and window updates
 /// of the connection do.
 fn wakeLoop(stream: *Connection.Stream, stop: *const std.atomic.Value(bool)) void {
-    const conn = stream.conn;
-    while (!stop.load(.acquire)) {
-        conn.lock.lockUncancelable(conn.io);
-        stream.cond.broadcast(conn.io);
-        conn.lock.unlock(conn.io);
-    }
+    while (!stop.load(.acquire)) stream.wake();
 }
 
 test "stopWaits ends each wait on the stream while the connection wakes its waiters" {
@@ -643,7 +652,7 @@ test "stopWaits ends each wait on the stream while the connection wakes its wait
         const stream = try conn.openStream();
         defer stream.close();
         // Without credit, `sendData` waits.
-        stream.send_window = 0;
+        stream.send_window.store(0, .seq_cst);
         var stop_wakes: std.atomic.Value(bool) = .init(false);
         var waker = try io.concurrent(wakeLoop, .{ stream, &stop_wakes });
         defer {
@@ -697,37 +706,33 @@ test "a frame on one stream does not wake the waits on the other streams" {
         started += 1;
     }
     for (idle) |s| try pollUntil(io, "a task waits on the stream", s, hasWaiter);
-    // The condition of std counts its wake-ups in `epoch`.
+    // Each stream counts its wake-ups in `epoch`.
     var epochs: [idle_count]u32 = undefined;
-    for (idle, &epochs) |s, *e| e.* = s.cond.epoch.load(.acquire);
+    for (idle, &epochs) |s, *e| e.* = s.epoch.load(.acquire);
     // The echo on one more stream brings headers, data and trailers. Before, each of these
     // frames woke each task that waited on the connection, also the tasks of the other
     // streams.
     const echoed = try request(&pair, "/echo", "next");
     gpa.free(echoed);
     for (idle, epochs) |s, e| {
-        try std.testing.expectEqual(e, s.cond.epoch.load(.acquire));
+        try std.testing.expectEqual(e, s.epoch.load(.acquire));
         try std.testing.expect(hasWaiter(s));
     }
 }
 
-/// The stream has a reset. The function takes the lock of the connection only with `tryLock`.
-/// Thus a task that holds the lock and waits cannot stop the test.
+/// The stream has a reset.
 fn hasReset(stream: *Connection.Stream) bool {
-    const conn = stream.conn;
-    if (!conn.lock.tryLock()) return false;
-    defer conn.lock.unlock(conn.io);
-    return stream.reset != null;
+    return stream.wasReset() != null;
 }
 
-test "a header block over the limit gives ENHANCE_YOUR_CALM after the connection unlocks" {
+test "a header block over the limit gives ENHANCE_YOUR_CALM while another task writes" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var pair: Pair = undefined;
     try pair.start(io, gpa, .{ .role = .client, .max_header_list_size = large_header_len });
     defer pair.stop();
     // After one exchange, the settings of both sides arrived. Thus the read task of the client
-    // writes no acknowledgment while the test holds the write lock.
+    // writes no acknowledgment while the test holds the writer.
     const first = try request(&pair, "/echo", "first");
     gpa.free(first);
     const conn = pair.client.conn;
@@ -738,12 +743,12 @@ test "a header block over the limit gives ENHANCE_YOUR_CALM after the connection
         .{ .name = ":scheme", .value = "http" },
         .{ .name = ":path", .value = "/large" },
     }, true);
-    // The test holds the write lock, as `sendHeaders` does when it takes the connection lock to
-    // give the next stream its id. The read task must not hold the connection lock while it
-    // waits for the write lock to send the reset. Before, the two tasks waited for each other.
-    conn.write_lock.lockUncancelable(io);
-    const polled = pollUntil(io, "a reset and a free connection lock", stream, hasReset);
-    conn.write_lock.unlock(io);
+    // The test holds the writer, as a task that writes a large frame does. The read task must
+    // not wait for the writer to send the reset. Before, the read task waited for a lock that
+    // the task of `sendHeaders` held.
+    try holdWriter(conn);
+    const polled = pollUntil(io, "a reset while another task writes", stream, hasReset);
+    releaseWriter(conn);
     try polled;
     try std.testing.expectEqual(frame.ErrorCode.enhance_your_calm, stream.wasReset().?);
     // The connection serves the next stream.
@@ -767,29 +772,25 @@ test "a cancel before the stream has an id keeps the stream from the peer" {
     try pair.start(io, gpa, .{ .role = .client });
     defer pair.stop();
     // After one exchange, the settings of both sides arrived. Thus the read task of the client
-    // writes no acknowledgment while the test holds the write lock.
+    // writes no acknowledgment while the test holds the writer.
     const first = try request(&pair, "/echo", "first");
     gpa.free(first);
     const conn = pair.client.conn;
     const stream = try conn.openStream();
     defer stream.close();
-    // The send passes its check of the stream and waits for the write lock. Then the cancel
-    // comes from another task. It sends no reset, because the stream has no id yet. Before, the
-    // headers then went out, and the server kept the stream open until the connection ended.
-    conn.write_lock.lockUncancelable(io);
-    var sender = io.concurrent(sendEchoHeaders, .{stream}) catch |err| {
-        conn.write_lock.unlock(io);
-        return err;
-    };
-    const contended = pollUntil(io, "the send waits for the write lock", &conn.write_lock, isContended);
+    // The send passes its check of the stream and puts its headers in the queue of the busy
+    // writer. Then the cancel comes. It sends no reset, because the stream has no id yet. The
+    // writer then drops the headers. Before, the headers went out, and the server kept the
+    // stream open until the connection ended.
+    try holdWriter(conn);
+    const sent = sendEchoHeaders(stream);
     stream.cancel();
-    conn.write_lock.unlock(io);
-    const result = sender.await(io);
-    try contended;
-    try std.testing.expectError(error.StreamReset, result);
-    try std.testing.expectEqual(0, stream.id);
+    releaseWriter(conn);
+    try sent;
+    try std.testing.expectError(error.StreamReset, stream.waitHeaders());
     const echoed = try request(&pair, "/echo", "next");
     defer gpa.free(echoed);
+    try std.testing.expectEqual(0, stream.id);
     try std.testing.expectEqual(2, pair.server.streams_seen.load(.monotonic));
 }
 
@@ -1155,12 +1156,12 @@ const HookRecorder = struct {
         if (std.mem.eql(u8, path, "/remove")) stream.setOnReset(null, null);
     }
 
-    /// The connection calls the hook under its lock, thus the hook only reads the stream.
+    /// The hook only reads the stream.
     fn onReset(userdata: ?*anyopaque, stream: *Connection.Stream) void {
         const self: *HookRecorder = @ptrCast(@alignCast(userdata.?));
         self.calls[stream.id] += 1;
-        self.codes[stream.id] = stream.reset;
-        self.closed[stream.id] = stream.conn_closed;
+        self.codes[stream.id] = stream.wasReset();
+        self.closed[stream.id] = stream.connClosed();
     }
 };
 
@@ -1427,4 +1428,29 @@ test "dispatchAtEnd gives a stream again at the end of its request and frees a s
     // The connection freed stream 3, which had no owner.
     try std.testing.expectEqual(0, conn.streams.count());
     try std.testing.expectEqual(0, conn.peer_streams_open);
+}
+
+test "a peer that sends PING frames while the writer waits ends the connection at the limit" {
+    const gpa = std.testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    const pings = Connection.max_queued_control / (frame.header_len + 8) + 100;
+    for (0..pings) |_| try appendFrame(gpa, &script, .ping, 0, 0, &(@as([8]u8, @splat(1))));
+    var reader: Io.Reader = .fixed(script.items);
+    const written = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(written);
+    var writer: Io.Writer = .fixed(written);
+    const conn = try Connection.init(gpa, std.testing.io, &reader, &writer, .{ .role = .server });
+    defer conn.deinit();
+    try conn.handshake();
+    // A writer that waits for a peer that does not read. The acknowledgments wait in the queue.
+    try holdWriter(conn);
+    conn.run();
+    releaseWriter(conn);
+    // The read task stopped before the end of the script, and the queue stayed small.
+    try std.testing.expect(reader.bufferedLen() > 0);
+    // Over the limit: the last acknowledgment and the GOAWAY frame.
+    try std.testing.expect(conn.queued_control.load(.monotonic) <= Connection.max_queued_control + 64);
 }

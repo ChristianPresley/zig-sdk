@@ -10,6 +10,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const lockfree = @import("../util/lockfree.zig");
 
 const ListCache = @This();
 
@@ -18,17 +19,41 @@ pub const views = 2;
 
 /// The version of the list. It changes at each change of the list.
 version: std.atomic.Value(u64) = .init(1),
-lock: Io.Mutex = .init,
-slots: [views]Slot = @splat(.{}),
+/// The text of each view. A newer text replaces the text of a slot with one atomic operation.
+slots: [views]std.atomic.Value(?*Text) = @splat(.init(null)),
+/// The texts that a newer text replaced. A reader can still copy one of them. The cache frees
+/// them when no task reads. Thus the cache has no lock.
+retired: lockfree.Retired(Text, "next") = .{},
 
-const Slot = struct {
-    version: u64 = 0,
-    /// The JSON text, from the general-purpose allocator of the server.
-    text: ?[]u8 = null,
+/// The JSON text of one view at one version. The bytes follow the struct, from the
+/// general-purpose allocator of the server.
+const Text = struct {
+    next: ?*Text = null,
+    version: u64,
+    len: usize,
+
+    fn create(gpa: Allocator, version: u64, text: []const u8) Allocator.Error!*Text {
+        const mem = try gpa.alignedAlloc(u8, .of(Text), @sizeOf(Text) + text.len);
+        const t: *Text = @ptrCast(mem.ptr);
+        t.* = .{ .version = version, .len = text.len };
+        @memcpy(mem[@sizeOf(Text)..], text);
+        return t;
+    }
+
+    fn bytes(t: *const Text) []const u8 {
+        const base: [*]const u8 = @ptrCast(t);
+        return base[@sizeOf(Text)..][0..t.len];
+    }
+
+    fn free(gpa: Allocator, t: *Text) void {
+        const base: [*]align(@alignOf(Text)) u8 = @ptrCast(t);
+        gpa.free(base[0 .. @sizeOf(Text) + t.len]);
+    }
 };
 
 pub fn deinit(self: *ListCache, gpa: Allocator) void {
-    for (&self.slots) |*s| if (s.text) |t| gpa.free(t);
+    for (&self.slots) |*s| if (s.load(.acquire)) |t| Text.free(gpa, t);
+    self.retired.deinit(gpa, Text.free);
     self.* = undefined;
 }
 
@@ -44,58 +69,58 @@ pub fn current(self: *const ListCache) u64 {
 
 /// Write the text of `view` to `w` when the slot has the current version. Returns false when
 /// the slot is stale or empty, and then writes nothing.
-pub fn writeTo(self: *ListCache, io: Io, view: usize, w: *Io.Writer) Io.Writer.Error!bool {
-    self.lock.lockUncancelable(io);
-    defer self.lock.unlock(io);
-    const slot = &self.slots[view];
-    const text = slot.text orelse return false;
-    if (slot.version != self.current()) return false;
-    try w.writeAll(text);
+pub fn writeTo(self: *ListCache, gpa: Allocator, view: usize, w: *Io.Writer) Io.Writer.Error!bool {
+    self.retired.enter();
+    defer self.retired.leave(gpa, Text.free);
+    const text = self.slots[view].load(.seq_cst) orelse return false;
+    if (text.version != self.current()) return false;
+    try w.writeAll(text.bytes());
     return true;
 }
 
 /// Keep a copy of `text` for `view`. The text is the list at `version`. The function does
 /// nothing when the list changed after `version`.
-pub fn put(self: *ListCache, io: Io, gpa: Allocator, view: usize, version: u64, text: []const u8) Allocator.Error!void {
+pub fn put(self: *ListCache, gpa: Allocator, view: usize, version: u64, text: []const u8) Allocator.Error!void {
     if (version != self.current()) return;
-    const copy = try gpa.dupe(u8, text);
-    var old: ?[]u8 = copy;
-    {
-        self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
-        const slot = &self.slots[view];
+    const fresh = try Text.create(gpa, version, text);
+    const slot = &self.slots[view];
+    // The loop reads the version of the old text, thus it counts as a reader.
+    self.retired.enter();
+    defer self.retired.leave(gpa, Text.free);
+    var old = slot.load(.seq_cst);
+    while (true) {
         // A slot can only go to a newer version.
-        if (version > slot.version or slot.text == null) {
-            old = slot.text;
-            slot.* = .{ .version = version, .text = copy };
-        }
+        if (old) |o| if (version <= o.version) {
+            Text.free(gpa, fresh);
+            return;
+        };
+        old = slot.cmpxchgWeak(old, fresh, .seq_cst, .seq_cst) orelse break;
     }
-    if (old) |o| gpa.free(o);
+    if (old) |o| self.retired.retire(o, gpa, Text.free);
 }
 
 test "a slot is current until the list changes" {
     const gpa = std.testing.allocator;
-    const io = std.testing.io;
     var cache: ListCache = .{};
     defer cache.deinit(gpa);
     var buf: [64]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
-    try std.testing.expect(!try cache.writeTo(io, 0, &w));
+    try std.testing.expect(!try cache.writeTo(gpa, 0, &w));
 
     const v = cache.current();
-    try cache.put(io, gpa, 0, v, "{\"tools\":[]}");
-    try std.testing.expect(try cache.writeTo(io, 0, &w));
+    try cache.put(gpa, 0, v, "{\"tools\":[]}");
+    try std.testing.expect(try cache.writeTo(gpa, 0, &w));
     try std.testing.expectEqualStrings("{\"tools\":[]}", w.buffered());
     // The other view has its own slot.
-    try std.testing.expect(!try cache.writeTo(io, 1, &w));
+    try std.testing.expect(!try cache.writeTo(gpa, 1, &w));
 
     // A change makes the slot stale. A text of the old version does not go in.
     cache.invalidate();
-    try std.testing.expect(!try cache.writeTo(io, 0, &w));
-    try cache.put(io, gpa, 0, v, "{\"tools\":[1]}");
-    try std.testing.expect(!try cache.writeTo(io, 0, &w));
-    try cache.put(io, gpa, 0, cache.current(), "{\"tools\":[2]}");
+    try std.testing.expect(!try cache.writeTo(gpa, 0, &w));
+    try cache.put(gpa, 0, v, "{\"tools\":[1]}");
+    try std.testing.expect(!try cache.writeTo(gpa, 0, &w));
+    try cache.put(gpa, 0, cache.current(), "{\"tools\":[2]}");
     w = .fixed(&buf);
-    try std.testing.expect(try cache.writeTo(io, 0, &w));
+    try std.testing.expect(try cache.writeTo(gpa, 0, &w));
     try std.testing.expectEqualStrings("{\"tools\":[2]}", w.buffered());
 }

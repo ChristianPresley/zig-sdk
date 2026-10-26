@@ -819,7 +819,7 @@ fn finishCachedResult(self: *Server, ctx: *RequestContext, cache: *ListCache, vi
     const start = aw.written().len;
     json.write(stamped, &aw.writer) catch return error.OutOfMemory;
     // Without memory for the copy, the next request serializes the list again.
-    cache.put(ctx.io, self.gpa, view, list_version, aw.written()[start..]) catch {};
+    cache.put(self.gpa, view, list_version, aw.written()[start..]) catch {};
     aw.writer.writeAll(message.response_tail) catch return error.OutOfMemory;
     return finishFrame(ctx, aw.written());
 }
@@ -828,7 +828,7 @@ fn finishCachedResult(self: *Server, ctx: *RequestContext, cache: *ListCache, vi
 fn finishFromCache(ctx: *RequestContext, cache: *ListCache, view: usize) RequestContext.Error!bool {
     var aw: Io.Writer.Allocating = .init(ctx.arena);
     message.writeResponseHead(&aw.writer, ctx.id) catch return error.OutOfMemory;
-    if (!(cache.writeTo(ctx.io, view, &aw.writer) catch return error.OutOfMemory)) return false;
+    if (!(cache.writeTo(ctx.gpa, view, &aw.writer) catch return error.OutOfMemory)) return false;
     aw.writer.writeAll(message.response_tail) catch return error.OutOfMemory;
     try finishFrame(ctx, aw.written());
     return true;
