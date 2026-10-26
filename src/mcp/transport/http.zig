@@ -2603,8 +2603,13 @@ fn chunkedLengthFresh(data: []const u8, max_body: usize) Chunked {
 }
 
 test "a new connection goes to the first shard that is not busy" {
+    // `pickIndex` reads `load` and `sleeping` only. Both must be set: a read of an undefined
+    // `bool` crashed this test in ReleaseFast.
     var shards: [3]Shard = undefined;
-    for (&shards) |*sh| sh.load = .init(0);
+    for (&shards) |*sh| {
+        sh.load = .init(0);
+        sh.sleeping = .init(false);
+    }
     try std.testing.expectEqual(0, pickIndex(&shards));
     shards[0].load.store(80, .monotonic);
     try std.testing.expectEqual(1, pickIndex(&shards));
