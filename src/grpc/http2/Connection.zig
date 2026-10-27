@@ -53,8 +53,9 @@ pub const Error = error{
 } || Io.Cancelable;
 
 /// The errors of the read task. A frame with a wrong length gives `FrameSizeError`
-/// (RFC 9113 sections 4.2 and 6).
-const ReadError = Error || error{ FrameSizeError, EnhanceYourCalm };
+/// (RFC 9113 sections 4.2 and 6). A header block that HPACK cannot decode gives
+/// `CompressionError` (RFC 9113 section 4.3).
+const ReadError = Error || error{ FrameSizeError, EnhanceYourCalm, CompressionError };
 
 io: Io,
 gpa: Allocator,
@@ -273,6 +274,7 @@ pub fn runUntilIdle(self: *Connection, hooks: ?IdleHooks) Exit {
             switch (e) {
                 error.ProtocolError => self.sendGoaway(.protocol_error),
                 error.FrameSizeError => self.sendGoaway(.frame_size_error),
+                error.CompressionError => self.sendGoaway(.compression_error),
                 error.EnhanceYourCalm => self.sendGoaway(.enhance_your_calm),
                 error.OutOfMemory => self.sendGoaway(.internal_error),
                 else => {},
@@ -811,7 +813,7 @@ fn onData(self: *Connection, header: frame.Header, payload: []const u8) Error!vo
     }
 }
 
-fn onHeaders(self: *Connection, header: frame.Header, payload: []const u8) Error!void {
+fn onHeaders(self: *Connection, header: frame.Header, payload: []const u8) ReadError!void {
     if (header.stream_id == 0) return error.ProtocolError;
     var block = payload;
     if (header.has(frame.Flags.padded)) {
@@ -824,33 +826,34 @@ fn onHeaders(self: *Connection, header: frame.Header, payload: []const u8) Error
         if (block.len < 5) return error.ProtocolError;
         block = block[5..];
     }
-    self.hb_buf.clearRetainingCapacity();
-    try self.hb_buf.appendSlice(self.gpa, block);
     self.hb_stream = header.stream_id;
     self.hb_flags = header.flags;
     if (header.has(frame.Flags.end_headers)) {
-        try self.finishHeaderBlock();
+        // A block in one frame decodes from the frame buffer, without a copy.
+        try self.finishHeaderBlock(block);
     } else {
+        self.hb_buf.clearRetainingCapacity();
+        try self.hb_buf.appendSlice(self.gpa, block);
         self.hb_active = true;
     }
 }
 
-fn onContinuation(self: *Connection, header: frame.Header, payload: []const u8) Error!void {
+fn onContinuation(self: *Connection, header: frame.Header, payload: []const u8) ReadError!void {
     if (!self.hb_active or header.stream_id != self.hb_stream) return error.ProtocolError;
     if (self.hb_buf.items.len + payload.len > self.options.max_header_block_size) return error.ProtocolError;
     try self.hb_buf.appendSlice(self.gpa, payload);
     if (header.has(frame.Flags.end_headers)) {
         self.hb_active = false;
-        try self.finishHeaderBlock();
+        defer self.hb_buf.clearRetainingCapacity();
+        try self.finishHeaderBlock(self.hb_buf.items);
     }
 }
 
 /// Decode the assembled block and hand it to the stream: request headers, response
 /// headers or trailers.
-fn finishHeaderBlock(self: *Connection) Error!void {
+fn finishHeaderBlock(self: *Connection, block: []const u8) ReadError!void {
     const stream_id = self.hb_stream;
     const end_stream = self.hb_flags & frame.Flags.end_stream != 0;
-    defer self.hb_buf.clearRetainingCapacity();
     // The stream that this block opens. It goes to `on_stream`, or it is refused and freed.
     var opened: ?*Stream = null;
     const s = self.streams.get(stream_id) orelse s: {
@@ -858,13 +861,13 @@ fn finishHeaderBlock(self: *Connection) Error!void {
             // A response for a stream we do not know, a block on a stream that this side
             // reset, or a bad id: decode to keep the HPACK state in sync, then ignore or
             // refuse. The peer can send a block before it sees the reset (section 5.1).
-            try self.decodeDiscard();
+            try self.decodeDiscard(block);
             if (self.options.role == .server and !self.wasResetHere(stream_id)) return error.ProtocolError;
             return;
         }
         @atomicStore(u31, &self.last_peer_stream_id, stream_id, .seq_cst);
         if (self.goaway_sent.load(.seq_cst) or self.peer_streams_open >= self.options.max_concurrent_streams) {
-            try self.decodeDiscard();
+            try self.decodeDiscard(block);
             self.rememberReset(stream_id);
             self.sendRst(stream_id, .refused_stream);
             return;
@@ -880,9 +883,10 @@ fn finishHeaderBlock(self: *Connection) Error!void {
     };
     var reset: ?frame.ErrorCode = null;
     decoded: {
-        const arena = s.arena_state.allocator();
-        var list: std.ArrayList(Header) = .empty;
-        self.decoder.decode(arena, self.hb_buf.items, &list) catch |e| switch (e) {
+        // One allocation in the stream arena holds the headers and their bytes. Thus they
+        // stay valid as long as the stream, after the next block and after the dynamic table
+        // evicts their entries.
+        const list = self.decoder.decodeOwned(s.arena_state.allocator(), block) catch |e| switch (e) {
             error.OutOfMemory => {
                 if (opened != null) self.unregisterOpened(s);
                 return error.OutOfMemory;
@@ -895,26 +899,26 @@ fn finishHeaderBlock(self: *Connection) Error!void {
             else => {
                 // A compression error ends the connection.
                 if (opened != null) self.unregisterOpened(s);
-                return error.ProtocolError;
+                return error.CompressionError;
             },
         };
         const state = s.state.load(.acquire);
         if (state & Stream.end_stream != 0 or s.reset_word.load(.acquire) != 0) {
             reset = .stream_closed;
         } else if (state & Stream.headers_done == 0) {
-            if (!validHeaders(list.items, false, self.options.role)) {
+            if (!validHeaders(list, false, self.options.role)) {
                 reset = .protocol_error;
                 s.setReset(.protocol_error);
             } else {
-                s.headers = list;
+                s.headers = .{ .items = list, .capacity = list.len };
                 s.setState(Stream.headers_done | if (end_stream) Stream.end_stream else 0);
             }
         } else {
-            if (!validHeaders(list.items, true, self.options.role) or !end_stream) {
+            if (!validHeaders(list, true, self.options.role) or !end_stream) {
                 reset = .protocol_error;
                 s.setReset(.protocol_error);
             } else {
-                s.trailers = list;
+                s.trailers = .{ .items = list, .capacity = list.len };
                 s.setState(Stream.trailers_done | Stream.end_stream);
             }
         }
@@ -994,16 +998,15 @@ fn wasResetHere(self: *const Connection, id: u31) bool {
     return std.mem.findScalar(u31, &self.reset_ids, id) != null;
 }
 
-/// Decode a block that goes nowhere, to keep the dynamic table in sync.
-fn decodeDiscard(self: *Connection) Error!void {
-    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
-    defer arena_state.deinit();
-    var list: std.ArrayList(Header) = .empty;
-    self.decoder.decode(arena_state.allocator(), self.hb_buf.items, &list) catch |e| switch (e) {
+/// Decode a block that goes nowhere, to keep the dynamic table in sync. The headers stay in
+/// the memory of the decoder until `trim`.
+fn decodeDiscard(self: *Connection, block: []const u8) ReadError!void {
+    _ = self.decoder.decodeBlock(block) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.HeaderListTooLarge, error.FieldTooLarge => {},
-        else => return error.ProtocolError,
+        else => return error.CompressionError,
     };
+    self.decoder.trim();
 }
 
 /// The header field rules of RFC 9113 section 8.

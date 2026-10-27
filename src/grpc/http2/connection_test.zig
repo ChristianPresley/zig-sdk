@@ -902,6 +902,16 @@ test "a control frame with a wrong length gives GOAWAY with FRAME_SIZE_ERROR" {
     try std.testing.expectEqual(frame.ErrorCode.frame_size_error, try goawayCodeFor(&(ping.encode() ++ [_]u8{0} ** 4)));
 }
 
+test "a header block that HPACK cannot decode gives GOAWAY with COMPRESSION_ERROR" {
+    // RFC 9113 section 4.3. Index 0 is not valid.
+    const headers: frame.Header = .{ .length = 1, .type = .headers, .flags = frame.Flags.end_headers | frame.Flags.end_stream, .stream_id = 1 };
+    try std.testing.expectEqual(frame.ErrorCode.compression_error, try goawayCodeFor(&(headers.encode() ++ [_]u8{0x80})));
+    // The same for a block on a stream that the server ignores: a stream id that the client
+    // must not use.
+    const ignored: frame.Header = .{ .length = 2, .type = .headers, .flags = frame.Flags.end_headers, .stream_id = 2 };
+    try std.testing.expectEqual(frame.ErrorCode.compression_error, try goawayCodeFor(&(ignored.encode() ++ [_]u8{ 0x00, 0x81 })));
+}
+
 test "a PING frame on a stream gives GOAWAY with PROTOCOL_ERROR" {
     const ping: frame.Header = .{ .length = 8, .type = .ping, .flags = 0, .stream_id = 1 };
     try std.testing.expectEqual(frame.ErrorCode.protocol_error, try goawayCodeFor(&(ping.encode() ++ [_]u8{0} ** 8)));
@@ -1453,4 +1463,66 @@ test "a peer that sends PING frames while the writer waits ends the connection a
     try std.testing.expect(reader.bufferedLen() > 0);
     // Over the limit: the last acknowledgment and the GOAWAY frame.
     try std.testing.expect(conn.queued_control.load(.monotonic) <= Connection.max_queued_control + 64);
+}
+
+test "the headers of a stream stay valid after the next blocks and the eviction of their entries" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, frame.preface);
+    try appendFrame(gpa, &script, .settings, 0, 0, &.{});
+    // Stream 1 adds "x-tag: one" to the dynamic table, with a Huffman value, and refers to it.
+    var tag: std.ArrayList(u8) = .empty;
+    defer tag.deinit(gpa);
+    try tag.appendSlice(gpa, "\x40\x05x-tag");
+    try hpack.Encoder.encodeInteger(gpa, &tag, 7, 0x80, 2);
+    try tag.appendSlice(gpa, &.{ 0x3d, 0x45 }); // "one" in the Huffman code
+    try tag.append(gpa, 0xbe);
+    try appendRequest(gpa, &script, 1, &(post ++ [_]Header{.{ .name = ":path", .value = "/1" }}), tag.items);
+    // Stream 3: a table size update to 0 evicts the entry. The block then adds "x-tag: two".
+    // The block comes in a HEADERS frame and a CONTINUATION frame.
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    try block.appendSlice(gpa, "\x20\x3f\xe1\x1f"); // size 0, then 4096
+    try (hpack.Encoder{}).encodeHeaders(gpa, &block, &(post ++ [_]Header{.{ .name = ":path", .value = "/3" }}));
+    try block.appendSlice(gpa, "\x40\x05x-tag\x03two");
+    const split = block.items.len / 2;
+    try appendFrame(gpa, &script, .headers, frame.Flags.end_stream, 3, block.items[0..split]);
+    try appendFrame(gpa, &script, .continuation, frame.Flags.end_headers, 3, block.items[split..]);
+    // Stream 5 refers to the new entry, and adds an entry that evicts nothing.
+    try appendRequest(gpa, &script, 5, &(post ++ [_]Header{.{ .name = ":path", .value = "/5" }}), "\xbe\x40\x05x-new\x05three");
+
+    var reader: Io.Reader = .fixed(script.items);
+    const written = try gpa.alloc(u8, 64 << 10);
+    defer gpa.free(written);
+    var writer: Io.Writer = .fixed(written);
+    var streams: StreamList = .{};
+    const conn = try Connection.init(gpa, io, &reader, &writer, .{
+        .role = .server,
+        .on_stream = StreamList.onStream,
+        .userdata = &streams,
+    });
+    defer conn.deinit();
+    try conn.handshake();
+    conn.run();
+    defer for (streams.items[0..streams.len]) |s| s.close();
+
+    try std.testing.expectEqual(3, streams.len);
+    const want = [_][]const []const u8{
+        &.{ "/1", "one", "one" },
+        &.{ "/3", "two" },
+        &.{ "/5", "two", "three" },
+    };
+    for (want, streams.items[0..3]) |w, s| {
+        const headers = s.headers.items;
+        try std.testing.expectEqualStrings(w[0], Connection.findHeader(headers, ":path").?);
+        var tags: usize = 0;
+        for (headers) |h| {
+            if (!std.mem.eql(u8, h.name, "x-tag") and !std.mem.eql(u8, h.name, "x-new")) continue;
+            tags += 1;
+            try std.testing.expectEqualStrings(w[tags], h.value);
+        }
+        try std.testing.expectEqual(w.len - 1, tags);
+    }
 }

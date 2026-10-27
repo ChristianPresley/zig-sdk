@@ -37,26 +37,79 @@ pub const Options = struct {
 pub const Decoder = struct {
     gpa: Allocator,
     options: Options,
-    /// Newest entry last.
+    /// The bytes of the dynamic table entries, oldest first, in `table[head..tail]`. A new
+    /// entry goes at `tail`, and an eviction only moves `head`. Thus the bytes of an entry
+    /// stay in place after its eviction, until a move. An insertion moves the live bytes to
+    /// the start or to a larger buffer when the end has no space. Before a move, `pin` copies
+    /// the strings of the fields of the block that refer to the table.
+    table: []u8 = &.{},
+    head: usize = 0,
+    tail: usize = 0,
+    /// The entries, oldest first, in `entries.items[first..]`.
     entries: std.ArrayList(Entry) = .empty,
+    first: usize = 0,
     size: usize = 0,
     /// The current table size limit, set by the encoder within `max_table_size`.
     table_size: u32,
+    /// The fields of the last block. The decoder keeps the memory for the next block.
+    fields: std.ArrayList(Field) = .empty,
+    /// The Huffman-decoded strings of the last block, and the copies that `pin` makes.
+    scratch: std.ArrayList(u8) = .empty,
+    /// The result of `decodeBlock`.
+    view: std.ArrayList(Header) = .empty,
 
-    const Entry = struct { name: []u8, value: []u8 };
+    /// The largest scratch buffer that the decoder keeps after a block, in units of
+    /// `max_header_list_size`. A larger buffer, for example after a long Huffman string that
+    /// gives `error.FieldTooLarge`, goes back to the allocator. The fields of a list under the
+    /// limit need less.
+    const scratch_keep_factor = 2;
+
+    /// An entry at `table[offset..]`: the name, then the value.
+    const Entry = struct { offset: usize, name_len: usize, value_len: usize };
+
+    /// A string of a decoded field, and the location of its bytes. The struct is small,
+    /// because the decoder copies it for each field.
+    const Str = struct {
+        /// The address of the bytes, or for `scratch` the start in `scratch`.
+        at: usize,
+        len: usize,
+        where: Where,
+
+        const Where = enum(u8) {
+            /// The static table: always valid.
+            static,
+            /// The block: valid while the block stays the same.
+            block,
+            /// The dynamic table: valid until the next move of the table. See `pin`.
+            table,
+            /// The scratch buffer: valid until the next block. The offset stays valid when
+            /// the buffer grows.
+            scratch,
+        };
+
+        fn fixed(where: Where, s: []const u8) Str {
+            return .{ .where = where, .at = @intFromPtr(s.ptr), .len = s.len };
+        }
+
+        /// The bytes of a string that is not in `scratch`.
+        fn slice(s: Str) []const u8 {
+            if (s.len == 0) return "";
+            return @as([*]const u8, @ptrFromInt(s.at))[0..s.len];
+        }
+    };
+
+    const Field = struct { name: Str, value: Str };
 
     pub fn init(gpa: Allocator, options: Options) Decoder {
         return .{ .gpa = gpa, .options = options, .table_size = options.max_table_size };
     }
 
     pub fn deinit(self: *Decoder) void {
-        for (self.entries.items) |e| self.freeEntry(e);
+        self.gpa.free(self.table);
         self.entries.deinit(self.gpa);
-    }
-
-    fn freeEntry(self: *Decoder, e: Entry) void {
-        self.gpa.free(e.name);
-        self.gpa.free(e.value);
+        self.fields.deinit(self.gpa);
+        self.scratch.deinit(self.gpa);
+        self.view.deinit(self.gpa);
     }
 
     /// Change the limit the peer must stay under (a new SETTINGS_HEADER_TABLE_SIZE).
@@ -71,81 +124,226 @@ pub const Decoder = struct {
     }
 
     fn evictTo(self: *Decoder, limit: usize) void {
-        while (self.size > limit and self.entries.items.len > 0) {
-            const oldest = self.entries.orderedRemove(0);
-            self.size -= oldest.name.len + oldest.value.len + entry_overhead;
-            self.freeEntry(oldest);
+        while (self.size > limit and self.first < self.entries.items.len) {
+            const oldest = self.entries.items[self.first];
+            self.first += 1;
+            self.size -= oldest.name_len + oldest.value_len + entry_overhead;
+            self.head = oldest.offset + oldest.name_len + oldest.value_len;
+        }
+        if (self.first == self.entries.items.len) {
+            // The bytes stay until the next move, because a field can refer to them.
+            self.entries.clearRetainingCapacity();
+            self.first = 0;
         }
     }
 
-    fn add(self: *Decoder, name: []const u8, value: []const u8) Allocator.Error!void {
-        const cost = name.len + value.len + entry_overhead;
+    /// Copy the strings of the fields of the block that refer to the table to `scratch`. Call
+    /// it before a move of the table bytes.
+    fn pin(self: *Decoder) Allocator.Error!void {
+        for (self.fields.items) |*f| {
+            f.name = try self.keep(f.name);
+            f.value = try self.keep(f.value);
+        }
+    }
+
+    /// Move the live bytes to the start of the table. The caller calls `pin` first.
+    fn compactBytes(self: *Decoder) void {
+        for (self.entries.items[self.first..]) |*e| e.offset -= self.head;
+        std.mem.copyForwards(u8, self.table, self.table[self.head..self.tail]);
+        self.tail -= self.head;
+        self.head = 0;
+    }
+
+    /// `name` and `value` must not be in the dynamic table, because the insertion can move
+    /// the table. The function gets their bytes only after `pin`, because `pin` can move
+    /// `scratch`.
+    fn add(self: *Decoder, name_str: Str, value_str: Str) Allocator.Error!void {
+        std.debug.assert(name_str.where != .table and value_str.where != .table);
+        const cost = name_str.len + value_str.len + entry_overhead;
         // An entry larger than the table empties it (section 4.4).
         if (cost > self.table_size) {
             self.evictTo(0);
             return;
         }
-        // Copy before the eviction: `name` can refer to an entry that it frees (section 4.4).
-        const n = try self.gpa.dupe(u8, name);
-        errdefer self.gpa.free(n);
-        const v = try self.gpa.dupe(u8, value);
-        errdefer self.gpa.free(v);
+        // Get the memory before the eviction. Thus an error leaves the table as it was. After
+        // the eviction, the live bytes and the new entry need `table_size` bytes or less. Thus
+        // a move to the start makes space at the end, and a move occurs at most one time for
+        // each `table_size` bytes of new entries. The eviction does not change `tail`, thus
+        // the need for a move is known before it.
+        const len = name_str.len + value_str.len;
+        const capacity = 2 * @as(usize, self.table_size);
+        const grow = self.table.len < capacity;
+        const move = grow or self.table.len - self.tail < len;
+        if (move) try self.pin();
+        if (grow) {
+            const bigger = try self.gpa.alloc(u8, capacity);
+            @memcpy(bigger[0 .. self.tail - self.head], self.table[self.head..self.tail]);
+            for (self.entries.items[self.first..]) |*e| e.offset -= self.head;
+            self.gpa.free(self.table);
+            self.table = bigger;
+            self.tail -= self.head;
+            self.head = 0;
+        }
+        if (self.first > 0 and self.entries.items.len == self.entries.capacity) {
+            // Move the live entries to the start of their list. Their offsets stay.
+            const live = self.entries.items[self.first..];
+            std.mem.copyForwards(Entry, self.entries.items, live);
+            self.entries.items.len = live.len;
+            self.first = 0;
+        }
         try self.entries.ensureUnusedCapacity(self.gpa, 1);
         self.evictTo(self.table_size - cost);
-        self.entries.appendAssumeCapacity(.{ .name = n, .value = v });
+        if (move) self.compactBytes();
+        std.debug.assert(self.table.len - self.tail >= len);
+        const name = self.bytes(name_str);
+        const value = self.bytes(value_str);
+        const at = self.table[self.tail..][0..len];
+        @memcpy(at[0..name.len], name);
+        @memcpy(at[name.len..], value);
+        self.entries.appendAssumeCapacity(.{ .offset = self.tail, .name_len = name.len, .value_len = value.len });
+        self.tail += len;
         self.size += cost;
     }
 
+    fn entryHeader(self: *const Decoder, e: Entry) Header {
+        const b = self.table[e.offset..][0 .. e.name_len + e.value_len];
+        return .{ .name = b[0..e.name_len], .value = b[e.name_len..] };
+    }
+
     /// The entry at a 1-based index over the static and then the dynamic table.
-    fn lookup(self: *const Decoder, index: u64) ?Header {
+    fn lookup(self: *const Decoder, index: u64) ?Field {
         if (index == 0) return null;
         if (index <= tables.static_table.len) {
             const s = tables.static_table[@intCast(index - 1)];
-            return .{ .name = s.name, .value = s.value };
+            return .{ .name = .fixed(.static, s.name), .value = .fixed(.static, s.value) };
         }
         const dyn = index - tables.static_table.len - 1;
-        if (dyn >= self.entries.items.len) return null;
-        const e = self.entries.items[self.entries.items.len - 1 - @as(usize, @intCast(dyn))];
-        return .{ .name = e.name, .value = e.value };
+        const live = self.entries.items[self.first..];
+        if (dyn >= live.len) return null;
+        const h = self.entryHeader(live[live.len - 1 - @as(usize, @intCast(dyn))]);
+        return .{ .name = .fixed(.table, h.name), .value = .fixed(.table, h.value) };
     }
 
-    /// The number of dynamic entries, newest first, for tests.
+    /// The dynamic entry at an index from the newest, for tests. The slices stay valid until
+    /// the next decode.
     pub fn dynamicEntry(self: *const Decoder, index_from_newest: usize) ?Header {
-        if (index_from_newest >= self.entries.items.len) return null;
-        const e = self.entries.items[self.entries.items.len - 1 - index_from_newest];
-        return .{ .name = e.name, .value = e.value };
+        const live = self.entries.items[self.first..];
+        if (index_from_newest >= live.len) return null;
+        return self.entryHeader(live[live.len - 1 - index_from_newest]);
     }
 
     pub fn dynamicSize(self: *const Decoder) usize {
         return self.size;
     }
 
-    /// Decode one header block. The decoder copies the headers into `arena`.
+    /// Decode one header block and append the headers to `out`. The decoder copies the
+    /// headers into `arena`.
+    pub fn decode(self: *Decoder, arena: Allocator, block: []const u8, out: *std.ArrayList(Header)) Error!void {
+        try out.appendSlice(arena, try self.decodeOwned(arena, block));
+    }
+
+    /// Decode one header block into one allocation from `arena`. The headers then stay valid
+    /// as long as `arena`. A string of the static table stays in the static table.
+    pub fn decodeOwned(self: *Decoder, arena: Allocator, block: []const u8) Error![]Header {
+        defer self.trim();
+        try self.decodeFields(block);
+        const fields = self.fields.items;
+        if (fields.len == 0) return &.{};
+        var total = fields.len * @sizeOf(Header);
+        for (fields) |f| total += copyLen(f.name) + copyLen(f.value);
+        // The headers and their bytes in one allocation. The function writes all of it, thus
+        // it does not fill it first, as `Allocator.alloc` does in a safe build.
+        const raw = arena.rawAlloc(total, .of(Header), @returnAddress()) orelse return error.OutOfMemory;
+        const headers: []Header = @as([*]Header, @ptrCast(@alignCast(raw)))[0..fields.len];
+        var at = fields.len * @sizeOf(Header);
+        for (headers, fields) |*h, f| {
+            h.* = .{ .name = self.copyStr(raw, &at, f.name), .value = self.copyStr(raw, &at, f.value) };
+        }
+        std.debug.assert(at == total);
+        return headers;
+    }
+
+    fn copyLen(s: Str) usize {
+        return if (s.where == .static) 0 else s.len;
+    }
+
+    fn copyStr(self: *const Decoder, raw: [*]u8, at: *usize, s: Str) []const u8 {
+        if (s.where == .static) return s.slice();
+        const dest = raw[at.*..][0..s.len];
+        @memcpy(dest, self.bytes(s));
+        at.* += s.len;
+        return dest;
+    }
+
+    /// Decode one header block without a copy. The headers refer to `block`, to the static
+    /// table and to the memory of the decoder. They stay valid until the next call of a
+    /// decode function or `deinit`, and while `block` stays the same.
+    pub fn decodeBlock(self: *Decoder, block: []const u8) Error![]const Header {
+        errdefer self.trim();
+        try self.decodeFields(block);
+        self.view.clearRetainingCapacity();
+        try self.view.ensureUnusedCapacity(self.gpa, self.fields.items.len);
+        for (self.fields.items) |f| self.view.appendAssumeCapacity(.{ .name = self.bytes(f.name), .value = self.bytes(f.value) });
+        return self.view.items;
+    }
+
+    /// Give a large scratch buffer back to the allocator. The headers of `decodeBlock` refer
+    /// to the buffer, thus call this function only after their use.
+    pub fn trim(self: *Decoder) void {
+        const keep_max = std.math.mul(usize, scratch_keep_factor, self.options.max_header_list_size) catch std.math.maxInt(usize);
+        if (self.scratch.capacity > keep_max) self.scratch.clearAndFree(self.gpa);
+    }
+
+    fn bytes(self: *const Decoder, s: Str) []const u8 {
+        return if (s.where == .scratch) self.scratch.items[s.at..][0..s.len] else s.slice();
+    }
+
+    /// Copy a string of the dynamic table to `scratch`, because the next move of the table
+    /// can overwrite it.
+    fn keep(self: *Decoder, s: Str) Allocator.Error!Str {
+        if (s.where != .table) return s;
+        const offset = self.scratch.items.len;
+        try self.scratch.appendSlice(self.gpa, s.slice());
+        return .{ .where = .scratch, .at = offset, .len = s.len };
+    }
+
+    /// Decode one header block into `fields`.
     ///
     /// After `error.FieldTooLarge` or `error.HeaderListTooLarge`, the decoder reads the rest of
-    /// the block and gives the error at the end. It adds no more headers to `out`, but it
+    /// the block and gives the error at the end. It adds no more headers to `fields`, but it
     /// applies each change to the dynamic table. Thus the table stays the same as the table of
     /// the encoder, and the next block of the connection decodes correctly (RFC 9113 section
     /// 4.3). The other errors end the connection, thus the decoder stops at once.
-    pub fn decode(self: *Decoder, arena: Allocator, block: []const u8, out: *std.ArrayList(Header)) Error!void {
-        var state: DecodeState = .{ .arena = arena, .out = out };
+    fn decodeFields(self: *Decoder, block: []const u8) Error!void {
+        self.fields.clearRetainingCapacity();
+        self.scratch.clearRetainingCapacity();
+        var state: DecodeState = .{};
         var r: BlockReader = .{ .buf = block };
         var saw_header = false;
         while (!r.eof()) {
             const first = r.buf[r.pos];
+            // After a size error, the block gives no headers. Thus the fields go, and each field
+            // then gives its scratch bytes back, also the copies of `pin`. The scratch data
+            // stays small, and no field keeps an offset past the end of `scratch`.
+            const mark = self.scratch.items.len;
+            defer if (state.size_error != null) {
+                self.fields.clearRetainingCapacity();
+                self.scratch.shrinkRetainingCapacity(mark);
+            };
             if (first & 0x80 != 0) {
                 // Indexed header field.
                 const index = try r.integer(7);
-                const h = self.lookup(index) orelse return error.Invalid;
-                try self.emit(&state, h.name, h.value);
+                const f = self.lookup(index) orelse return error.Invalid;
+                try self.emit(&state, f.name, f.value);
                 saw_header = true;
             } else if (first & 0x40 != 0) {
                 // Literal with incremental indexing.
-                const h = try self.literal(&state, &r, 6);
-                // An indexed name refers to a dynamic entry that `add` can evict.
-                const name = try arena.dupe(u8, h.name);
-                try self.add(name, h.value);
-                try self.emit(&state, name, h.value);
+                const f = try self.literal(&state, &r, 6);
+                // An indexed name can refer to the entry that `add` evicts. A move of the table
+                // can then overwrite it.
+                const name = try self.keep(f.name);
+                try self.add(name, f.value);
+                try self.emit(&state, name, f.value);
                 saw_header = true;
             } else if (first & 0x20 != 0) {
                 // Dynamic table size update: only at the start of a block.
@@ -155,18 +353,16 @@ pub const Decoder = struct {
                 self.resize(@intCast(new_size));
             } else {
                 // Literal without indexing (0000) or never indexed (0001).
-                const h = try self.literal(&state, &r, 4);
-                try self.emit(&state, h.name, h.value);
+                const f = try self.literal(&state, &r, 4);
+                try self.emit(&state, f.name, f.value);
                 saw_header = true;
             }
         }
         if (state.size_error) |e| return e;
     }
 
-    /// The output of one call of `decode`.
+    /// The state of one call of `decodeFields`.
     const DecodeState = struct {
-        arena: Allocator,
-        out: *std.ArrayList(Header),
         list_size: usize = 0,
         /// The first size error of the block. After it, `emit` adds no header.
         size_error: ?Error = null,
@@ -176,17 +372,20 @@ pub const Decoder = struct {
         }
     };
 
-    fn emit(self: *Decoder, state: *DecodeState, name: []const u8, value: []const u8) Error!void {
+    /// Add a field to `fields`. A string of the dynamic table stays in the table until a move
+    /// of the table. Then `pin` copies it. The copies stay under the limit of the header list.
+    /// Thus a block of small indexes to large entries cannot make much scratch data.
+    fn emit(self: *Decoder, state: *DecodeState, name: Str, value: Str) Error!void {
         if (state.size_error != null) return;
         state.list_size += name.len + value.len + entry_overhead;
         if (state.list_size > self.options.max_header_list_size) return state.setSizeError(error.HeaderListTooLarge);
-        try state.out.append(state.arena, .{ .name = try state.arena.dupe(u8, name), .value = try state.arena.dupe(u8, value) });
+        try self.fields.append(self.gpa, .{ .name = name, .value = value });
     }
 
     /// A literal representation: an indexed or literal name, then a literal value.
-    fn literal(self: *Decoder, state: *DecodeState, r: *BlockReader, prefix: u4) Error!Header {
+    fn literal(self: *Decoder, state: *DecodeState, r: *BlockReader, prefix: u4) Error!Field {
         const index = try r.integer(prefix);
-        const name: []const u8 = if (index == 0)
+        const name: Str = if (index == 0)
             try self.string(state, r)
         else
             (self.lookup(index) orelse return error.Invalid).name;
@@ -197,17 +396,19 @@ pub const Decoder = struct {
     /// A string over `max_field_size` sets `error.FieldTooLarge`. The function still decodes
     /// the string, because a dynamic table entry can need it. The string is part of the
     /// block, thus the size of the block limits it.
-    fn string(self: *Decoder, state: *DecodeState, r: *BlockReader) Error![]const u8 {
+    fn string(self: *Decoder, state: *DecodeState, r: *BlockReader) Error!Str {
         if (r.eof()) return error.Truncated;
         const huff = r.buf[r.pos] & 0x80 != 0;
         const len = try r.integer(7);
         const raw = try r.take(std.math.cast(usize, len) orelse return error.Truncated);
         if (raw.len > self.options.max_field_size) state.setSizeError(error.FieldTooLarge);
-        if (!huff) return raw;
-        var decoded: std.ArrayList(u8) = .empty;
-        try huffman.decode(state.arena, &decoded, raw);
-        if (decoded.items.len > self.options.max_field_size) state.setSizeError(error.FieldTooLarge);
-        return decoded.items;
+        if (!huff) return .fixed(.block, raw);
+        const offset = self.scratch.items.len;
+        try self.scratch.ensureUnusedCapacity(self.gpa, huffman.maxDecodedLen(raw.len));
+        const n = try huffman.decodeInto(self.scratch.unusedCapacitySlice(), raw);
+        self.scratch.items.len += n;
+        if (n > self.options.max_field_size) state.setSizeError(error.FieldTooLarge);
+        return .{ .where = .scratch, .at = offset, .len = n };
     }
 };
 
@@ -462,4 +663,267 @@ test "a literal whose indexed name the new entry evicts keeps the name" {
     try decoder.decode(arena, "\x7e\x28" ++ "x" ** 40, &out);
     try std.testing.expectEqualStrings("name", out.items[2].name);
     try std.testing.expectEqual(0, decoder.dynamicSize());
+}
+
+fn inside(outer: []const u8, inner: []const u8) bool {
+    if (inner.len == 0) return false;
+    const o = @intFromPtr(outer.ptr);
+    const i = @intFromPtr(inner.ptr);
+    return i >= o and i < o + outer.len;
+}
+
+test "decoded headers stay valid after eviction and after the next blocks" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var decoder: Decoder = .init(gpa, .{ .max_table_size = 96 });
+    defer decoder.deinit();
+    const encoder: Encoder = .{};
+
+    // Block 1: a literal with incremental indexing and a Huffman value, then an indexed
+    // reference to the new entry, a static entry and a literal without indexing.
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    try block.append(gpa, 0x40);
+    try encoder.encodeString(gpa, &block, "x-first");
+    try encoder.encodeString(gpa, &block, "www.example.com");
+    try block.append(gpa, 0xbe); // index 62: the new entry
+    try block.append(gpa, 0x83); // :method POST
+    try encoder.encodeHeader(gpa, &block, "x-plain", "\x01\x02", false);
+    const first = try decoder.decodeOwned(arena, block.items);
+    try std.testing.expectEqual(4, first.len);
+    // No string refers to the block or to the memory of the decoder. The static entry stays
+    // in the static table.
+    for (first) |h| for ([_][]const u8{ h.name, h.value }) |str| {
+        try std.testing.expect(!inside(block.items, str));
+        try std.testing.expect(!inside(decoder.table, str));
+        try std.testing.expect(!inside(decoder.scratch.allocatedSlice(), str));
+    };
+    try std.testing.expectEqual(@intFromPtr(tables.static_table[2].value.ptr), @intFromPtr(first[2].value.ptr));
+
+    // The next blocks reuse the block buffer and the scratch buffer, and their entries evict
+    // the entry of block 1 and move the table.
+    var prng: std.Random.DefaultPrng = .init(1);
+    const random = prng.random();
+    for (0..200) |round| {
+        @memset(block.items, 0xee);
+        block.clearRetainingCapacity();
+        var name_buf: [16]u8 = undefined;
+        var value_buf: [40]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "x-{d}", .{round}) catch unreachable;
+        const value = value_buf[0..random.uintLessThan(usize, value_buf.len)];
+        random.bytes(value);
+        try block.append(gpa, 0x40);
+        try encoder.encodeString(gpa, &block, name);
+        try encoder.encodeString(gpa, &block, value);
+        try block.append(gpa, 0xbe);
+        const got = try decoder.decodeOwned(arena, block.items);
+        try std.testing.expectEqualStrings(name, got[0].name);
+        try std.testing.expectEqualSlices(u8, value, got[1].value);
+    }
+    try std.testing.expect(decoder.dynamicEntry(0) != null);
+    const want = [_]Header{
+        .{ .name = "x-first", .value = "www.example.com" },
+        .{ .name = "x-first", .value = "www.example.com" },
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = "x-plain", .value = "\x01\x02" },
+    };
+    for (want, first) |w, g| {
+        try std.testing.expectEqualStrings(w.name, g.name);
+        try std.testing.expectEqualStrings(w.value, g.value);
+    }
+}
+
+test "a view of a block refers to the block and to the decoder" {
+    const gpa = std.testing.allocator;
+    var decoder: Decoder = .init(gpa, .{});
+    defer decoder.deinit();
+    // A literal name and value without Huffman, a Huffman value, and an indexed dynamic
+    // entry.
+    const block = "\x40\x01a\x01b" ++ "\x00\x01c\x8c\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff" ++ "\xbe";
+    const view = try decoder.decodeBlock(block);
+    try std.testing.expectEqual(3, view.len);
+    try std.testing.expect(inside(block, view[0].name) and inside(block, view[0].value));
+    try std.testing.expectEqualStrings("www.example.com", view[1].value);
+    try std.testing.expect(inside(decoder.scratch.items, view[1].value));
+    // The indexed entry stays in the table: no insertion moved the table after it.
+    try std.testing.expect(inside(decoder.table, view[2].name));
+    try std.testing.expectEqualStrings("a", view[2].name);
+    try std.testing.expectEqualStrings("b", view[2].value);
+}
+
+test "the dynamic table agrees with a simple model under random insertions" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var decoder: Decoder = .init(gpa, .{ .max_table_size = 512, .max_header_list_size = 1 << 20, .max_field_size = 1 << 20 });
+    defer decoder.deinit();
+    const encoder: Encoder = .{ .huffman = false };
+    // The model: the entries, newest first, and their size.
+    var model: std.ArrayList(Header) = .empty;
+    var model_size: usize = 0;
+    var limit: usize = 512;
+    var prng: std.Random.DefaultPrng = .init(0x4c);
+    const random = prng.random();
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    var want: std.ArrayList(Header) = .empty;
+    var moves: usize = 0;
+    for (0..3000) |_| {
+        block.clearRetainingCapacity();
+        want.clearRetainingCapacity();
+        if (random.uintLessThan(u8, 20) == 0) {
+            limit = random.uintLessThan(usize, 513);
+            try Encoder.encodeInteger(gpa, &block, 5, 0x20, limit);
+            while (model_size > limit) model_size -= removeOldest(&model);
+        }
+        // Up to 6 operations: a reference to an entry, or an insertion. A reference before
+        // an insertion that moves the table must keep its bytes.
+        const ops = 1 + random.uintLessThan(usize, 6);
+        for (0..ops) |_| {
+            if (model.items.len > 0 and random.boolean()) {
+                const index = random.uintLessThan(usize, model.items.len);
+                try Encoder.encodeInteger(gpa, &block, 7, 0x80, 62 + index);
+                try want.append(arena, model.items[index]);
+                continue;
+            }
+            var name_buf: [200]u8 = undefined;
+            var value_buf: [300]u8 = undefined;
+            const name = name_buf[0 .. 1 + random.uintLessThan(usize, name_buf.len - 1)];
+            for (name) |*c| c.* = 'a' + random.uintLessThan(u8, 26);
+            const value = value_buf[0..random.uintLessThan(usize, value_buf.len)];
+            random.bytes(value);
+            // A literal name, or the name of a dynamic entry that the insertion can evict.
+            const by_index = model.items.len > 0 and random.boolean();
+            const index = if (by_index) random.uintLessThan(usize, model.items.len) else 0;
+            const new_name = if (by_index) model.items[index].name else name;
+            try Encoder.encodeInteger(gpa, &block, 6, 0x40, if (by_index) 62 + index else 0);
+            if (!by_index) try encoder.encodeString(gpa, &block, name);
+            try encoder.encodeString(gpa, &block, value);
+            const cost = new_name.len + value.len + entry_overhead;
+            const owned: Header = .{ .name = try arena.dupe(u8, new_name), .value = try arena.dupe(u8, value) };
+            try want.append(arena, owned);
+            if (cost > limit) {
+                model.clearRetainingCapacity();
+                model_size = 0;
+            } else {
+                while (model_size + cost > limit) model_size -= removeOldest(&model);
+                try model.insert(arena, 0, owned);
+                model_size += cost;
+            }
+        }
+        const table_before = decoder.table.ptr;
+        const head_before = decoder.head;
+        const got = try decoder.decodeOwned(arena, block.items);
+        if (decoder.table.ptr != table_before or decoder.head < head_before) moves += 1;
+        try std.testing.expectEqual(want.items.len, got.len);
+        for (want.items, got) |w, g| {
+            try std.testing.expectEqualStrings(w.name, g.name);
+            try std.testing.expectEqualSlices(u8, w.value, g.value);
+        }
+        try std.testing.expectEqual(model_size, decoder.dynamicSize());
+        for (model.items, 0..) |w, i| {
+            const entry = decoder.dynamicEntry(i).?;
+            try std.testing.expectEqualStrings(w.name, entry.name);
+            try std.testing.expectEqualSlices(u8, w.value, entry.value);
+        }
+        try std.testing.expect(decoder.dynamicEntry(model.items.len) == null);
+    }
+    // The sequence moved the table many times. A reference before the move then needs the
+    // copy of `pin`.
+    try std.testing.expect(moves > 100);
+}
+
+fn removeOldest(model: *std.ArrayList(Header)) usize {
+    const oldest = model.pop().?;
+    return oldest.name.len + oldest.value.len + entry_overhead;
+}
+
+test "references to a large entry over the list limit do not grow the scratch buffer" {
+    const gpa = std.testing.allocator;
+    var decoder: Decoder = .init(gpa, .{ .max_table_size = 4096, .max_field_size = 4096, .max_header_list_size = 8 << 10 });
+    defer decoder.deinit();
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    try block.append(gpa, 0x40);
+    try Encoder.encodeInteger(gpa, &block, 7, 0, 1);
+    try block.append(gpa, 'n');
+    try Encoder.encodeInteger(gpa, &block, 7, 0, 4000);
+    try block.appendNTimes(gpa, 'v', 4000);
+    // 10,000 references of one byte each to the entry of 4,033 octets.
+    try block.appendNTimes(gpa, 0xbe, 10_000);
+    try std.testing.expectError(error.HeaderListTooLarge, decoder.decodeBlock(block.items));
+    try std.testing.expect(decoder.scratch.items.len <= 8 << 10);
+    // Literals with the name of the entry after the size error: the copies of the name go
+    // back.
+    block.clearRetainingCapacity();
+    try block.appendNTimes(gpa, 0xbe, 3);
+    for (0..1000) |_| try block.appendSlice(gpa, &.{ 0x0f, 0x2f, 0x00 }); // index 62, empty value
+    try std.testing.expectError(error.HeaderListTooLarge, decoder.decodeBlock(block.items));
+    try std.testing.expect(decoder.scratch.items.len <= 8 << 10);
+}
+
+test "a reference keeps its bytes when a later insertion of the block moves the table" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A table of 64 octets has a buffer of 128. Each entry costs 60 and evicts the entry
+    // before it, but its 28 bytes stay until a move.
+    var decoder: Decoder = .init(gpa, .{ .max_table_size = 64 });
+    defer decoder.deinit();
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    for (0..10) |i| {
+        try block.appendSlice(gpa, "\x40\x01n\x1b");
+        try block.appendNTimes(gpa, 'a' + @as(u8, @intCast(i)), 27);
+        try block.append(gpa, 0xbe);
+    }
+    const got = try decoder.decodeOwned(arena, block.items);
+    try std.testing.expectEqual(20, got.len);
+    for (0..10) |i| {
+        const want = [_]u8{'a' + @as(u8, @intCast(i))} ** 27;
+        try std.testing.expectEqualStrings("n", got[2 * i].name);
+        try std.testing.expectEqualStrings(&want, got[2 * i].value);
+        try std.testing.expectEqualStrings("n", got[2 * i + 1].name);
+        try std.testing.expectEqualStrings(&want, got[2 * i + 1].value);
+    }
+    // The table moved, thus `pin` copied the earlier references.
+    try std.testing.expect(decoder.scratch.items.len > 0);
+}
+
+test "a long Huffman string does not leave a large scratch buffer behind" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var decoder: Decoder = .init(gpa, .{});
+    defer decoder.deinit();
+    const keep_max = Decoder.scratch_keep_factor * decoder.options.max_header_list_size;
+    // A literal without indexing with a Huffman value of 30,000 octets: over the field limit.
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    try (Encoder{}).encodeHeader(gpa, &block, "x-long", "a" ** 30_000, false);
+    try std.testing.expectError(error.FieldTooLarge, decoder.decodeOwned(arena, block.items));
+    try std.testing.expect(decoder.scratch.capacity <= keep_max);
+    try std.testing.expectError(error.FieldTooLarge, decoder.decodeBlock(block.items));
+    try std.testing.expect(decoder.scratch.capacity <= keep_max);
+    // A block under the limits keeps its small buffer for the next block.
+    block.clearRetainingCapacity();
+    try (Encoder{}).encodeHeader(gpa, &block, "x-short", "www.example.com", false);
+    const got = try decoder.decodeOwned(arena, block.items);
+    try std.testing.expectEqualStrings("www.example.com", got[0].value);
+    try std.testing.expect(decoder.scratch.capacity > 0 and decoder.scratch.capacity <= keep_max);
+}
+
+test "a size error clears the fields of the block" {
+    const gpa = std.testing.allocator;
+    var decoder: Decoder = .init(gpa, .{ .max_field_size = 16, .max_header_list_size = 200 });
+    defer decoder.deinit();
+    // A header, then a value over the field limit, then a literal with incremental indexing.
+    try std.testing.expectError(error.FieldTooLarge, decoder.decodeBlock("\x00\x01a\x01b" ++ "\x00\x01n\x11" ++ "a" ** 17 ++ "\x40\x01k\x01v"));
+    try std.testing.expectEqual(0, decoder.fields.items.len);
+    try std.testing.expectEqualStrings("k", decoder.dynamicEntry(0).?.name);
 }
