@@ -4,6 +4,8 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-26
+
 ### Added
 
 - `ToolDef.quick`. Set it only for a tool whose handler does not wait for I/O, a timer or a lock, and returns in some microseconds. The handler can send events, for example with `notifyToolsListChanged`. The gRPC server does not wait for a slow subscriber, but another transport can wait.
@@ -457,7 +459,8 @@ This file records all notable changes to this project. The format follows Keep a
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.5.3...v0.6.0
