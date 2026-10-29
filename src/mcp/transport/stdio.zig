@@ -929,7 +929,7 @@ pub const Client = struct {
             .wasi => return true,
             else => {
                 const posix = std.posix;
-                var status: if (builtin.link_libc) c_int else u32 = 0;
+                var status: if (builtin.link_libc) c_int else i32 = 0;
                 const rc = posix.system.waitpid(id, &status, posix.W.NOHANG);
                 self.exit_status = switch (posix.errno(rc)) {
                     .SUCCESS => if (rc == 0) return false else Io.Threaded.statusToTerm(@bitCast(status)),
