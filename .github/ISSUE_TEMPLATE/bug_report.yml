@@ -12,7 +12,7 @@ body:
     id: zig
     attributes:
       label: Zig version
-      value: 0.16.0
+      value: 0.17.0
   - type: textarea
     id: steps
     attributes:

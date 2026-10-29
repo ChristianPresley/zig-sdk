@@ -2,7 +2,7 @@
 
 The unofficial Zig SDK for the Model Context Protocol (MCP).
 
-This library gives you an MCP server and an MCP client in Zig 0.16.0. It has no dependency other than the Zig toolchain. It obeys MCP specification revision 2026-07-28 only.[^mcp-spec]
+This library gives you an MCP server and an MCP client in Zig 0.17.0. It has no dependency other than the Zig toolchain. It obeys MCP specification revision 2026-07-28 only.[^mcp-spec]
 
 ## Consume the SDK
 
@@ -18,7 +18,7 @@ The project is in development. The [Roadmap](https://github.com/ChristianPresley
 
 ## Requirements
 
-- Zig 0.16.0. The package sets `minimum_zig_version` to this version.
+- Zig 0.17.0. The package sets `minimum_zig_version` to this version.
 - No other dependency.
 
 ## Add the package to your project
