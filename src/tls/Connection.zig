@@ -194,7 +194,7 @@ pub fn readRecord(self: *Connection) RecordError!Record {
         error.EndOfStream => return error.TlsConnectionTruncated,
         error.ReadFailed => return error.ReadFailed,
     };
-    const ct: tls.ContentType = @enumFromInt(header[0]);
+    const ct: tls.ContentType = @fromBackingInt(@intCast(header[0]));
     const len: usize = std.mem.readInt(u16, header[3..5], .big);
     switch (ct) {
         .change_cipher_spec, .alert, .handshake, .application_data => {},
@@ -251,7 +251,7 @@ pub fn readRecord(self: *Connection) RecordError!Record {
             var n = out.len;
             while (n > 0 and out[n - 1] == 0) n -= 1;
             if (n == 0) return error.TlsUnexpectedMessage;
-            const inner: tls.ContentType = @enumFromInt(out[n - 1]);
+            const inner: tls.ContentType = @fromBackingInt(@intCast(out[n - 1]));
             switch (inner) {
                 .alert, .handshake, .application_data => {},
                 else => return error.TlsUnexpectedMessage,
@@ -324,7 +324,7 @@ fn readIndirect(c: *Connection) Reader.Error!void {
         .application_data => c.pending = rec.data,
         .alert => {
             if (rec.data.len != 2) return failRead(c, error.TlsDecodeError);
-            const alert: tls.Alert = .{ .level = @enumFromInt(rec.data[0]), .description = @enumFromInt(rec.data[1]) };
+            const alert: tls.Alert = .{ .level = @fromBackingInt(@intCast(rec.data[0])), .description = @fromBackingInt(@intCast(rec.data[1])) };
             c.alert = alert;
             switch (alert.description) {
                 .close_notify => {
@@ -352,7 +352,7 @@ fn handlePostHandshake(c: *Connection, data: []const u8) (ReadError || error{Wri
     var i: usize = 0;
     while (i < data.len) {
         if (data.len - i < 4) return error.TlsDecodeError;
-        const msg_type: tls.HandshakeType = @enumFromInt(data[i]);
+        const msg_type: tls.HandshakeType = @fromBackingInt(@intCast(data[i]));
         const len = std.mem.readInt(u24, data[i + 1 ..][0..3], .big);
         i += 4;
         if (data.len - i < len) return error.TlsDecodeError; // messages that span records are not supported here
@@ -361,7 +361,7 @@ fn handlePostHandshake(c: *Connection, data: []const u8) (ReadError || error{Wri
         switch (msg_type) {
             .key_update => {
                 if (body.len != 1) return error.TlsDecodeError;
-                const request: tls.KeyUpdateRequest = @enumFromInt(body[0]);
+                const request: tls.KeyUpdateRequest = @fromBackingInt(@intCast(body[0]));
                 switch (request) {
                     .update_requested => {
                         // Answer under the current keys, then rotate our own (section 4.6.3).
@@ -403,8 +403,8 @@ fn encryptInto(c: *Connection, out: []u8, bytes: []const u8, content_type: tls.C
             const n: usize = @min(bytes.len - consumed, tls.max_ciphertext_inner_record_len, out.len -| (tls.record_header_len + written));
             if (n == 0) return .{ .written = written, .consumed = consumed };
             const header = out[written..][0..tls.record_header_len];
-            header[0] = @intFromEnum(content_type);
-            std.mem.writeInt(u16, header[1..3], @intFromEnum(tls.ProtocolVersion.tls_1_2), .big);
+            header[0] = @backingInt(content_type);
+            std.mem.writeInt(u16, header[1..3], @backingInt(tls.ProtocolVersion.tls_1_2), .big);
             std.mem.writeInt(u16, header[3..5], @intCast(n), .big);
             written += tls.record_header_len;
             @memcpy(out[written..][0..n], bytes[consumed..][0..n]);
@@ -429,13 +429,13 @@ fn encryptInto(c: *Connection, out: []u8, bytes: []const u8, content_type: tls.C
                     pad = space - n;
                 }
                 @memcpy(cleartext[0..n], bytes[consumed..][0..n]);
-                cleartext[n] = @intFromEnum(content_type);
+                cleartext[n] = @backingInt(content_type);
                 @memset(cleartext[n + 1 ..][0..pad], 0);
                 consumed += n;
                 const inner_len = n + 1 + pad;
                 const header = out[written..][0..tls.record_header_len];
-                header[0] = @intFromEnum(tls.ContentType.application_data);
-                std.mem.writeInt(u16, header[1..3], @intFromEnum(tls.ProtocolVersion.tls_1_2), .big);
+                header[0] = @backingInt(tls.ContentType.application_data);
+                std.mem.writeInt(u16, header[1..3], @backingInt(tls.ProtocolVersion.tls_1_2), .big);
                 std.mem.writeInt(u16, header[3..5], @intCast(inner_len + S.AEAD.tag_length), .big);
                 written += tls.record_header_len;
                 const ciphertext = out[written..][0..inner_len];
@@ -463,13 +463,13 @@ pub fn writeRecord(c: *Connection, content_type: tls.ContentType, bytes: []const
 
 /// Write a plaintext change_cipher_spec record (middlebox compatibility mode).
 pub fn writeChangeCipherSpec(c: *Connection) Writer.Error!void {
-    try c.output.writeAll(&.{ @intFromEnum(tls.ContentType.change_cipher_spec), 0x03, 0x03, 0x00, 0x01, 0x01 });
+    try c.output.writeAll(&.{ @backingInt(tls.ContentType.change_cipher_spec), 0x03, 0x03, 0x00, 0x01, 0x01 });
 }
 
 /// Send an alert and flush. The field `alert` also records a fatal alert.
 pub fn sendAlert(c: *Connection, level: tls.Alert.Level, description: tls.Alert.Description) Writer.Error!void {
     if (level == .fatal) c.alert = .{ .level = level, .description = description };
-    try c.writeRecord(.alert, &.{ @intFromEnum(level), @intFromEnum(description) });
+    try c.writeRecord(.alert, &.{ @backingInt(level), @backingInt(description) });
     try c.output.flush();
 }
 
@@ -547,7 +547,7 @@ fn flush(w: *Writer) Writer.Error!void {
 
 test "encrypted record round trip" {
     const S = suites.Suite.Type(.AES_128_GCM_SHA256);
-    const secret = [_]u8{3} ** S.digest_length;
+    const secret = @as([S.digest_length]u8, @splat(3));
 
     // Encrypt with the server write keys into an allocating writer.
     var unused_in: Reader = .fixed("");
@@ -564,7 +564,7 @@ test "encrypted record round trip" {
     try c.end();
     const wire = sink.written();
     try std.testing.expect(wire.len > 14 + 5 + 16);
-    try std.testing.expectEqual(@intFromEnum(tls.ContentType.application_data), wire[0]);
+    try std.testing.expectEqual(@backingInt(tls.ContentType.application_data), wire[0]);
 
     // Decrypt on a peer with the matching read keys. The key update rotates them.
     var peer_in: Reader = .fixed(wire);
@@ -589,7 +589,7 @@ fn appendTestRecord(comptime S: type, gpa: std.mem.Allocator, keys: *suites.Traf
     const inner = try gpa.alloc(u8, inner_len);
     defer gpa.free(inner);
     @memcpy(inner[0..content.len], content);
-    inner[content.len] = @intFromEnum(content_type);
+    inner[content.len] = @backingInt(content_type);
     @memset(inner[content.len + 1 ..], 0);
     try appendSealedRecord(S, gpa, keys, wire, inner);
 }
@@ -600,8 +600,8 @@ fn appendSealedRecord(comptime S: type, gpa: std.mem.Allocator, keys: *suites.Tr
     const start = wire.items.len;
     try wire.resize(gpa, start + tls.record_header_len + len);
     const rec = wire.items[start..];
-    rec[0] = @intFromEnum(tls.ContentType.application_data);
-    std.mem.writeInt(u16, rec[1..3], @intFromEnum(tls.ProtocolVersion.tls_1_2), .big);
+    rec[0] = @backingInt(tls.ContentType.application_data);
+    std.mem.writeInt(u16, rec[1..3], @backingInt(tls.ProtocolVersion.tls_1_2), .big);
     std.mem.writeInt(u16, rec[3..5], @intCast(len), .big);
     const body = rec[tls.record_header_len..];
     S.AEAD.encrypt(body[0..inner.len], body[inner.len..][0..S.AEAD.tag_length], inner, rec[0..tls.record_header_len], keys.nonce(), keys.key);
@@ -614,7 +614,7 @@ test "a record that does not fit after unread data arrives in order" {
     // `peekDelimiterInclusive` keep unread data in the buffer, as an HTTP head does.
     const gpa = std.testing.allocator;
     const S = suites.Suite.Type(.AES_128_GCM_SHA256);
-    const secret = [_]u8{5} ** S.digest_length;
+    const secret = @as([S.digest_length]u8, @splat(5));
     var keys: suites.TrafficKeys(S) = .fromSecret(secret);
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(gpa);
@@ -625,21 +625,21 @@ test "a record that does not fit after unread data arrives in order" {
     var big: [full]u8 = undefined;
     var parts: [6][]const u8 = undefined;
     // A few hundred bytes without a line end.
-    parts[0] = "a" ** 300;
+    parts[0] = &@as([300]u8, @splat('a'));
     // A full record with a line end inside.
     @memset(&big, 'b');
     big[16000] = '\n';
     parts[1] = try gpa.dupe(u8, &big);
     defer gpa.free(parts[1]);
     // A short record with the largest padding.
-    parts[2] = "d" ** 100;
+    parts[2] = &@as([100]u8, @splat('d'));
     // A full record with a line end inside.
     @memset(&big, 'e');
     big[15000] = '\n';
     parts[3] = try gpa.dupe(u8, &big);
     defer gpa.free(parts[3]);
     // A short record, then a full record without a line end: the buffer becomes full.
-    parts[4] = "f" ** 300;
+    parts[4] = &@as([300]u8, @splat('f'));
     @memset(&big, 'g');
     parts[5] = try gpa.dupe(u8, &big);
     defer gpa.free(parts[5]);
@@ -693,21 +693,21 @@ test "a record that does not fit after unread data arrives in order" {
 test "the receive path removes padding and refuses bad inner plaintexts" {
     const gpa = std.testing.allocator;
     const S = suites.Suite.Type(.CHACHA20_POLY1305_SHA256);
-    const secret = [_]u8{6} ** S.digest_length;
+    const secret = @as([S.digest_length]u8, @splat(6));
     const Case = struct { inner: []const u8, want: anyerror![]const u8 };
     var max_padded: [max_inner_plaintext_len]u8 = @splat(0);
     max_padded[0] = 'x';
-    max_padded[1] = @intFromEnum(tls.ContentType.application_data);
+    max_padded[1] = @backingInt(tls.ContentType.application_data);
     var over: [max_inner_plaintext_len + 1]u8 = @splat(0);
     over[0] = 'x';
-    over[1] = @intFromEnum(tls.ContentType.application_data);
+    over[1] = @backingInt(tls.ContentType.application_data);
     const cases = [_]Case{
         // Padding after the content type goes away.
         .{ .inner = "ok\x17\x00\x00\x00", .want = "ok" },
         // The largest inner plaintext: one content byte and the most padding.
         .{ .inner = &max_padded, .want = "x" },
         // Only zeros: no content type (RFC 8446 section 5.4).
-        .{ .inner = &([_]u8{0} ** 32), .want = error.TlsUnexpectedMessage },
+        .{ .inner = &(@as([32]u8, @splat(0))), .want = error.TlsUnexpectedMessage },
         // No inner plaintext at all.
         .{ .inner = "", .want = error.TlsUnexpectedMessage },
         // One byte more than 2^14 + 1, also when the extra bytes are padding.
@@ -794,7 +794,7 @@ test "padded records decrypt to their content and stay in the size limit" {
     for (message, 0..) |*b, i| b.* = @truncate(i % 251);
     inline for (.{ suites.Suite.AES_128_GCM_SHA256, suites.Suite.AEGIS_128L_SHA256, suites.Suite.AEGIS_256_SHA512 }) |suite| {
         const S = suites.Suite.Type(suite);
-        const secret = [_]u8{4} ** S.digest_length;
+        const secret = @as([S.digest_length]u8, @splat(4));
         for (policies) |policy| {
             var unused_in: Reader = .fixed("");
             var sink: Writer.Allocating = .init(gpa);
@@ -858,7 +858,7 @@ test "padded records decrypt to their content and stay in the size limit" {
 test "a padded record that does not fit waits for a new buffer" {
     const gpa = std.testing.allocator;
     const S = suites.Suite.Type(.AES_128_GCM_SHA256);
-    const secret = [_]u8{8} ** S.digest_length;
+    const secret = @as([S.digest_length]u8, @splat(8));
     var unused_in: Reader = .fixed("");
     var unused_out: Writer = .failing;
     var read_buf: [min_read_buffer_len]u8 = undefined;
@@ -889,5 +889,5 @@ test "a padded record that does not fit waits for a new buffer" {
     p.read_keys = suites.DirectionKeys.init(.AES_128_GCM_SHA256, secret);
     p.handshake_complete = true;
     try std.testing.expectEqual(tls.max_ciphertext_inner_record_len, (try p.readRecord()).data.len);
-    try std.testing.expectEqualStrings("q" ** 10, (try p.readRecord()).data);
+    try std.testing.expectEqualStrings(&@as([10]u8, @splat('q')), (try p.readRecord()).data);
 }

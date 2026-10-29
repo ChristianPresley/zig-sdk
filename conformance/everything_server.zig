@@ -546,9 +546,9 @@ fn logCall(ctx: *const Ctx, start: std.Io.Clock.Timestamp, result: anytype) void
 fn logged(comptime handler: anytype) @TypeOf(handler) {
     const info = @typeInfo(@TypeOf(handler)).@"fn";
     const R = info.return_type.?;
-    return switch (info.params.len) {
+    return switch (info.param_types.len) {
         2 => struct {
-            fn call(ctx: *Ctx, a: info.params[1].type.?) R {
+            fn call(ctx: *Ctx, a: info.param_types[1].?) R {
                 if (!state.log_requests.load(.monotonic)) return handler(ctx, a);
                 const start = std.Io.Clock.Timestamp.now(ctx.io, .awake);
                 const result = handler(ctx, a);
@@ -557,7 +557,7 @@ fn logged(comptime handler: anytype) @TypeOf(handler) {
             }
         }.call,
         3 => struct {
-            fn call(ctx: *Ctx, a: info.params[1].type.?, b: info.params[2].type.?) R {
+            fn call(ctx: *Ctx, a: info.param_types[1].?, b: info.param_types[2].?) R {
                 if (!state.log_requests.load(.monotonic)) return handler(ctx, a, b);
                 const start = std.Io.Clock.Timestamp.now(ctx.io, .awake);
                 const result = handler(ctx, a, b);
@@ -779,7 +779,7 @@ fn parseArgs(args: []const []const u8) !Config {
 pub fn main(init: std.process.Init) !void {
     // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
     // every allocation of every thread. The allocator of std for many threads has no such lock.
-    const gpa = if (builtin.mode == .Debug) init.gpa else std.heap.smp_allocator;
+    const gpa = if (builtin.mode == .debug) init.gpa else std.heap.smp_allocator;
     // Each task that waits is a thread. On Windows, `stack_size` is only the committed part of its
     // stack, and the reserve stays the 16 MiB of the executable. Thus 64 KiB keeps the full stack.
     var threaded: std.Io.Threaded = .init(gpa, .{

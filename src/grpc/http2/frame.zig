@@ -69,7 +69,7 @@ pub const Header = struct {
     pub fn parse(bytes: *const [header_len]u8) Header {
         return .{
             .length = std.mem.readInt(u24, bytes[0..3], .big),
-            .type = @enumFromInt(bytes[3]),
+            .type = @fromBackingInt(@intCast(bytes[3])),
             .flags = bytes[4],
             .stream_id = @truncate(std.mem.readInt(u32, bytes[5..9], .big) & 0x7fff_ffff),
         };
@@ -78,7 +78,7 @@ pub const Header = struct {
     pub fn encode(self: Header) [header_len]u8 {
         var out: [header_len]u8 = undefined;
         std.mem.writeInt(u24, out[0..3], self.length, .big);
-        out[3] = @intFromEnum(self.type);
+        out[3] = @backingInt(self.type);
         out[4] = self.flags;
         std.mem.writeInt(u32, out[5..9], self.stream_id, .big);
         return out;
@@ -115,7 +115,7 @@ pub const Settings = struct {
 
     /// Apply one received setting.
     pub fn apply(self: *Settings, setting: Setting) ApplyError!void {
-        switch (@as(SettingId, @enumFromInt(setting.id))) {
+        switch (@as(SettingId, @fromBackingInt(@intCast(setting.id)))) {
             .header_table_size => self.header_table_size = setting.value,
             .enable_push => {
                 if (setting.value > 1) return error.ProtocolError;

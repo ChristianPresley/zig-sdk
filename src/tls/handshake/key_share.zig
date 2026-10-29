@@ -26,7 +26,7 @@ pub const Group = enum(u16) {
     }
 
     pub fn wire(g: Group) u16 {
-        return @intFromEnum(g);
+        return @backingInt(g);
     }
 
     /// True for a group that has a post-quantum part.
@@ -74,13 +74,13 @@ pub const KeyShare = union(Group) {
         while (attempts < 8) : (attempts += 1) {
             io.randomSecure(&seed) catch return error.EntropyUnavailable;
             switch (g) {
-                .x25519 => return .{ .x25519 = X25519.KeyPair.generateDeterministic(seed[0..32].*) catch continue },
+                .x25519 => return .{ .x25519 = X25519.KeyPair.generateDeterministic(seed[0..32].*) },
                 .secp256r1 => return .{ .secp256r1 = P256.KeyPair.generateDeterministic(seed[0..32].*) catch continue },
                 .secp384r1 => return .{ .secp384r1 = P384.KeyPair.generateDeterministic(seed[0..48].*) catch continue },
                 .x25519_mlkem768 => {
                     var kp = MLKem768.KeyPair.generateDeterministic(seed[0..MLKem768.seed_length].*) catch continue;
                     defer crypto.secureZero(u8, std.mem.asBytes(&kp));
-                    const x = X25519.KeyPair.generateDeterministic(seed[MLKem768.seed_length..][0..X25519.seed_length].*) catch continue;
+                    const x = X25519.KeyPair.generateDeterministic(seed[MLKem768.seed_length..][0..X25519.seed_length].*);
                     return .{ .x25519_mlkem768 = .{
                         .mlkem = kp.secret_key,
                         .encapsulation_key = kp.public_key.toBytes(),
@@ -193,7 +193,7 @@ pub fn respond(io: std.Io, g: Group, peer: []const u8, public_out: *[max_public_
     var attempts: u8 = 0;
     while (attempts < 8) : (attempts += 1) {
         io.randomSecure(&seed) catch return error.EntropyUnavailable;
-        var x = X25519.KeyPair.generateDeterministic(seed[MLKem768.encaps_seed_length..][0..X25519.seed_length].*) catch continue;
+        var x = X25519.KeyPair.generateDeterministic(seed[MLKem768.encaps_seed_length..][0..X25519.seed_length].*);
         defer crypto.secureZero(u8, std.mem.asBytes(&x));
         var ss_x = X25519.scalarmult(x.secret_key, peer[ek_len..][0..X25519.public_length].*) catch return error.DecryptError;
         defer crypto.secureZero(u8, &ss_x);
@@ -246,21 +246,21 @@ test "rejects malformed and low-order peer keys" {
     var x = try KeyShare.generate(io, .x25519);
     defer x.wipe();
     var out: [max_shared_len]u8 = undefined;
-    try std.testing.expectError(error.IllegalParameter, x.sharedSecret(&[_]u8{1} ** 31, &out));
-    try std.testing.expectError(error.DecryptError, x.sharedSecret(&[_]u8{0} ** 32, &out));
+    try std.testing.expectError(error.IllegalParameter, x.sharedSecret(&@as([31]u8, @splat(1)), &out));
+    try std.testing.expectError(error.DecryptError, x.sharedSecret(&@as([32]u8, @splat(0)), &out));
     var p = try KeyShare.generate(io, .secp256r1);
     defer p.wipe();
-    try std.testing.expectError(error.IllegalParameter, p.sharedSecret(&[_]u8{4} ++ [_]u8{1} ** 64, &out));
-    try std.testing.expectError(error.IllegalParameter, p.sharedSecret(&[_]u8{2} ** 33, &out));
+    try std.testing.expectError(error.IllegalParameter, p.sharedSecret(&[_]u8{4} ++ @as([64]u8, @splat(1)), &out));
+    try std.testing.expectError(error.IllegalParameter, p.sharedSecret(&@as([33]u8, @splat(2)), &out));
 
     // The hybrid group checks lengths on both sides and the encapsulation key on the server.
     var h = try KeyShare.generate(io, .x25519_mlkem768);
     defer h.wipe();
-    try std.testing.expectError(error.IllegalParameter, h.sharedSecret(&[_]u8{1} ** 1119, &out));
-    try std.testing.expectError(error.IllegalParameter, h.sharedSecret(&[_]u8{1} ** 1216, &out));
+    try std.testing.expectError(error.IllegalParameter, h.sharedSecret(&@as([1119]u8, @splat(1)), &out));
+    try std.testing.expectError(error.IllegalParameter, h.sharedSecret(&@as([1216]u8, @splat(1)), &out));
     var pub_buf: [max_public_len]u8 = undefined;
-    try std.testing.expectError(error.IllegalParameter, respond(io, .x25519_mlkem768, &[_]u8{1} ** 1215, &pub_buf, &out));
-    try std.testing.expectError(error.IllegalParameter, respond(io, .x25519_mlkem768, &[_]u8{0xff} ** 1216, &pub_buf, &out));
+    try std.testing.expectError(error.IllegalParameter, respond(io, .x25519_mlkem768, &@as([1215]u8, @splat(1)), &pub_buf, &out));
+    try std.testing.expectError(error.IllegalParameter, respond(io, .x25519_mlkem768, &@as([1216]u8, @splat(0xff)), &pub_buf, &out));
     var hb: [max_public_len]u8 = undefined;
     var good = h.publicBytes(&hb)[0..hybrid_client_share_len].*;
     @memset(good[1184..], 0);

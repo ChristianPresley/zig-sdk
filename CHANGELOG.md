@@ -4,6 +4,13 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+### Changed
+
+- The package needs Zig 0.17.0 (`minimum_zig_version`). Zig 0.16.0 does not build it. Zig 0.17.0 removed the operator `**`, renamed the optimize modes to `debug`, `safe`, `fast` and `small`, and changed `@typeInfo` to give arrays of field names and types. The source follows these changes. No public API of the package changes.
+- `zig build` steps get their arguments from `-- args` with `addPassthruArgs`, because `b.args` is gone. The steps `lint-docs`, `gen-bibliography` and `gen-dictionary` use their default arguments only when you give no argument.
+- `zig build test -Dfuzz` no longer copies the test runner of the toolchain. The runner of Zig 0.17.0 compiles with `-ffuzz`.
+- The tests of the request arena of the client now check that the arena does not grow, in place of an equal size. The arena of Zig 0.17.0 can have a different capacity for equal work.
+
 ## [0.8.0] - 2026-10-26
 
 ### Added

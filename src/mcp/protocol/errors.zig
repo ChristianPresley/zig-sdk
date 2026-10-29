@@ -22,7 +22,7 @@ pub const Code = enum(i64) {
     _,
 
     pub fn int(self: Code) i64 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Codes that this implementation must never emit: reserved codes from earlier revisions

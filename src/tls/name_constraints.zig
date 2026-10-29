@@ -40,7 +40,7 @@ pub const Form = enum(u4) {
     }
 
     fn bit(self: Form) u16 {
-        return @as(u16, 1) << @intFromEnum(self);
+        return @as(u16, 1) << @backingInt(self);
     }
 };
 
@@ -55,7 +55,7 @@ pub const GeneralName = struct {
         if (element.tag & 0xc0 != 0x80) return error.Malformed; // context-specific class
         const number = element.tag & 0x1f;
         if (number > 8) return error.Malformed;
-        const form: Form = @enumFromInt(number);
+        const form: Form = @fromBackingInt(@intCast(number));
         const constructed = element.tag & 0x20 != 0;
         const want_constructed = switch (form) {
             .other_name, .x400_address, .directory_name, .edi_party_name => true,

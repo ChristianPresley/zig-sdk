@@ -223,17 +223,17 @@ fn Owned(comptime T: type) type {
 /// A copy of `value` with each string and string list in `arena`.
 pub fn clone(comptime T: type, arena: Allocator, value: T) Allocator.Error!T {
     var out = value;
-    inline for (@typeInfo(T).@"struct".fields) |f| {
-        switch (f.type) {
-            []const u8 => @field(out, f.name) = try arena.dupe(u8, @field(value, f.name)),
-            ?[]const u8 => if (@field(value, f.name)) |s| {
-                @field(out, f.name) = try arena.dupe(u8, s);
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |fname, ftype| {
+        switch (ftype) {
+            []const u8 => @field(out, fname) = try arena.dupe(u8, @field(value, fname)),
+            ?[]const u8 => if (@field(value, fname)) |s| {
+                @field(out, fname) = try arena.dupe(u8, s);
             },
             []const []const u8 => {
-                const list = @field(value, f.name);
+                const list = @field(value, fname);
                 const copy = try arena.alloc([]const u8, list.len);
                 for (list, copy) |s, *d| d.* = try arena.dupe(u8, s);
-                @field(out, f.name) = copy;
+                @field(out, fname) = copy;
             },
             else => {},
         }

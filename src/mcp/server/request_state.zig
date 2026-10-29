@@ -93,7 +93,7 @@ test "seal and unseal" {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var codec: Codec = .{ .key = [_]u8{7} ** key_length, .ttl_seconds = 600 };
+    var codec: Codec = .{ .key = @as([key_length]u8, @splat(7)), .ttl_seconds = 600 };
     const ad = try aad(arena, "tools/call", "echo", "");
     const sealed = try codec.seal(arena, std.testing.io, ad, "{\"round\":1}", 1_000);
     try std.testing.expect(std.mem.startsWith(u8, sealed, "v1."));
@@ -112,7 +112,7 @@ test "sealed state is bound to the principal" {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var codec: Codec = .{ .key = [_]u8{9} ** key_length, .ttl_seconds = 600 };
+    var codec: Codec = .{ .key = @as([key_length]u8, @splat(9)), .ttl_seconds = 600 };
     const alice = try principalTag(arena, "https://as.example", "alice", "app");
     const ad = try aad(arena, "tools/call", "echo", alice);
     const sealed = try codec.seal(arena, std.testing.io, ad, "{}", 1_000);

@@ -1867,7 +1867,7 @@ const TlsConn = struct {
             const now = nowNanoseconds(io);
             if (d != unlimited and now >= d) {
                 tc.timed_out.store(true, .release);
-                r.err = error.Timeout;
+                r.err = error.ConnectionTimedOut;
                 return error.ReadFailed;
             }
             const wait_ns = @min(if (d == unlimited) poll_slice_ns else d - now, poll_slice_ns);
@@ -2100,7 +2100,7 @@ fn statusForCode(code: i64) http.Status {
     return switch (code) {
         -32700, -32600, -32602, -32020, -32021, -32022 => .bad_request,
         -32601 => .not_found,
-        @intFromEnum(errors.Code.rate_limited) => .too_many_requests,
+        @backingInt(errors.Code.rate_limited) => .too_many_requests,
         else => .ok,
     };
 }
@@ -2173,7 +2173,7 @@ fn handleRequest(rc: *RequestContext, request: *http.Server.Request) !bool {
                 try headers.appendSlice(arena, c.headers(&buf));
                 try headers.append(arena, .{ .name = "content-type", .value = "application/json" });
                 try request.respond(c.body, .{
-                    .status = @enumFromInt(c.status),
+                    .status = @fromBackingInt(@intCast(c.status)),
                     .keep_alive = request.head.keep_alive,
                     .extra_headers = headers.items,
                 });
@@ -2658,7 +2658,7 @@ test "many tasks push to one inbox at the same time, and the consumer gets each 
     var group: Io.Group = .init;
     for (0..producers) |p| try group.concurrent(io, Push.run, .{ &inbox, conns[p * per .. (p + 1) * per] });
     var seen: usize = 0;
-    var last = [_]usize{0} ** producers;
+    var last = @as([producers]usize, @splat(0));
     while (seen < conns.len) {
         var it = inbox.takeAll();
         while (it) |c| : (it = c.inbox_next) {

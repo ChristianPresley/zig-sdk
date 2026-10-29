@@ -215,7 +215,7 @@ fn verifySignature(key: Key, alg: Algorithm, input: []const u8, signature: []con
             const Hash = std.crypto.hash.sha2.Sha256;
             switch (modulus.len) {
                 inline 256, 384, 512 => |len| {
-                    const sig = signature[0..len].*;
+                    const sig = signature[0..len];
                     if (alg == .RS256) {
                         Certificate.rsa.PKCS1v1_5Signature.verify(len, sig, input, pk, Hash) catch return false;
                     } else {
@@ -650,7 +650,7 @@ test "es256 verification" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{7} ** 32);
+    const kp = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(7)));
     const header = try encodeSegment(arena, "{\"alg\":\"ES256\"}");
     const payload = try encodeSegment(arena, "{\"sub\":\"bob\",\"exp\":2000}");
     const input = try std.mem.concat(arena, u8, &.{ header, ".", payload });
@@ -765,7 +765,7 @@ test "jwk set parsing" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const kp = try Ecdsa.KeyPair.generateDeterministic([_]u8{9} ** 32);
+    const kp = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(9)));
     const point = kp.public_key.toUncompressedSec1();
     const x = try encodeSegment(arena, point[1..33]);
     const y = try encodeSegment(arena, point[33..65]);

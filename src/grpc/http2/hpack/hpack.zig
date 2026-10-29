@@ -614,7 +614,7 @@ test "invalid blocks" {
     try std.testing.expectError(error.Truncated, decoder.decode(arena, &.{ 0x40, 0x0a, 'a' }, &out));
     try std.testing.expectError(error.Invalid, decoder.decode(arena, &.{ 0x82, 0x3f, 0xe1, 0x1f }, &out)); // size update after a header
     try std.testing.expectError(error.Invalid, decoder.decode(arena, &.{ 0x3f, 0xe1, 0x7f }, &out)); // size update above the limit
-    try std.testing.expectError(error.FieldTooLarge, decoder.decode(arena, "\x00\x11" ++ "a" ** 17 ++ "\x00", &out));
+    try std.testing.expectError(error.FieldTooLarge, decoder.decode(arena, "\x00\x11" ++ @as([17]u8, @splat('a')) ++ "\x00", &out));
     try std.testing.expectError(error.InvalidHuffman, decoder.decode(arena, &.{ 0x00, 0x81, 0xff, 0x00 }, &out));
 }
 
@@ -627,10 +627,10 @@ test "a size error keeps the dynamic table the same as the table of the encoder"
     defer decoder.deinit();
     var out: std.ArrayList(Header) = .empty;
     // A value over the field limit, then a literal with incremental indexing.
-    try std.testing.expectError(error.FieldTooLarge, decoder.decode(arena, "\x00\x01n\x11" ++ "a" ** 17 ++ "\x40\x01k\x01v", &out));
+    try std.testing.expectError(error.FieldTooLarge, decoder.decode(arena, "\x00\x01n\x11" ++ @as([17]u8, @splat('a')) ++ "\x40\x01k\x01v", &out));
     try std.testing.expectEqualStrings("k", (decoder.dynamicEntry(0) orelse return error.TestExpectedEntry).name);
     // Three headers over the list limit, then a literal with incremental indexing.
-    try std.testing.expectError(error.HeaderListTooLarge, decoder.decode(arena, "\x00\x01a\x01b" ** 3 ++ "\x40\x01m\x01w", &out));
+    try std.testing.expectError(error.HeaderListTooLarge, decoder.decode(arena, ("\x00\x01a\x01b" ++ "\x00\x01a\x01b" ++ "\x00\x01a\x01b") ++ "\x40\x01m\x01w", &out));
     try std.testing.expectEqualStrings("m", (decoder.dynamicEntry(0) orelse return error.TestExpectedEntry).name);
     // The next block refers to both entries. Before, the decoder stopped at the error and
     // did not add them, thus this block gave `error.Invalid` or another header.
@@ -660,7 +660,7 @@ test "a literal whose indexed name the new entry evicts keeps the name" {
     try std.testing.expectEqualStrings("name", decoder.dynamicEntry(0).?.name);
     try std.testing.expectEqual(38, decoder.dynamicSize());
     // An entry larger than the table empties it, and the header still has its name.
-    try decoder.decode(arena, "\x7e\x28" ++ "x" ** 40, &out);
+    try decoder.decode(arena, "\x7e\x28" ++ @as([40]u8, @splat('x')), &out);
     try std.testing.expectEqualStrings("name", out.items[2].name);
     try std.testing.expectEqual(0, decoder.dynamicSize());
 }
@@ -884,7 +884,7 @@ test "a reference keeps its bytes when a later insertion of the block moves the 
     const got = try decoder.decodeOwned(arena, block.items);
     try std.testing.expectEqual(20, got.len);
     for (0..10) |i| {
-        const want = [_]u8{'a' + @as(u8, @intCast(i))} ** 27;
+        const want = @as([27]u8, @splat('a' + @as(u8, @intCast(i))));
         try std.testing.expectEqualStrings("n", got[2 * i].name);
         try std.testing.expectEqualStrings(&want, got[2 * i].value);
         try std.testing.expectEqualStrings("n", got[2 * i + 1].name);
@@ -905,7 +905,7 @@ test "a long Huffman string does not leave a large scratch buffer behind" {
     // A literal without indexing with a Huffman value of 30,000 octets: over the field limit.
     var block: std.ArrayList(u8) = .empty;
     defer block.deinit(gpa);
-    try (Encoder{}).encodeHeader(gpa, &block, "x-long", "a" ** 30_000, false);
+    try (Encoder{}).encodeHeader(gpa, &block, "x-long", &@as([30_000]u8, @splat('a')), false);
     try std.testing.expectError(error.FieldTooLarge, decoder.decodeOwned(arena, block.items));
     try std.testing.expect(decoder.scratch.capacity <= keep_max);
     try std.testing.expectError(error.FieldTooLarge, decoder.decodeBlock(block.items));
@@ -923,7 +923,7 @@ test "a size error clears the fields of the block" {
     var decoder: Decoder = .init(gpa, .{ .max_field_size = 16, .max_header_list_size = 200 });
     defer decoder.deinit();
     // A header, then a value over the field limit, then a literal with incremental indexing.
-    try std.testing.expectError(error.FieldTooLarge, decoder.decodeBlock("\x00\x01a\x01b" ++ "\x00\x01n\x11" ++ "a" ** 17 ++ "\x40\x01k\x01v"));
+    try std.testing.expectError(error.FieldTooLarge, decoder.decodeBlock("\x00\x01a\x01b" ++ "\x00\x01n\x11" ++ @as([17]u8, @splat('a')) ++ "\x40\x01k\x01v"));
     try std.testing.expectEqual(0, decoder.fields.items.len);
     try std.testing.expectEqualStrings("k", decoder.dynamicEntry(0).?.name);
 }

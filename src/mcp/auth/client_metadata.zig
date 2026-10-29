@@ -349,8 +349,8 @@ fn isPublicIp4(b: [4]u8) bool {
 
 fn isPublicIp6(b: [16]u8) bool {
     // IPv4-mapped (::ffff:0:0/96) and NAT64 (64:ff9b::/96): check the IPv4 address.
-    const mapped_prefix = [_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff };
-    const nat64_prefix = [_]u8{ 0, 0x64, 0xff, 0x9b } ++ [_]u8{0} ** 8;
+    const mapped_prefix = @as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff };
+    const nat64_prefix = [_]u8{ 0, 0x64, 0xff, 0x9b } ++ @as([8]u8, @splat(0));
     if (std.mem.eql(u8, b[0..12], &mapped_prefix) or std.mem.eql(u8, b[0..12], &nat64_prefix)) return isPublicIp4(b[12..16].*);
     // 6to4 (2002::/16) carries an IPv4 address in the next 32 bits.
     if (b[0] == 0x20 and b[1] == 0x02) return isPublicIp4(b[2..6].*);

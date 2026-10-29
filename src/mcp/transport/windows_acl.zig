@@ -91,7 +91,7 @@ pub fn createPrivateDirectory(path: []const u8) DirectoryError!void {
     if (CreateDirectoryW(try toWide(path, &path_w), &attributes) == 0) {
         const code = windows.GetLastError();
         if (code == .ALREADY_EXISTS) return error.PathAlreadyExists;
-        return failCode("CreateDirectoryW", @intFromEnum(code));
+        return failCode("CreateDirectoryW", @backingInt(code));
     }
 }
 
@@ -199,7 +199,7 @@ fn openForSecurity(path: []const u8, access: windows.DWORD) Error!windows.HANDLE
 }
 
 fn fail(comptime function: []const u8) error{AccessControlFailed} {
-    return failCode(function, @intFromEnum(windows.GetLastError()));
+    return failCode(function, @backingInt(windows.GetLastError()));
 }
 
 fn failCode(comptime function: []const u8, code: windows.DWORD) error{AccessControlFailed} {

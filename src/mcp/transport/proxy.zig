@@ -182,8 +182,8 @@ pub fn isLoopback(host: []const u8) bool {
     const address = Io.net.IpAddress.parse(name, 0) catch return false;
     return switch (address) {
         .ip4 => |a| a.bytes[0] == 127,
-        .ip6 => |a| std.mem.eql(u8, &a.bytes, &([_]u8{0} ** 15 ++ [_]u8{1})) or
-            (std.mem.eql(u8, a.bytes[0..12], &([_]u8{0} ** 10 ++ [_]u8{ 0xff, 0xff })) and a.bytes[12] == 127),
+        .ip6 => |a| std.mem.eql(u8, &a.bytes, &(@as([15]u8, @splat(0)) ++ [_]u8{1})) or
+            (std.mem.eql(u8, a.bytes[0..12], &(@as([10]u8, @splat(0)) ++ [_]u8{ 0xff, 0xff })) and a.bytes[12] == 127),
     };
 }
 
@@ -354,7 +354,7 @@ pub fn tunnel(in: *Io.Reader, out: *Io.Writer, proxy: Proxy, host: []const u8, p
     // RFC 9110 section 9.3.6: each 2xx status opens the tunnel.
     if (status / 100 == 2) return;
     // The phrase comes from the table of std, not from the proxy.
-    const known: std.http.Status = @enumFromInt(status);
+    const known: std.http.Status = @fromBackingInt(@intCast(status));
     const text = known.phrase() orelse "";
     if (status == 407) {
         log.warn("the proxy {f} refused the tunnel to {s}:{d} with status 407 {s}: the proxy URL has no user and password, or wrong ones", .{ proxy, host, port, text });
@@ -569,7 +569,7 @@ test "the CONNECT request and its answer" {
         "HTTP/1.1 2000 OK\r\n\r\n",
         "HTTP/1.1 200",
         "",
-        "HTTP/1.1 200 OK\r\nx: " ++ "a" ** 600 ++ "\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nx: " ++ @as([600]u8, @splat('a')) ++ "\r\n\r\n",
     }) |text| {
         const in = answer.init(text);
         var out: Io.Writer = .fixed(&out_buf);

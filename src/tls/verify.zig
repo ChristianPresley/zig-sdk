@@ -317,7 +317,7 @@ fn verifyRsaPss(comptime scheme: tls.SignatureScheme, pub_key: []const u8, signa
             if (signature.len != modulus_len) return error.InvalidSignatureLength;
             const key: PublicKey = try .fromBytes(components.exponent, components.modulus);
             const sig = Certificate.rsa.PSSSignature.fromBytes(modulus_len, signature);
-            try Certificate.rsa.PSSSignature.concatVerify(modulus_len, sig, &.{message}, key, Hash);
+            try Certificate.rsa.PSSSignature.concatVerify(modulus_len, &sig, &.{message}, key, Hash);
         },
         else => return error.UnsupportedModulus,
     }
@@ -410,7 +410,7 @@ test "chains and CertificateVerify signatures with RSA-PSS keys" {
     defer key.deinit();
     var sig_buf: [PrivateKey.max_signature_len]u8 = undefined;
     const message = "transcript hash";
-    const sig = try key.signScheme(.rsa_pss_pss_sha256, message, [_]u8{3} ** 48, &sig_buf);
+    const sig = try key.signScheme(.rsa_pss_pss_sha256, message, @as([48]u8, @splat(3)), &sig_buf);
     try verifySignature(&leaf, .rsa_pss_pss_sha256, sig, message);
     try std.testing.expectError(error.TlsDecryptError, verifySignature(&leaf, .rsa_pss_pss_sha256, sig, "another hash"));
     try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&leaf, .rsa_pss_pss_sha384, sig, message));
@@ -423,7 +423,7 @@ test "chains and CertificateVerify signatures with RSA-PSS keys" {
     var ca_key = try PrivateKey.parsePem(gpa, ca_key_text);
     defer ca_key.deinit();
     for ([_]tls.SignatureScheme{ .rsa_pss_pss_sha256, .rsa_pss_pss_sha384, .rsa_pss_pss_sha512 }) |s| {
-        const ca_sig = try ca_key.signScheme(s, message, [_]u8{4} ** 48, &sig_buf);
+        const ca_sig = try ca_key.signScheme(s, message, @as([48]u8, @splat(4)), &sig_buf);
         try verifySignature(&ca_leaf, s, ca_sig, message);
     }
     try std.testing.expectError(error.TlsBadSignatureScheme, verifySignature(&ca_leaf, .rsa_pss_rsae_sha256, sig, message));

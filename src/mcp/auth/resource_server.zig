@@ -463,7 +463,7 @@ test "DPoP: bound tokens, proofs, nonces and the downgrade to bearer" {
     const keys = [_]jwt.Key{.{ .alg = .HS256, .material = .{ .secret = secret } }};
     var jv: JwtVerifier = .{ .options = .{ .keys = &keys, .audience = "https://rs.example/mcp" }, .clock = .{ .fixed = fixedNow } };
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    var prover: dpop.Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{31} ** 32) });
+    var prover: dpop.Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(31))) });
     defer prover.deinit();
     prover.clock = fixedNow;
     const issuer: dpop.NonceIssuer = try .init(io);
@@ -515,7 +515,7 @@ test "DPoP: bound tokens, proofs, nonces and the downgrade to bearer" {
     try std.testing.expect(std.mem.indexOf(u8, two.www_authenticate, "invalid_dpop_proof") != null);
     const wrong_uri = try prover.proof(arena, "POST", "https://rs.example/other", bound);
     try std.testing.expect(std.mem.indexOf(u8, (try rs.authorizeRequest(arena, .{ .authorization = dpop_auth, .dpop = &.{wrong_uri} })).challenge.www_authenticate, "invalid_dpop_proof") != null);
-    var thief: dpop.Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{32} ** 32) });
+    var thief: dpop.Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(32))) });
     defer thief.deinit();
     thief.clock = fixedNow;
     const stolen = try thief.proof(arena, "POST", "https://rs.example/mcp", bound);

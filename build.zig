@@ -10,13 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Unit tests. `-Dfuzz` prepares them for `zig build test -Dfuzz --fuzz` on Zig 0.16.0: a test
-    // runner whose fuzz path compiles, and the LLVM backend, because the self-hosted backend of
-    // Debug builds emits no `__sancov_pcs1` table and the fuzzer then sees no coverage.
-    const fuzz = b.option(bool, "fuzz", "Prepare the unit tests for --fuzz on Zig 0.16.0") orelse false;
-    const test_runner: ?std.Build.Step.Compile.TestRunner = if (fuzz) fuzzTestRunner(b) else null;
+    // Unit tests. `-Dfuzz` prepares them for `zig build test -Dfuzz --fuzz`: it selects the LLVM
+    // backend, because the self-hosted backend of Debug builds emits no `__sancov_pcs1` table and
+    // the fuzzer then sees no coverage.
+    const fuzz = b.option(bool, "fuzz", "Prepare the unit tests for --fuzz") orelse false;
     const use_llvm: ?bool = if (fuzz) true else null;
-    const mod_tests = b.addTest(.{ .root_module = mcp, .test_runner = test_runner, .use_llvm = use_llvm });
+    const mod_tests = b.addTest(.{ .root_module = mcp, .use_llvm = use_llvm });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
@@ -28,7 +27,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "mcp", .module = mcp }},
     });
-    const grpc_tests = b.addTest(.{ .root_module = mcp_grpc, .test_runner = test_runner, .use_llvm = use_llvm });
+    const grpc_tests = b.addTest(.{ .root_module = mcp_grpc, .use_llvm = use_llvm });
     test_step.dependOn(&b.addRunArtifact(grpc_tests).step);
 
     // The tests of the documentation tools.
@@ -44,7 +43,7 @@ pub fn build(b: *std.Build) void {
 
     // Formatting check.
     const fmt_step = b.step("fmt", "Check formatting");
-    const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "build.zig.zon", "src", "examples", "tools", "conformance", "bench" }, .check = true });
+    const fmt = b.addFmt(.{ .paths = &.{ b.path("build.zig"), b.path("build.zig.zon"), b.path("src"), b.path("examples"), b.path("tools"), b.path("conformance"), b.path("bench") }, .check = true });
     fmt_step.dependOn(&fmt.step);
 
     // Examples.
@@ -67,7 +66,7 @@ pub fn build(b: *std.Build) void {
         // The test of the command line of the gRPC client.
         if (std.mem.eql(u8, name, "grpc_client")) test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = exe.root_module })).step);
         const run = b.addRunArtifact(exe);
-        if (b.args) |args| run.addArgs(args);
+        run.addPassthruArgs();
         b.step(b.fmt("run-{s}", .{name}), b.fmt("Run the {s} example", .{name})).dependOn(&run.step);
     }
 
@@ -113,7 +112,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/mcp.zig"),
             .target = target,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const install_docs = b.addInstallDirectory(.{
@@ -130,7 +129,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/mcp_grpc.zig"),
             .target = target,
-            .optimize = .Debug,
+            .optimize = .debug,
             .imports = &.{.{ .name = "mcp", .module = mcp }},
         }),
     });
@@ -157,25 +156,25 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{ .{ .name = "mcp", .module = mcp }, .{ .name = "mcp_grpc", .module = mcp_grpc } },
         }),
     });
     const run_bench = b.addRunArtifact(bench);
     run_bench.setCwd(b.path("."));
-    if (b.args) |args| run_bench.addArgs(args);
+    run_bench.addPassthruArgs();
     b.step("bench", "Run the benchmarks").dependOn(&run_bench.step);
 
     // Tools written in Zig and run through `zig build <step>`.
-    addTool(b, "lint-docs", "Check prose against the project STE profile", "tools/lint_docs/main.zig", &.{ "--strict", "--string-literals" });
-    addTool(b, "census", "Check the schema fixtures against the Zig types", "tools/schema_census.zig", &.{});
-    addTool(b, "commit-policy", "Check commits for a sole signed author", "tools/commit_policy.zig", &.{});
-    addTool(b, "gen-bibliography", "Check the bibliography and render it", "tools/gen_bibliography.zig", &.{ "--check", "--out", "docs/generated/bibliography.md" });
-    addTool(b, "gen-dictionary", "Render the project dictionary", "tools/gen_dictionary.zig", &.{ "--out", "docs/generated/dictionary.md" });
-    addTool(b, "check-version", "Check that a release tag matches the package version", "tools/check_version.zig", &.{});
-    addTool(b, "changelog-section", "Print the changelog section of a version", "tools/changelog_section.zig", &.{});
-    addTool(b, "extract-requirements", "Extract the normative sentences of the specification", "tools/extract_requirements.zig", &.{});
-    addTool(b, "spec-matrix", "Check the requirement mapping and render the conformance matrix", "tools/gen_spec_matrix.zig", &.{});
+    addTool(b, "lint-docs", "Check prose against the project STE profile", "tools/lint_docs/main.zig");
+    addTool(b, "census", "Check the schema fixtures against the Zig types", "tools/schema_census.zig");
+    addTool(b, "commit-policy", "Check commits for a sole signed author", "tools/commit_policy.zig");
+    addTool(b, "gen-bibliography", "Check the bibliography and render it", "tools/gen_bibliography.zig");
+    addTool(b, "gen-dictionary", "Render the project dictionary", "tools/gen_dictionary.zig");
+    addTool(b, "check-version", "Check that a release tag matches the package version", "tools/check_version.zig");
+    addTool(b, "changelog-section", "Print the changelog section of a version", "tools/changelog_section.zig");
+    addTool(b, "extract-requirements", "Extract the normative sentences of the specification", "tools/extract_requirements.zig");
+    addTool(b, "spec-matrix", "Check the requirement mapping and render the conformance matrix", "tools/gen_spec_matrix.zig");
 
     // Unit tests of the requirement tools and the changelog tool run with the other tests.
     for ([_][]const u8{ "tools/extract_requirements.zig", "tools/gen_spec_matrix.zig", "tools/changelog_section.zig" }) |path| {
@@ -197,33 +196,17 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-/// The fuzz path of the test runner of Zig 0.16.0 gives a `builtin.StackTrace` to
-/// `std.debug.writeStackTrace`, which takes a `debug.StackTrace`, so no test with a fuzz
-/// target compiles with `-ffuzz`. This makes a copy of the runner of the installed toolchain
-/// with `std.debug.writeErrorReturnTrace` in that call. The repository keeps no copy.
-fn fuzzTestRunner(b: *std.Build) std.Build.Step.Compile.TestRunner {
-    const sub_path = "compiler/test_runner.zig";
-    const source = b.graph.zig_lib_directory.handle.readFileAlloc(b.graph.io, sub_path, b.allocator, .limited(1 << 20)) catch |err|
-        std.debug.panic("cannot read {s} of the Zig library: {t}", .{ sub_path, err });
-    const needle = "std.debug.writeStackTrace(trace, stderr)";
-    if (std.mem.count(u8, source, needle) != 1)
-        std.debug.panic("{s} of the Zig library does not have one '{s}'; remove -Dfuzz", .{ sub_path, needle });
-    const fixed = std.mem.replaceOwned(u8, b.allocator, source, needle, "std.debug.writeErrorReturnTrace(trace, stderr)") catch @panic("OOM");
-    const files = b.addWriteFiles();
-    return .{ .path = files.add("fuzz_test_runner.zig", fixed), .mode = .server };
-}
-
-fn addTool(b: *std.Build, step_name: []const u8, description: []const u8, source: []const u8, default_args: []const []const u8) void {
+fn addTool(b: *std.Build, step_name: []const u8, description: []const u8, source: []const u8) void {
     const exe = b.addExecutable(.{
         .name = step_name,
         .root_module = b.createModule(.{
             .root_source_file = b.path(source),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const run = b.addRunArtifact(exe);
     run.setCwd(b.path("."));
-    if (b.args) |args| run.addArgs(args) else run.addArgs(default_args);
+    run.addPassthruArgs();
     b.step(step_name, description).dependOn(&run.step);
 }

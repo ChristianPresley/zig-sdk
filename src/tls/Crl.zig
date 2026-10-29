@@ -208,7 +208,7 @@ fn parseEntry(element: der.Element) InnerError!ParsedEntry {
             if (parsed.oid.isOid(oid_reason_code)) {
                 const value = try (try der.parseExact(parsed.extension.value)).expect(der.tag_enumerated);
                 if (value.content.len != 1) return error.InvalidLength;
-                result.entry.reason = @enumFromInt(value.content[0]);
+                result.entry.reason = @fromBackingInt(@intCast(value.content[0]));
             } else if (parsed.oid.isOid(oid_certificate_issuer)) {
                 // The entry belongs to another issuer: an indirect CRL.
                 return error.UnsupportedCrl;

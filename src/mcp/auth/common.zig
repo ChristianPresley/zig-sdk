@@ -403,7 +403,7 @@ pub const Fetcher = struct {
         }
         var redirect_buf: [2048]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);
-        const status: u16 = @intFromEnum(response.head.status);
+        const status: u16 = @backingInt(response.head.status);
         const location: ?[]const u8 = if (response.head.location) |l| try arena.dupe(u8, l) else null;
         var nonce: ?[]const u8 = null;
         var it = response.head.iterateHeaders();
@@ -496,7 +496,7 @@ pub const Fetcher = struct {
     /// `arena`, and `transfer` is the buffer of the body reader.
     fn receiveReply(self: *Fetcher, arena: Allocator, reader: *http.Reader, transfer: []u8) !Reply {
         const head = try http.Client.Response.Head.parse(try reader.receiveHead());
-        const status: u16 = @intFromEnum(head.status);
+        const status: u16 = @backingInt(head.status);
         // The head is in the buffer of the reader until the body read.
         const location: ?[]const u8 = if (head.location) |l| try arena.dupe(u8, l) else null;
         var nonce: ?[]const u8 = null;
@@ -1132,7 +1132,7 @@ test "client authentication" {
     try std.testing.expectError(error.AuthMethodUnsupported, secret.apply(io, arena, 1000, .{ .issuer = "https://as", .auth_methods_supported = &.{"private_key_jwt"} }, &form.writer, &headers));
 
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{3} ** 32) };
+    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(3))) };
     const signed: ClientAuth = .{ .private_key_jwt = .{ .client_id = "c", .key = &key, .kid = "k" } };
     try std.testing.expectError(error.SigningAlgorithmUnsupported, signed.apply(io, arena, 1000, .{ .issuer = "https://as", .signing_algs_supported = &.{"RS256"} }, &form.writer, &headers));
     var jwt_form: Io.Writer.Allocating = .init(arena);

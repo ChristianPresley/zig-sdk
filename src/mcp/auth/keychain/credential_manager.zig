@@ -203,7 +203,7 @@ fn writeTarget(target: [:0]const u16, blob: []u8, persist: Persist) Error!void {
     credential.TargetName = @constCast(target.ptr);
     credential.CredentialBlobSize = @intCast(blob.len);
     credential.CredentialBlob = blob.ptr;
-    credential.Persist = @intFromEnum(persist);
+    credential.Persist = @backingInt(persist);
     if (CredWriteW(&credential, 0) == 0) return failure("CredWriteW", windows.GetLastError());
 }
 
@@ -220,7 +220,7 @@ fn failure(comptime function: []const u8, code: windows.Win32Error) Error {
         .NO_SUCH_LOGON_SESSION => return error.KeychainUnavailable,
         .NOT_ENOUGH_MEMORY, .OUTOFMEMORY => return error.OutOfMemory,
         else => {
-            log.warn(function ++ " failed with Windows error {d}", .{@intFromEnum(code)});
+            log.warn(function ++ " failed with Windows error {d}", .{@backingInt(code)});
             return error.StorageFailed;
         },
     }

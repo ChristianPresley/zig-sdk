@@ -866,7 +866,7 @@ fn sampleValue(comptime B: type, comptime spec: F, arena: Allocator, i: u8) Allo
         .int64 => -(@as(i64, 1) << 40) - spec.number - i,
         .uint32 => 1000 + spec.number + i,
         .uint64 => (@as(u64, 1) << 63) + spec.number + i,
-        .enumeration => @enumFromInt(1 + @as(i32, i)),
+        .enumeration => @fromBackingInt(@intCast(1 + @as(i32, i))),
         .float => 0.25 + @as(f32, @floatFromInt(i)),
         .double => -1.5e10 - @as(f64, @floatFromInt(i)),
         .message => try sample(B, arena),

@@ -569,11 +569,11 @@ test "the strict check gives false for a frame that the scanner cannot read" {
     // A top-level key with an escape sequence is too long for the buffer of the scanner. The
     // "method" key has an escape sequence too, and a value has the text "error". The fallback
     // check takes this notification for a response, and the strict check does not.
-    const notification = "{\"jsonrpc\":\"2.0\",\"\\u0078" ++ "x" ** 80 ++ "\":0,\"\\u006dethod\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"error\"}}";
+    const notification = "{\"jsonrpc\":\"2.0\",\"\\u0078" ++ @as([80]u8, @splat('x')) ++ "\":0,\"\\u006dethod\":\"notifications/message\",\"params\":{\"level\":\"info\",\"data\":\"error\"}}";
     try std.testing.expect(frameIsResponse(notification));
     try std.testing.expect(!frameIsResponseStrict(notification));
     // A response that the scanner cannot read also gives false.
-    try std.testing.expect(!frameIsResponseStrict("{\"jsonrpc\":\"2.0\",\"\\u0078" ++ "x" ** 80 ++ "\":0,\"id\":1,\"result\":{}}"));
+    try std.testing.expect(!frameIsResponseStrict("{\"jsonrpc\":\"2.0\",\"\\u0078" ++ @as([80]u8, @splat('x')) ++ "\":0,\"id\":1,\"result\":{}}"));
 }
 
 test "router routes responses by id and progress by token" {
@@ -670,15 +670,15 @@ test "a frame that the router cannot read makes the request with its id fail" {
     const Case = struct { line: []const u8, fails: ?i64 };
     const cases = [_]Case{
         // A line over the limit. The id comes after the result, as some servers write it.
-        .{ .line = "{\"jsonrpc\":\"2.0\",\"result\":{\"id\":2,\"text\":\"" ++ "x" ** 2000 ++ "\"},\"id\":1}", .fails = 1 },
+        .{ .line = "{\"jsonrpc\":\"2.0\",\"result\":{\"id\":2,\"text\":\"" ++ @as([2000]u8, @splat('x')) ++ "\"},\"id\":1}", .fails = 1 },
         // A line that is not valid UTF-8.
         .{ .line = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"text\":\"\xff\"}}", .fails = 2 },
         // A response without a result is not a JSON-RPC message.
         .{ .line = "{\"jsonrpc\":\"2.0\",\"id\":1}", .fails = 1 },
         // A response that nests too deep for the parser.
-        .{ .line = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"a\":" ++ "[" ** 300 ++ "]" ** 300 ++ "}}", .fails = 2 },
+        .{ .line = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"a\":" ++ @as([300]u8, @splat('[')) ++ @as([300]u8, @splat(']')) ++ "}}", .fails = 2 },
         // A notification over the limit fails no request.
-        .{ .line = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"message\":\"" ++ "x" ** 2000 ++ "\"}}", .fails = null },
+        .{ .line = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"message\":\"" ++ @as([2000]u8, @splat('x')) ++ "\"}}", .fails = null },
         // A line that is not JSON, for example a log line of the server on the wrong stream.
         .{ .line = "server started", .fails = null },
         // An error response with a null id, while two requests wait for their first frame.
@@ -801,8 +801,8 @@ test "the warning of a dropped frame has the reason and a short request id only"
     // The server sets the text of a string id. The note shortens it and replaces control
     // characters.
     w = .fixed(&buf);
-    try w.print("{f}", .{DropNote{ .what = .{ .response = .{ .string = "a\nb" ++ "c" ** 100 } }, .outcome = .not_in_flight }});
-    try std.testing.expectEqualStrings("dropped the response of request \"a?b" ++ "c" ** 61 ++ "...\": the request is not in flight", w.buffered());
+    try w.print("{f}", .{DropNote{ .what = .{ .response = .{ .string = "a\nb" ++ @as([100]u8, @splat('c')) } }, .outcome = .not_in_flight }});
+    try std.testing.expectEqualStrings("dropped the response of request \"a?b" ++ @as([61]u8, @splat('c')) ++ "...\": the request is not in flight", w.buffered());
 }
 
 /// The sink of a request with `inline_exchange` in the tests. It counts the notifications.

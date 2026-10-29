@@ -85,7 +85,7 @@ pub const Reader = struct {
         if (tag > std.math.maxInt(u32)) return error.Malformed;
         const number: u32 = @intCast(tag >> 3);
         if (number == 0) return error.Malformed;
-        const wire_type: WireType = @enumFromInt(@as(u3, @truncate(tag)));
+        const wire_type: WireType = @fromBackingInt(@intCast(@as(u3, @truncate(tag))));
         switch (wire_type) {
             .varint => return .{ .number = number, .wire_type = wire_type, .value = .{ .varint = try self.varint() } },
             .fixed64 => {
@@ -123,7 +123,7 @@ pub const Writer = struct {
     }
 
     pub fn tag(self: Writer, number: u32, wire_type: WireType) Allocator.Error!void {
-        try self.varint((@as(u64, number) << 3) | @intFromEnum(wire_type));
+        try self.varint((@as(u64, number) << 3) | @backingInt(wire_type));
     }
 
     pub fn bytesField(self: Writer, number: u32, bytes: []const u8) Allocator.Error!void {

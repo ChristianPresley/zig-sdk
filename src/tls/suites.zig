@@ -38,7 +38,7 @@ pub const Suite = enum(u16) {
     }
 
     pub fn wire(s: Suite) u16 {
-        return @intFromEnum(s);
+        return @backingInt(s);
     }
 
     /// True for the two AEGIS suites.
@@ -80,7 +80,7 @@ pub fn SuiteT(comptime AeadType: type, comptime HashType: type) type {
 pub fn Schedule(comptime S: type) type {
     return struct {
         pub const Secret = [S.digest_length]u8;
-        const zeroes = [1]u8{0} ** S.digest_length;
+        const zeroes = @as([S.digest_length]u8, @splat(0));
 
         pub fn earlySecret() Secret {
             return S.Hkdf.extract(&[1]u8{0}, &zeroes);
@@ -214,8 +214,8 @@ pub const Transcript = union(enum) {
 
 test "traffic key nonce" {
     const S = Suite.Type(.AES_128_GCM_SHA256);
-    var keys: TrafficKeys(S) = .fromSecret([_]u8{7} ** 32);
-    keys.iv = [_]u8{0} ** 12;
+    var keys: TrafficKeys(S) = .fromSecret(@as([32]u8, @splat(7)));
+    keys.iv = @as([12]u8, @splat(0));
     keys.seq = 0x0102;
     const n = keys.nonce();
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2 }, &n);
@@ -288,20 +288,20 @@ test "AEGIS traffic keys and the record nonce" {
         try std.testing.expectEqual(case[1], S.AEAD.nonce_length);
         try std.testing.expectEqual(16, S.AEAD.tag_length);
         try std.testing.expectEqual(case[2], S.digest_length);
-        var keys: TrafficKeys(S) = .fromSecret([_]u8{9} ** S.digest_length);
+        var keys: TrafficKeys(S) = .fromSecret(@as([S.digest_length]u8, @splat(9)));
         try std.testing.expectEqual(case[1], keys.key.len);
         try std.testing.expectEqual(case[1], keys.iv.len);
-        keys.iv = [_]u8{0xff} ** case[1];
+        keys.iv = @as([case[1]]u8, @splat(0xff));
         keys.seq = 0x0102;
         const n = keys.nonce();
-        try std.testing.expectEqualSlices(u8, &([_]u8{0xff} ** (case[1] - 2)), n[0 .. case[1] - 2]);
+        try std.testing.expectEqualSlices(u8, &(@as([(case[1] - 2)]u8, @splat(0xff))), n[0 .. case[1] - 2]);
         try std.testing.expectEqualSlices(u8, &.{ 0xfe, 0xfd }, n[case[1] - 2 ..]);
         // A key update derives a new secret, key and IV, and starts the sequence again.
         const old_key = keys.key;
         keys.update();
         try std.testing.expectEqual(0, keys.seq);
         try std.testing.expect(!std.mem.eql(u8, &old_key, &keys.key));
-        var dk = DirectionKeys.init(case[0], [_]u8{9} ** S.digest_length);
+        var dk = DirectionKeys.init(case[0], @as([S.digest_length]u8, @splat(9)));
         dk.wipe();
         try std.testing.expect(dk == .none);
     }

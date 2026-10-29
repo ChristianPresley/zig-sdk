@@ -298,7 +298,7 @@ pub const Client = struct {
         defer conn.close();
         conn.send("POST", self.target.path, self.target.host_header, headers.items, ex.frame) catch return error.WriteFailed;
         const response = conn.receiveHead() catch return error.ReadFailed;
-        ex.http_status = @intFromEnum(response.head.status);
+        ex.http_status = @backingInt(response.head.status);
         var nonce: ?[]const u8 = null;
         var www: ?[]const u8 = null;
         var it = response.head.iterateHeaders();
@@ -428,6 +428,6 @@ test "the log text of a header value of the server has no control characters" {
     try w.print("{f}", .{HeaderText{ .value = "" }});
     try std.testing.expectEqualStrings("none", w.buffered());
     w = .fixed(&buf);
-    try w.print("{f}", .{HeaderText{ .value = "a" ** 120 }});
-    try std.testing.expectEqualStrings("a" ** 100 ++ "...", w.buffered());
+    try w.print("{f}", .{HeaderText{ .value = &@as([120]u8, @splat('a')) }});
+    try std.testing.expectEqualStrings(@as([100]u8, @splat('a')) ++ "...", w.buffered());
 }

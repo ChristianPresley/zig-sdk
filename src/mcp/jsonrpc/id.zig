@@ -53,7 +53,7 @@ pub const RequestId = union(enum) {
 
     pub fn hash(self: RequestId) u64 {
         var h = std.hash.Wyhash.init(0);
-        h.update(&.{@intFromEnum(std.meta.activeTag(self))});
+        h.update(&.{@backingInt(std.meta.activeTag(self))});
         switch (self) {
             .string => |s| h.update(s),
             .integer => |i| h.update(std.mem.asBytes(&i)),

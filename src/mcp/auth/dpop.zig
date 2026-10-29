@@ -434,7 +434,7 @@ test "a proof verifies and binds to the token" {
     const arena = arena_state.allocator();
     const io = std.testing.io;
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    var prover: Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{11} ** 32) });
+    var prover: Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(11))) });
     defer prover.deinit();
     prover.clock = fixedClock;
     try std.testing.expectEqual(43, prover.jkt.len);
@@ -481,7 +481,7 @@ test "proof headers that the verifier refuses" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{12} ** 32) };
+    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(12))) };
     const jwk = try jwt.publicJwk(arena, &key);
     const claims = "{\"jti\":\"j\",\"htm\":\"POST\",\"htu\":\"https://h/t\",\"iat\":1000}";
     const expect: Expectation = .{ .method = "POST", .uri = "https://h/t" };
@@ -492,7 +492,7 @@ test "proof headers that the verifier refuses" {
     const private = try std.fmt.allocPrint(arena, "{s},\"d\":\"AAAA\"}}", .{jwk[0 .. jwk.len - 1]});
     try std.testing.expectError(error.BadKey, verifyProof(arena, try jwt.sign(arena, &key, claims, .{ .typ = proof_type, .jwk = private }), expect, .{}, 1000));
     // Another key in the `jwk` header than the key that signed.
-    const other: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{13} ** 32) };
+    const other: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(13))) };
     try std.testing.expectError(error.BadSignature, verifyProof(arena, try jwt.sign(arena, &key, claims, .{ .typ = proof_type, .jwk = try jwt.publicJwk(arena, &other) }), expect, .{}, 1000));
     // HS256 and missing claims.
     const hs: jwt.SigningKey = .{ .hs256 = "a-shared-secret-of-thirty-two-b!" };
@@ -564,7 +564,7 @@ test "nonces: the issuer accepts its own nonces within the lifetime" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    var prover: Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{14} ** 32) });
+    var prover: Prover = try .init(io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(14))) });
     defer prover.deinit();
     prover.clock = fixedClock;
     const expect: Expectation = .{ .method = "POST", .uri = "https://rs.example/mcp" };
@@ -589,7 +589,7 @@ test "the replay check refuses a second use of a proof" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    var prover: Prover = try .init(std.testing.io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{15} ** 32) });
+    var prover: Prover = try .init(std.testing.io, std.testing.allocator, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(15))) });
     defer prover.deinit();
     prover.clock = fixedClock;
     const Store = struct {

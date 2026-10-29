@@ -104,9 +104,9 @@ pub const Method = enum {
     }
 
     const map = std.StaticStringMap(Method).initComptime(blk: {
-        const fields = @typeInfo(Method).@"enum".fields;
-        var kvs: [fields.len]struct { []const u8, Method } = undefined;
-        for (fields, 0..) |f, i| kvs[i] = .{ f.name, @enumFromInt(f.value) };
+        const tags = std.meta.tags(Method);
+        var kvs: [tags.len]struct { []const u8, Method } = undefined;
+        for (tags, 0..) |t, i| kvs[i] = .{ @tagName(t), t };
         break :blk kvs;
     });
 };
@@ -167,5 +167,5 @@ test "method table" {
     try std.testing.expect(!Method.@"tools/call".isCacheable());
     try std.testing.expect(Method.@"tools/call".allowsInputRequired());
     try std.testing.expectEqual(HeaderNameSource.uri, Method.@"resources/read".headerNameSource());
-    try std.testing.expectEqual(10, @typeInfo(Method).@"enum".fields.len);
+    try std.testing.expectEqual(10, @typeInfo(Method).@"enum".field_names.len);
 }

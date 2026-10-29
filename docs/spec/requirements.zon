@@ -1908,7 +1908,7 @@
             .level = .must_not,
             .keywords = .{"MUST NOT"},
             .party = .both,
-            .text = "Implementations of this protocol version MUST NOT emit these codes: `-32002` \xe2\x80\x94 resource not found (2025-11-25 and earlier; replaced by `-32602`).",
+            .text = "Implementations of this protocol version MUST NOT emit these codes: `-32002` — resource not found (2025-11-25 and earlier; replaced by `-32602`).",
         },
         .{
             .id = "basic#023-96e2d9",
@@ -1930,7 +1930,7 @@
             .level = .must_not,
             .keywords = .{"MUST NOT"},
             .party = .both,
-            .text = "Implementations of this protocol version MUST NOT emit these codes: `-32042` \xe2\x80\x94 URL elicitation required (2025-11-25 only).",
+            .text = "Implementations of this protocol version MUST NOT emit these codes: `-32042` — URL elicitation required (2025-11-25 only).",
         },
         .{
             .id = "basic#025-18b8d7",
@@ -3481,7 +3481,7 @@
             .level = .may,
             .keywords = .{"MAY"},
             .party = .client,
-            .text = "A client MAY have multiple active subscriptions concurrently \xe2\x80\x94 for example, one listening for tools-list changes and another for resource updates.",
+            .text = "A client MAY have multiple active subscriptions concurrently — for example, one listening for tools-list changes and another for resource updates.",
         },
         .{
             .id = "basic/patterns/subscriptions#007-0c5b5f",
@@ -3492,7 +3492,7 @@
             .level = .should,
             .keywords = .{"SHOULD"},
             .party = .server,
-            .text = "The server tears it down (e.g., during shutdown) \xe2\x80\x94 it SHOULD send a successful `subscriptions/listen` response to signal a graceful end (see Graceful Closure), then close the stream.",
+            .text = "The server tears it down (e.g., during shutdown) — it SHOULD send a successful `subscriptions/listen` response to signal a graceful end (see Graceful Closure), then close the stream.",
         },
         .{
             .id = "basic/patterns/subscriptions#008-fd9c08",
@@ -3525,7 +3525,7 @@
             .level = .must,
             .keywords = .{"MUST"},
             .party = .client,
-            .text = "On stdio, if the connection is terminated and then re-established, the client MUST re-send `subscriptions/listen` to re-establish its subscriptions \xe2\x80\x94 the server holds no subscription state across reconnections.",
+            .text = "On stdio, if the connection is terminated and then re-established, the client MUST re-send `subscriptions/listen` to re-establish its subscriptions — the server holds no subscription state across reconnections.",
         },
         .{
             .id = "basic/transports#001-41e2a7",
@@ -4020,7 +4020,7 @@
             .level = .may,
             .keywords = .{"MAY"},
             .party = .server,
-            .text = "The server MAY send JSON-RPC notifications \xe2\x80\x94 for example, [`notifications/progress`][notifications-progress] or [`notifications/message`][notifications-message] \xe2\x80\x94 before the final response.",
+            .text = "The server MAY send JSON-RPC notifications — for example, [`notifications/progress`][notifications-progress] or [`notifications/message`][notifications-message] — before the final response.",
         },
         .{
             .id = "basic/transports/streamable-http#019-2f0a7c",
@@ -4284,7 +4284,7 @@
             .level = .must,
             .keywords = .{"MUST"},
             .party = .both,
-            .text = "Integer values MUST be within the safe range for JavaScript (\xe2\x88\x922^53+1 to 2^53\xe2\x88\x921)",
+            .text = "Integer values MUST be within the safe range for JavaScript (−2^53+1 to 2^53−1)",
         },
         .{
             .id = "basic/transports/streamable-http#043-a31f64",
@@ -4680,7 +4680,7 @@
             .level = .should,
             .keywords = .{"SHOULD"},
             .party = .both,
-            .text = "Intermediaries that enforce policy based on mirrored headers (e.g., routing or rate-limiting by tenant) SHOULD verify that the `MCP-Protocol-Version` header indicates a version that requires header\xe2\x80\x93body validation.",
+            .text = "Intermediaries that enforce policy based on mirrored headers (e.g., routing or rate-limiting by tenant) SHOULD verify that the `MCP-Protocol-Version` header indicates a version that requires header–body validation.",
         },
         .{
             .id = "basic/transports/streamable-http#079-567c06",
@@ -6165,7 +6165,7 @@
             .level = .may,
             .keywords = .{"MAY"},
             .party = .server,
-            .text = "The set MAY vary by the authorization presented on the request \xe2\x80\x94 for example, returning only the prompts the caller's granted scopes permit \xe2\x80\x94 since credentials are per-request input, not connection state.",
+            .text = "The set MAY vary by the authorization presented on the request — for example, returning only the prompts the caller's granted scopes permit — since credentials are per-request input, not connection state.",
         },
         .{
             .id = "server/prompts#006-70deba",
@@ -6385,7 +6385,7 @@
             .level = .may,
             .keywords = .{"MAY"},
             .party = .server,
-            .text = "The set MAY vary by the authorization presented on the request \xe2\x80\x94 for example, returning only the resources the caller's granted scopes permit \xe2\x80\x94 since credentials are per-request input, not connection state.",
+            .text = "The set MAY vary by the authorization presented on the request — for example, returning only the resources the caller's granted scopes permit — since credentials are per-request input, not connection state.",
         },
         .{
             .id = "server/resources#006-296107",
@@ -6429,7 +6429,7 @@
             .level = .should,
             .keywords = .{"SHOULD"},
             .party = .server,
-            .text = "Servers SHOULD use this scheme only when the client is able to fetch and load the resource directly from the web on its own\xe2\x80\x94that is, it doesn\xe2\x80\x99t need to read the resource via the MCP server.",
+            .text = "Servers SHOULD use this scheme only when the client is able to fetch and load the resource directly from the web on its own—that is, it doesn’t need to read the resource via the MCP server.",
         },
         .{
             .id = "server/resources#010-9ef5d9",
@@ -6451,7 +6451,7 @@
             .level = .may,
             .keywords = .{"MAY"},
             .party = .server,
-            .text = "MCP servers MAY identify file:// resources with an XDG MIME type, like `inode/directory`, to represent non-regular files (such as directories) that don\xe2\x80\x99t otherwise have a standard MIME type.",
+            .text = "MCP servers MAY identify file:// resources with an XDG MIME type, like `inode/directory`, to represent non-regular files (such as directories) that don’t otherwise have a standard MIME type.",
         },
         .{
             .id = "server/resources#012-dc2c9c",
@@ -6660,7 +6660,7 @@
             .level = .may,
             .keywords = .{"MAY"},
             .party = .server,
-            .text = "The set MAY vary by the authorization presented on the request \xe2\x80\x94 for example, returning only the tools the caller's granted scopes permit \xe2\x80\x94 since credentials are per-request input, not connection state.",
+            .text = "The set MAY vary by the authorization presented on the request — for example, returning only the tools the caller's granted scopes permit — since credentials are per-request input, not connection state.",
         },
         .{
             .id = "server/tools#010-965d8c",
@@ -6880,7 +6880,7 @@
             .level = .must,
             .keywords = .{"MUST"},
             .party = .server,
-            .text = "Integer values MUST be within the safe range for integers represented using IEEE754 double-precision floating point numbers (\xe2\x88\x922^53+1 to 2^53\xe2\x88\x921)",
+            .text = "Integer values MUST be within the safe range for integers represented using IEEE754 double-precision floating point numbers (−2^53+1 to 2^53−1)",
         },
         .{
             .id = "server/tools#030-109915",

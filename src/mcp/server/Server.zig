@@ -430,9 +430,9 @@ fn parseSchemaObject(self: *Server, text: []const u8, require_object_type: bool)
 /// the handler. The SDK derives the input schema from that type at compile time.
 pub fn addTool(self: *Server, def: ToolDef, comptime handler: anytype) RegisterError!void {
     const Fn = @TypeOf(handler);
-    const params = @typeInfo(Fn).@"fn".params;
+    const params = @typeInfo(Fn).@"fn".param_types;
     if (params.len != 2) @compileError("tool handler must be fn (*RequestContext, Args) anyerror!Outcome(CallToolResult)");
-    const Args = params[1].type.?;
+    const Args = params[1].?;
     if (Args == Value) return self.addToolJson(def, handler);
     const Wrapper = struct {
         fn call(ctx: *RequestContext, args: Value) anyerror!Outcome(types.CallToolResult) {
@@ -1611,7 +1611,7 @@ test {
 test "the size of a filter is its compact JSON, also above the buffer of the counter" {
     try std.testing.expectEqual(2, filterBytes(.{}));
     try std.testing.expectEqual("{\"toolsListChanged\":true}".len, filterBytes(.{ .toolsListChanged = true }));
-    const uri = "file:///" ++ "x" ** 300;
+    const uri = "file:///" ++ @as([300]u8, @splat('x'));
     const uris = [_][]const u8{ uri, uri };
     const expected = "{\"resourceSubscriptions\":[\"\",\"\"]}".len + 2 * uri.len;
     try std.testing.expectEqual(expected, filterBytes(.{ .resourceSubscriptions = &uris }));

@@ -310,7 +310,7 @@ fn roleJson(cx: *Context, r: pb.Role) Error!Value {
     switch (r) {
         .user => return .{ .string = "user" },
         .assistant => return .{ .string = "assistant" },
-        else => return cx.fail(error.Invalid, "the role {d}", .{@intFromEnum(r)}),
+        else => return cx.fail(error.Invalid, "the role {d}", .{@backingInt(r)}),
     }
 }
 
@@ -368,7 +368,7 @@ fn iconsJson(cx: *Context, icons: []const pb.Icon) Error!Value {
             .unspecified => {},
             .light => try obj.putString("theme", "light"),
             .dark => try obj.putString("theme", "dark"),
-            _ => return cx.fail(error.Invalid, "the icon theme {d}", .{@intFromEnum(icon.theme)}),
+            _ => return cx.fail(error.Invalid, "the icon theme {d}", .{@backingInt(icon.theme)}),
         }
         try array.append(obj.value());
     }
@@ -399,7 +399,7 @@ fn putCache(obj: *Obj, ttl: ?well_known.Duration, scope: pb.CacheScope) Error!vo
         .unspecified => {},
         .public => try obj.putString("cacheScope", "public"),
         .private => try obj.putString("cacheScope", "private"),
-        _ => return obj.cx.fail(error.Invalid, "the cache scope {d}", .{@intFromEnum(scope)}),
+        _ => return obj.cx.fail(error.Invalid, "the cache scope {d}", .{@backingInt(scope)}),
     }
 }
 
@@ -796,7 +796,7 @@ fn inputResponseJson(cx: *Context, r: pb.InputResponse) Error!Value {
             .accept => "accept",
             .decline => "decline",
             .cancel => "cancel",
-            else => return cx.fail(error.Invalid, "the elicitation result type {d}", .{@intFromEnum(e.type)}),
+            else => return cx.fail(error.Invalid, "the elicitation result type {d}", .{@backingInt(e.type)}),
         });
         if (e.content) |c| try obj.put("content", c);
     } else if (r.sampling_create_message_result) |s| {
@@ -916,7 +916,7 @@ fn samplingRequestJson(cx: *Context, s: pb.SamplingCreateMessageRequest) Error!V
         .none => {},
         .this_server => try obj.putString("includeContext", "thisServer"),
         .all_servers => try obj.putString("includeContext", "allServers"),
-        _ => return cx.fail(error.Invalid, "the includeContext value {d}", .{@intFromEnum(s.include_context)}),
+        _ => return cx.fail(error.Invalid, "the includeContext value {d}", .{@backingInt(s.include_context)}),
     }
     if (s.temperature) |t| try obj.put("temperature", try f32Json(cx, t));
     try obj.put("maxTokens", .{ .integer = s.max_tokens });
@@ -1087,7 +1087,7 @@ fn primitiveJson(cx: *Context, p: Prim) Error!Value {
             .uri => try obj.putString("format", "uri"),
             .date => try obj.putString("format", "date"),
             .date_time => try obj.putString("format", "date-time"),
-            _ => return cx.fail(error.Invalid, "the string format {d}", .{@intFromEnum(s.format)}),
+            _ => return cx.fail(error.Invalid, "the string format {d}", .{@backingInt(s.format)}),
         }
         if (s.default_value) |d| try obj.putString("default", d);
     } else if (p.number_schema) |n| {
@@ -1383,7 +1383,7 @@ fn responseToJson(cx: *Context, comptime rpc: Rpc, msg: rpc.Response()) Error!Va
             if (common.request_state) |rs| try obj.putString("requestState", rs);
             return obj.value();
         },
-        _ => return cx.fail(error.Invalid, "the result type {d}", .{@intFromEnum(common.result_type)}),
+        _ => return cx.fail(error.Invalid, "the result type {d}", .{@backingInt(common.result_type)}),
     }
     try obj.putString("resultType", "complete");
     try obj.putMeta(common.metadata);

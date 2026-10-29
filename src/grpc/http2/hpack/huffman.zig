@@ -273,10 +273,10 @@ test "the table decoder agrees with the bit decoder" {
     }
     // The bound of `maxDecodedLen` holds for the shortest codes: '0' has five bits.
     input.clearRetainingCapacity();
-    try encode(gpa, &input, "0" ** 40);
+    try encode(gpa, &input, &@as([40]u8, @splat('0')));
     try std.testing.expectEqual(25, input.items.len);
     try std.testing.expectEqual(40, maxDecodedLen(input.items.len));
     got.clearRetainingCapacity();
     try decode(gpa, &got, input.items);
-    try std.testing.expectEqualStrings("0" ** 40, got.items);
+    try std.testing.expectEqualStrings(&@as([40]u8, @splat('0')), got.items);
 }

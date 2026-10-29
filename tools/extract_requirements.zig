@@ -74,7 +74,10 @@ pub fn main(init: std.process.Init) !u8 {
     const cwd = Io.Dir.cwd();
     const upstream_path = try std.fs.path.join(arena, &.{ spec_dir, "UPSTREAM.zon" });
     const upstream_text = try cwd.readFileAllocOptions(io, upstream_path, arena, .limited(64 << 10), .of(u8), 0);
-    const upstream = try std.zon.parse.fromSliceAlloc(Upstream, arena, upstream_text, null, .{ .ignore_unknown_fields = true });
+    const upstream = blk: {
+        var diag: std.zon.parse.Diagnostics = undefined;
+        break :blk try std.zon.parse.fromSlice(Upstream, .{ .gpa = init.gpa, .arena = arena, .source = upstream_text, .diagnostics = &diag, .ignore_unknown_fields = true });
+    };
 
     // Collect the pages in a stable order.
     var pages: std.ArrayList([]const u8) = .empty;
@@ -101,8 +104,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     const rendered = try render(arena, upstream, spec_dir, all.items);
 
-    var counts = [_]usize{0} ** @typeInfo(Level).@"enum".fields.len;
-    for (all.items) |r| counts[@intFromEnum(r.level)] += 1;
+    var counts = @as([@typeInfo(Level).@"enum".field_names.len]usize, @splat(0));
+    for (all.items) |r| counts[@backingInt(r.level)] += 1;
     std.debug.print("extract-requirements: {d} pages, {d} requirements (must {d}, must_not {d}, should {d}, should_not {d}, may {d})\n", .{
         pages.items.len, all.items.len, counts[0], counts[1], counts[2], counts[3], counts[4],
     });

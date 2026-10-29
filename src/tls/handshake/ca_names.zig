@@ -9,7 +9,7 @@ const der = @import("../der.zig");
 const CertChain = @import("../CertChain.zig");
 const verify = @import("../verify.zig");
 
-pub const extension_type: u16 = @intFromEnum(tls.ExtensionType.certificate_authorities);
+pub const extension_type: u16 = @backingInt(tls.ExtensionType.certificate_authorities);
 
 /// The largest name list that the client sends in a ClientHello. The client also keeps the
 /// first ClientHello at 16 KiB or less, because the SDK server and many other servers refuse a
@@ -181,14 +181,14 @@ pub fn write(b: *codec.Builder, trust: verify.Trust, max_list_len: usize) bool {
 /// when they fit in `max_request_list_len` bytes. `buf` has `max_request_message_len` bytes.
 pub fn certificateRequest(buf: []u8, schemes: []const tls.SignatureScheme, names: ?verify.Trust) []u8 {
     var b: codec.Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(tls.HandshakeType.certificate_request));
+    b.byte(@backingInt(tls.HandshakeType.certificate_request));
     const msg = b.beginLen(u24);
     b.byte(0); // certificate_request_context
     const exts = b.beginLen(u16);
-    b.int(u16, @intFromEnum(tls.ExtensionType.signature_algorithms));
+    b.int(u16, @backingInt(tls.ExtensionType.signature_algorithms));
     const ext = b.beginLen(u16);
     const list = b.beginLen(u16);
-    for (schemes) |s| b.int(u16, @intFromEnum(s));
+    for (schemes) |s| b.int(u16, @backingInt(s));
     b.endLen(u16, list);
     b.endLen(u16, ext);
     if (names) |trust| _ = write(&b, trust, max_request_list_len);
@@ -272,7 +272,7 @@ test "the names of the anchors round trip through a CertificateRequest" {
     const msg = certificateRequest(&buf, &.{ .ecdsa_secp256r1_sha256, .rsa_pss_pss_sha256 }, .{ .ca_set = &set });
     try std.testing.expectEqual(msg.len - 4, std.mem.readInt(u24, msg[1..4], .big));
     const req = try client.CertificateRequest.parse(msg[4..]);
-    try std.testing.expect(req.offersScheme(@intFromEnum(tls.SignatureScheme.rsa_pss_pss_sha256)));
+    try std.testing.expect(req.offersScheme(@backingInt(tls.SignatureScheme.rsa_pss_pss_sha256)));
     const list = req.authorities.?;
     try std.testing.expect(contains(list, test_name));
     const pss_name = "\x30\x22\x31\x20\x30\x1e\x06\x03\x55\x04\x03\x0c\x17zig-sdk RSA-PSS test CA";

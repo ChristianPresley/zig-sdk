@@ -967,7 +967,7 @@ pub const Client = struct {
             if (self.job) |job| {
                 _ = win.TerminateJobObject(job, 1);
             } else {
-                _ = std.os.windows.ntdll.NtTerminateProcess(self.child.id.?, @enumFromInt(1));
+                _ = std.os.windows.ntdll.NtTerminateProcess(self.child.id.?, @fromBackingInt(@intCast(1)));
             }
             return;
         }
@@ -1147,8 +1147,8 @@ const ExitText = struct {
         switch (term) {
             .exited => |code| try w.print("exit code {d}", .{code}),
             // Windows has no signals.
-            .signal => |sig| if (@TypeOf(sig) == void) try w.writeAll("a signal") else try w.print("signal {d}", .{@intFromEnum(sig)}),
-            .stopped => |sig| if (@TypeOf(sig) == void) try w.writeAll("stopped") else try w.print("stopped by signal {d}", .{@intFromEnum(sig)}),
+            .signal => |sig| if (@TypeOf(sig) == void) try w.writeAll("a signal") else try w.print("signal {d}", .{@backingInt(sig)}),
+            .stopped => |sig| if (@TypeOf(sig) == void) try w.writeAll("stopped") else try w.print("stopped by signal {d}", .{@backingInt(sig)}),
             .unknown => |status| try w.print("status {d}", .{status}),
         }
     }

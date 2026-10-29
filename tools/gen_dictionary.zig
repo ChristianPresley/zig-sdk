@@ -88,7 +88,8 @@ fn render(arena: Allocator, io: Io, dir: Io.Dir, w: *Io.Writer) !usize {
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
-    const args = try init.minimal.args.toSlice(arena);
+    const cli_args = try init.minimal.args.toSlice(arena);
+    const args: []const []const u8 = if (cli_args.len > 1) cli_args else &.{ cli_args[0], "--out", "docs/generated/dictionary.md" };
     var outs: std.ArrayList([]const u8) = .empty;
     var check = false;
     var i: usize = 1;

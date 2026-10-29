@@ -312,7 +312,7 @@ test "typed: JSON-RPC errors map to status codes and back" {
     try std.testing.expectError(error.Rpc, f.client.readResource(arena, "test://none", options));
     try std.testing.expectEqualStrings("test://none", json.getString(diag.rpc_error.?.data.?, "uri").?);
     // A long error: no mcp-error-bin, thus the code from mcp-error-code and a shorter message.
-    const long_uri = "test://" ++ "x" ** 5000;
+    const long_uri = "test://" ++ @as([5000]u8, @splat('x'));
     try std.testing.expectError(error.Rpc, f.client.readResource(arena, long_uri, options));
     try std.testing.expectEqual(@as(i64, -32602), diag.rpc_error.?.code);
     try std.testing.expectEqual(service.max_error_message_bytes, diag.rpc_error.?.message.len);

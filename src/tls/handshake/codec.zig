@@ -22,7 +22,7 @@ pub const ParseError = error{
 
 /// True when `extension_type` has a name in `tls.ExtensionType`.
 pub fn isKnownExtension(extension_type: u16) bool {
-    for (std.enums.values(tls.ExtensionType)) |v| if (@intFromEnum(v) == extension_type) return true;
+    for (std.enums.values(tls.ExtensionType)) |v| if (@backingInt(v) == extension_type) return true;
     return false;
 }
 
@@ -84,7 +84,7 @@ pub const ClientHello = struct {
         if (!d.eof()) return error.DecodeError;
 
         // Every extension type at most once (section 4.2). The set covers all 2^16 types.
-        var seen: ExtensionSet = .initEmpty();
+        var seen: ExtensionSet = .empty;
         while (!exts.eof()) {
             if (hello.has_pre_shared_key) return error.IllegalParameter; // pre_shared_key must be last
             exts.ensure(4) catch return error.DecodeError;
@@ -93,7 +93,7 @@ pub const ClientHello = struct {
             var ext = exts.sub(len) catch return error.DecodeError;
             if (seen.isSet(et)) return error.IllegalParameter;
             seen.set(et);
-            switch (@as(tls.ExtensionType, @enumFromInt(et))) {
+            switch (@as(tls.ExtensionType, @fromBackingInt(@intCast(et)))) {
                 .supported_versions => {
                     ext.ensure(1) catch return error.DecodeError;
                     const list_len = ext.decode(u8);
@@ -101,7 +101,7 @@ pub const ClientHello = struct {
                     var list = ext.sub(list_len) catch return error.DecodeError;
                     while (!list.eof()) {
                         list.ensure(2) catch return error.DecodeError;
-                        if (list.decode(u16) == @intFromEnum(tls.ProtocolVersion.tls_1_3)) hello.offers_tls_1_3 = true;
+                        if (list.decode(u16) == @backingInt(tls.ProtocolVersion.tls_1_3)) hello.offers_tls_1_3 = true;
                     }
                 },
                 .supported_groups => {
@@ -205,7 +205,7 @@ pub const ClientHello = struct {
     /// Each key share is for a group in supported_groups, and no two key shares have the same
     /// group (section 4.2.8). The parser checked the layout of both lists.
     fn checkKeyShareGroups(self: *const ClientHello) ParseError!void {
-        var offered: ExtensionSet = .initEmpty();
+        var offered: ExtensionSet = .empty;
         var i: usize = 0;
         while (i + 2 <= self.supported_groups.len) : (i += 2) offered.set(std.mem.readInt(u16, self.supported_groups[i..][0..2], .big));
         i = 0;
@@ -308,19 +308,19 @@ pub const Builder = struct {
 /// Build a ServerHello or, with `hrr`, a HelloRetryRequest.
 pub fn serverHello(buf: []u8, random: [32]u8, session_id: []const u8, suite: u16, group: u16, public: []const u8, hrr: bool) []u8 {
     var b: Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(HandshakeType.server_hello));
+    b.byte(@backingInt(HandshakeType.server_hello));
     const msg = b.beginLen(u24);
-    b.int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2));
+    b.int(u16, @backingInt(tls.ProtocolVersion.tls_1_2));
     b.bytes(&random);
     b.byte(@intCast(session_id.len));
     b.bytes(session_id);
     b.int(u16, suite);
     b.byte(0); // legacy_compression_method
     const exts = b.beginLen(u16);
-    b.int(u16, @intFromEnum(tls.ExtensionType.supported_versions));
+    b.int(u16, @backingInt(tls.ExtensionType.supported_versions));
     b.int(u16, 2);
-    b.int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_3));
-    b.int(u16, @intFromEnum(tls.ExtensionType.key_share));
+    b.int(u16, @backingInt(tls.ProtocolVersion.tls_1_3));
+    b.int(u16, @backingInt(tls.ExtensionType.key_share));
     const ks = b.beginLen(u16);
     b.int(u16, group);
     if (!hrr) {
@@ -338,25 +338,25 @@ pub fn serverHello(buf: []u8, random: [32]u8, session_id: []const u8, suite: u16
 pub fn helloRetryRequest(buf: []u8, session_id: []const u8, suite: u16, group: ?u16, cookie: ?[]const u8) []u8 {
     std.debug.assert(group != null or cookie != null);
     var b: Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(HandshakeType.server_hello));
+    b.byte(@backingInt(HandshakeType.server_hello));
     const msg = b.beginLen(u24);
-    b.int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2));
+    b.int(u16, @backingInt(tls.ProtocolVersion.tls_1_2));
     b.bytes(&tls.hello_retry_request_sequence);
     b.byte(@intCast(session_id.len));
     b.bytes(session_id);
     b.int(u16, suite);
     b.byte(0); // legacy_compression_method
     const exts = b.beginLen(u16);
-    b.int(u16, @intFromEnum(tls.ExtensionType.supported_versions));
+    b.int(u16, @backingInt(tls.ExtensionType.supported_versions));
     b.int(u16, 2);
-    b.int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_3));
+    b.int(u16, @backingInt(tls.ProtocolVersion.tls_1_3));
     if (group) |g| {
-        b.int(u16, @intFromEnum(tls.ExtensionType.key_share));
+        b.int(u16, @backingInt(tls.ExtensionType.key_share));
         b.int(u16, 2);
         b.int(u16, g);
     }
     if (cookie) |value| {
-        b.int(u16, @intFromEnum(tls.ExtensionType.cookie));
+        b.int(u16, @backingInt(tls.ExtensionType.cookie));
         const ext = b.beginLen(u16);
         b.int(u16, @intCast(value.len));
         b.bytes(value);
@@ -369,11 +369,11 @@ pub fn helloRetryRequest(buf: []u8, session_id: []const u8, suite: u16, group: ?
 
 pub fn encryptedExtensions(buf: []u8, alpn: ?[]const u8, server_name_ack: bool) []u8 {
     var b: Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(HandshakeType.encrypted_extensions));
+    b.byte(@backingInt(HandshakeType.encrypted_extensions));
     const msg = b.beginLen(u24);
     const exts = b.beginLen(u16);
     if (alpn) |name| {
-        b.int(u16, @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation));
+        b.int(u16, @backingInt(tls.ExtensionType.application_layer_protocol_negotiation));
         const ext = b.beginLen(u16);
         const list = b.beginLen(u16);
         b.byte(@intCast(name.len));
@@ -382,7 +382,7 @@ pub fn encryptedExtensions(buf: []u8, alpn: ?[]const u8, server_name_ack: bool) 
         b.endLen(u16, ext);
     }
     if (server_name_ack) {
-        b.int(u16, @intFromEnum(tls.ExtensionType.server_name));
+        b.int(u16, @backingInt(tls.ExtensionType.server_name));
         b.int(u16, 0);
     }
     b.endLen(u16, exts);
@@ -392,7 +392,7 @@ pub fn encryptedExtensions(buf: []u8, alpn: ?[]const u8, server_name_ack: bool) 
 
 pub fn certificateVerify(buf: []u8, scheme: u16, signature: []const u8) []u8 {
     var b: Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(HandshakeType.certificate_verify));
+    b.byte(@backingInt(HandshakeType.certificate_verify));
     const msg = b.beginLen(u24);
     b.int(u16, scheme);
     b.int(u16, @intCast(signature.len));
@@ -403,7 +403,7 @@ pub fn certificateVerify(buf: []u8, scheme: u16, signature: []const u8) []u8 {
 
 pub fn finished(buf: []u8, verify_data: []const u8) []u8 {
     var b: Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(HandshakeType.finished));
+    b.byte(@backingInt(HandshakeType.finished));
     const msg = b.beginLen(u24);
     b.bytes(verify_data);
     b.endLen(u24, msg);
@@ -412,7 +412,7 @@ pub fn finished(buf: []u8, verify_data: []const u8) []u8 {
 
 pub fn keyUpdate(buf: []u8, request_update: bool) []u8 {
     var b: Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(HandshakeType.key_update));
+    b.byte(@backingInt(HandshakeType.key_update));
     b.int(u24, 1);
     b.byte(if (request_update) 1 else 0);
     return b.slice();
@@ -422,20 +422,20 @@ pub fn keyUpdate(buf: []u8, request_update: bool) []u8 {
 /// HelloRetryRequest (RFC 8446 section 4.4.1).
 pub fn messageHash(buf: []u8, hash: []const u8) []u8 {
     var b: Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(HandshakeType.message_hash));
+    b.byte(@backingInt(HandshakeType.message_hash));
     b.int(u24, @intCast(hash.len));
     b.bytes(hash);
     return b.slice();
 }
 
-pub const certificate_verify_context = " " ** 64 ++ "TLS 1.3, server CertificateVerify\x00";
-pub const client_certificate_verify_context = " " ** 64 ++ "TLS 1.3, client CertificateVerify\x00";
+pub const certificate_verify_context = @as([64]u8, @splat(' ')) ++ "TLS 1.3, server CertificateVerify\x00";
+pub const client_certificate_verify_context = @as([64]u8, @splat(' ')) ++ "TLS 1.3, client CertificateVerify\x00";
 
 test "parse a minimal client hello" {
     var b: Builder = .{ .buf = try std.testing.allocator.alloc(u8, 512) };
     defer std.testing.allocator.free(b.buf);
     b.int(u16, 0x0303);
-    b.bytes(&([_]u8{7} ** 32));
+    b.bytes(&(@as([32]u8, @splat(7))));
     b.byte(0); // session id
     b.int(u16, 4);
     b.int(u16, 0x1301);
@@ -464,7 +464,7 @@ test "parse a minimal client hello" {
     b.int(u16, 4 + 32);
     b.int(u16, 0x001d);
     b.int(u16, 32);
-    b.bytes(&([_]u8{9} ** 32));
+    b.bytes(&(@as([32]u8, @splat(9))));
     // server_name
     b.int(u16, 0);
     b.int(u16, 2 + 3 + 9);
@@ -487,7 +487,7 @@ test "parse a minimal client hello" {
     try std.testing.expect(!hello.offersSuite(0x1302));
     try std.testing.expect(hello.offersGroup(0x001d));
     try std.testing.expect(hello.offersScheme(0x0403));
-    try std.testing.expectEqualSlices(u8, &([_]u8{9} ** 32), hello.keyShare(0x001d).?);
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(9))), hello.keyShare(0x001d).?);
     try std.testing.expect(hello.keyShare(0x0017) == null);
     try std.testing.expectEqualStrings("localhost", hello.server_name.?);
     try std.testing.expect(hello.offersAlpn("http/1.1"));
@@ -507,7 +507,7 @@ const TestExtension = struct { type: u16, body: []const u8 };
 fn testHello(buf: []u8, exts: []const TestExtension) []u8 {
     var b: Builder = .{ .buf = buf };
     b.int(u16, 0x0303);
-    b.bytes(&([_]u8{7} ** 32));
+    b.bytes(&(@as([32]u8, @splat(7))));
     b.byte(0);
     b.int(u16, 2);
     b.int(u16, 0x1301);
@@ -526,7 +526,7 @@ fn testHello(buf: []u8, exts: []const TestExtension) []u8 {
 const test_versions: TestExtension = .{ .type = 43, .body = "\x02\x03\x04" };
 const test_groups: TestExtension = .{ .type = 10, .body = "\x00\x04\x00\x1d\x00\x17" };
 const test_schemes: TestExtension = .{ .type = 13, .body = "\x00\x02\x04\x03" };
-const test_share: TestExtension = .{ .type = 51, .body = "\x00\x24\x00\x1d\x00\x20" ++ "\x09" ** 32 };
+const test_share: TestExtension = .{ .type = 51, .body = "\x00\x24\x00\x1d\x00\x20" ++ @as([32]u8, @splat(9)) };
 
 test "a duplicate extension after many other extensions is refused" {
     var buf: [4096]u8 = undefined;
@@ -577,7 +577,7 @@ test "trailing bytes in a known client hello extension are a decode error" {
         .{ .type = 43, .body = "\x02\x03\x04\x00" },
         .{ .type = 10, .body = "\x00\x04\x00\x1d\x00\x17\x00" },
         .{ .type = 13, .body = "\x00\x02\x04\x03\x00" },
-        .{ .type = 51, .body = "\x00\x24\x00\x1d\x00\x20" ++ "\x09" ** 32 ++ "\x00" },
+        .{ .type = 51, .body = "\x00\x24\x00\x1d\x00\x20" ++ @as([32]u8, @splat(9)) ++ "\x00" },
         .{ .type = 0, .body = "\x00\x0c\x00\x00\x09localhost\x00" },
         .{ .type = 0, .body = "\x00\x0d\x00\x00\x09localhost\x00" },
         .{ .type = 16, .body = "\x00\x03\x02h2\x00" },
@@ -615,7 +615,7 @@ test "the certificate_authorities extension of a client hello" {
 
 test "server hello builder" {
     var buf: [256]u8 = undefined;
-    const sh = serverHello(&buf, [_]u8{1} ** 32, "abc", 0x1301, 0x001d, &([_]u8{2} ** 32), false);
+    const sh = serverHello(&buf, @as([32]u8, @splat(1)), "abc", 0x1301, 0x001d, &(@as([32]u8, @splat(2))), false);
     try std.testing.expectEqual(@as(u8, 2), sh[0]);
     try std.testing.expectEqual(sh.len - 4, std.mem.readInt(u24, sh[1..4], .big));
     const hrr = serverHello(&buf, tls.hello_retry_request_sequence, "abc", 0x1301, 0x0017, &.{}, true);

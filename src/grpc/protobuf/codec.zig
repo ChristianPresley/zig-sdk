@@ -144,8 +144,8 @@ pub fn decodeMessage(comptime T: type, arena: Allocator, bytes: []const u8, budg
     if (depth >= budget.limits.max_depth) return error.TooDeep;
     try budget.take(1);
     var result: T = .{};
-    var caps = [_]usize{0} ** T.proto.len;
-    var seen = [_]bool{false} ** T.proto.len;
+    var caps = @as([T.proto.len]usize, @splat(0));
+    var seen = @as([T.proto.len]bool, @splat(false));
     var r: wire.Reader = .init(bytes);
     while (try r.next()) |f| {
         inline for (T.proto, 0..) |spec, i| {
@@ -220,7 +220,7 @@ fn decodeValue(comptime B: type, comptime kind: Kind, f: wire.Field, arena: Allo
         .int64 => return @bitCast(f.value.varint),
         .uint32 => return @truncate(f.value.varint),
         .uint64 => return f.value.varint,
-        .enumeration => return @enumFromInt(@as(i32, @bitCast(@as(u32, @truncate(f.value.varint))))),
+        .enumeration => return @fromBackingInt(@intCast(@as(i32, @bitCast(@as(u32, @truncate(f.value.varint)))))),
         .float => return @bitCast(f.value.fixed32),
         .double => return @bitCast(f.value.fixed64),
         .message => return decodeMessage(B, arena, f.value.bytes, budget, depth + 1),
@@ -259,7 +259,7 @@ fn isDefault(comptime kind: Kind, v: anytype) bool {
         .bool => !v,
         .int32, .int64, .uint32, .uint64 => v == 0,
         .float, .double => v == 0 and !std.math.signbit(v),
-        .enumeration => @intFromEnum(v) == 0,
+        .enumeration => @backingInt(v) == 0,
         .message, .json_struct => unreachable,
     };
 }
@@ -296,7 +296,7 @@ fn encodeRaw(comptime kind: Kind, w: wire.Writer, v: anytype) Allocator.Error!vo
         .int32 => try w.varint(@bitCast(@as(i64, v))),
         .int64 => try w.varint(@bitCast(v)),
         .uint32, .uint64 => try w.varint(v),
-        .enumeration => try w.varint(@bitCast(@as(i64, @intFromEnum(v)))),
+        .enumeration => try w.varint(@bitCast(@as(i64, @backingInt(v)))),
         .float => try w.fixed32(@bitCast(v)),
         .double => try w.fixed64(@bitCast(v)),
         .message, .json_struct => unreachable,
@@ -355,7 +355,7 @@ test "codec round trip of every kind and shape" {
         .flag = true,
         .ratio = 0,
         .weight = 1.5,
-        .kind = @enumFromInt(7),
+        .kind = @fromBackingInt(@intCast(7)),
         .data = "\x00\xff",
         .tags = &.{ "a", "" },
         .numbers = &.{ -1, 0, 300 },
@@ -372,7 +372,7 @@ test "codec round trip of every kind and shape" {
     try std.testing.expectEqual(@as(?f32, 0), back.ratio);
     try std.testing.expectEqual(1.5, back.weight);
     // An unknown enum value stays as it is.
-    try std.testing.expectEqual(7, @intFromEnum(back.kind));
+    try std.testing.expectEqual(7, @backingInt(back.kind));
     try std.testing.expectEqualSlices(u8, "\x00\xff", back.data);
     try std.testing.expectEqual(2, back.tags.len);
     try std.testing.expectEqualStrings("", back.tags[1]);

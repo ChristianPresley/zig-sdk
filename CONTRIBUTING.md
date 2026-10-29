@@ -16,7 +16,7 @@ If you send a pull request, the maintainer applies your change as a signed commi
 
 ## Set up the repository
 
-1. Install Zig 0.16.0.
+1. Install Zig 0.17.0.
 2. Clone the repository.
 3. Run `git config core.hooksPath .githooks`.
 4. Run `zig build test`.

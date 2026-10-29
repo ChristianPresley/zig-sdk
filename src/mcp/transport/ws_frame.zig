@@ -32,7 +32,7 @@ pub const Opcode = enum(u4) {
 
     /// True for close, ping and pong, and for the reserved control opcodes.
     pub fn isControl(op: Opcode) bool {
-        return @intFromEnum(op) & 0x8 != 0;
+        return @backingInt(op) & 0x8 != 0;
     }
 
     /// True for the opcodes that RFC 6455 defines.
@@ -143,7 +143,7 @@ pub const MaskSource = struct {
 /// of a server.
 pub fn writeHeader(w: *Io.Writer, fin: bool, opcode: Opcode, len: u64, mask: ?[4]u8) Io.Writer.Error!void {
     var buf: [14]u8 = undefined;
-    buf[0] = @as(u8, if (fin) 0x80 else 0) | @as(u8, @intFromEnum(opcode));
+    buf[0] = @as(u8, if (fin) 0x80 else 0) | @as(u8, @backingInt(opcode));
     const mask_bit: u8 = if (mask != null) 0x80 else 0;
     var n: usize = 2;
     if (len < 126) {
@@ -183,7 +183,7 @@ pub fn writeFrame(w: *Io.Writer, fin: bool, opcode: Opcode, payload: []const u8,
 /// The payload of a close frame: the code and the reason. The function cuts a long reason at
 /// a character boundary, so that the payload has at most 125 bytes.
 pub fn closePayload(buf: *[max_control_payload]u8, code: CloseCode, reason: []const u8) []const u8 {
-    std.mem.writeInt(u16, buf[0..2], @intFromEnum(code), .big);
+    std.mem.writeInt(u16, buf[0..2], @backingInt(code), .big);
     var len = @min(reason.len, max_control_payload - 2);
     while (len > 0 and len < reason.len and reason[len] & 0xc0 == 0x80) len -= 1;
     @memcpy(buf[2..][0..len], reason[0..len]);
@@ -231,7 +231,7 @@ pub fn readHeader(in: *Io.Reader) ReadError!Header {
     const b0 = first[0];
     const b1 = first[1];
     if (b0 & 0x70 != 0) return error.ProtocolError;
-    const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0)));
+    const opcode: Opcode = @fromBackingInt(@intCast(@as(u4, @truncate(b0))));
     if (!opcode.isKnown()) return error.ProtocolError;
     const fin = b0 & 0x80 != 0;
     const masked = b1 & 0x80 != 0;
@@ -592,8 +592,8 @@ test "close frames carry a valid code and a reason" {
     for ([_]u16{ 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000 }) |c| try testing.expect(!validCloseCode(c));
     // A long reason gets cut at a character boundary.
     var buf: [max_control_payload]u8 = undefined;
-    const long = "é" ** 100;
-    const payload = closePayload(&buf, .going_away, long);
+    const long: [200]u8 = @bitCast(@as([100][2]u8, @splat("é".*)));
+    const payload = closePayload(&buf, .going_away, &long);
     try testing.expect(payload.len <= max_control_payload);
     try testing.expect(std.unicode.utf8ValidateSlice(payload[2..]));
     try testing.expectEqual(1001, std.mem.readInt(u16, payload[0..2], .big));
@@ -602,15 +602,15 @@ test "close frames carry a valid code and a reason" {
 test "limits of frames and messages" {
     var aw: Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try writeFrame(&aw.writer, true, .text, "x" ** 100, null);
+    try writeFrame(&aw.writer, true, .text, &@as([100]u8, @splat('x')), null);
     var in: Io.Reader = .fixed(aw.written());
     var r: Reader = .{ .in = &in, .gpa = testing.allocator, .role = .client, .max_frame_bytes = 99, .max_message_bytes = 1000 };
     defer r.deinit();
     try testing.expectError(error.MessageTooBig, r.next());
     // Two fragments of 60 bytes pass the frame limit but not a message limit of 100.
     aw.clearRetainingCapacity();
-    try writeFrame(&aw.writer, false, .text, "x" ** 60, null);
-    try writeFrame(&aw.writer, true, .continuation, "x" ** 60, null);
+    try writeFrame(&aw.writer, false, .text, &@as([60]u8, @splat('x')), null);
+    try writeFrame(&aw.writer, true, .continuation, &@as([60]u8, @splat('x')), null);
     var in2: Io.Reader = .fixed(aw.written());
     var r2: Reader = .{ .in = &in2, .gpa = testing.allocator, .role = .client, .max_frame_bytes = 99, .max_message_bytes = 100 };
     defer r2.deinit();

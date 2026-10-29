@@ -301,10 +301,10 @@ test "parse fixture keys" {
         try std.testing.expect(pk.len == 65 or pk.len == 97 or pk.len == 32 or pk.len == 270);
         var sig_buf: [max_signature_len]u8 = undefined;
         for (key.schemes()) |s| {
-            const sig = try key.signScheme(s, "hello", [_]u8{1} ** 48, &sig_buf);
+            const sig = try key.signScheme(s, "hello", @as([48]u8, @splat(1)), &sig_buf);
             try std.testing.expect(sig.len >= 64);
         }
-        try std.testing.expectError(error.SigningFailed, key.signScheme(.rsa_pkcs1_sha256, "hello", [_]u8{1} ** 48, &sig_buf));
+        try std.testing.expectError(error.SigningFailed, key.signScheme(.rsa_pkcs1_sha256, "hello", @as([48]u8, @splat(1)), &sig_buf));
     }
     try std.testing.expectError(error.NoKeyFound, parsePem(gpa, "nothing here"));
     try std.testing.expectError(error.InvalidEncoding, parseDer("\x30\x00"));
@@ -335,7 +335,7 @@ test "RSA-PSS keys sign only with the rsa_pss_pss schemes" {
     const gpa = std.testing.allocator;
     var sig_buf: [max_signature_len]u8 = undefined;
     var pk_buf: [max_public_key_len]u8 = undefined;
-    const noise = [_]u8{7} ** 48;
+    const noise = @as([48]u8, @splat(7));
 
     // A key without parameters: every rsa_pss_pss scheme, and no rsa_pss_rsae scheme.
     const free_text = try readFixture("test/fixtures/tls/pem/rsa-pss.key");

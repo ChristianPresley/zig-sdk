@@ -1176,7 +1176,7 @@ test "http limits: a chunked body with more data than max_body_bytes gets 413" {
 
     const head = "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n";
     // Two chunks of 40 bytes: each is under the limit, together they are over it.
-    const data = "x" ** 40;
+    const data = @as([40]u8, @splat('x'));
     const raw = try Raw.open(gpa, f.transport.bound_port);
     defer raw.close(gpa);
     try raw.send(try std.fmt.allocPrint(arena, "{s}28\r\n{s}\r\n28\r\n{s}\r\n0\r\n\r\n", .{ head, data, data }));
@@ -1201,7 +1201,7 @@ test "http limits: a chunked body whose framing passes the buffer gets 413" {
     // it before its answer, and the close sends no reset.
     const limit = 200 + 100 + 4096;
     const head = "POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n";
-    const chunk = "1;" ++ "a" ** 900 ++ "\r\nx\r\n";
+    const chunk = "1;" ++ @as([900]u8, @splat('a')) ++ "\r\nx\r\n";
     var bytes: std.ArrayList(u8) = .empty;
     try bytes.appendSlice(arena, head);
     for (0..4) |_| try bytes.appendSlice(arena, chunk);

@@ -249,7 +249,7 @@ fn run(
     if (hello.server_name) |name| c.setServerName(name);
     const chain = selectChain(config, c.serverName(), hello.certificate_authorities) orelse return abort(c, options, .unrecognized_name, error.TlsUnrecognizedName);
     const scheme = for (chain.key.schemes()) |s| {
-        if (hello.offersScheme(@intFromEnum(s))) break s;
+        if (hello.offersScheme(@backingInt(s))) break s;
     } else return abort(c, options, .handshake_failure, error.TlsHandshakeFailure);
     const alpn = selectAlpn(config, &hello) catch return abort(c, options, .no_application_protocol, error.TlsNoApplicationProtocol);
     if (alpn) |name| c.setAlpn(name);
@@ -309,7 +309,7 @@ fn run(
     options.io.randomSecure(&noise) catch return abort(c, options, .internal_error, error.EntropyUnavailable);
     var sig_buf: [PrivateKey.max_signature_len]u8 = undefined;
     const signature = chain.key.signScheme(scheme, &to_sign, noise, &sig_buf) catch return abort(c, options, .internal_error, error.TlsInternalError);
-    const cv = codec.certificateVerify(&msg_buf, @intFromEnum(scheme), signature);
+    const cv = codec.certificateVerify(&msg_buf, @backingInt(scheme), signature);
     c.writeRecord(.handshake, cv) catch return error.WriteFailed;
     transcript.update(cv);
 
@@ -394,14 +394,14 @@ fn writeStapledCertificate(c: *Connection, transcript: *suites.Transcript, chain
     const extensions_len = 4 + status_len;
     const list_len = 3 + leaf.len + 2 + extensions_len + others.len;
     var head: [11]u8 = undefined;
-    head[0] = @intFromEnum(tls.HandshakeType.certificate);
+    head[0] = @backingInt(tls.HandshakeType.certificate);
     std.mem.writeInt(u24, head[1..4], @intCast(1 + 3 + list_len), .big);
     head[4] = 0; // empty certificate_request_context
     std.mem.writeInt(u24, head[5..8], @intCast(list_len), .big);
     std.mem.writeInt(u24, head[8..11], @intCast(leaf.len), .big);
     var status_head: [10]u8 = undefined;
     std.mem.writeInt(u16, status_head[0..2], @intCast(extensions_len), .big);
-    std.mem.writeInt(u16, status_head[2..4], @intFromEnum(tls.ExtensionType.status_request), .big);
+    std.mem.writeInt(u16, status_head[2..4], @backingInt(tls.ExtensionType.status_request), .big);
     std.mem.writeInt(u16, status_head[4..6], @intCast(status_len), .big);
     status_head[6] = 1; // status_type ocsp
     std.mem.writeInt(u24, status_head[7..10], @intCast(response.len), .big);

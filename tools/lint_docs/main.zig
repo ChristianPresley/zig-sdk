@@ -35,7 +35,8 @@ const usage =
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
-    const args = try init.minimal.args.toSlice(arena);
+    const cli_args = try init.minimal.args.toSlice(arena);
+    const args: []const []const u8 = if (cli_args.len > 1) cli_args else &.{ cli_args[0], "--strict", "--string-literals" };
     var linter: Linter = .{ .arena = arena, .io = io, .dir = Io.Dir.cwd() };
     var paths: std.ArrayList([]const u8) = .empty;
     var format: ?Linter.Format = null;

@@ -298,7 +298,7 @@ fn verifyRsaPkcs1(comptime Hash: type, message: []const u8, signature: []const u
         inline 256, 384, 512 => |modulus_len| {
             if (signature.len != modulus_len) return error.BadSignature;
             const public = rsa.PublicKey.fromBytes(components.exponent, components.modulus) catch return error.BadSignature;
-            rsa.PKCS1v1_5Signature.verify(modulus_len, signature[0..modulus_len].*, message, public, Hash) catch return error.BadSignature;
+            rsa.PKCS1v1_5Signature.verify(modulus_len, signature[0..modulus_len], message, public, Hash) catch return error.BadSignature;
         },
         else => return error.UnsupportedAlgorithm,
     }

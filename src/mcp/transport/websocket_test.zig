@@ -297,7 +297,7 @@ const Raw = struct {
                 .close => |c| {
                     try std.testing.expectEqual(code, c.code.?);
                     var buf: [ws.max_control_payload]u8 = undefined;
-                    raw.send(true, .close, ws.closePayload(&buf, @enumFromInt(code), ""), true) catch {};
+                    raw.send(true, .close, ws.closePayload(&buf, @fromBackingInt(@intCast(code)), ""), true) catch {};
                     return;
                 },
                 else => {},
@@ -709,11 +709,11 @@ test "websocket server closes with the code of each protocol violation" {
     // A frame above `max_frame_bytes`, and fragments above `max_message_bytes`.
     var w: Io.Writer.Allocating = .init(gpa);
     defer w.deinit();
-    try ws.writeFrame(&w.writer, true, .text, "x" ** 700, .{ 1, 2, 3, 4 });
+    try ws.writeFrame(&w.writer, true, .text, &@as([700]u8, @splat('x')), .{ 1, 2, 3, 4 });
     try expectViolation(&f, w.written(), 1009);
     w.clearRetainingCapacity();
-    try ws.writeFrame(&w.writer, false, .text, "x" ** 500, .{ 1, 2, 3, 4 });
-    try ws.writeFrame(&w.writer, true, .continuation, "x" ** 600, .{ 1, 2, 3, 4 });
+    try ws.writeFrame(&w.writer, false, .text, &@as([500]u8, @splat('x')), .{ 1, 2, 3, 4 });
+    try ws.writeFrame(&w.writer, true, .continuation, &@as([600]u8, @splat('x')), .{ 1, 2, 3, 4 });
     try expectViolation(&f, w.written(), 1009);
 }
 
@@ -757,7 +757,7 @@ test "websocket server answers a ping, joins fragments and echoes the close code
 
     // The server answers a close frame with the same code and ends the connection.
     var buf: [ws.max_control_payload]u8 = undefined;
-    try raw.send(true, .close, ws.closePayload(&buf, @enumFromInt(4000), "bye"), true);
+    try raw.send(true, .close, ws.closePayload(&buf, @fromBackingInt(@intCast(4000)), "bye"), true);
     const answer = (try raw.next()).close;
     try std.testing.expectEqual(4000, answer.code.?);
     try raw.expectEnd();
@@ -1257,7 +1257,7 @@ test "websocket authorization: the server closes with 1008 when the token expire
 test "websocket authorization: a DPoP-bound token with a nonce, method GET and the http form of the URL" {
     const io = std.testing.io;
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    var prover: mcp.auth.DpopProver = try .init(io, gpa, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{41} ** 32) });
+    var prover: mcp.auth.DpopProver = try .init(io, gpa, .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(41))) });
     defer prover.deinit();
     prover.clock = authClock;
     const issuer: mcp.auth.dpop.NonceIssuer = try .init(io);

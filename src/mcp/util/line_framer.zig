@@ -327,7 +327,7 @@ test "framer enforces the line limit on both paths" {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const long = "x" ** 300;
+    const long = @as([300]u8, @splat('x'));
     var small_buf: [16]u8 = undefined;
     var fixed: Io.Reader = .fixed(long ++ "\nok\n");
     // Route through a limited reader with a small buffer so the slow path is taken.
@@ -341,7 +341,7 @@ test "framer skips the whole oversize line" {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const long = "x" ** 300;
+    const long = @as([300]u8, @splat('x'));
     var small_buf: [16]u8 = undefined;
     var fixed: Io.Reader = .fixed(long ++ "\nok\n" ++ long);
     var limited = fixed.limited(.unlimited, &small_buf);
@@ -403,7 +403,7 @@ test "the scanner gives no id for a value that it cannot keep" {
         "{\"id\":{\"a\":1},\"result\":{}}",
         "{\"id\":[1],\"result\":{}}",
         // Longer than the buffer.
-        "{\"id\":\"" ++ "x" ** TopLevelScanner.max_id_bytes ++ "\",\"result\":{}}",
+        "{\"id\":\"" ++ @as([TopLevelScanner.max_id_bytes]u8, @splat('x')) ++ "\",\"result\":{}}",
         // The text ends in the value.
         "{\"result\":{},\"id\":12",
         // A key with an escape sequence does not count.
@@ -429,7 +429,7 @@ test "framer finds the id of a dropped line on both paths and of a line that is 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const long = "{\"jsonrpc\":\"2.0\",\"result\":{\"text\":\"" ++ "x" ** 300 ++ "\"},\"id\":42}";
+    const long = "{\"jsonrpc\":\"2.0\",\"result\":{\"text\":\"" ++ @as([300]u8, @splat('x')) ++ "\"},\"id\":42}";
     const input = long ++ "\n{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"text\":\"\xff\"}}\nok\n";
 
     // The fast path: the whole line is in the reader buffer.

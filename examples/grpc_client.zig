@@ -69,7 +69,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Config {
 pub fn main(init: std.process.Init) !void {
     // In a release build without libc, `init.gpa` is the debug allocator of std, with one lock for
     // every allocation of every thread. The allocator of std for many threads has no such lock.
-    const gpa = if (builtin.mode == .Debug) init.gpa else std.heap.smp_allocator;
+    const gpa = if (builtin.mode == .debug) init.gpa else std.heap.smp_allocator;
     // Each task that waits is a thread. On Windows, `stack_size` is only the committed part of its
     // stack, and the reserve stays the 16 MiB of the executable. Thus 64 KiB keeps the full stack.
     var threaded: std.Io.Threaded = .init(gpa, .{

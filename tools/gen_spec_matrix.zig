@@ -84,15 +84,14 @@ pub fn main(init: std.process.Init) !u8 {
 
     const cwd = Io.Dir.cwd();
     const req_text = try cwd.readFileAllocOptions(io, requirements_path, arena, .limited(32 << 20), .of(u8), 0);
-    var diag: std.zon.parse.Diagnostics = .{};
-    const reqs = std.zon.parse.fromSliceAlloc(RequirementsFile, arena, req_text, &diag, .{}) catch |e| {
-        std.debug.print("::error file={s}::cannot parse: {t}\n{f}\n", .{ requirements_path, e, diag });
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const reqs = std.zon.parse.fromSlice(RequirementsFile, .{ .gpa = init.gpa, .arena = arena, .source = req_text, .diagnostics = &diag }) catch |e| {
+        std.debug.print("::error file={s}::cannot parse: {t}\n{f}\n", .{ requirements_path, e, diag.fmt(requirements_path) });
         return 1;
     };
     const map_text = try cwd.readFileAllocOptions(io, mapping_path, arena, .limited(32 << 20), .of(u8), 0);
-    diag = .{};
-    const map = std.zon.parse.fromSliceAlloc(MappingFile, arena, map_text, &diag, .{}) catch |e| {
-        std.debug.print("::error file={s}::cannot parse: {t}\n{f}\n", .{ mapping_path, e, diag });
+    const map = std.zon.parse.fromSlice(MappingFile, .{ .gpa = init.gpa, .arena = arena, .source = map_text, .diagnostics = &diag }) catch |e| {
+        std.debug.print("::error file={s}::cannot parse: {t}\n{f}\n", .{ mapping_path, e, diag.fmt(mapping_path) });
         return 1;
     };
 
@@ -116,7 +115,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const page = try render(arena, reqs, map, checker.by_id, stats);
-    const must = stats.levels[@intFromEnum(Level.must)].add(stats.levels[@intFromEnum(Level.must_not)]);
+    const must = stats.levels[@backingInt(Level.must)].add(stats.levels[@backingInt(Level.must_not)]);
     std.debug.print("spec-matrix: {d} requirements, {d} tested, {d} n/a, {d} app, {d} gap. MUST and MUST NOT: {d} of {d} tested, {d} gap.\n", .{
         stats.total.total, stats.total.tested, stats.total.na, stats.total.app, stats.total.gap, must.tested, must.total, must.gap,
     });
@@ -302,7 +301,7 @@ const Counts = struct {
     }
 };
 
-const level_count = @typeInfo(Level).@"enum".fields.len;
+const level_count = @typeInfo(Level).@"enum".field_names.len;
 
 const Stats = struct {
     total: Counts = .{},
@@ -314,7 +313,7 @@ fn computeStats(reqs: []const Requirement, by_id: std.StringHashMapUnmanaged(Map
     for (reqs) |r| {
         const status = if (by_id.get(r.id)) |m| m.status else .gap;
         s.total.count(status);
-        s.levels[@intFromEnum(r.level)].count(status);
+        s.levels[@backingInt(r.level)].count(status);
     }
     return s;
 }
@@ -408,14 +407,14 @@ fn render(arena: Allocator, reqs: RequirementsFile, map: MappingFile, by_id: std
     try w.writeAll("| gap | No test checks the requirement yet. The reason tells what is missing. |\n\n");
 
     try w.writeAll("## Summary\n\n");
-    const must = stats.levels[@intFromEnum(Level.must)].add(stats.levels[@intFromEnum(Level.must_not)]);
+    const must = stats.levels[@backingInt(Level.must)].add(stats.levels[@backingInt(Level.must_not)]);
     try w.print("The specification has {d} normative sentences. {d} are MUST or MUST NOT requirements. ", .{ stats.total.total, must.total });
     try w.print("Of these, {d} are tested, {d} do not apply, {d} are for the application and {d} are gaps.\n\n", .{ must.tested, must.na, must.app, must.gap });
     try w.writeAll("The column Covered gives the part of the requirements that has a test, an n/a reason or an app reason.\n\n");
 
     try w.writeAll("### By keyword\n\n");
     try w.writeAll("| Keyword | Total | Tested | n/a | App | Gap | Covered |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
-    for (std.enums.values(Level)) |lv| try writeCountsRow(w, levelName(lv), stats.levels[@intFromEnum(lv)]);
+    for (std.enums.values(Level)) |lv| try writeCountsRow(w, levelName(lv), stats.levels[@backingInt(lv)]);
     try writeCountsRow(w, "All", stats.total);
     try w.writeAll("\n");
 

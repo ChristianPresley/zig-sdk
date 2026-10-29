@@ -1021,8 +1021,8 @@ test "limits" {
     // Nested counted repetition grows by multiplication and fails before any allocation.
     try testing.expectError(error.RegexTooLarge, compile(gpa, "((a{1000}){1000}){1000}", .{}));
     try testing.expectError(error.RegexTooLarge, compile(gpa, "a{4294967295}", .{}));
-    try testing.expectError(error.RegexTooLarge, compile(gpa, "(" ** (max_group_depth + 2) ++ ")" ** (max_group_depth + 2), .{}));
-    var deep = try compile(gpa, "(" ** 100 ++ "a" ++ ")" ** 100, .{});
+    try testing.expectError(error.RegexTooLarge, compile(gpa, &(@as([(max_group_depth + 2)]u8, @splat('(')) ++ @as([(max_group_depth + 2)]u8, @splat(')'))), .{}));
+    var deep = try compile(gpa, @as([100]u8, @splat('(')) ++ "a" ++ @as([100]u8, @splat(')')), .{});
     deep.deinit(gpa);
 }
 
@@ -1051,8 +1051,8 @@ test "pathological patterns run in linear time" {
         try testing.expect(work_long <= (long.len + 1) * 3 * re.insts.len);
     }
     // The last pattern matches, the others do not.
-    try expectMatch("(a?){30}a{30}", "a" ** 30, true);
-    try expectMatch("^(a+)+$", "a" ** 64 ++ "b", false);
+    try expectMatch("(a?){30}a{30}", &@as([30]u8, @splat('a')), true);
+    try expectMatch("^(a+)+$", @as([64]u8, @splat('a')) ++ "b", false);
 }
 
 test "input that is not UTF-8 and encoded surrogates" {

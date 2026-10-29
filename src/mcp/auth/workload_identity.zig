@@ -597,7 +597,7 @@ test "workload JWT validation rules" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{21} ** 32) };
+    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(21))) };
     var buf: [97]u8 = undefined;
     const trusted = [_]TrustedIssuer{.{ .issuer = "https://issuer.example.org", .keys = &.{key.verificationKey(&buf, "k1")} }};
     const Allow = struct {

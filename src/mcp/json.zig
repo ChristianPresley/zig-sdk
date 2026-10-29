@@ -226,10 +226,10 @@ pub fn Discriminated(comptime U: type, comptime key: []const u8) type {
             const tag_value = source.object.get(key) orelse return error.MissingField;
             if (tag_value != .string) return error.UnexpectedToken;
             const tag = tag_value.string;
-            inline for (@typeInfo(U).@"union".fields) |field| {
-                if (std.mem.eql(u8, field.name, tag)) {
-                    const payload = try std.json.innerParseFromValue(field.type, allocator, source, options);
-                    return @unionInit(U, field.name, payload);
+            inline for (@typeInfo(U).@"union".field_names, @typeInfo(U).@"union".field_types) |fname, ftype| {
+                if (std.mem.eql(u8, fname, tag)) {
+                    const payload = try std.json.innerParseFromValue(ftype, allocator, source, options);
+                    return @unionInit(U, fname, payload);
                 }
             }
             return error.InvalidEnumTag;

@@ -303,7 +303,13 @@ test "parser ignores a long event ID, thus many small events after it use little
     try p.feed(id_line);
     try p.feed("\n");
     // 1024 small events in one feed, as one read of a response body gives them.
-    try p.feed("data:x\n\n" ** 1024);
+    const input = comptime blk: {
+        @setEvalBranchQuota(10_000);
+        var buf: [8 * 1024]u8 = undefined;
+        for (0..1024) |i| buf[i * 8 ..][0..8].* = "data:x\n\n".*;
+        break :blk buf;
+    };
+    try p.feed(&input);
     // Before, each event got a copy of the ID: 1024 copies of 64 KiB.
     try std.testing.expect(peak.peak < 4 * max_event_bytes);
     var count: usize = 0;

@@ -725,7 +725,7 @@ const Conn = struct {
     /// Write one HTTP response and end the connection after it.
     fn respondBody(conn: *Conn, status: u16, headers: []const http.Header, content_type: []const u8, body: []const u8) error{WriteFailed}!void {
         const w = conn.out;
-        const phrase = (@as(http.Status, @enumFromInt(status))).phrase() orelse "";
+        const phrase = (@as(http.Status, @fromBackingInt(@intCast(status)))).phrase() orelse "";
         w.print("HTTP/1.1 {d} {s}\r\ncontent-type: {s}\r\ncontent-length: {d}\r\nconnection: close\r\n", .{ status, phrase, content_type, body.len }) catch return error.WriteFailed;
         for (headers) |h| w.print("{s}: {s}\r\n", .{ h.name, h.value }) catch return error.WriteFailed;
         w.writeAll("\r\n") catch return error.WriteFailed;
@@ -750,7 +750,7 @@ const Conn = struct {
         while (true) {
             const event = reader.next() catch |e| {
                 const code = ws.closeCodeFor(e) orelse return .peer_gone;
-                log.debug("closed a connection with code {d}: {t}", .{ @intFromEnum(code), e });
+                log.debug("closed a connection with code {d}: {t}", .{ @backingInt(code), e });
                 conn.sendClose(code, closeReason(e));
                 // Read until the answer of the peer, so that the end of the TCP connection
                 // does not discard the close frame. The supervisor limits the time: it closes
@@ -820,7 +820,7 @@ const Conn = struct {
     /// Answer the close frame of the peer with the same code, or with an empty payload.
     fn answerClose(conn: *Conn, code: ?u16) void {
         var buf: [ws.max_control_payload]u8 = undefined;
-        const payload: []const u8 = if (code) |c| ws.closePayload(&buf, @enumFromInt(c), "") else "";
+        const payload: []const u8 = if (code) |c| ws.closePayload(&buf, @fromBackingInt(@intCast(c)), "") else "";
         conn.sendClosePayload(payload);
     }
 
@@ -1394,7 +1394,7 @@ pub const Client = struct {
         conn.flush() catch return error.ConnectFailed;
 
         const response = conn.receiveHead() catch return error.HandshakeFailed;
-        const status: u16 = @intFromEnum(response.head.status);
+        const status: u16 = @backingInt(response.head.status);
         var nonce: ?[]const u8 = null;
         var www: ?[]const u8 = null;
         var upgrade_value: []const u8 = "";
@@ -1511,7 +1511,7 @@ const Link = struct {
 
     fn answerClose(link: *Link, code: ?u16) void {
         var buf: [ws.max_control_payload]u8 = undefined;
-        const payload: []const u8 = if (code) |c| ws.closePayload(&buf, @enumFromInt(c), "") else "";
+        const payload: []const u8 = if (code) |c| ws.closePayload(&buf, @fromBackingInt(@intCast(c)), "") else "";
         link.sendClosePayload(payload);
     }
 
@@ -1556,7 +1556,7 @@ const Link = struct {
         while (true) {
             const event = reader.next() catch |e| {
                 if (ws.closeCodeFor(e)) |code| {
-                    log.debug("closed the connection with code {d}: {t}", .{ @intFromEnum(code), e });
+                    log.debug("closed the connection with code {d}: {t}", .{ @backingInt(code), e });
                     link.sendClose(code, closeReason(e));
                     link.markDead();
                     // Wait for the answer of the server. The teardown limits the time.

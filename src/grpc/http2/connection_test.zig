@@ -327,7 +327,7 @@ const EchoServer = struct {
             return;
         }
         if (std.mem.eql(u8, path, "/large")) {
-            const value = [_]u8{'a'} ** (large_header_len + 1);
+            const value = @as([(large_header_len + 1)]u8, @splat('a'));
             stream.sendHeaders(&.{ .{ .name = ":status", .value = "200" }, .{ .name = "x-large", .value = &value } }, true) catch {};
             return;
         }
@@ -648,7 +648,7 @@ test "stopWaits ends each wait on the stream while the connection wakes its wait
     // condition of std then gives no `error.Canceled`. The flag of `stopWaits` does not get
     // lost. The streams have no id, thus no frame goes out for them.
     for (0..200) |i| {
-        const kind: WaitKind = @enumFromInt(i % @typeInfo(WaitKind).@"enum".fields.len);
+        const kind: WaitKind = @fromBackingInt(@intCast(i % @typeInfo(WaitKind).@"enum".field_names.len));
         const stream = try conn.openStream();
         defer stream.close();
         // Without credit, `sendData` waits.
@@ -845,7 +845,7 @@ const GoawayReader = struct {
                 continue;
             }
             const payload = try self.reader.takeArray(8);
-            return @enumFromInt(std.mem.readInt(u32, payload[4..8], .big));
+            return @fromBackingInt(@intCast(std.mem.readInt(u32, payload[4..8], .big)));
         }
     }
 
@@ -899,7 +899,7 @@ test "a frame larger than the maximum frame size gives GOAWAY with FRAME_SIZE_ER
 
 test "a control frame with a wrong length gives GOAWAY with FRAME_SIZE_ERROR" {
     const ping: frame.Header = .{ .length = 4, .type = .ping, .flags = 0, .stream_id = 0 };
-    try std.testing.expectEqual(frame.ErrorCode.frame_size_error, try goawayCodeFor(&(ping.encode() ++ [_]u8{0} ** 4)));
+    try std.testing.expectEqual(frame.ErrorCode.frame_size_error, try goawayCodeFor(&(ping.encode() ++ @as([4]u8, @splat(0)))));
 }
 
 test "a header block that HPACK cannot decode gives GOAWAY with COMPRESSION_ERROR" {
@@ -914,7 +914,7 @@ test "a header block that HPACK cannot decode gives GOAWAY with COMPRESSION_ERRO
 
 test "a PING frame on a stream gives GOAWAY with PROTOCOL_ERROR" {
     const ping: frame.Header = .{ .length = 8, .type = .ping, .flags = 0, .stream_id = 1 };
-    try std.testing.expectEqual(frame.ErrorCode.protocol_error, try goawayCodeFor(&(ping.encode() ++ [_]u8{0} ** 8)));
+    try std.testing.expectEqual(frame.ErrorCode.protocol_error, try goawayCodeFor(&(ping.encode() ++ @as([8]u8, @splat(0)))));
 }
 
 // -- A server connection that reads a fixed sequence of frames ------------------------------
@@ -957,7 +957,7 @@ const StreamList = struct {
 test "a refused request frees its stream and keeps the HPACK table of the connection" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const large = [_]u8{'a'} ** 2000;
+    const large = @as([2000]u8, @splat('a'));
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(gpa);
     try script.appendSlice(gpa, frame.preface);
@@ -1006,7 +1006,7 @@ test "a refused request frees its stream and keeps the HPACK table of the connec
         const header = frame.Header.parse(try out.takeArray(frame.header_len));
         const payload = try out.take(header.length);
         try std.testing.expect(header.type != .goaway);
-        if (header.type == .rst_stream) resets[header.stream_id] = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
+        if (header.type == .rst_stream) resets[header.stream_id] = @fromBackingInt(@intCast(std.mem.readInt(u32, payload[0..4], .big)));
     }
     try std.testing.expectEqual(@as(?frame.ErrorCode, .enhance_your_calm), resets[1]);
     try std.testing.expectEqual(@as(?frame.ErrorCode, .protocol_error), resets[3]);
@@ -1070,8 +1070,8 @@ fn runScriptAt(gpa: std.mem.Allocator, script: []const u8, split: usize, options
         const header = frame.Header.parse(try out.takeArray(frame.header_len));
         const payload = try out.take(header.length);
         switch (header.type) {
-            .rst_stream => result.resets[header.stream_id] = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big)),
-            .goaway => result.goaway = @enumFromInt(std.mem.readInt(u32, payload[4..8], .big)),
+            .rst_stream => result.resets[header.stream_id] = @fromBackingInt(@intCast(std.mem.readInt(u32, payload[0..4], .big))),
+            .goaway => result.goaway = @fromBackingInt(@intCast(std.mem.readInt(u32, payload[4..8], .big))),
             else => {},
         }
     }
@@ -1084,7 +1084,7 @@ const trailer = [_]Header{.{ .name = "x-trailer", .value = "1" }};
 
 test "a header block on a stream that this side reset is ignored" {
     const gpa = std.testing.allocator;
-    const large = [_]u8{'a'} ** 2000;
+    const large = @as([2000]u8, @splat('a'));
     var script: std.ArrayList(u8) = .empty;
     defer script.deinit(gpa);
     try script.appendSlice(gpa, frame.preface);
@@ -1182,7 +1182,7 @@ test "the hook of setOnReset runs once at a reset or at the end of the connectio
     defer script.deinit(gpa);
     try script.appendSlice(gpa, frame.preface);
     try appendFrame(gpa, &script, .settings, 0, 0, &.{});
-    const cancel = [_]u8{ 0, 0, 0, @intFromEnum(frame.ErrorCode.cancel) };
+    const cancel = [_]u8{ 0, 0, 0, @backingInt(frame.ErrorCode.cancel) };
     // Stream 1 gets a reset from the peer, twice. Stream 3 stays open until the end of the
     // connection. Stream 5 closes at once. Stream 7 gets its hook after the end of the
     // connection. Stream 9 loses its hook before its reset.
@@ -1413,7 +1413,7 @@ test "dispatchAtEnd gives a stream again at the end of its request and frees a s
     try appendFrame(gpa, &script, .data, 0, 1, "ab");
     try appendFrame(gpa, &script, .data, frame.Flags.end_stream, 1, "cd");
     var code: [4]u8 = undefined;
-    std.mem.writeInt(u32, &code, @intFromEnum(frame.ErrorCode.cancel), .big);
+    std.mem.writeInt(u32, &code, @backingInt(frame.ErrorCode.cancel), .big);
     try appendFrame(gpa, &script, .rst_stream, 0, 3, &code);
     try appendFrame(gpa, &script, .data, 0, 5, "e");
     try appendHeaders(gpa, &script, 5, frame.Flags.end_stream, &trailer, "");

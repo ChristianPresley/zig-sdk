@@ -38,7 +38,8 @@ pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const arena = init.arena.allocator();
     const io = init.io;
-    const args = try init.minimal.args.toSlice(arena);
+    const cli_args = try init.minimal.args.toSlice(arena);
+    const args: []const []const u8 = if (cli_args.len > 1) cli_args else &.{ cli_args[0], "--check", "--out", "docs/generated/bibliography.md" };
     var check = false;
     var outs: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
@@ -55,11 +56,11 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const text = try Io.Dir.cwd().readFileAllocOptions(io, "docs/bibliography.zon", arena, .limited(4 << 20), .of(u8), 0);
-    const entries = std.zon.parse.fromSliceAlloc([]const Entry, gpa, text, null, .{}) catch |e| {
-        std.debug.print("gen-bibliography: cannot parse docs/bibliography.zon: {t}\n", .{e});
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const entries = std.zon.parse.fromSlice([]const Entry, .{ .gpa = gpa, .arena = arena, .source = text, .diagnostics = &diag }) catch |e| {
+        std.debug.print("gen-bibliography: cannot parse docs/bibliography.zon: {t}\n{f}\n", .{ e, diag.fmt("docs/bibliography.zon") });
         return 1;
     };
-    defer std.zon.parse.free(gpa, entries);
 
     var problems: usize = 0;
     if (check) problems = checkEntries(entries);

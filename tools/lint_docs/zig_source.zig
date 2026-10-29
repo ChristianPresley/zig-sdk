@@ -33,8 +33,8 @@ pub const Source = struct {
 /// Parses `source` and collects the doc comments. With `string_literals`, it also collects
 /// the string literals of `.message = "..."` field values outside `test` blocks.
 pub fn scan(arena: Allocator, source: []const u8, string_literals: bool) !Source {
-    const source_z = try arena.dupeZ(u8, source);
-    var tree = try Ast.parse(arena, source_z, .zig);
+    const source_z = try arena.dupeSentinel(u8, source, 0);
+    var tree = try Ast.parse(arena, source_z, .{});
     defer tree.deinit(arena);
 
     var errors: std.ArrayList(ParseError) = .empty;

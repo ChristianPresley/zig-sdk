@@ -23,12 +23,12 @@ pub const Code = enum(u8) {
     pub fn fromWire(text: []const u8) ?Code {
         const n = std.fmt.parseInt(u8, text, 10) catch return null;
         if (n > 16) return null;
-        return @enumFromInt(n);
+        return @fromBackingInt(@intCast(n));
     }
 
     pub fn wire(self: Code) []const u8 {
         return switch (self) {
-            inline else => |c| std.fmt.comptimePrint("{d}", .{@intFromEnum(c)}),
+            inline else => |c| std.fmt.comptimePrint("{d}", .{@backingInt(c)}),
         };
     }
 };

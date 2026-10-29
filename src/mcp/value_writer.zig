@@ -274,10 +274,10 @@ pub const ValueWriter = struct {
             .optional => return if (v) |payload| w.write(payload) else w.write(null),
             .@"enum" => |info| {
                 if (std.meta.hasFn(T, "jsonStringify")) return v.jsonStringify(w);
-                if (!info.is_exhaustive) {
-                    inline for (info.fields) |field| {
-                        if (v == @field(T, field.name)) break;
-                    } else return w.write(@intFromEnum(v));
+                if (info.mode == .nonexhaustive) {
+                    inline for (info.field_names) |fname| {
+                        if (v == @field(T, fname)) break;
+                    } else return w.write(@backingInt(v));
                 }
                 return w.tagName(@tagName(v));
             },
@@ -287,14 +287,14 @@ pub const ValueWriter = struct {
                 const info = @typeInfo(T).@"union";
                 const Tag = info.tag_type orelse @compileError("Unable to stringify untagged union '" ++ @typeName(T) ++ "'");
                 try w.beginObject();
-                inline for (info.fields) |field| {
-                    if (v == @field(Tag, field.name)) {
-                        try w.objectField(field.name);
-                        if (field.type == void) {
+                inline for (info.field_names, info.field_types) |fname, ftype| {
+                    if (v == @field(Tag, fname)) {
+                        try w.objectField(fname);
+                        if (ftype == void) {
                             try w.beginObject();
                             try w.endObject();
                         } else {
-                            try w.write(@field(v, field.name));
+                            try w.write(@field(v, fname));
                         }
                         break;
                     }
@@ -304,12 +304,12 @@ pub const ValueWriter = struct {
             .@"struct" => |info| {
                 if (std.meta.hasFn(T, "jsonStringify")) return v.jsonStringify(w);
                 if (info.is_tuple) try w.beginArray() else try w.beginObject();
-                inline for (info.fields) |field| {
-                    if (field.type == void) continue;
-                    const skip = @typeInfo(field.type) == .optional and !w.options.emit_null_optional_fields and @field(v, field.name) == null;
+                inline for (info.field_names, info.field_types) |fname, ftype| {
+                    if (ftype == void) continue;
+                    const skip = @typeInfo(ftype) == .optional and !w.options.emit_null_optional_fields and @field(v, fname) == null;
                     if (!skip) {
-                        if (!info.is_tuple) try w.objectField(field.name);
-                        try w.write(@field(v, field.name));
+                        if (!info.is_tuple) try w.objectField(fname);
+                        try w.write(@field(v, fname));
                     }
                 }
                 return if (info.is_tuple) w.endArray() else w.endObject();
@@ -424,7 +424,7 @@ const Everything = struct {
     large: f64 = 1.7976931348623157e308,
     single: f32 = 0.1,
     color: Color = .green,
-    open: OpenEnum = @enumFromInt(9),
+    open: OpenEnum = @fromBackingInt(@intCast(9)),
     named: OpenEnum = .one,
     shapes: [3]Shape = .{ .{ .circle = 1.5 }, .{ .square = .{ .side = 4 } }, .none },
     tuple: struct { u8, []const u8 } = .{ 1, "two" },

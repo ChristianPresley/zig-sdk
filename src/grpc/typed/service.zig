@@ -83,16 +83,14 @@ pub const Rpc = enum {
     pub fn fromPath(text: []const u8) ?Rpc {
         if (!std.mem.startsWith(u8, text, path_prefix)) return null;
         const name = text[path_prefix.len..];
-        inline for (std.meta.fields(Rpc)) |f| {
-            const r: Rpc = @enumFromInt(f.value);
+        inline for (std.meta.tags(Rpc)) |r| {
             if (std.mem.eql(u8, name, r.rpcName())) return r;
         }
         return null;
     }
 
     pub fn fromMethod(text: []const u8) ?Rpc {
-        inline for (std.meta.fields(Rpc)) |f| {
-            const r: Rpc = @enumFromInt(f.value);
+        inline for (std.meta.tags(Rpc)) |r| {
             if (std.mem.eql(u8, text, r.method())) return r;
         }
         return null;

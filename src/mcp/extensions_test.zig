@@ -225,7 +225,7 @@ test "skills: registration rules" {
     try testing.expectError(error.InvalidFilePath, server.addSkill(.{ .name = "tool", .skill_md = md, .files = &.{ .{ .path = "a", .content = "" }, .{ .path = "a", .content = "" } } }));
     try testing.expectError(error.InvalidSkillPath, server.addSkill(.{ .prefix = "a b", .name = "tool", .skill_md = md }));
     try testing.expectError(error.TooManySkillFiles, server.addSkill(.{ .name = "tool", .skill_md = md, .files = &.{ .{ .path = "a", .content = "" }, .{ .path = "b", .content = "" }, .{ .path = "c", .content = "" } } }));
-    try testing.expectError(error.SkillTooLarge, server.addSkill(.{ .name = "tool", .skill_md = md, .files = &.{.{ .path = "big", .content = "x" ** 200 }} }));
+    try testing.expectError(error.SkillTooLarge, server.addSkill(.{ .name = "tool", .skill_md = md, .files = &.{.{ .path = "big", .content = &@as([200]u8, @splat('x')) }} }));
     try server.addSkill(.{ .name = "tool", .skill_md = md, .files = &.{.{ .path = "inner/SKILL.md", .content = "---\nname: inner\ndescription: Nested\n---\n" }} });
     try testing.expectError(error.DuplicateSkill, server.addSkill(.{ .name = "tool", .skill_md = md }));
 

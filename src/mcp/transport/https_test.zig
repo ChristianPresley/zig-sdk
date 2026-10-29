@@ -143,10 +143,10 @@ test "a partial head and then a full record do not stop the https server" {
         });
         defer conn.deinit();
         // One record with the start of a head, without its end.
-        try conn.writer.writeAll("POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\nx-filler: " ++ "a" ** 260);
+        try conn.writer.writeAll("POST /mcp HTTP/1.1\r\nhost: 127.0.0.1\r\nx-filler: " ++ @as([260]u8, @splat('a')));
         try conn.writer.flush();
         // One full record that continues the same header line.
-        const filler = [_]u8{'a'} ** std.crypto.tls.max_ciphertext_inner_record_len;
+        const filler = @as([std.crypto.tls.max_ciphertext_inner_record_len]u8, @splat('a'));
         try conn.writer.writeAll(&filler);
         try conn.writer.flush();
         // The head is too long for the server: it answers 431 and closes.

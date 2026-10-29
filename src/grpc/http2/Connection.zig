@@ -199,12 +199,12 @@ pub fn handshake(self: *Connection) Error!void {
     }
     var settings: [6 * 6]u8 = undefined;
     const list = [_]frame.Setting{
-        .{ .id = @intFromEnum(frame.SettingId.header_table_size), .value = 4096 },
-        .{ .id = @intFromEnum(frame.SettingId.enable_push), .value = 0 },
-        .{ .id = @intFromEnum(frame.SettingId.max_concurrent_streams), .value = self.options.max_concurrent_streams },
-        .{ .id = @intFromEnum(frame.SettingId.initial_window_size), .value = self.options.initial_window_size },
-        .{ .id = @intFromEnum(frame.SettingId.max_frame_size), .value = self.options.max_frame_size },
-        .{ .id = @intFromEnum(frame.SettingId.max_header_list_size), .value = self.options.max_header_list_size },
+        .{ .id = @backingInt(frame.SettingId.header_table_size), .value = 4096 },
+        .{ .id = @backingInt(frame.SettingId.enable_push), .value = 0 },
+        .{ .id = @backingInt(frame.SettingId.max_concurrent_streams), .value = self.options.max_concurrent_streams },
+        .{ .id = @backingInt(frame.SettingId.initial_window_size), .value = self.options.initial_window_size },
+        .{ .id = @backingInt(frame.SettingId.max_frame_size), .value = self.options.max_frame_size },
+        .{ .id = @backingInt(frame.SettingId.max_header_list_size), .value = self.options.max_header_list_size },
     };
     for (list, 0..) |s, i| settings[i * 6 ..][0..6].* = s.encode();
     // Raise the connection window from the default to ours. The two frames go out together.
@@ -609,7 +609,7 @@ fn emit(self: *Connection, s: Send) Error!void {
     defer if (s.stream_id == 0) if (s.stream) |st| {
         if (st.reset_word.load(.seq_cst) != 0 and st.claimReset()) {
             var code: [4]u8 = undefined;
-            std.mem.writeInt(u32, &code, @intFromEnum(frame.ErrorCode.cancel), .big);
+            std.mem.writeInt(u32, &code, @backingInt(frame.ErrorCode.cancel), .big);
             self.writeFrameRaw(.rst_stream, 0, id, &code) catch self.failWrites();
         }
     };
@@ -695,13 +695,13 @@ fn sendGoaway(self: *Connection, code: frame.ErrorCode) void {
     const last = @atomicLoad(u31, &self.last_peer_stream_id, .seq_cst);
     var payload: [8]u8 = undefined;
     std.mem.writeInt(u32, payload[0..4], last, .big);
-    std.mem.writeInt(u32, payload[4..8], @intFromEnum(code), .big);
+    std.mem.writeInt(u32, payload[4..8], @backingInt(code), .big);
     self.submit(.{ .kind = .goaway, .payload = &payload }) catch {};
 }
 
 fn sendRst(self: *Connection, stream_id: u31, code: frame.ErrorCode) void {
     var payload: [4]u8 = undefined;
-    std.mem.writeInt(u32, &payload, @intFromEnum(code), .big);
+    std.mem.writeInt(u32, &payload, @backingInt(code), .big);
     self.submit(.{ .kind = .rst_stream, .stream_id = stream_id, .payload = &payload }) catch {};
 }
 
@@ -910,7 +910,7 @@ fn finishHeaderBlock(self: *Connection, block: []const u8) ReadError!void {
                 reset = .protocol_error;
                 s.setReset(.protocol_error);
             } else {
-                s.headers = .{ .items = list, .capacity = list.len };
+                s.headers = .fromOwnedSlice(list);
                 s.setState(Stream.headers_done | if (end_stream) Stream.end_stream else 0);
             }
         } else {
@@ -918,7 +918,7 @@ fn finishHeaderBlock(self: *Connection, block: []const u8) ReadError!void {
                 reset = .protocol_error;
                 s.setReset(.protocol_error);
             } else {
-                s.trailers = .{ .items = list, .capacity = list.len };
+                s.trailers = .fromOwnedSlice(list);
                 s.setState(Stream.trailers_done | Stream.end_stream);
             }
         }
@@ -1051,7 +1051,7 @@ fn validHeaders(headers: []const Header, trailers: bool, role: Role) bool {
 fn onRstStream(self: *Connection, header: frame.Header, payload: []const u8) ReadError!void {
     if (header.stream_id == 0) return error.ProtocolError;
     if (header.length != 4) return error.FrameSizeError;
-    const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[0..4], .big));
+    const code: frame.ErrorCode = @fromBackingInt(@intCast(std.mem.readInt(u32, payload[0..4], .big)));
     if (self.streams.get(header.stream_id)) |s| {
         s.setReset(code);
         // A stream without an owner: no task closes it.
@@ -1080,7 +1080,7 @@ fn onSettings(self: *Connection, header: frame.Header, payload: []const u8) Read
         self.peer.enable_push = next.enable_push;
         self.peer.max_concurrent_streams = next.max_concurrent_streams;
         self.peer.max_header_list_size = next.max_header_list_size;
-        if (@as(frame.SettingId, @enumFromInt(setting.id)) == .initial_window_size) {
+        if (@as(frame.SettingId, @fromBackingInt(@intCast(setting.id))) == .initial_window_size) {
             // The change applies to every open stream (section 6.9.2), also to a stream that the
             // writer registered just now. A stream that the writer registers after the store
             // above applies the change itself (`assignId`). Each stream applies it once.
@@ -1097,7 +1097,7 @@ fn onSettings(self: *Connection, header: frame.Header, payload: []const u8) Read
 fn onGoaway(self: *Connection, header: frame.Header, payload: []const u8) Error!void {
     if (header.stream_id != 0 or header.length < 8) return error.ProtocolError;
     const last: u31 = @truncate(std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff);
-    const code: frame.ErrorCode = @enumFromInt(std.mem.readInt(u32, payload[4..8], .big));
+    const code: frame.ErrorCode = @fromBackingInt(@intCast(std.mem.readInt(u32, payload[4..8], .big)));
     if (code != .no_error) log.warn("peer sent GOAWAY with {t}", .{code});
     self.goaway_received.store(true, .seq_cst);
     // A stream that the writer registered before the store above is in the table now. A later
@@ -1466,7 +1466,7 @@ pub const Stream = struct {
     /// Give the stream the reset `code` when it has none, wake its waits and run the hook of
     /// the owner.
     fn setReset(self: *Stream, code: frame.ErrorCode) void {
-        _ = self.reset_word.cmpxchgStrong(0, @intFromEnum(code) + 1, .seq_cst, .seq_cst);
+        _ = self.reset_word.cmpxchgStrong(0, @backingInt(code) + 1, .seq_cst, .seq_cst);
         self.wake();
         self.fireHook();
     }
@@ -1474,7 +1474,7 @@ pub const Stream = struct {
     fn checkOpen(self: *const Stream) Error!void {
         if (self.conn.write_failed.load(.acquire)) return error.Closed;
         const word = self.reset_word.load(.seq_cst);
-        if (word != 0) return if (word - 1 == @intFromEnum(frame.ErrorCode.refused_stream)) error.Closed else error.StreamReset;
+        if (word != 0) return if (word - 1 == @backingInt(frame.ErrorCode.refused_stream)) error.Closed else error.StreamReset;
         if (self.connClosed() or self.conn.closed.load(.seq_cst)) return error.Closed;
     }
 
@@ -1759,7 +1759,7 @@ pub const Stream = struct {
     pub fn wasReset(self: *const Stream) ?frame.ErrorCode {
         const word = self.reset_word.load(.seq_cst);
         if (word == 0) return null;
-        return @enumFromInt(word - 1);
+        return @fromBackingInt(@intCast(word - 1));
     }
 };
 
@@ -1819,7 +1819,7 @@ test "a stream of this side gets a change of the initial window that came before
     defer s.close();
     try std.testing.expectEqual(frame.default_initial_window, s.send_window.load(.seq_cst));
     // The peer raises the initial window before the stream is in the table.
-    var payload: [6]u8 = (frame.Setting{ .id = @intFromEnum(frame.SettingId.initial_window_size), .value = 100_000 }).encode();
+    var payload: [6]u8 = (frame.Setting{ .id = @backingInt(frame.SettingId.initial_window_size), .value = 100_000 }).encode();
     try conn.onSettings(.{ .length = 6, .type = .settings, .flags = 0, .stream_id = 0 }, &payload);
     try s.sendHeaders(&.{ .{ .name = ":method", .value = "POST" }, .{ .name = ":scheme", .value = "http" }, .{ .name = ":path", .value = "/" } }, false);
     conn.syncQueues();

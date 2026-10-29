@@ -365,7 +365,7 @@ fn chooseIdentity(options: Options, authorities: ?[]const u8) ?*const CertChain 
 fn sendClientCertificate(comptime S: type, c: *Connection, transcript: *suites.Transcript, options: Options, req: CertificateRequest, identity: ?*const CertChain, alert_out: ?*tls.Alert) ConnectError!void {
     var cert_buf: [CertChain.max_chain_bytes + 512]u8 = undefined;
     var b: codec.Builder = .{ .buf = &cert_buf };
-    b.byte(@intFromEnum(tls.HandshakeType.certificate));
+    b.byte(@backingInt(tls.HandshakeType.certificate));
     const msg = b.beginLen(u24);
     b.byte(req.context_len);
     b.bytes(req.context());
@@ -382,7 +382,7 @@ fn sendClientCertificate(comptime S: type, c: *Connection, transcript: *suites.T
 
     const chain = identity orelse return;
     const scheme = for (chain.key.schemes()) |s| {
-        if (req.offersScheme(@intFromEnum(s))) break s;
+        if (req.offersScheme(@backingInt(s))) break s;
     } else return common.abort(c, alert_out, .handshake_failure, error.TlsHandshakeFailure);
     var to_sign: [client_verify_context.len + S.digest_length]u8 = undefined;
     @memcpy(to_sign[0..client_verify_context.len], client_verify_context);
@@ -392,7 +392,7 @@ fn sendClientCertificate(comptime S: type, c: *Connection, transcript: *suites.T
     var sig_buf: [PrivateKey.max_signature_len]u8 = undefined;
     const signature = chain.key.signScheme(scheme, &to_sign, noise, &sig_buf) catch return common.abort(c, alert_out, .internal_error, error.TlsInternalError);
     var cv_buf: [8 + PrivateKey.max_signature_len]u8 = undefined;
-    const cv = codec.certificateVerify(&cv_buf, @intFromEnum(scheme), signature);
+    const cv = codec.certificateVerify(&cv_buf, @backingInt(scheme), signature);
     c.writeRecord(.handshake, cv) catch return error.WriteFailed;
     transcript.update(cv);
 }
@@ -426,9 +426,9 @@ const Hello = struct { bytes: []u8, names_sent: bool };
 /// fit. In the first ClientHello they must also keep the message at 16 KiB or less.
 fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Options, shares: []const key_share.KeyShare, cookie: ?[]const u8, send_names: bool) Hello {
     var b: codec.Builder = .{ .buf = buf };
-    b.byte(@intFromEnum(tls.HandshakeType.client_hello));
+    b.byte(@backingInt(tls.HandshakeType.client_hello));
     const msg = b.beginLen(u24);
-    b.int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_2));
+    b.int(u16, @backingInt(tls.ProtocolVersion.tls_1_2));
     b.bytes(&random);
     b.byte(32);
     b.bytes(session_id);
@@ -439,7 +439,7 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
     b.byte(0); // null compression
     const exts = b.beginLen(u16);
     if (isServerName(options.host)) {
-        b.int(u16, @intFromEnum(tls.ExtensionType.server_name));
+        b.int(u16, @backingInt(tls.ExtensionType.server_name));
         const ext = b.beginLen(u16);
         const list = b.beginLen(u16);
         b.byte(0); // host_name
@@ -449,14 +449,14 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
         b.endLen(u16, ext);
     }
     {
-        b.int(u16, @intFromEnum(tls.ExtensionType.supported_versions));
+        b.int(u16, @backingInt(tls.ExtensionType.supported_versions));
         const ext = b.beginLen(u16);
         b.byte(2);
-        b.int(u16, @intFromEnum(tls.ProtocolVersion.tls_1_3));
+        b.int(u16, @backingInt(tls.ProtocolVersion.tls_1_3));
         b.endLen(u16, ext);
     }
     {
-        b.int(u16, @intFromEnum(tls.ExtensionType.supported_groups));
+        b.int(u16, @backingInt(tls.ExtensionType.supported_groups));
         const ext = b.beginLen(u16);
         const list = b.beginLen(u16);
         for (options.groups) |g| b.int(u16, g.wire());
@@ -464,15 +464,15 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
         b.endLen(u16, ext);
     }
     {
-        b.int(u16, @intFromEnum(tls.ExtensionType.signature_algorithms));
+        b.int(u16, @backingInt(tls.ExtensionType.signature_algorithms));
         const ext = b.beginLen(u16);
         const list = b.beginLen(u16);
-        for (offered_schemes) |s| b.int(u16, @intFromEnum(s));
+        for (offered_schemes) |s| b.int(u16, @backingInt(s));
         b.endLen(u16, list);
         b.endLen(u16, ext);
     }
     {
-        b.int(u16, @intFromEnum(tls.ExtensionType.key_share));
+        b.int(u16, @backingInt(tls.ExtensionType.key_share));
         const ext = b.beginLen(u16);
         const list = b.beginLen(u16);
         var public_buf: [key_share.max_public_len]u8 = undefined;
@@ -486,7 +486,7 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
         b.endLen(u16, ext);
     }
     if (options.alpn.len > 0) {
-        b.int(u16, @intFromEnum(tls.ExtensionType.application_layer_protocol_negotiation));
+        b.int(u16, @backingInt(tls.ExtensionType.application_layer_protocol_negotiation));
         const ext = b.beginLen(u16);
         const list = b.beginLen(u16);
         for (options.alpn) |name| {
@@ -498,7 +498,7 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
     }
     if (options.revocation.ocsp_stapling != .off) {
         // status_type ocsp, no responder IDs, no request extensions (RFC 6066 section 8).
-        b.int(u16, @intFromEnum(tls.ExtensionType.status_request));
+        b.int(u16, @backingInt(tls.ExtensionType.status_request));
         b.int(u16, 5);
         b.byte(1);
         b.int(u16, 0);
@@ -513,7 +513,7 @@ fn clientHello(buf: []u8, random: [32]u8, session_id: *const [32]u8, options: Op
         names_sent = ca_names.write(&b, options.trust, limit);
     }
     if (cookie) |value| {
-        b.int(u16, @intFromEnum(tls.ExtensionType.cookie));
+        b.int(u16, @backingInt(tls.ExtensionType.cookie));
         const ext = b.beginLen(u16);
         b.int(u16, @intCast(value.len));
         b.bytes(value);
@@ -555,7 +555,7 @@ pub const ServerHello = struct {
     pub fn parse(body: []u8) codec.ParseError!ServerHello {
         var d: Decoder = .fromTheirSlice(body);
         d.ensure(2 + 32 + 1) catch return error.DecodeError;
-        if (d.decode(u16) != @intFromEnum(tls.ProtocolVersion.tls_1_2)) return error.ProtocolVersion;
+        if (d.decode(u16) != @backingInt(tls.ProtocolVersion.tls_1_2)) return error.ProtocolVersion;
         var sh: ServerHello = .{ .random = d.array(32).*, .session_id = &.{}, .cipher_suite = 0, .is_hrr = false };
         sh.is_hrr = std.mem.eql(u8, &sh.random, &tls.hello_retry_request_sequence);
         const sid_len = d.decode(u8);
@@ -576,11 +576,11 @@ pub const ServerHello = struct {
             const et = exts.decode(u16);
             const len = exts.decode(u16);
             var ext = exts.sub(len) catch return error.DecodeError;
-            switch (@as(tls.ExtensionType, @enumFromInt(et))) {
+            switch (@as(tls.ExtensionType, @fromBackingInt(@intCast(et)))) {
                 .supported_versions => {
                     if (version_ok) return error.IllegalParameter;
                     ext.ensure(2) catch return error.DecodeError;
-                    if (ext.decode(u16) != @intFromEnum(tls.ProtocolVersion.tls_1_3)) return error.ProtocolVersion;
+                    if (ext.decode(u16) != @backingInt(tls.ProtocolVersion.tls_1_3)) return error.ProtocolVersion;
                     if (!ext.eof()) return error.DecodeError;
                     version_ok = true;
                 },
@@ -635,7 +635,7 @@ pub const EncryptedExtensions = struct {
         var exts = d.sub(ext_len) catch return error.DecodeError;
         if (!d.eof()) return error.DecodeError;
         var result: EncryptedExtensions = .{};
-        var seen: codec.ExtensionSet = .initEmpty();
+        var seen: codec.ExtensionSet = .empty;
         while (!exts.eof()) {
             exts.ensure(4) catch return error.DecodeError;
             const et = exts.decode(u16);
@@ -643,7 +643,7 @@ pub const EncryptedExtensions = struct {
             var ext = exts.sub(len) catch return error.DecodeError;
             if (seen.isSet(et)) return error.IllegalParameter;
             seen.set(et);
-            switch (@as(tls.ExtensionType, @enumFromInt(et))) {
+            switch (@as(tls.ExtensionType, @fromBackingInt(@intCast(et)))) {
                 .application_layer_protocol_negotiation => {
                     if (!offered.alpn) return error.UnsupportedExtension;
                     ext.ensure(3) catch return error.DecodeError;
@@ -695,7 +695,7 @@ pub const CertificateRequest = struct {
         const ext_len = d.decode(u16);
         var exts = d.sub(ext_len) catch return error.DecodeError;
         if (!d.eof()) return error.DecodeError;
-        var seen: codec.ExtensionSet = .initEmpty();
+        var seen: codec.ExtensionSet = .empty;
         while (!exts.eof()) {
             exts.ensure(4) catch return error.DecodeError;
             const et = exts.decode(u16);
@@ -704,7 +704,7 @@ pub const CertificateRequest = struct {
             if (seen.isSet(et)) return error.IllegalParameter;
             seen.set(et);
             if (et == ca_names.extension_type) result.authorities = try ca_names.parse(ext.buf);
-            if (@as(tls.ExtensionType, @enumFromInt(et)) == .signature_algorithms) {
+            if (@as(tls.ExtensionType, @fromBackingInt(@intCast(et))) == .signature_algorithms) {
                 ext.ensure(2) catch return error.DecodeError;
                 const list_len = ext.decode(u16);
                 if (list_len < 2 or list_len % 2 != 0) return error.DecodeError;
@@ -720,7 +720,7 @@ pub const CertificateRequest = struct {
                 }
             }
         }
-        if (!seen.isSet(@intFromEnum(tls.ExtensionType.signature_algorithms))) return error.MissingExtension;
+        if (!seen.isSet(@backingInt(tls.ExtensionType.signature_algorithms))) return error.MissingExtension;
         return result;
     }
 
@@ -736,7 +736,7 @@ pub const CertificateRequest = struct {
 
 test "server hello parsing" {
     var buf: [256]u8 = undefined;
-    const sh = codec.serverHello(&buf, [_]u8{1} ** 32, "abc", 0x1301, 0x001d, &([_]u8{2} ** 32), false);
+    const sh = codec.serverHello(&buf, @as([32]u8, @splat(1)), "abc", 0x1301, 0x001d, &(@as([32]u8, @splat(2))), false);
     const parsed = try ServerHello.parse(sh[4..]);
     try std.testing.expect(!parsed.is_hrr);
     try std.testing.expectEqual(0x1301, parsed.cipher_suite);
@@ -767,9 +767,9 @@ test "the default client hello offers no AEGIS suite" {
     defer shares.wipe();
     try shares.generate(io, &.{.x25519});
     var buf: [client_hello_buffer_len]u8 = undefined;
-    const session_id = [_]u8{0} ** 32;
+    const session_id = @as([32]u8, @splat(0));
     {
-        const hello = try codec.ClientHello.parse(clientHello(&buf, [_]u8{1} ** 32, &session_id, options, shares.slice(), null, false).bytes[4..]);
+        const hello = try codec.ClientHello.parse(clientHello(&buf, @as([32]u8, @splat(1)), &session_id, options, shares.slice(), null, false).bytes[4..]);
         for (suites.default_suites) |s| try std.testing.expect(hello.offersSuite(s.wire()));
         try std.testing.expect(!hello.offersSuite(Suite.AEGIS_128L_SHA256.wire()));
         try std.testing.expect(!hello.offersSuite(Suite.AEGIS_256_SHA512.wire()));
@@ -777,7 +777,7 @@ test "the default client hello offers no AEGIS suite" {
     // The option adds both AEGIS suites.
     options.cipher_suites = suites.default_suites_with_aegis;
     {
-        const hello = try codec.ClientHello.parse(clientHello(&buf, [_]u8{1} ** 32, &session_id, options, shares.slice(), null, false).bytes[4..]);
+        const hello = try codec.ClientHello.parse(clientHello(&buf, @as([32]u8, @splat(1)), &session_id, options, shares.slice(), null, false).bytes[4..]);
         for (suites.default_suites) |s| try std.testing.expect(hello.offersSuite(s.wire()));
         try std.testing.expect(hello.offersSuite(Suite.AEGIS_128L_SHA256.wire()));
         try std.testing.expect(hello.offersSuite(Suite.AEGIS_256_SHA512.wire()));
@@ -802,9 +802,9 @@ test "trailing bytes and duplicates in server extensions are refused" {
     var buf: [256]u8 = undefined;
     const versions = "\x00\x2b\x00\x02\x03\x04";
     const versions_long = "\x00\x2b\x00\x03\x03\x04\x00";
-    const share = "\x00\x33\x00\x24\x00\x1d\x00\x20" ++ "\x02" ** 32;
-    _ = try ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions ++ share));
-    try std.testing.expectError(error.DecodeError, ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions_long ++ share)));
+    const share = "\x00\x33\x00\x24\x00\x1d\x00\x20" ++ @as([32]u8, @splat(2));
+    _ = try ServerHello.parse(testServerHello(&buf, @as([32]u8, @splat(1)), versions ++ share));
+    try std.testing.expectError(error.DecodeError, ServerHello.parse(testServerHello(&buf, @as([32]u8, @splat(1)), versions_long ++ share)));
     // A HelloRetryRequest cookie with a trailing byte.
     const hrr_share = "\x00\x33\x00\x02\x00\x1d";
     _ = try ServerHello.parse(testServerHello(&buf, tls.hello_retry_request_sequence, versions ++ "\x00\x2c\x00\x04\x00\x02\xaa\xbb" ++ hrr_share));
@@ -830,9 +830,9 @@ test "trailing bytes and duplicates in server extensions are refused" {
     var ee_versions = [_]u8{ 0, 6, 0, 43, 0, 2, 3, 4 };
     try std.testing.expectError(error.IllegalParameter, EncryptedExtensions.parse(&ee_versions, .{}));
     // ServerHello: a pre-shared key that the client did not offer, and an unknown extension.
-    try std.testing.expectError(error.UnsupportedExtension, ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions ++ share ++ "\x00\x29\x00\x02\x00\x00")));
-    try std.testing.expectError(error.UnsupportedExtension, ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions ++ share ++ "\xfe\xfe\x00\x00")));
-    try std.testing.expectError(error.IllegalParameter, ServerHello.parse(testServerHello(&buf, [_]u8{1} ** 32, versions ++ share ++ "\x00\x10\x00\x00")));
+    try std.testing.expectError(error.UnsupportedExtension, ServerHello.parse(testServerHello(&buf, @as([32]u8, @splat(1)), versions ++ share ++ "\x00\x29\x00\x02\x00\x00")));
+    try std.testing.expectError(error.UnsupportedExtension, ServerHello.parse(testServerHello(&buf, @as([32]u8, @splat(1)), versions ++ share ++ "\xfe\xfe\x00\x00")));
+    try std.testing.expectError(error.IllegalParameter, ServerHello.parse(testServerHello(&buf, @as([32]u8, @splat(1)), versions ++ share ++ "\x00\x10\x00\x00")));
 
     // CertificateRequest: signature_algorithms with a trailing byte, and a duplicate unknown
     // extension.
@@ -876,22 +876,22 @@ test "options outside the limits of the client hello buffer give TlsInvalidOptio
     var out: Writer = .fixed(&out_buf);
     const base: Options = .{ .io = io, .host = "localhost", .trust = .self_signed, .read_buffer = &read_buf, .write_buffer = &write_buf };
     try std.testing.expect(optionsFit(base));
-    const long_name = [_]u8{'a'} ** 256;
+    const long_name = @as([256]u8, @splat('a'));
     var options = base;
     options.alpn = &.{&long_name};
     try std.testing.expect(!optionsFit(options));
     options.alpn = &.{""};
     try std.testing.expect(!optionsFit(options));
-    const name = [_]u8{'a'} ** 200;
+    const name = @as([200]u8, @splat('a'));
     options.alpn = &.{ &name, &name, &name, &name, &name, &name };
     try std.testing.expect(!optionsFit(options));
     options.alpn = &.{ &name, &name, &name, &name, &name };
     try std.testing.expect(optionsFit(options));
     options = base;
-    options.cipher_suites = &([_]Suite{.AES_128_GCM_SHA256} ** (max_cipher_suites + 1));
+    options.cipher_suites = &(@as([max_cipher_suites + 1]Suite, @splat(.AES_128_GCM_SHA256)));
     try std.testing.expect(!optionsFit(options));
     options = base;
-    options.groups = &([_]key_share.Group{.x25519} ** (max_groups + 1));
+    options.groups = &(@as([max_groups + 1]key_share.Group, @splat(.x25519)));
     try std.testing.expect(!optionsFit(options));
     // connect refuses the options before it writes a byte.
     options = base;

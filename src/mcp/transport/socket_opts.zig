@@ -67,7 +67,7 @@ fn control(io: Io, socket: Io.net.Socket, mode: Mode, value: *u32) Error!void {
             switch (result.device_io_control.u.Status) {
                 .SUCCESS => {},
                 else => |status| {
-                    log.debug("TCP_NODELAY {t} failed: NTSTATUS 0x{x}", .{ mode, @intFromEnum(status) });
+                    log.debug("TCP_NODELAY {t} failed: NTSTATUS 0x{x}", .{ mode, @backingInt(status) });
                     return error.OptionRejected;
                 },
             }

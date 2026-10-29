@@ -121,8 +121,8 @@ fn render(comptime T: type, comptime meta: ?FieldMeta, comptime depth: usize) []
             },
             .@"enum" => |info| {
                 var values: []const u8 = "";
-                for (info.fields, 0..) |f, i| {
-                    values = values ++ (if (i > 0) "," else "") ++ jsonString(f.name);
+                for (info.field_names, 0..) |fname, i| {
+                    values = values ++ (if (i > 0) "," else "") ++ jsonString(fname);
                 }
                 return "{\"type\":\"string\",\"enum\":[" ++ values ++ "]" ++ extra ++ "}";
             },
@@ -132,12 +132,12 @@ fn render(comptime T: type, comptime meta: ?FieldMeta, comptime depth: usize) []
                 var props: []const u8 = "";
                 var required: []const u8 = "";
                 var required_count: usize = 0;
-                for (info.fields, 0..) |f, i| {
-                    const fm = fieldMeta(T, f.name);
-                    props = props ++ (if (i > 0) "," else "") ++ jsonString(f.name) ++ ":" ++ render(f.type, fm, depth + 1);
-                    const is_optional = @typeInfo(f.type) == .optional;
-                    if (!is_optional and f.default_value_ptr == null) {
-                        required = required ++ (if (required_count > 0) "," else "") ++ jsonString(f.name);
+                for (info.field_names, info.field_types, info.field_attrs, 0..) |fname, ftype, fattrs, i| {
+                    const fm = fieldMeta(T, fname);
+                    props = props ++ (if (i > 0) "," else "") ++ jsonString(fname) ++ ":" ++ render(ftype, fm, depth + 1);
+                    const is_optional = @typeInfo(ftype) == .optional;
+                    if (!is_optional and fattrs.default_value_ptr == null) {
+                        required = required ++ (if (required_count > 0) "," else "") ++ jsonString(fname);
                         required_count += 1;
                     }
                 }
@@ -152,8 +152,8 @@ fn render(comptime T: type, comptime meta: ?FieldMeta, comptime depth: usize) []
             .@"union" => |info| {
                 if (info.tag_type == null) @compileError("schema derivation: untagged unions are not supported");
                 var variants: []const u8 = "";
-                for (info.fields, 0..) |f, i| {
-                    variants = variants ++ (if (i > 0) "," else "") ++ render(f.type, null, depth + 1);
+                for (info.field_types, 0..) |ftype, i| {
+                    variants = variants ++ (if (i > 0) "," else "") ++ render(ftype, null, depth + 1);
                 }
                 return "{\"oneOf\":[" ++ variants ++ "]" ++ extra ++ "}";
             },

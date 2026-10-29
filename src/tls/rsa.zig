@@ -319,7 +319,7 @@ fn emsaPssVerify(comptime Hash: type, message: []const u8, em: []const u8, em_bi
     Hash.hash(message, &m_hash, .{});
     var expected: [h_len]u8 = undefined;
     var hasher: Hash = .init(.{});
-    hasher.update(&([_]u8{0} ** 8));
+    hasher.update(&(@as([8]u8, @splat(0))));
     hasher.update(&m_hash);
     hasher.update(db[db_len - salt_len .. db_len]);
     hasher.final(&expected);
@@ -347,7 +347,7 @@ pub fn emsaPssEncode(comptime Hash: type, message: []const u8, salt: *const [Has
     // H = Hash(0x00 * 8 || mHash || salt).
     var h: [h_len]u8 = undefined;
     var hasher: Hash = .init(.{});
-    hasher.update(&([_]u8{0} ** 8));
+    hasher.update(&(@as([8]u8, @splat(0))));
     hasher.update(&m_hash);
     hasher.update(salt);
     hasher.final(&h);
@@ -436,7 +436,7 @@ fn verifyWithStd(comptime Hash: type, key: *const PrivateKey, message: []const u
     const components = try Std.PublicKey.parseDer(key.publicKeyDer(&pk_buf));
     const public_key: Std.PublicKey = try .fromBytes(components.exponent, components.modulus);
     switch (sig.len) {
-        inline 256, 384, 512 => |len| try Std.PSSSignature.verify(len, sig[0..len].*, message, public_key, Hash),
+        inline 256, 384, 512 => |len| try Std.PSSSignature.verify(len, sig[0..len], message, public_key, Hash),
         else => return error.UnsupportedModulus,
     }
 }
@@ -476,8 +476,8 @@ test "RSASSA-PKCS1-v1_5 signatures verify with the std verifier" {
     var out: [max_modulus_len]u8 = undefined;
     inline for (.{ crypto.hash.sha2.Sha256, crypto.hash.sha2.Sha384, crypto.hash.sha2.Sha512 }) |Hash| {
         const sig = try key.signPkcs1v15(Hash, "header.payload", &out);
-        try Std.PKCS1v1_5Signature.verify(256, sig[0..256].*, "header.payload", public_key, Hash);
-        try std.testing.expectError(error.InvalidSignature, Std.PKCS1v1_5Signature.verify(256, sig[0..256].*, "other", public_key, Hash));
+        try Std.PKCS1v1_5Signature.verify(256, sig[0..256], "header.payload", public_key, Hash);
+        try std.testing.expectError(error.InvalidSignature, Std.PKCS1v1_5Signature.verify(256, sig[0..256], "other", public_key, Hash));
     }
 }
 

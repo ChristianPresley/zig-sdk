@@ -2065,9 +2065,9 @@ test "parameters, scopes, verifiers and redirect URIs" {
 
     try std.testing.expectEqual(2, (try parseScope(arena, "mcp:read  mcp:write mcp:read", 8)).len);
     try std.testing.expectError(error.InvalidScope, parseScope(arena, "bad\"scope", 8));
-    try std.testing.expect(validVerifier("a" ** 43));
-    try std.testing.expect(!validVerifier("a" ** 42));
-    try std.testing.expect(!validVerifier(("a" ** 42) ++ "+"));
+    try std.testing.expect(validVerifier(&@as([43]u8, @splat('a'))));
+    try std.testing.expect(!validVerifier(&@as([42]u8, @splat('a'))));
+    try std.testing.expect(!validVerifier((@as([42]u8, @splat('a'))) ++ "+"));
 
     try std.testing.expect(redirectMatches("http://127.0.0.1/callback", "http://127.0.0.1:53111/callback"));
     try std.testing.expect(redirectMatches("http://[::1]:80/cb", "http://[::1]:9/cb"));

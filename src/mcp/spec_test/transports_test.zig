@@ -506,7 +506,7 @@ const Fixture = struct {
         try conn.flush();
         const response = try conn.receiveHead();
         const head = try arena.dupe(u8, response.bytes);
-        const status: u16 = @intFromEnum(response.head.status);
+        const status: u16 = @backingInt(response.head.status);
         const reader = conn.bodyReader(&response);
         const reply_body = try reader.allocRemaining(arena, .limited(1 << 20));
         return .{ .status = status, .head = head, .body = reply_body };

@@ -76,5 +76,5 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
-      # -Dfuzz: the fuzz path of the test runner of Zig 0.16.0 does not compile. See build.zig.
+      # -Dfuzz: the LLVM backend, because the self-hosted backend emits no coverage table. See build.zig.
       - run: zig build test -Dfuzz --fuzz=200000 --summary all

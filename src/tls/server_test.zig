@@ -253,7 +253,7 @@ test "a TLS 1.2 client hello is refused with protocol_version" {
     var out_buf: [512]u8 = undefined;
     var writer = stream.writer(io, &out_buf);
     // A minimal TLS 1.2-only ClientHello: no supported_versions extension.
-    const hello = [_]u8{ 0x16, 0x03, 0x01, 0x00, 0x2d, 0x01, 0x00, 0x00, 0x29, 0x03, 0x03 } ++ [_]u8{0} ** 32 ++
+    const hello = [_]u8{ 0x16, 0x03, 0x01, 0x00, 0x2d, 0x01, 0x00, 0x00, 0x29, 0x03, 0x03 } ++ @as([32]u8, @splat(0)) ++
         [_]u8{ 0x00, 0x00, 0x02, 0xc0, 0x2f, 0x01, 0x00 };
     try writer.interface.writeAll(&hello);
     try writer.interface.flush();
@@ -262,7 +262,7 @@ test "a TLS 1.2 client hello is refused with protocol_version" {
     const alert = try reader.interface.takeArray(7);
     try std.testing.expectEqual(0x15, alert[0]); // alert record
     try std.testing.expectEqual(2, alert[5]); // fatal
-    try std.testing.expectEqual(@intFromEnum(std.crypto.tls.Alert.Description.missing_extension), alert[6]);
+    try std.testing.expectEqual(@backingInt(std.crypto.tls.Alert.Description.missing_extension), alert[6]);
     future.await(io);
     try std.testing.expectError(error.TlsMissingExtension, echo.result);
 }
@@ -487,14 +487,14 @@ test "a malformed certificate_authorities extension is refused with decode_error
     b.byte(0x01);
     const msg = b.beginLen(u24);
     b.bytes(&.{ 0x03, 0x03 });
-    b.bytes(&([_]u8{0x11} ** 32));
+    b.bytes(&(@as([32]u8, @splat(0x11))));
     b.bytes(&.{ 0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00 });
     const exts = b.beginLen(u16);
     b.bytes(&.{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 });
     b.bytes(&.{ 0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x1d });
     b.bytes(&.{ 0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x04, 0x03 });
     b.bytes(&.{ 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 });
-    b.bytes(&([_]u8{0x09} ** 32));
+    b.bytes(&(@as([32]u8, @splat(0x09))));
     b.bytes(&.{ 0x00, 0x2f, 0x00, 0x06, 0x00, 0x04, 0x00, 0x02, 0x30, 0x00 });
     b.endLen(u16, exts);
     b.endLen(u24, msg);
@@ -508,7 +508,7 @@ test "a malformed certificate_authorities extension is refused with decode_error
     const alert = try reader.interface.takeArray(7);
     try std.testing.expectEqual(0x15, alert[0]); // alert record
     try std.testing.expectEqual(2, alert[5]); // fatal
-    try std.testing.expectEqual(@intFromEnum(std.crypto.tls.Alert.Description.decode_error), alert[6]);
+    try std.testing.expectEqual(@backingInt(std.crypto.tls.Alert.Description.decode_error), alert[6]);
     future.await(io);
     try std.testing.expectError(error.TlsDecodeError, echo.result);
 }

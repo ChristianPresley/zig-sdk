@@ -636,7 +636,7 @@ test "oauth client keeps its record in a file storage, and a second client needs
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
-    const file_key = [_]u8{0x5a} ** 32;
+    const file_key = @as([32]u8, @splat(0x5a));
     const server_url = try mock.serverUrl(arena);
     test_time = 1_000_000;
 
@@ -786,7 +786,7 @@ test "oauth clients that share a file storage use the tokens that the other clie
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
-    const file_key = [_]u8{0x5b} ** 32;
+    const file_key = @as([32]u8, @splat(0x5b));
     const server_url = try mock.serverUrl(arena);
     test_time = 1_000_000;
 
@@ -886,7 +886,7 @@ test "oauth client takes the tokens of another process that rotated the refresh 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
-    const file_key = [_]u8{0x5c} ** 32;
+    const file_key = @as([32]u8, @splat(0x5c));
     const server_url = try mock.serverUrl(arena);
     const key = try dynamicKey(arena, mock.base, server_url);
     test_time = 1_000_000;
@@ -947,7 +947,7 @@ test "oauth client removes refused tokens from the storage only when no other cl
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
-    const file_key = [_]u8{0x5d} ** 32;
+    const file_key = @as([32]u8, @splat(0x5d));
     const server_url = try mock.serverUrl(arena);
     const key = try dynamicKey(arena, mock.base, server_url);
     test_time = 1_000_000;
@@ -1000,7 +1000,7 @@ test "oauth client keeps its registration and refresh token when a record of ano
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
-    const file_key = [_]u8{0x5e} ** 32;
+    const file_key = @as([32]u8, @splat(0x5e));
     const server_url = try mock.serverUrl(arena);
     const key = try dynamicKey(arena, mock.base, server_url);
     test_time = 1_000_000;
@@ -1057,7 +1057,7 @@ test "oauth client deletes the stored record after a refused client only when no
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/tokens", .{tmp.sub_path});
-    const file_key = [_]u8{0x5f} ** 32;
+    const file_key = @as([32]u8, @splat(0x5f));
     const server_url = try mock.serverUrl(arena);
     const key = try dynamicKey(arena, mock.base, server_url);
     test_time = 1_000_000;

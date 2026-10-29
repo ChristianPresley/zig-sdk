@@ -94,7 +94,7 @@ pub const Element = struct {
         const minute = try digits(rest[6..8]);
         const second = try digits(rest[8..10]);
         if (month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 59) return error.InvalidLength;
-        const month_enum: std.time.epoch.Month = @enumFromInt(month);
+        const month_enum: std.time.epoch.Month = @fromBackingInt(@intCast(month));
         if (day > std.time.epoch.getDaysInMonth(@intCast(year), month_enum)) return error.InvalidLength;
         return daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
     }

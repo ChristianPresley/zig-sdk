@@ -528,7 +528,7 @@ pub const LoggingLevel = enum {
 
     /// Severity order: higher is more severe.
     pub fn severity(self: LoggingLevel) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

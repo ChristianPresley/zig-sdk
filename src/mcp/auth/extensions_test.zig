@@ -85,7 +85,7 @@ const FakeAuth = struct {
             .future = undefined,
             .base = undefined,
             .idp_issuer = undefined,
-            .idp_key = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{5} ** 32) },
+            .idp_key = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(5))) },
             .nonce_issuer = try .init(io),
         };
         const address = try Io.net.IpAddress.parse("127.0.0.1", 0);
@@ -433,7 +433,7 @@ test "client credentials: private_key_jwt and renewal before expiry" {
     const arena = arena_state.allocator();
 
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{8} ** 32) };
+    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(8))) };
     const point = key.es256.public_key.toUncompressedSec1();
     @memcpy(auth.client_key[0..point.len], &point);
     auth.client_key_len = point.len;
@@ -456,7 +456,7 @@ test "client credentials: private_key_jwt and renewal before expiry" {
 
     // A key that the server does not accept stops the flow with the server error code.
     auth.expires_in = 3600;
-    const other: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{4} ** 32) };
+    const other: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(4))) };
     var bad: mcp.auth.ClientCredentials = .init(std.testing.io, std.testing.allocator, .{
         .client = .{ .private_key_jwt = .{ .client_id = cc_client_id, .key = &other } },
         .allow_http = true,
@@ -550,7 +550,7 @@ test "DPoP: client credentials with DPoP-bound tokens and nonces at both servers
 
     // A key with an algorithm that the authorization server does not list.
     const P384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
-    var p384: dpop.Prover = try .init(io, gpa, .{ .es384 = try P384.KeyPair.generateDeterministic([_]u8{9} ** 48) });
+    var p384: dpop.Prover = try .init(io, gpa, .{ .es384 = try P384.KeyPair.generateDeterministic(@as([48]u8, @splat(9))) });
     defer p384.deinit();
     var unsupported: mcp.auth.ClientCredentials = .init(io, gpa, .{
         .client = .{ .client_secret = .{ .client_id = cc_client_id, .client_secret = cc_client_secret } },
@@ -579,7 +579,7 @@ test "workload identity: a workload JWT as a grant, with keys from OpenID Connec
 
     // The issuer of the workload JWTs and its JWK set.
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{22} ** 32) };
+    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(22))) };
     const jwk = try jwt.publicJwk(arena, &key);
     issuer.jwks = try std.fmt.allocPrint(arena, "{{\"keys\":[{s},\"kid\":\"wl1\",\"use\":\"sig\"}}]}}", .{jwk[0 .. jwk.len - 1]});
     const issuer_url = try std.fmt.allocPrint(arena, "{s}/wl", .{issuer.base});
@@ -630,7 +630,7 @@ test "id-jag validation rules" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic([_]u8{6} ** 32) };
+    const key: jwt.SigningKey = .{ .es256 = try Ecdsa.KeyPair.generateDeterministic(@as([32]u8, @splat(6))) };
     var buf: [97]u8 = undefined;
     const trusted = [_]enterprise.TrustedIssuer{.{ .issuer = "https://idp.example", .keys = &.{key.verificationKey(&buf, null)} }};
     const Replay = struct {
