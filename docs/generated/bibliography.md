@@ -1475,6 +1475,15 @@ This page lists every source that the wiki, the README and the design documents 
 - Accessed: 2026-09-29
 - Note: Local source of truth: C:\zig\lib\std (0.16.0).
 
+### ZIG-0.17-RELNOTES
+
+- Title: 0.17.0 Release Notes
+- Author: Zig Software Foundation
+- Publisher: ziglang.org
+- Date: 2026-10-01
+- URL: <https://ziglang.org/download/0.17.0/release-notes.html>
+- Accessed: 2026-10-29
+
 ### ZIG-BUILD-GUIDE
 
 - Title: Zig Build System (learn guide)

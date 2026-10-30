@@ -1243,6 +1243,16 @@
         .category = "zig",
     },
     .{
+        .id = "ZIG-0.17-RELNOTES",
+        .title = "0.17.0 Release Notes",
+        .author = "Zig Software Foundation",
+        .publisher = "ziglang.org",
+        .date = "2026-10-01",
+        .url = "https://ziglang.org/download/0.17.0/release-notes.html",
+        .accessed = "2026-10-29",
+        .category = "zig",
+    },
+    .{
         .id = "ZIG-BUILD-GUIDE",
         .title = "Zig Build System (learn guide)",
         .author = "Zig Software Foundation",
