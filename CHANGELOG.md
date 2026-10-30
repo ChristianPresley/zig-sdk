@@ -4,6 +4,8 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-29
+
 ### Changed
 
 - The package needs Zig 0.17.0 (`minimum_zig_version`). Zig 0.16.0 does not build it. Zig 0.17.0 removed the operator `**`, renamed the optimize modes to `debug`, `safe`, `fast` and `small`, and changed `@typeInfo` to give arrays of field names and types. The source follows these changes. No public API of the package changes.
@@ -466,7 +468,8 @@ This file records all notable changes to this project. The format follows Keep a
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.6.0...v0.7.0
