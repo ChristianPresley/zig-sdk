@@ -11,7 +11,7 @@ permissions:
 jobs:
   wiki-lint:
     name: wiki-lint
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || vars.LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/checkout@v7
@@ -30,7 +30,7 @@ jobs:
 
   link-check:
     name: link-check
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || vars.LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Check every URL of the bibliography
@@ -51,7 +51,7 @@ jobs:
 
   release-safe-matrix:
     name: test (${{ matrix.os }}, ReleaseSafe)
-    runs-on: ${{ matrix.os != 'ubuntu-24.04' && matrix.os || ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || vars.LINUX_RUNNER || 'ubuntu-24.04') }}
+    runs-on: ${{ matrix.os != 'ubuntu-24.04' && matrix.os || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +64,7 @@ jobs:
 
   bench-smoke:
     name: bench-smoke
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || vars.LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
@@ -72,7 +72,7 @@ jobs:
 
   fuzz:
     name: fuzz
-    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || vars.LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
