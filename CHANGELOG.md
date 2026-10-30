@@ -4,6 +4,15 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-29
+
+### Changed
+
+- The minimum Zig version is still 0.17.0. The CI pins, the documents and the examples name Zig 0.17.0 only.
+- The two tests of the request arena of the client allow a margin of 64 KiB. The capacity of the arena of Zig 0.17.0 depends on thread timing, because the tests read it while the listen job runs.
+- `docs/spec/requirements.zon` has the characters that are not ASCII as they are. The ZON writer of Zig 0.17.0 does not escape them.
+- The bibliography has the release notes of Zig 0.17.0.
+
 ## [0.9.0] - 2026-10-29
 
 ### Changed
@@ -468,7 +477,8 @@ This file records all notable changes to this project. The format follows Keep a
 - Fuzz targets for every parser (`zig build test --fuzz`), run nightly. A certificate precheck now rejects malformed peer certificates before the std parser reads them; the first fuzz run found that the std parser reads out of bounds on truncated input.
 - CI workflow with a GitHub-native Zig installation step, a consumer build through `b.dependency`, a nightly workflow (wiki lint, link check, ReleaseSafe matrix) and a release workflow that verifies the signed tag and publishes the changelog section.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-sdk/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/ChristianPresley/zig-sdk/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/ChristianPresley/zig-sdk/compare/v0.7.0...v0.7.1
